@@ -770,6 +770,18 @@ working. Directories dcg creates for the database are owner-only (`0700`).
 `dcg doctor` prints the resolved path, which rule selected it, and whether the
 hook can write there.
 
+What a row can and cannot tell you:
+
+- `hostname` is the machine that recorded the row, so databases copied off
+  several machines can be merged and still attributed.
+- `exit_code` is always NULL on rows the hook writes. dcg runs *before* the
+  command, so it never learns how the command ended. Read NULL as "unknown",
+  not as "succeeded". History records dcg's decisions (allow, deny, warn,
+  bypass); it cannot by itself show that an allowed command did damage.
+- `dcg history analyze` works from those decisions. With no recorded commands
+  it says so and makes no recommendations. A pack that never matched is listed
+  but never recommended for removal: a guard pack that stays quiet is working.
+
 ### Output Formats and `DCG_FORMAT`
 
 `--format` (and the `DCG_FORMAT` env var, which seeds the default) is

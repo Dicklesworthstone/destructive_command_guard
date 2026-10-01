@@ -110,6 +110,12 @@ tru = "0.2.2"
 # stack and the regex renderer below already has a purpose-built highlighter.
 rich_rust = { version = "0.2.2", features = ["markdown"], optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# Safe `gethostname()` for the history `hostname` column (#514). nix is already
+# compiled in through ctrlc; this only turns on its `hostname` feature, so no
+# new crate enters the graph and `#![forbid(unsafe_code)]` still holds here.
+nix = { version = "0.31", default-features = false, features = ["hostname"] }
+
 [build-dependencies]
 vergen-gix = { version = "10.0.0-beta.8", features = ["build", "cargo", "rustc"] }
 # Windows PE metadata (#303): a VERSIONINFO resource (product/company/

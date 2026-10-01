@@ -1507,6 +1507,11 @@ pub enum HistoryAction {
     },
 
     /// Analyze pack effectiveness and generate recommendations
+    ///
+    /// Works from recorded decisions (allow, deny, warn, bypass), not command
+    /// outcomes: dcg's hooks run before a command executes, so `exit_code` is
+    /// NULL (unknown) on the rows they write. With no recorded commands it
+    /// reports that there is nothing to analyze.
     #[command(name = "analyze")]
     Analyze {
         /// Time period in days (default: 30)
@@ -10344,7 +10349,9 @@ fn history_analyze(
     // Get enabled packs from config
     let config = Config::load();
     let enabled_pack_ids = config.enabled_pack_ids();
-    let enabled_packs: Vec<&str> = enabled_pack_ids.iter().map(String::as_str).collect();
+    let mut enabled_packs: Vec<&str> = enabled_pack_ids.iter().map(String::as_str).collect();
+    // A set has no order; sort so the listing is stable from run to run.
+    enabled_packs.sort_unstable();
 
     let analysis = db.analyze_pack_effectiveness(days, &enabled_packs)?;
 
@@ -10364,6 +10371,36 @@ fn history_analyze(
         analysis.period_days,
         analysis.total_commands.to_string().yellow()
     );
+
+    // Nothing recorded means nothing was judged. Printing the usual sections
+    // here produced green "no gaps" checks and advice to disable `core` drawn
+    // from zero commands (#513).
+    if !analysis.has_data {
+        println!(
+            "{}",
+            format!(
+                "No command history in the last {} days, so there is nothing to analyze.",
+                analysis.period_days
+            )
+            .yellow()
+        );
+        if crate::history::history_disabled_by_env() {
+            println!(
+                "History collection is turned off by {ENV_HISTORY_DISABLED} in this environment."
+            );
+        } else if config.history.enabled {
+            println!(
+                "History collection is enabled; rows appear as the hook evaluates commands \
+                 (database: {}).",
+                ResolvedHistoryPath::resolve(&config.history).path.display()
+            );
+        } else {
+            println!(
+                "History collection is off. Enable it in config.toml with:\n\n  [history]\n  enabled = true\n"
+            );
+        }
+        return Ok(());
+    }
 
     // Show recommendations (always unless specific view requested)
     if !false_positives && !gaps || recommendations_only {
@@ -10463,11 +10500,14 @@ fn history_analyze(
             );
         }
 
-        // Show inactive packs
+        // Show inactive packs. A guard pack that never fired is working, so
+        // this is a listing, not advice to disable anything (#513).
         if !analysis.inactive_packs.is_empty() {
             println!(
-                "\n{} Inactive packs (enabled but never triggered): {}",
+                "\n{} Enabled packs with no matches in these {} commands (expected for \
+                 guard packs; not a reason to disable them): {}",
                 "ℹ️ ".dimmed(),
+                analysis.total_commands,
                 analysis.inactive_packs.join(", ").dimmed()
             );
         }

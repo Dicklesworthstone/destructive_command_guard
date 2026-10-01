@@ -11,6 +11,21 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+### Command history
+
+- `dcg history analyze` on an empty history now says there is nothing to
+  analyze and how to enable `[history]`, instead of green "no coverage gaps"
+  checks and advice to disable packs, `core` first, drawn from zero commands.
+  The JSON output gains `has_data`. With data, a pack that never matched is
+  still listed but is no longer recommended for removal: a guard pack that
+  stays quiet is working (#513).
+- History rows now record the machine's `hostname`; it was always NULL (#514).
+- The docs and `dcg history analyze --help` now state that `exit_code` is NULL
+  on every row the hook writes, because the hook runs before the command and
+  cannot know how it ended. NULL means unknown, not success (#515).
+
 ## [v0.15.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.2) -- 2026-10-01 [Release]
 
 **This is a security fix release. v0.15.1 can fail open under load: upgrade.**

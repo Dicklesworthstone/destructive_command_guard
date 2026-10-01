@@ -367,6 +367,14 @@ The database path resolves in this order (highest priority first):
    `%LOCALAPPDATA%\dcg\history.db`
 
 `DCG_HISTORY_DISABLED=1` prevents the database from being opened at all.
+
+Each row records the decision, the rule that made it, the agent, working
+directory, session, and the recording machine's `hostname`. The `exit_code`
+column is NULL on every row the hook writes: the hook runs before the command
+executes, so the outcome is unknown to dcg, and NULL means "unknown", not
+"succeeded". `dcg history analyze` therefore reports on decisions, not
+outcomes, and with an empty history it reports that there is nothing to
+analyze instead of producing recommendations.
 Directories dcg creates for the database are `0700` on Unix. `dcg doctor`
 reports the resolved path, its source, and whether the hook can write there
 (check id `history` in `--format json`).

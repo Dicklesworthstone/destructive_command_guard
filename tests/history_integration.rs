@@ -619,6 +619,54 @@ fn test_history_writer_logs_allow() {
     assert_eq!(reader.count_commands().unwrap(), 1);
 }
 
+/// #514: the writer fills `hostname` for rows that leave it unset, and keeps
+/// one a caller (an import, say) already carries.
+#[test]
+fn history_writer_records_hostname_unless_the_entry_has_one_514() {
+    init_test_logging();
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    let db_path = temp_dir.path().join("history_writer_hostname.db");
+    let config = HistoryConfig {
+        enabled: true,
+        redaction_mode: HistoryRedactionMode::None,
+        ..Default::default()
+    };
+    let writer = HistoryWriter::new(Some(db_path.clone()), &config);
+    for (command, hostname) in [
+        ("git status", None),
+        ("ls", Some("imported-host".to_string())),
+    ] {
+        writer.log(CommandEntry {
+            timestamp: Utc::now(),
+            agent_type: "claude_code".to_string(),
+            working_dir: "/tmp".to_string(),
+            command: command.to_string(),
+            outcome: Outcome::Allow,
+            hostname,
+            ..Default::default()
+        });
+    }
+    finish_history_writer(writer, "hostname entries");
+
+    let reader = HistoryDb::open(Some(db_path)).expect("open reader");
+    let rows = reader
+        .connection()
+        .query("SELECT command, hostname FROM commands ORDER BY id")
+        .expect("query hostnames");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        sv_to_opt_string(&rows[0].values()[1]).as_deref(),
+        destructive_command_guard::history::local_hostname(),
+        "an unset hostname is filled with this machine's"
+    );
+    assert_eq!(
+        sv_to_opt_string(&rows[1].values()[1]).as_deref(),
+        Some("imported-host"),
+        "a hostname the entry already carries is kept"
+    );
+}
+
 #[test]
 fn test_history_writer_respects_disabled() {
     init_test_logging();

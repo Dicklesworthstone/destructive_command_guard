@@ -268,13 +268,20 @@ pub struct CommandEntry {
     /// Optional session ID to group commands.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// Exit code if the command was executed.
+    /// Exit code of the command, when the writer knows it.
+    ///
+    /// dcg's hooks run *before* the command executes, so every row they write
+    /// leaves this `None` (SQL `NULL`): it means "unknown", never "succeeded"
+    /// (#515). Nothing in dcg fills it today; the column exists for sources that
+    /// observe the outcome.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     /// Parent command ID for subshell tracking.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_command_id: Option<i64>,
-    /// Hostname for multi-machine setups.
+    /// Hostname of the machine that recorded the row, so merged databases
+    /// from several machines stay attributable. The history writer fills it
+    /// when the caller leaves it `None` (#514).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     /// Allowlist layer that matched (if command was allowed by allowlist).
@@ -2479,6 +2486,23 @@ impl HistoryDb {
         )?;
         let total_commands = u64::try_from(sv_to_i64(&total_row.values()[0])).unwrap_or(0);
 
+        // With nothing recorded there is nothing to judge: every pack would be
+        // "inactive" and every gap check vacuously clean, which used to read as
+        // a green verdict recommending that `core` be disabled (#513).
+        if total_commands == 0 {
+            return Ok(PackEffectivenessAnalysis {
+                period_days,
+                analyzed_at: now,
+                total_commands,
+                has_data: false,
+                high_value_patterns: Vec::new(),
+                potentially_aggressive: Vec::new(),
+                inactive_packs: Vec::new(),
+                potential_gaps: Vec::new(),
+                recommendations: Vec::new(),
+            });
+        }
+
         // Query pattern effectiveness (denied + bypassed counts)
         let pattern_stats = self.query_pattern_effectiveness(&since_ts, &end_ts)?;
 
@@ -2487,9 +2511,20 @@ impl HistoryDb {
 
         // Find inactive packs
         let active_packs = self.query_active_packs(&since_ts, &end_ts)?;
+        // An enabled id may be a category marker: the config always carries
+        // `core`, while rows name the leaf pack (`core.git`). Comparing them by
+        // equality listed `core` as never triggered on every machine (#513).
         let inactive_packs: Vec<String> = enabled_packs
             .iter()
-            .filter(|pack| !active_packs.contains(&pack.to_string()))
+            .filter(|pack| {
+                let pack: &str = pack;
+                !active_packs.iter().any(|active| {
+                    active == pack
+                        || active
+                            .strip_prefix(pack)
+                            .is_some_and(|rest| rest.starts_with('.'))
+                })
+            })
             .map(std::string::ToString::to_string)
             .collect();
 
@@ -2497,17 +2532,14 @@ impl HistoryDb {
         let potential_gaps = self.find_coverage_gaps(&since_ts, &end_ts)?;
 
         // Generate recommendations
-        let recommendations = Self::generate_recommendations(
-            &high_value,
-            &aggressive,
-            &inactive_packs,
-            &potential_gaps,
-        );
+        let recommendations =
+            Self::generate_recommendations(&high_value, &aggressive, &potential_gaps);
 
         Ok(PackEffectivenessAnalysis {
             period_days,
             analyzed_at: now,
             total_commands,
+            has_data: true,
             high_value_patterns: high_value,
             potentially_aggressive: aggressive,
             inactive_packs,
@@ -2713,10 +2745,14 @@ impl HistoryDb {
     }
 
     /// Generate recommendations based on analysis.
+    ///
+    /// A pack that never matched is deliberately not a recommendation: a guard
+    /// pack that stays quiet on a well-behaved machine is doing its job, and
+    /// zero denials cannot show that the tooling it guards is never used (#513).
+    /// Such packs are only listed, in [`PackEffectivenessAnalysis::inactive_packs`].
     fn generate_recommendations(
         high_value: &[PatternEffectiveness],
         aggressive: &[PatternEffectiveness],
-        inactive_packs: &[String],
         gaps: &[PotentialGap],
     ) -> Vec<PackRecommendation> {
         let mut recommendations = Vec::new();
@@ -2738,24 +2774,6 @@ impl HistoryDb {
                 config_change: None,
                 related_pattern: Some(p.pattern.clone()),
                 priority: 8,
-            });
-        }
-
-        // Recommend disabling inactive packs
-        for pack in inactive_packs.iter().take(3) {
-            recommendations.push(PackRecommendation {
-                recommendation_type: RecommendationType::DisablePack,
-                description: format!(
-                    "Pack '{pack}' is enabled but has not triggered any rules. \
-                     Consider disabling it to reduce overhead."
-                ),
-                suggested_action: None,
-                config_change: Some(format!(
-                    "[packs.{}]\nenabled = false",
-                    pack.replace('.', "_")
-                )),
-                related_pattern: Some(pack.clone()),
-                priority: 3,
             });
         }
 
@@ -3487,8 +3505,6 @@ pub enum RecommendationType {
     RelaxPattern,
     /// Consider enabling a currently disabled pack.
     EnablePack,
-    /// Consider disabling an unused pack.
-    DisablePack,
     /// Add a new pattern to cover a gap.
     AddPattern,
     /// General tuning suggestion.
@@ -3525,11 +3541,17 @@ pub struct PackEffectivenessAnalysis {
     pub analyzed_at: DateTime<Utc>,
     /// Total commands analyzed.
     pub total_commands: u64,
+    /// Whether any command was recorded in the period. When `false`, every
+    /// list below is empty because there was nothing to analyze, not because
+    /// the analysis found nothing (#513).
+    pub has_data: bool,
     /// High-value patterns (high volume, low bypass rate).
     pub high_value_patterns: Vec<PatternEffectiveness>,
     /// Potentially overly aggressive patterns (high bypass rate).
     pub potentially_aggressive: Vec<PatternEffectiveness>,
-    /// Enabled packs that never triggered.
+    /// Enabled packs that matched none of the recorded commands. Informational
+    /// only: for a guard pack this is the expected state, not a reason to
+    /// disable it.
     pub inactive_packs: Vec<String>,
     /// Potential coverage gaps (dangerous commands that were allowed).
     pub potential_gaps: Vec<PotentialGap>,
@@ -5350,6 +5372,63 @@ mod tests {
         assert!(analysis.high_value_patterns.is_empty());
         assert!(analysis.potentially_aggressive.is_empty());
         assert_eq!(analysis.total_commands, 0);
+        // #513: nothing recorded is not "every pack inactive" or "no gaps";
+        // it is no data, and nothing may be recommended from it.
+        assert!(!analysis.has_data);
+        assert!(analysis.inactive_packs.is_empty());
+        assert!(analysis.potential_gaps.is_empty());
+        assert!(analysis.recommendations.is_empty());
+    }
+
+    #[test]
+    fn a_category_counts_as_active_when_one_of_its_packs_matched_513() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+        insert_analysis_entry(&db, "reset-hard", "core.git", Outcome::Deny, now);
+
+        let analysis = db
+            .analyze_pack_effectiveness(30, &["core", "corex", "core.filesystem", "database"])
+            .unwrap();
+
+        assert_eq!(
+            analysis.inactive_packs,
+            vec![
+                "corex".to_string(),
+                "core.filesystem".to_string(),
+                "database".to_string()
+            ],
+            "`core` covers `core.git`; a lookalike prefix or a sibling leaf does not"
+        );
+    }
+
+    #[test]
+    fn quiet_packs_are_listed_but_never_recommended_for_removal_513() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+        for _ in 0..200 {
+            insert_analysis_entry(&db, "reset-hard", "core.git", Outcome::Deny, now);
+        }
+
+        let analysis = db
+            .analyze_pack_effectiveness(30, &["core.git", "core.filesystem", "database.redis"])
+            .unwrap();
+
+        assert!(analysis.has_data);
+        assert_eq!(
+            analysis.inactive_packs,
+            vec!["core.filesystem".to_string(), "database.redis".to_string()]
+        );
+        for rec in &analysis.recommendations {
+            let related = rec.related_pattern.as_deref().unwrap_or_default();
+            assert!(
+                !analysis.inactive_packs.iter().any(|pack| pack == related),
+                "a quiet pack must not be the subject of a recommendation: {rec:?}"
+            );
+            assert!(
+                !rec.description.contains("disabl") && rec.config_change.is_none(),
+                "no recommendation may suggest disabling a pack: {rec:?}"
+            );
+        }
     }
 
     #[test]

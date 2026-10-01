@@ -992,6 +992,7 @@ dependencies = [
  "insta",
  "libc",
  "memchr",
+ "nix",
  "once_cell",
  "predicates",
  "proptest",

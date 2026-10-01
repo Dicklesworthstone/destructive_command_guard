@@ -72,6 +72,46 @@ pub const ENV_HISTORY_DISABLED: &str = "DCG_HISTORY_DISABLED";
 /// omission from unexplained data loss. Normal robot/hook output stays silent.
 pub const ENV_HISTORY_DIAGNOSTICS: &str = "DCG_HISTORY_DIAGNOSTICS";
 
+/// The machine's hostname for the history `hostname` column (#514).
+///
+/// Resolved once per process and cached: a hook process records at most a few
+/// rows, and the lookup is one syscall on Unix and one environment read on
+/// Windows, so it never spawns a process. `None` when the platform gives no
+/// usable name; a NULL column then means "unknown", as it always has.
+#[must_use]
+pub fn local_hostname() -> Option<&'static str> {
+    static HOSTNAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOSTNAME
+        .get_or_init(|| resolve_local_hostname().and_then(|raw| normalize_hostname(&raw)))
+        .as_deref()
+}
+
+#[cfg(unix)]
+fn resolve_local_hostname() -> Option<String> {
+    nix::unistd::gethostname()
+        .ok()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+#[cfg(windows)]
+fn resolve_local_hostname() -> Option<String> {
+    // Windows sets COMPUTERNAME for every process; it is the NetBIOS name,
+    // which is what `hostname.exe` prints.
+    env::var("COMPUTERNAME").ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn resolve_local_hostname() -> Option<String> {
+    None
+}
+
+/// Trim a raw hostname and reject one that is empty or contains control
+/// characters, so the column never holds a newline or a terminal escape.
+fn normalize_hostname(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    (!name.is_empty() && !name.chars().any(char::is_control)).then(|| name.to_string())
+}
+
 fn history_diagnostic(status: &str, detail: std::fmt::Arguments<'_>) {
     if env::var(ENV_HISTORY_DIAGNOSTICS)
         .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -438,6 +478,11 @@ impl HistoryWriter {
             entry.session_id = Some(self.session_id.clone());
         }
         if let Some(sender) = &self.sender {
+            // Every writer path used to leave this NULL, so rows from several
+            // machines could not be told apart once merged (#514).
+            if entry.hostname.is_none() {
+                entry.hostname = local_hostname().map(str::to_string);
+            }
             if let Err(e) = sender.send(HistoryMessage::Entry(Box::new(entry))) {
                 // Channel disconnected - worker thread likely crashed or shutdown
                 warn!(
@@ -1088,6 +1133,31 @@ fn redact_for_history(command: &str, mode: HistoryRedactionMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostname_normalization_rejects_empty_and_control_characters_514() {
+        assert_eq!(
+            normalize_hostname("  build-01 \n"),
+            Some("build-01".to_string())
+        );
+        assert_eq!(normalize_hostname(""), None);
+        assert_eq!(normalize_hostname(" \t\n"), None);
+        assert_eq!(normalize_hostname("evil\nhost"), None);
+        assert_eq!(normalize_hostname("esc\u{1b}[31m"), None);
+    }
+
+    #[test]
+    fn local_hostname_is_resolved_once_and_is_never_blank_514() {
+        let first = local_hostname();
+        if cfg!(unix) {
+            assert!(first.is_some(), "gethostname must name a Unix host");
+        }
+        if let Some(name) = first {
+            assert!(!name.is_empty() && name == name.trim());
+            // Cached: the same allocation comes back.
+            assert!(std::ptr::eq(name, local_hostname().unwrap()));
+        }
+    }
 
     #[test]
     fn idle_and_disabled_workers_have_no_flush_poll_timer() {
