@@ -26,6 +26,13 @@ const MAX_GIT_ALIAS_DEPTH: usize = 64;
 pub(crate) const GIT_ALIAS_UNVERIFIED_RULE: &str = "git-alias-semantic-unverified";
 pub(crate) const GIT_ALIAS_UNVERIFIED_REASON: &str = "The invoked Git alias depends on shell expansion, contains a cycle, or exceeds dcg's bounded semantic analysis.";
 pub(crate) const BRANCH_DYNAMIC_RULE: &str = "branch-dynamic-token";
+/// `git branch -d` / `--delete` without any force: Git itself refuses to
+/// delete a branch it does not consider merged. Split from
+/// [`BRANCH_FORCE_DELETE_RULE`] so policy can treat the two differently (#509).
+pub(crate) const BRANCH_DELETE_RULE: &str = "branch-delete";
+/// `-D`, `--delete --force`, `-f`/`--force`, `-M`, `-C`: forms that skip
+/// Git's merge check or overwrite an existing ref.
+pub(crate) const BRANCH_FORCE_DELETE_RULE: &str = "branch-force-delete";
 pub(crate) const BRANCH_DYNAMIC_REASON: &str = "A dynamic shell expansion in this git branch command can expand into a deletion or forced ref update. Quote the branch name or add `--` to make it a literal creation.";
 
 /// A visible Git shell alias together with the arguments Git will append when
@@ -60,9 +67,14 @@ pub(crate) enum InvokedGitAliasDecision {
 pub(crate) enum BranchCommandDecision {
     NotBranch,
     NonDestructive,
-    /// A literal deletion / force flag was proven (`-d`, `-D`, `--delete`,
-    /// `-f`, `-M`, `-C`). Attributed to `branch-force-delete`.
+    /// A literal forced deletion or forced ref update was proven (`-D`,
+    /// `--delete --force`, `-f`, `-M`, `-C`). Attributed to
+    /// [`BRANCH_FORCE_DELETE_RULE`].
     Destructive,
+    /// A literal deletion with no force was proven (`-d`, `--delete`): Git
+    /// refuses it for an unmerged branch. Attributed to
+    /// [`BRANCH_DELETE_RULE`] (#509).
+    MergeCheckedDelete,
     /// The destructive verdict rests on an unresolvable dynamic word that
     /// *may* expand or field-split into a deletion / force flag (#274).
     /// Attributed to [`BRANCH_DYNAMIC_RULE`] so the denial explains the actual
@@ -303,12 +315,141 @@ struct BranchMutationState {
 }
 
 impl BranchMutationState {
+    /// `-d`/`--delete` sets bit 1, `-D` sets bit 2. `-D` is Git's shorthand
+    /// for `--delete --force`, so only bit 1 without any force is the
+    /// merge-checked deletion.
     const fn decision(self) -> BranchCommandDecision {
-        if self.delete_bits != 0 || self.force || self.forced_move_or_copy {
+        if self.delete_bits & 2 != 0 || self.force || self.forced_move_or_copy {
             BranchCommandDecision::Destructive
+        } else if self.delete_bits != 0 {
+            BranchCommandDecision::MergeCheckedDelete
         } else {
             BranchCommandDecision::NonDestructive
         }
+    }
+
+    /// Whether the scan proved any ref mutation, forced or merge-checked.
+    const fn mutates(self) -> bool {
+        self.decision().is_destructive()
+    }
+}
+
+impl BranchCommandDecision {
+    /// Whether this decision blocks the command.
+    #[must_use]
+    pub(crate) const fn is_destructive(self) -> bool {
+        matches!(
+            self,
+            Self::Destructive | Self::MergeCheckedDelete | Self::DestructiveDynamic
+        )
+    }
+
+    /// The `core.git` rule a blocking decision is attributed to. Every caller
+    /// that turns a branch decision into a finding goes through this, so the
+    /// pack check and the evaluator cannot attribute the same command
+    /// differently.
+    #[must_use]
+    pub(crate) const fn rule_name(self) -> Option<&'static str> {
+        match self {
+            Self::Destructive => Some(BRANCH_FORCE_DELETE_RULE),
+            Self::MergeCheckedDelete => Some(BRANCH_DELETE_RULE),
+            Self::DestructiveDynamic => Some(BRANCH_DYNAMIC_RULE),
+            Self::NotBranch | Self::NonDestructive | Self::Unparsed => None,
+        }
+    }
+}
+
+/// The rule for a `branch-force-delete` *regex* match (#509).
+///
+/// The regex is the fallback for a branch command the semantic parser could
+/// not read (an unmodeled control-flow keyword in front, an unusual launcher),
+/// and it matches every delete form, `-d` included. `text` starts at the
+/// match; this reads the flags after the first `branch` word up to the end of
+/// that command and reports [`BRANCH_DELETE_RULE`] only when every option is
+/// one it understands and the result is a deletion without force. Anything it
+/// cannot read keeps [`BRANCH_FORCE_DELETE_RULE`], the stricter id, so a
+/// policy that relaxes `branch-delete` can never relax a forced form here.
+pub(crate) fn branch_regex_fallback_rule(text: &str) -> &'static str {
+    const SEPARATORS: &[char] = &[';', '&', '|', '(', ')', '<', '>'];
+    let unquote = |token: &str| token.trim_matches(|c| c == '\'' || c == '"').to_string();
+    // A newline ends the command unless it is escaped, and a continued line
+    // is not read here.
+    let line = text.split('\n').next().unwrap_or(text);
+    if line.trim_end().ends_with('\\') {
+        return BRANCH_FORCE_DELETE_RULE;
+    }
+    let mut tokens = line.split_ascii_whitespace();
+    let found_branch = tokens.by_ref().any(|raw| {
+        let token = unquote(raw);
+        let base = token.rsplit(['/', '\\']).next().unwrap_or(&token);
+        token.eq_ignore_ascii_case("branch")
+            || base.eq_ignore_ascii_case("git-branch")
+            || base.eq_ignore_ascii_case("git-branch.exe")
+    });
+    if !found_branch {
+        return BRANCH_FORCE_DELETE_RULE;
+    }
+    let argv: Vec<&str> = tokens.collect();
+    // With a quote among the arguments a separator may be quoted data, and
+    // the words after it may still be options of this command.
+    if argv.iter().any(|raw| raw.contains(SEPARATORS))
+        && argv.iter().any(|raw| raw.contains(['\'', '"']))
+    {
+        return BRANCH_FORCE_DELETE_RULE;
+    }
+    let mut mutation = BranchMutationState::default();
+    for raw in argv {
+        // The command ends at the first separator; whatever precedes it in
+        // this token still belongs to it.
+        let (raw, ends_command) = raw
+            .find(SEPARATORS)
+            .map_or((raw, false), |at| (&raw[..at], true));
+        let token = unquote(raw);
+        if let Some(flags) = token.strip_prefix('-') {
+            if token.contains(|c: char| {
+                matches!(c, '`' | '^' | '$' | '\\' | '{' | '}' | '*' | '?' | '[')
+            }) {
+                return BRANCH_FORCE_DELETE_RULE;
+            }
+            if matches!(token.as_str(), "--" | "--end-of-options") {
+                break;
+            }
+            if flags.starts_with('-') {
+                let Some(resolved) = resolve_branch_long_option(&token) else {
+                    return BRANCH_FORCE_DELETE_RULE;
+                };
+                match resolved.name {
+                    "delete" if resolved.negated => mutation.delete_bits &= !1,
+                    "delete" => mutation.delete_bits |= 1,
+                    "force" => mutation.force = !resolved.negated,
+                    // An option that may take the next word as its value
+                    // changes how the rest reads; do not guess.
+                    _ if !resolved.negated
+                        && !resolved.inline_value
+                        && !matches!(resolved.arity, BranchLongOptionArity::None) =>
+                    {
+                        return BRANCH_FORCE_DELETE_RULE;
+                    }
+                    _ => {}
+                }
+            } else {
+                for flag in flags.chars() {
+                    match flag {
+                        'd' => mutation.delete_bits |= 1,
+                        'v' | 'q' | 'r' | 'a' | 'l' | 'i' => {}
+                        _ => return BRANCH_FORCE_DELETE_RULE,
+                    }
+                }
+            }
+        }
+        if ends_command {
+            break;
+        }
+    }
+    if mutation.decision() == BranchCommandDecision::MergeCheckedDelete {
+        BRANCH_DELETE_RULE
+    } else {
+        BRANCH_FORCE_DELETE_RULE
     }
 }
 
@@ -785,7 +926,7 @@ fn literal_branch_tokens_prove_mutation<'a>(tokens: impl Iterator<Item = Option<
             }
         }
     }
-    matches!(mutation.decision(), BranchCommandDecision::Destructive)
+    mutation.mutates()
 }
 
 fn sole_posix_branch_name_query(command: &str) -> bool {
@@ -3606,7 +3747,7 @@ fn semantic_branch_argv_may_mutate(words: &[GitSemanticWord], dialect: ShellDial
     let mut index = 0usize;
     while let Some(word) = words.get(index) {
         if !word.dynamic && matches!(word.decoded.as_str(), "--" | "--end-of-options") {
-            return mutation.decision() == BranchCommandDecision::Destructive;
+            return mutation.mutates();
         }
         if word.dynamic {
             if branch_dynamic_word_may_mutate(word, dialect) {
@@ -3700,7 +3841,7 @@ fn semantic_branch_argv_may_mutate(words: &[GitSemanticWord], dialect: ShellDial
         }
         index += 1;
     }
-    mutation.decision() == BranchCommandDecision::Destructive
+    mutation.mutates()
 }
 
 /// Fail closed only when active shell expansion can occupy Git's executable,
@@ -4395,7 +4536,9 @@ const fn symbolic_scan_decision(
         return decision;
     }
     match decision {
-        BranchCommandDecision::Destructive => BranchCommandDecision::DestructiveDynamic,
+        BranchCommandDecision::Destructive | BranchCommandDecision::MergeCheckedDelete => {
+            BranchCommandDecision::DestructiveDynamic
+        }
         _ => BranchCommandDecision::NotBranch,
     }
 }
@@ -6187,10 +6330,61 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 ]
             }
         ),
-        // Branch deletion and forced ref updates cross a user-intent boundary.
-        // Lowercase `-d` checks merge state, but still removes the branch name,
-        // tracking configuration, and convenient reflog anchor. Agents must
-        // therefore ask before every delete form, not only force deletion (#209).
+        // Merge-checked branch deletion (`-d` / `--delete`, no force). Git
+        // refuses to delete a branch it does not consider merged, but the
+        // command still removes the branch name, its tracking configuration
+        // and the convenient reflog anchor, so it is denied by default like
+        // the forced forms (#209). It has its own id so `[policy.rules]` and
+        // allowlists can relax it without relaxing `-D` (#509); an entry for
+        // `branch-force-delete` still covers it (see
+        // `crate::packs::legacy_rule_names`).
+        //
+        // Evaluated only by the branch semantic parser, which is what can tell
+        // `-d` from `-D`, `--delete --force` and `-df`. The regex is
+        // intentionally unsatisfiable; a branch command the parser cannot read
+        // falls back to the `branch-force-delete` regex below, which matches
+        // every delete form.
+        DestructivePattern {
+            regex: crate::packs::regex_engine::LazyCompiledRegex::new(r"(?!)"),
+            reason: "git branch deletion requires explicit user approval.",
+            name: Some(BRANCH_DELETE_RULE),
+            severity: crate::packs::Severity::High,
+            explanation: Some(
+                "git branch -d (or --delete) removes a branch reference. Git refuses when it \
+                 does not consider the branch merged into its upstream or HEAD, but a merged \
+                 deletion still discards the branch name, its tracking configuration, and the \
+                 convenient reflog reference. The user may intentionally need any of those, so \
+                 agents must not delete a branch without explicit approval.\n\n\
+                 This rule covers only the merge-checked form. -D, --delete --force, -f, -M and \
+                 -C are reported as branch-force-delete. To let agents delete merged branches \
+                 after review while still refusing the forced forms, set\n\
+                 [policy.rules] \"core.git:branch-delete\" = \"ask\".\n\n\
+                 Review without changing refs:\n\
+                 - git branch -vv: Show branch tips and upstream tracking state\n\
+                 - git branch --merged / --no-merged: Review Git's merge classification\n\n\
+                 Recovery if deletion already happened:\n\
+                   git reflog  # Find the commit hash while it is still retained\n\
+                   git branch <branch> <commit-hash>",
+            ),
+            suggestions: &const {
+                [
+                    PatternSuggestion::new(
+                        "git branch -vv",
+                        "Review branch tips and upstream tracking state without changing refs",
+                    ),
+                    PatternSuggestion::new(
+                        "git branch --merged && git branch --no-merged",
+                        "Review Git's merged and unmerged classifications before asking approval",
+                    ),
+                ]
+            },
+            executables: None,
+        },
+        // Forced branch deletion and forced ref updates cross a user-intent
+        // boundary. The semantic parser attributes only the forced forms here;
+        // this regex still matches every delete form, including `-d`, because
+        // it is the fallback for a branch command the parser cannot read, and
+        // there the stricter attribution is the safe one.
         //
         // Intermediate tokens between `git` and `branch`, and between
         // `branch` and the force-flag, are constrained to NOT contain
@@ -6214,13 +6408,16 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             r"(?:^|[^[:alnum:]_-])(?i:(?:git(?:\.exe)?[ \t]+(?:[^\s&;|`()<>]+[ \t]+)*branch|git-branch(?:\.exe)?))[ \t]+(?:[^\s&;|`()<>]+[ \t]+)*(?:-[a-zA-Z]*[dDfMC][a-zA-Z]*(?:\s|$)|--(?:d(?:e(?:l(?:e(?:t(?:e)?)?)?)?)?|forc(?:e)?)(?:\s|$))",
             "git branch deletion or forced ref updates require explicit user approval.",
             High,
-            "git branch -d, -D, or --delete removes a branch reference. Lowercase -d \
-             checks that Git considers the branch merged, but it still discards the branch \
-             name, tracking configuration, and convenient reflog reference. The user may \
-             intentionally need any of those. The -f/--force forms can also move an existing \
-             branch reference away from commits. Agents must not cross either user-intent \
-             boundary without explicit approval. The -M and -C shorthands force-overwrite an \
-             existing rename/copy target and require the same approval.\n\n\
+            "git branch -D (--delete --force) removes a branch reference without Git's \
+             merge check, so commits reachable only from that branch are left to the reflog \
+             and garbage collection. The -f/--force forms can also move an existing branch \
+             reference away from commits, and the -M and -C shorthands force-overwrite an \
+             existing rename/copy target. Agents must not cross these user-intent boundaries \
+             without explicit approval.\n\n\
+             The merge-checked deletion (-d / --delete without force) is reported as \
+             core.git:branch-delete when dcg can parse the command; a command it cannot \
+             parse is reported here. A [policy.rules] or allowlist entry for this rule also \
+             covers core.git:branch-delete unless that rule has its own entry.\n\n\
              Review without changing refs:\n\
              - git branch -vv: Show branch tips and upstream tracking state\n\
              - git branch --merged / --no-merged: Review Git's merge classification\n\
@@ -6738,11 +6935,7 @@ mod tests {
             ] {
                 let decision = branch_command_decision_in_dialect(command, dialect);
                 assert!(
-                    !matches!(
-                        decision,
-                        BranchCommandDecision::Destructive
-                            | BranchCommandDecision::DestructiveDynamic
-                    ),
+                    !decision.is_destructive(),
                     "dynamic executable without git evidence must not be branch-destructive: {command} ({dialect:?}) -> {decision:?}"
                 );
             }
@@ -6776,11 +6969,7 @@ mod tests {
             for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
                 let decision = branch_command_decision_in_dialect(command, dialect);
                 assert!(
-                    !matches!(
-                        decision,
-                        BranchCommandDecision::Destructive
-                            | BranchCommandDecision::DestructiveDynamic
-                    ),
+                    !decision.is_destructive(),
                     "no git evidence, must not deny as git branch: {command} ({dialect:?}) -> {decision:?}"
                 );
             }
@@ -6843,11 +7032,7 @@ mod tests {
             for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
                 let decision = branch_command_decision_in_dialect(command, dialect);
                 assert!(
-                    !matches!(
-                        decision,
-                        BranchCommandDecision::Destructive
-                            | BranchCommandDecision::DestructiveDynamic
-                    ),
+                    !decision.is_destructive(),
                     "no branch mutation evidence, must not deny: {command} ({dialect:?}) -> {decision:?}"
                 );
             }
@@ -6885,11 +7070,7 @@ mod tests {
             for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
                 let decision = branch_command_decision_in_dialect(command, dialect);
                 assert!(
-                    !matches!(
-                        decision,
-                        BranchCommandDecision::Destructive
-                            | BranchCommandDecision::DestructiveDynamic
-                    ),
+                    !decision.is_destructive(),
                     "wildcard basename is no git evidence: {command} ({dialect:?}) -> {decision:?}"
                 );
             }
@@ -6914,10 +7095,7 @@ mod tests {
         for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
             let decision = branch_command_decision_in_dialect(command, dialect);
             assert!(
-                !matches!(
-                    decision,
-                    BranchCommandDecision::Destructive | BranchCommandDecision::DestructiveDynamic
-                ),
+                !decision.is_destructive(),
                 "python heredoc body is not a git branch command: ({dialect:?}) -> {decision:?}"
             );
         }
@@ -6940,11 +7118,7 @@ mod tests {
             for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
                 let decision = branch_command_decision_in_dialect(command, dialect);
                 assert!(
-                    matches!(
-                        decision,
-                        BranchCommandDecision::Destructive
-                            | BranchCommandDecision::DestructiveDynamic
-                    ),
+                    decision.is_destructive(),
                     "literal git basename must stay fail-closed: {command} ({dialect:?}) -> {decision:?}"
                 );
             }
@@ -7108,25 +7282,29 @@ mod tests {
             for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
                 let decision = branch_command_decision_in_dialect(command, dialect);
                 assert!(
-                    !matches!(
-                        decision,
-                        BranchCommandDecision::Destructive
-                            | BranchCommandDecision::DestructiveDynamic
-                    ),
+                    !decision.is_destructive(),
                     "safe branch creation spelling must not fail closed: {command} ({dialect:?}) -> {decision:?}"
                 );
             }
         }
-        // Literal deletion / force flags keep the original attribution.
-        for command in [
-            "git branch -D main",
-            "git branch -d merged",
-            "git branch -f main HEAD~1",
+        // Literal deletion / force flags keep their literal attribution:
+        // forced forms on branch-force-delete, the merge-checked `-d` on
+        // branch-delete (#509).
+        for (command, expected) in [
+            ("git branch -D main", BranchCommandDecision::Destructive),
+            (
+                "git branch -d merged",
+                BranchCommandDecision::MergeCheckedDelete,
+            ),
+            (
+                "git branch -f main HEAD~1",
+                BranchCommandDecision::Destructive,
+            ),
         ] {
             assert_eq!(
                 branch_command_decision_in_dialect(command, ShellDialect::Posix),
-                BranchCommandDecision::Destructive,
-                "literal mutation flags stay on branch-force-delete: {command}"
+                expected,
+                "literal mutation flags keep a literal rule: {command}"
             );
         }
     }
@@ -7362,10 +7540,7 @@ mod tests {
         ] {
             let decision = branch_command_decision_in_dialect(command, dialect);
             assert!(
-                matches!(
-                    decision,
-                    BranchCommandDecision::Destructive | BranchCommandDecision::DestructiveDynamic
-                ),
+                decision.is_destructive(),
                 "active syntax can select destructive Git branch semantics: {command} -> {decision:?}"
             );
         }
@@ -8142,10 +8317,7 @@ git x",
         // substring, so the pack-level keyword quick-reject never reaches the
         // regex — the semantic decision is the meaningful guard here.)
         assert!(
-            matches!(
-                branch_command_decision("gi[t] branch -D feature"),
-                BranchCommandDecision::Destructive | BranchCommandDecision::DestructiveDynamic
-            ),
+            branch_command_decision("gi[t] branch -D feature").is_destructive(),
             "closed bracket expression in executable position must stay fail-closed"
         );
     }
@@ -8168,27 +8340,80 @@ git x",
         }
     }
 
+    /// #509: the regex fallback reports `branch-delete` only for a readable
+    /// merge-checked deletion; every forced or unreadable form keeps the
+    /// stricter `branch-force-delete`.
+    #[test]
+    fn branch_regex_fallback_attribution_is_conservative_509() {
+        for text in [
+            "git branch -d feature",
+            "git branch --delete feature",
+            "git branch --del feature",
+            "git branch -vd a b c",
+            "elif git branch --delete stale; then true; fi",
+            "git.exe' branch --delete feature",
+            "git branch -d x; git branch -D y",
+            "git branch -d x && git push -f",
+            "git branch --force --no-force -d feature",
+            "git branch --no-format -d feature",
+            "git branch -d feature\ngit branch -D other",
+        ] {
+            assert_eq!(
+                branch_regex_fallback_rule(text),
+                BRANCH_DELETE_RULE,
+                "{text:?}"
+            );
+        }
+        for text in [
+            "git branch -D feature",
+            "git branch -d -f feature",
+            "git branch -d feature -f",
+            "git branch -df feature",
+            "git branch --delete --force feature",
+            "git branch -d feature --force",
+            "git branch -f feature",
+            "git branch -M a b",
+            "git branch -C a b",
+            "git branch -d 'x;y' -f",
+            "git branch -d \"a ; b\" -D",
+            "git branch -d x \\\n -f",
+            "git branch -`d feature",
+            "git branch -^d feature",
+            "git branch -$flag feature",
+            "git branch --format -d feature",
+            "git branch -u up -d feature",
+            "git branch --unknown-option -d feature",
+            "git status -d",
+            "",
+        ] {
+            assert_eq!(
+                branch_regex_fallback_rule(text),
+                BRANCH_FORCE_DELETE_RULE,
+                "{text:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_branch_delete_and_force_update_high() {
         // Every branch deletion form and forced ref update is a default-deny
         // user-intent boundary, even when Git considers the branch merged.
+        // The merge-checked deletion is reported as `branch-delete`, every
+        // forced form as `branch-force-delete` (#509).
         let pack = create_pack();
 
         assert_blocks_with_severity(&pack, "git branch -d feature", Severity::High);
         assert_blocks_with_severity(&pack, "git branch -D feature", Severity::High);
-        assert_blocks_with_pattern(&pack, "git branch -d feature", "branch-force-delete");
+        assert_blocks_with_pattern(&pack, "git branch -d feature", "branch-delete");
         assert_blocks_with_pattern(&pack, "git branch -D feature", "branch-force-delete");
-        assert_blocks_with_pattern(&pack, "git branch --delete feature", "branch-force-delete");
+        assert_blocks_with_pattern(&pack, "git branch --delete feature", "branch-delete");
         assert_blocks_with_pattern(&pack, "git branch --force feature", "branch-force-delete");
         assert_blocks_with_pattern(&pack, "git branch -f feature", "branch-force-delete");
         for cmd in [
-            "git branch -M old existing",
-            "git branch -C old existing",
             "git branch --d feature",
             "git branch --del feature",
             "git branch --dele feature",
             "git branch --delet feature",
-            "git branch --forc feature",
             "git branch --no-format -d feature",
             "git branch --no-sort -d feature",
             "git branch --no-points-at -d feature",
@@ -8197,8 +8422,7 @@ git x",
             "git branch --merged HEAD -d feature",
             "git branch --contains HEAD --delete feature",
             "git branch --no-delete -d feature",
-            "git branch --no-force -f feature",
-            "git branch -D --no-delete --no-force feature",
+            "git branch --force --no-force -d feature",
             "git --no-literal-pathspecs branch --del feature",
             "git --shallow-file shallow branch -d feature",
             "git --attr-source HEAD branch --del feature",
@@ -8209,44 +8433,58 @@ git x",
             "/usr/lib/git-core/git-branch --delete feature",
             "git -c alias.x=branch x -d feature",
             "git -calias.x=branch x --delete feature",
-            "git -c alias.x=y -c alias.y=branch x -D feature",
             "git -c 'alias.x=!git branch' x -d feature",
             "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=branch git x -d feature",
             "ALIAS_COMMAND=branch git --config-env=alias.x=ALIAS_COMMAND x -d feature",
             r"& 'C:\Program Files\Git\cmd\git.exe' branch -d feature",
         ] {
+            assert_blocks_with_pattern(&pack, cmd, "branch-delete");
+        }
+        for cmd in [
+            "git branch -M old existing",
+            "git branch -C old existing",
+            "git branch --forc feature",
+            "git branch --no-force -f feature",
+            "git branch -D --no-delete --no-force feature",
+            "git branch -d -f feature",
+            "git branch -df feature",
+            "git branch --delete --force feature",
+            "git branch --force --delete feature",
+            "git branch -d --force feature",
+            "git -c alias.x=y -c alias.y=branch x -D feature",
+        ] {
             assert_blocks_with_pattern(&pack, cmd, "branch-force-delete");
         }
 
-        // Combined short-flag forms (previously missed) — all map to
-        // force-delete semantics:
+        // Combined short-flag forms (previously missed):
         //   -Dr   (force-delete a remote-tracking branch)
         //   -vD   (verbose + force-delete)
         //   -fv   (force + verbose)
         //   -vdf  (verbose + delete + force)
+        //   -vd   (verbose + merge-checked delete)
         assert_blocks_with_pattern(
             &pack,
             "git branch -Dr origin/feature",
             "branch-force-delete",
         );
         assert_blocks_with_pattern(&pack, "git branch -vD feature", "branch-force-delete");
-        assert_blocks_with_pattern(&pack, "git branch -vd feature", "branch-force-delete");
+        assert_blocks_with_pattern(&pack, "git branch -vd feature", "branch-delete");
         assert_blocks_with_pattern(&pack, "git branch -fv feature", "branch-force-delete");
         assert_blocks_with_pattern(&pack, "git branch -vdf feature", "branch-force-delete");
         assert_blocks_with_pattern(
             &pack,
             "sudo git -C /tmp/repo branch -d feature",
-            "branch-force-delete",
+            "branch-delete",
         );
         assert_blocks_with_pattern(
             &pack,
             "git --no-pager branch --delete feature",
-            "branch-force-delete",
+            "branch-delete",
         );
         assert_blocks_with_pattern(
             &pack,
             "git branch --format -d --delete feature",
-            "branch-force-delete",
+            "branch-delete",
         );
         // Read-only and branch-creation forms remain safe.
         assert!(
@@ -8349,11 +8587,7 @@ git x",
                 "quoted format data must not trigger branch deletion; cmd={cmd}"
             );
         }
-        assert_blocks_with_pattern(
-            &pack,
-            "git branch -tdirect -d feature",
-            "branch-force-delete",
-        );
+        assert_blocks_with_pattern(&pack, "git branch -tdirect -d feature", "branch-delete");
     }
 
     #[test]
@@ -8372,15 +8606,23 @@ git x",
         for command in destructive {
             assert_eq!(
                 branch_command_decision_in_dialect(command, ShellDialect::Posix),
-                BranchCommandDecision::Destructive,
+                BranchCommandDecision::MergeCheckedDelete,
                 "literal command substitution must not hide deletion: {command}"
             );
             assert_eq!(
                 branch_command_decision(command),
-                BranchCommandDecision::Destructive,
+                BranchCommandDecision::MergeCheckedDelete,
                 "unknown callers must conservatively recognize POSIX substitution: {command}"
             );
         }
+        assert_eq!(
+            branch_command_decision_in_dialect(
+                "git branch -$(printf D) feature",
+                ShellDialect::Posix
+            ),
+            BranchCommandDecision::Destructive,
+            "a substituted -D stays a forced deletion"
+        );
 
         for command in [
             "git branch --format $(printf %s -d)",

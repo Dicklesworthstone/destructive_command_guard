@@ -840,14 +840,12 @@ impl Pack {
         }
         if self.id == "core.git" {
             match crate::packs::core::git::branch_command_decision(cmd) {
-                crate::packs::core::git::BranchCommandDecision::Destructive => {
-                    return self.destructive_match_by_name("branch-force-delete", cmd);
-                }
-                crate::packs::core::git::BranchCommandDecision::DestructiveDynamic => {
-                    return self.destructive_match_by_name(
-                        crate::packs::core::git::BRANCH_DYNAMIC_RULE,
-                        cmd,
-                    );
+                decision @ (crate::packs::core::git::BranchCommandDecision::Destructive
+                | crate::packs::core::git::BranchCommandDecision::MergeCheckedDelete
+                | crate::packs::core::git::BranchCommandDecision::DestructiveDynamic) => {
+                    return decision
+                        .rule_name()
+                        .and_then(|name| self.destructive_match_by_name(name, cmd));
                 }
                 crate::packs::core::git::BranchCommandDecision::NonDestructive => return None,
                 crate::packs::core::git::BranchCommandDecision::NotBranch
@@ -862,15 +860,32 @@ impl Pack {
                     .matches_destructive_named_by(cmd, |name| name != Some("branch-force-delete"));
             }
         }
-        self.destructive_patterns
+        let found = self
+            .destructive_patterns
             .iter()
-            .find(|p| p.matches_command(cmd))
-            .map(|p| DestructiveMatch {
-                reason: p.reason,
-                name: p.name,
-                severity: p.severity,
-                explanation: p.explanation,
-            })
+            .find(|p| p.matches_command(cmd));
+        // #509: the `branch-force-delete` regex is the fallback for a branch
+        // command the parser could not read; a readable merge-checked
+        // deletion is reported as `branch-delete`, as the parser would.
+        let found = match found {
+            Some(p)
+                if self.id == "core.git"
+                    && p.name == Some(crate::packs::core::git::BRANCH_FORCE_DELETE_RULE) =>
+            {
+                let rule = crate::packs::core::git::branch_regex_fallback_rule(cmd);
+                self.destructive_patterns
+                    .iter()
+                    .find(|candidate| candidate.name == Some(rule))
+                    .or(found)
+            }
+            other => other,
+        };
+        found.map(|p| DestructiveMatch {
+            reason: p.reason,
+            name: p.name,
+            severity: p.severity,
+            explanation: p.explanation,
+        })
     }
 
     fn matches_destructive_named_by(
@@ -1490,6 +1505,25 @@ const CAREFUL_COMPANY_PRESET_MEMBERS: &[&str] = &[
     "cloud.gcp",
     "cloud.azure",
 ];
+
+/// Pattern names (in the same pack) that `pattern_name` was split out of.
+///
+/// Rule ids are what `[policy.rules]` and allowlist `rule = "..."` entries key
+/// on, so splitting one rule into two would silently narrow every existing
+/// entry for the original id. Instead, an entry for a listed legacy name keeps
+/// covering the split-out rule, and an entry naming the split-out rule itself
+/// wins over it (the more specific id). This is the single table both the
+/// policy resolver and the allowlist matcher consult.
+///
+/// - `core.git:branch-delete` (merge-checked `git branch -d`) was reported as
+///   `core.git:branch-force-delete` until #509.
+#[must_use]
+pub fn legacy_rule_names(pack_id: &str, pattern_name: &str) -> &'static [&'static str] {
+    match (pack_id, pattern_name) {
+        ("core.git", "branch-delete") => &["branch-force-delete"],
+        _ => &[],
+    }
+}
 
 /// Return the curated membership for a preset ID, if `id` names one.
 ///
@@ -5473,20 +5507,41 @@ destructive_patterns:
         let pack = REGISTRY.get("core.git").expect("core.git pack");
         let enabled = HashSet::from(["core.git".to_string()]);
 
-        for command in [
-            "git branch -d feature",
-            "git branch --del feature",
-            "git branch -M old existing",
-            "git branch --no-format -d feature",
-            "gIt.ExE branch --delete feature",
+        // #509: both sides of the legacy-id link name real rules of the pack,
+        // so a rename cannot silently turn the compatibility table into a
+        // no-op.
+        let names: HashSet<_> = pack
+            .destructive_patterns
+            .iter()
+            .filter_map(|pattern| pattern.name)
+            .collect();
+        assert!(names.contains("branch-delete"));
+        for legacy in legacy_rule_names("core.git", "branch-delete") {
+            assert!(names.contains(legacy), "legacy id {legacy} must exist");
+        }
+        assert_eq!(
+            legacy_rule_names("core.git", "branch-delete"),
+            &["branch-force-delete"]
+        );
+        assert!(legacy_rule_names("core.git", "branch-force-delete").is_empty());
+
+        for (command, rule) in [
+            ("git branch -d feature", "branch-delete"),
+            ("git branch --del feature", "branch-delete"),
+            ("git branch -M old existing", "branch-force-delete"),
+            ("git branch -D feature", "branch-force-delete"),
+            ("git branch --delete --force feature", "branch-force-delete"),
+            ("git branch --no-format -d feature", "branch-delete"),
+            ("gIt.ExE branch --delete feature", "branch-delete"),
         ] {
             let pack_match = pack.check(command).expect("pack must deny");
             let registry_match = REGISTRY.check_command(command, &enabled);
             assert!(registry_match.blocked, "registry must deny {command:?}");
-            assert_eq!(pack_match.name, Some("branch-force-delete"));
+            assert_eq!(pack_match.name, Some(rule), "{command:?}");
             assert_eq!(
                 registry_match.pattern_name.as_deref(),
-                Some("branch-force-delete")
+                Some(rule),
+                "{command:?}"
             );
         }
 

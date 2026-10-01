@@ -374,6 +374,26 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
     );
 
     m.insert(
+        "core.git:branch-delete",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Confirm Git considers the branch merged with `git branch --merged`",
+            )
+            .with_command("git branch --merged"),
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Review branch tips and upstream tracking state with `git branch -vv`",
+            )
+            .with_command("git branch -vv"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Ask the user for explicit approval before deleting a branch",
+            ),
+        ],
+    );
+
+    m.insert(
         "core.git:branch-force-delete",
         vec![
             Suggestion::new(
@@ -2331,6 +2351,7 @@ mod tests {
             "core.git:push-force-short",
             "core.git:checkout-discard",
             "core.git:checkout-ref-discard",
+            "core.git:branch-delete",
             "core.git:branch-force-delete",
             "core.git:restore-worktree",
             "core.git:restore-worktree-explicit",

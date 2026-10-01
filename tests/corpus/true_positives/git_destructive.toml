@@ -97,31 +97,31 @@ rule_id = "core.git:branch-force-delete"
 description = "git branch -d deletes a merged branch ref"
 command = "git branch -d merged-branch"
 expected = "deny"
-rule_id = "core.git:branch-force-delete"
+rule_id = "core.git:branch-delete"
 
 [[case]]
 description = "git branch --delete removes a branch ref"
 command = "git branch --delete merged-branch"
 expected = "deny"
-rule_id = "core.git:branch-force-delete"
+rule_id = "core.git:branch-delete"
 
 [[case]]
 description = "git branch combined short flags delete a branch ref"
 command = "git branch -vd merged-branch"
 expected = "deny"
-rule_id = "core.git:branch-force-delete"
+rule_id = "core.git:branch-delete"
 
 [[case]]
 description = "git branch unique delete abbreviation removes a branch ref"
 command = "git branch --del merged-branch"
 expected = "deny"
-rule_id = "core.git:branch-force-delete"
+rule_id = "core.git:branch-delete"
 
 [[case]]
 description = "git branch negated format takes no value before delete"
 command = "git branch --no-format -d merged-branch"
 expected = "deny"
-rule_id = "core.git:branch-force-delete"
+rule_id = "core.git:branch-delete"
 
 [[case]]
 description = "git branch uppercase move overwrites an existing ref"
@@ -139,13 +139,13 @@ rule_id = "core.git:branch-force-delete"
 description = "mixed-case Windows git executable still deletes a branch"
 command = "gIt.ExE branch --delete merged-branch"
 expected = "deny"
-rule_id = "core.git:branch-force-delete"
+rule_id = "core.git:branch-delete"
 
 [[case]]
 description = "literal POSIX substitutions cannot splice a hidden branch deletion"
 command = "g$(printf it) br$(printf anch) -$(printf d) merged-branch"
 expected = "deny"
-rule_id = "core.git:branch-force-delete"
+rule_id = "core.git:branch-delete"
 
 [[case]]
 description = "unresolved POSIX output cannot occupy a branch option role"

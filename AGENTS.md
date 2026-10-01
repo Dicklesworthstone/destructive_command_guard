@@ -699,7 +699,8 @@ DCG_BYPASS=1 <command>
 | `core.git:restore-discard` | `git restore <file>` (without `--staged`) | High |
 | `core.git:clean-force` | `git clean -f`, `git clean -fd` | High |
 | `core.git:force-push` | `git push --force`, `git push -f` | High |
-| `core.git:branch-force-delete` | `git branch -d`, `--delete`, `-D`, `-f`, `-M`, `-C` | High |
+| `core.git:branch-delete` | `git branch -d`, `--delete` (merge-checked, no force) | High |
+| `core.git:branch-force-delete` | `git branch -D`, `--delete --force`, `-f`, `-M`, `-C` (a policy/allowlist entry for it also covers `branch-delete` unless that rule has its own) | High |
 | `core.git:stash-drop` | `git stash drop` — Medium, so the default policy **warns and lets it run** (the dropped stash stays recoverable via `git fsck` until gc) | Medium |
 | `core.git:stash-clear` | `git stash clear` | Critical |
 

@@ -2452,11 +2452,20 @@ impl PolicyConfig {
         pattern_name: Option<&str>,
         severity: Option<crate::packs::Severity>,
     ) -> crate::packs::DecisionMode {
-        // 1. Rule-specific override
-        if let (Some(pack), Some(pattern)) = (pack_id, pattern_name) {
-            let rule_id = format!("{pack}:{pattern}");
-            if let Some(mode) = self.rules.get(&rule_id) {
-                return mode.to_decision_mode();
+        // 1. Rule-specific override. An entry for the rule's own id wins; an
+        //    entry for an id it was split out of still applies (#509).
+        if let (Some(pack), Some(pattern)) = (pack_id, pattern_name)
+            && !self.rules.is_empty()
+        {
+            let names = std::iter::once(pattern).chain(
+                crate::packs::legacy_rule_names(pack, pattern)
+                    .iter()
+                    .copied(),
+            );
+            for name in names {
+                if let Some(mode) = self.rules.get(&format!("{pack}:{name}")) {
+                    return mode.to_decision_mode();
+                }
             }
         }
 
@@ -8364,6 +8373,66 @@ enabled = false
             Some(crate::packs::Severity::High),
         );
         assert_eq!(mode, crate::packs::DecisionMode::Log);
+    }
+
+    /// #509: `branch-delete` was split out of `branch-force-delete`. An entry
+    /// for the old id keeps covering the new one; an entry for the new id
+    /// wins; the legacy link never runs the other way.
+    #[test]
+    fn test_policy_legacy_rule_id_covers_split_rule_509() {
+        let policy_with = |rules: &[(&str, PolicyMode)]| PolicyConfig {
+            default_mode: None,
+            observe_until: None,
+            packs: std::collections::HashMap::new(),
+            rules: rules
+                .iter()
+                .map(|(rule, mode)| ((*rule).to_string(), *mode))
+                .collect(),
+        };
+        let high = Some(crate::packs::Severity::High);
+        let mode = |policy: &PolicyConfig, pattern: &str| {
+            policy.resolve_mode(Some("core.git"), Some(pattern), high)
+        };
+
+        let legacy = policy_with(&[("core.git:branch-force-delete", PolicyMode::Ask)]);
+        assert_eq!(
+            mode(&legacy, "branch-delete"),
+            crate::packs::DecisionMode::Ask
+        );
+        assert_eq!(
+            mode(&legacy, "branch-force-delete"),
+            crate::packs::DecisionMode::Ask
+        );
+
+        let split = policy_with(&[("core.git:branch-delete", PolicyMode::Ask)]);
+        assert_eq!(
+            mode(&split, "branch-delete"),
+            crate::packs::DecisionMode::Ask
+        );
+        assert_eq!(
+            mode(&split, "branch-force-delete"),
+            crate::packs::DecisionMode::Deny,
+            "the new id must not relax the forced forms"
+        );
+
+        let both = policy_with(&[
+            ("core.git:branch-force-delete", PolicyMode::Ask),
+            ("core.git:branch-delete", PolicyMode::Deny),
+        ]);
+        assert_eq!(
+            mode(&both, "branch-delete"),
+            crate::packs::DecisionMode::Deny
+        );
+        assert_eq!(
+            mode(&both, "branch-force-delete"),
+            crate::packs::DecisionMode::Ask
+        );
+
+        // The link is specific to this pack and rule.
+        assert_eq!(
+            legacy.resolve_mode(Some("other.pack"), Some("branch-delete"), high),
+            crate::packs::DecisionMode::Deny
+        );
     }
 
     #[test]

@@ -4423,10 +4423,7 @@ mod tests {
         let finding = evaluate_extracted_command(destructive, &options, &config, &ctx)
             .expect("escaped branch deletion must produce a scan finding");
         assert_eq!(finding.decision, ScanDecision::Deny);
-        assert_eq!(
-            finding.rule_id.as_deref(),
-            Some("core.git:branch-force-delete")
-        );
+        assert_eq!(finding.rule_id.as_deref(), Some("core.git:branch-delete"));
 
         assert!(
             evaluate_extracted_command(format_data, &options, &config, &ctx).is_none(),

@@ -47,6 +47,19 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   delimiter (`qx{…}`, `qx(…)`, `qx[…]`, …), not only `qx/…/`. Payloads the
   catalogue already reports keep their `heredoc.*` rule ids (#512).
 
+### Git branch rules
+
+- `git branch -d` / `--delete` without force is now reported as
+  `core.git:branch-delete`. `-D`, `--delete --force`, `-df`, `-f`, `-M` and
+  `-C` stay on `core.git:branch-force-delete`. Both are still denied by
+  default. Setting `[policy.rules] "core.git:branch-delete" = "ask"` lets an
+  agent propose merged-branch cleanup for approval while forced deletion stays
+  denied, which no configuration could express before (#509).
+- Existing configuration keeps its meaning: a `[policy.rules]` or allowlist
+  entry for `core.git:branch-force-delete` still covers `-d` unless
+  `core.git:branch-delete` has an entry of its own, which then wins. Tools that
+  read `ruleId` from deny output or history will see the new id for `-d`.
+
 ## [v0.15.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.2) -- 2026-10-01 [Release]
 
 **This is a security fix release. v0.15.1 can fail open under load: upgrade.**

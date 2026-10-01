@@ -434,7 +434,7 @@ DCG assumes the AI agent is **well-intentioned but fallible**. It catches honest
 
 **Q: Why block both `git branch -d` and `git branch -D`?**
 
-Lowercase `-d` checks merge state, but still removes the branch name, upstream-tracking configuration, and convenient reflog reference. Those are user-owned state, so every delete form requires explicit approval. Review first with `git branch -vv`, `git branch --merged`, and `git branch --no-merged`.
+Lowercase `-d` checks merge state, but still removes the branch name, upstream-tracking configuration, and convenient reflog reference. Those are user-owned state, so every delete form requires explicit approval. Review first with `git branch -vv`, `git branch --merged`, and `git branch --no-merged`. The merge-checked form is its own rule, `core.git:branch-delete`, so `[policy.rules] "core.git:branch-delete" = "ask"` turns it into an approval prompt while `-D` (`core.git:branch-force-delete`) stays denied.
 
 **Q: Why is `git push --force-with-lease` allowed?**
 

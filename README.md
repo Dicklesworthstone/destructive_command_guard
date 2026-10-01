@@ -3202,6 +3202,15 @@ git push origin v0.1.0
 
 Lowercase `-d` verifies that Git considers a branch merged, but it still removes the branch name, upstream-tracking configuration, and convenient reflog reference. Those are user-owned state and may still matter after a merge. DCG therefore treats every branch deletion as an approval boundary; use `git branch -vv`, `git branch --merged`, and `git branch --no-merged` to review state without changing refs.
 
+The two forms are separate rules. `-d` / `--delete` without force is `core.git:branch-delete`; `-D`, `--delete --force`, `-f`, `-M` and `-C` are `core.git:branch-force-delete`. To let an agent propose merged-branch cleanup for approval while still refusing forced deletion:
+
+```toml
+[policy.rules]
+"core.git:branch-delete" = "ask"
+```
+
+Before v0.15.3 both forms were reported as `core.git:branch-force-delete`. A `[policy.rules]` or allowlist entry for that id still covers `-d` unless `core.git:branch-delete` has an entry of its own.
+
 **Q: Why is `git push --force-with-lease` allowed?**
 
 Force-with-lease is a safer alternative that refuses to push if the remote has commits you haven't seen. It prevents accidentally overwriting someone else's work.

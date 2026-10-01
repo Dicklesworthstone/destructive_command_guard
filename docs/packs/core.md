@@ -62,6 +62,7 @@ These patterns match potentially destructive commands:
 | `push-force-long` | Force push can destroy remote history. Use --force-with-lease if necessary. | critical |
 | `push-force-short` | Force push (-f) can destroy remote history. Use --force-with-lease if necessary. | critical |
 | `push-force-refspec` | A '+' refspec force-pushes that ref and can destroy remote history. Use --force-with-lease if necessary. | critical |
+| `branch-delete` | git branch deletion requires explicit user approval. | high |
 | `branch-force-delete` | git branch deletion or forced ref updates require explicit user approval. | high |
 | `stash-drop` | git stash drop deletes a single stash. Recoverable via `git fsck` (unreachable objects). | medium |
 | `stash-clear` | git stash clear permanently deletes ALL stashed changes. | critical |

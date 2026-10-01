@@ -21380,6 +21380,23 @@ fn evaluate_packs_with_allowlists_at_depth(
                 continue;
             }
 
+            // #509: a readable merge-checked deletion matched by the
+            // `branch-force-delete` regex is reported as `branch-delete`.
+            let pattern = if pack_id == "core.git"
+                && pattern.name == Some(crate::packs::core::git::BRANCH_FORCE_DELETE_RULE)
+            {
+                let rule = crate::packs::core::git::branch_regex_fallback_rule(
+                    command_for_packs
+                        .get(span.start..)
+                        .unwrap_or(command_for_packs),
+                );
+                pack.destructive_patterns
+                    .iter()
+                    .find(|candidate| candidate.name == Some(rule))
+                    .unwrap_or(pattern)
+            } else {
+                pattern
+            };
             let reason = pattern.reason;
             let mapped_span = map_span_with_offset(span, normalized_offset, original_len);
             let preview = mapped_span
@@ -25981,15 +25998,8 @@ fn evaluate_pack_destructive_patterns(
             continue;
         }
 
-        let semantic_branch_rule = match branch_decision {
-            Some(crate::packs::core::git::BranchCommandDecision::Destructive) => {
-                Some("branch-force-delete")
-            }
-            Some(crate::packs::core::git::BranchCommandDecision::DestructiveDynamic) => {
-                Some(crate::packs::core::git::BRANCH_DYNAMIC_RULE)
-            }
-            _ => None,
-        };
+        let semantic_branch_rule =
+            branch_decision.and_then(crate::packs::core::git::BranchCommandDecision::rule_name);
         let semantic_branch_match =
             semantic_branch_rule.is_some() && pattern.name == semantic_branch_rule;
         if semantic_branch_rule.is_some() && !semantic_branch_match {
@@ -26174,6 +26184,26 @@ fn evaluate_pack_destructive_patterns(
             }
         }
 
+        // #509: the `branch-force-delete` regex only fires for a branch command
+        // the semantic parser could not read, and it matches every delete
+        // form. A readable merge-checked deletion is reported as
+        // `branch-delete`, exactly as the parser would have reported it.
+        let pattern = if pack_id == "core.git"
+            && !semantic_branch_match
+            && pattern.name == Some(crate::packs::core::git::BRANCH_FORCE_DELETE_RULE)
+        {
+            let text = matched_span
+                .as_ref()
+                .and_then(|span| pattern_command.get(span.start.saturating_sub(slice_offset)..))
+                .unwrap_or(pattern_command);
+            let rule = crate::packs::core::git::branch_regex_fallback_rule(text);
+            pack.destructive_patterns
+                .iter()
+                .find(|candidate| candidate.name == Some(rule))
+                .unwrap_or(pattern)
+        } else {
+            pattern
+        };
         let reason = pattern.reason;
         let mapped_span = matched_span
             .as_ref()
@@ -30063,7 +30093,7 @@ mod tests {
             ("{ git branch -D stale; }", "branch-force-delete"),
             (
                 "if false; then true; elif git branch --delete stale; then true; fi",
-                "branch-force-delete",
+                "branch-delete",
             ),
             (
                 "if false; then true; else env FOO=1 git reset --hard; fi",
@@ -35066,10 +35096,7 @@ mod tests {
         );
         let branch_info = branch_result.pattern_info.as_ref().unwrap();
         assert_eq!(branch_info.severity, Some(crate::packs::Severity::High));
-        assert_eq!(
-            branch_info.pattern_name.as_deref(),
-            Some("branch-force-delete")
-        );
+        assert_eq!(branch_info.pattern_name.as_deref(), Some("branch-delete"));
 
         for command in [
             "git branch --show-current && ls -d",
@@ -35110,16 +35137,21 @@ mod tests {
         let heredoc_settings = config.heredoc_settings();
 
         let destructive = [
-            "git branch -d feature",
-            "git branch --del feature",
-            "git branch -M old existing",
-            "git branch --no-format -d feature",
-            "git branch --set-upstream -d feature",
-            "git branch --merged HEAD -d feature",
-            "FOO=bar git branch --del feature",
-            "gIt.ExE branch -d feature",
-            r"& 'C:\Program Files\Git\cmd\git.exe' branch --delete feature",
-            r#"git branch --del "$(printf feature)""#,
+            ("git branch -d feature", "branch-delete"),
+            ("git branch --del feature", "branch-delete"),
+            ("git branch -M old existing", "branch-force-delete"),
+            ("git branch -D feature", "branch-force-delete"),
+            ("git branch -df feature", "branch-force-delete"),
+            ("git branch --no-format -d feature", "branch-delete"),
+            ("git branch --set-upstream -d feature", "branch-delete"),
+            ("git branch --merged HEAD -d feature", "branch-delete"),
+            ("FOO=bar git branch --del feature", "branch-delete"),
+            ("gIt.ExE branch -d feature", "branch-delete"),
+            (
+                r"& 'C:\Program Files\Git\cmd\git.exe' branch --delete feature",
+                "branch-delete",
+            ),
+            (r#"git branch --del "$(printf feature)""#, "branch-delete"),
         ];
         let safe = [
             "git branch --format -d",
@@ -35137,7 +35169,7 @@ mod tests {
         ];
 
         for index in [None, keyword_index.as_ref()] {
-            for command in destructive.iter().copied() {
+            for (command, expected_rule) in destructive.iter().copied() {
                 let result = evaluate_command_with_pack_order_deadline_at_path(
                     command,
                     &enabled_keywords,
@@ -35157,7 +35189,11 @@ mod tests {
                 );
                 let info = result.pattern_info.expect("denial must have metadata");
                 assert_eq!(info.pack_id.as_deref(), Some("core.git"));
-                assert_eq!(info.pattern_name.as_deref(), Some("branch-force-delete"));
+                assert_eq!(
+                    info.pattern_name.as_deref(),
+                    Some(expected_rule),
+                    "{command:?}"
+                );
                 assert_eq!(info.severity, Some(crate::packs::Severity::High));
             }
             for command in safe.iter().copied() {
@@ -38973,7 +39009,7 @@ mod tests {
                     .pattern_info
                     .as_ref()
                     .and_then(|info| info.pattern_name.as_deref()),
-                Some("branch-force-delete")
+                Some("branch-delete")
             );
         }
     }
@@ -38994,12 +39030,12 @@ mod tests {
             (
                 ShellDialect::PowerShell,
                 "g`it branch -`d feature",
-                "branch-force-delete",
+                "branch-delete",
             ),
             (
                 ShellDialect::PowerShell,
                 "& g`it branch --de`lete feature",
-                "branch-force-delete",
+                "branch-delete",
             ),
             (ShellDialect::PowerShell, "g`it reset --ha`rd", "reset-hard"),
             (ShellDialect::PowerShell, "git re`set --hard", "reset-hard"),
@@ -39027,29 +39063,29 @@ mod tests {
             (
                 ShellDialect::Cmd,
                 "g^it branch -^d feature",
-                "branch-force-delete",
+                "branch-delete",
             ),
             (ShellDialect::Cmd, "g^it reset --ha^rd", "reset-hard"),
             (ShellDialect::Cmd, "%G% reset --hard", "reset-hard"),
             (
                 ShellDialect::Posix,
                 "git branch $'-d' feature",
-                "branch-force-delete",
+                "branch-delete",
             ),
             (
                 ShellDialect::Posix,
                 "git branch -$'d' feature",
-                "branch-force-delete",
+                "branch-delete",
             ),
             (
                 ShellDialect::Posix,
                 "git branch $'--delete' feature",
-                "branch-force-delete",
+                "branch-delete",
             ),
             (
                 ShellDialect::Posix,
                 "git branch --$'delete' feature",
-                "branch-force-delete",
+                "branch-delete",
             ),
             (ShellDialect::Posix, "g$'i't reset --hard", "reset-hard"),
             (
@@ -39060,12 +39096,12 @@ mod tests {
             (
                 ShellDialect::Posix,
                 "git branch $\"-d\" feature",
-                "branch-force-delete",
+                "branch-delete",
             ),
             (
                 ShellDialect::PowerShell,
                 "Write-Output @'\nit's inert data\n'@; git branch -d feature",
-                "branch-force-delete",
+                "branch-delete",
             ),
             // Both escape shapes below used to be pinned as allowed under the
             // unknown dialect — the #294 residual gap: the escape hides the
@@ -39077,12 +39113,12 @@ mod tests {
             (
                 ShellDialect::Unknown,
                 "g`it branch -`d feature",
-                "branch-force-delete",
+                "branch-delete",
             ),
             (
                 ShellDialect::Unknown,
                 "g^it branch -^d feature",
-                "branch-force-delete",
+                "branch-delete",
             ),
         ];
         let safe = [
@@ -39749,7 +39785,7 @@ mod tests {
             (
                 ShellDialect::PowerShell,
                 "Write-Output $(g`it branch -`d feature)",
-                "branch-force-delete",
+                "branch-delete",
             ),
             (
                 ShellDialect::PowerShell,
@@ -40614,7 +40650,7 @@ mod tests {
                 assert_eq!(info.pack_id.as_deref(), Some("core.git"), "{command:?}");
                 assert_eq!(
                     info.pattern_name.as_deref(),
-                    Some("branch-force-delete"),
+                    Some("branch-delete"),
                     "{command:?}"
                 );
                 assert!(
@@ -40740,6 +40776,8 @@ mod tests {
             );
         }
 
+        // The entry names the pre-#509 id, which still covers the
+        // merge-checked deletion this payload performs.
         let allowed_encoded = powershell_command_base64("git branch -d allowed-by-rule");
         let command = format!("powershell -EncodedCommand {allowed_encoded}");
         let allowlists = project_allowlists_for_rule(
@@ -40766,7 +40804,7 @@ mod tests {
         assert_eq!(allowlist.layer, AllowlistLayer::Project);
         assert_eq!(
             allowlist.matched.pattern_name.as_deref(),
-            Some("branch-force-delete")
+            Some("branch-delete")
         );
     }
 
