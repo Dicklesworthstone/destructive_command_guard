@@ -26882,6 +26882,26 @@ fn evaluate_heredoc(
         // If content is Bash, extract inner commands and feed them back to the full evaluator.
         // This ensures that `kubectl`, `docker`, etc. inside heredocs are checked against their packs.
         if content.language == crate::heredoc::ScriptLanguage::Bash {
+            // An awk program printing a computed value into a shell that runs
+            // its stdin (`print "rm " $1 | "sh"`) is the shell-level
+            // `awk '{print "rm " $1}' f | sh` inside awk, and gets that
+            // pipeline's verdict and rule (#511).
+            if content.heredoc_type.is_none()
+                && content.content == crate::heredoc::AWK_COMPUTED_PRINT_SCRIPT
+                && content.target_command.as_deref() == Some("awk")
+            {
+                if let Some(denial) = launcher_unverified_denial(
+                    PIPELINE_CONSUMER_RULE,
+                    "POSIX shell executes the text an awk program prints into it, but the \
+                     printed value is computed at run time and cannot be statically verified",
+                    context.allowlists,
+                    context.project_path,
+                    first_allowlist_hit,
+                ) {
+                    return Some(denial);
+                }
+                continue;
+            }
             // An inline `-c` script that is nothing but one expansion or
             // command substitution (`bash -c "$X"`, `sh -c "$(wget -qO- …)"`)
             // runs source dcg never sees. The keyword pre-filter below skipped

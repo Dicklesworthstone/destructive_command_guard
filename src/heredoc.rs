@@ -2070,6 +2070,15 @@ fn extract_inline_scripts(
                 continue;
             }
 
+            // A launcher spelled inside another command's quoted argument,
+            // behind prose, is not one the shell runs (#510).
+            if cap
+                .get(1)
+                .is_some_and(|name| inline_launcher_is_quoted_prose(command, name.start()))
+            {
+                continue;
+            }
+
             // Enforce content size limit
             if content.len() > limits.max_body_bytes {
                 // Skip but don't add to skip_reasons (would be too noisy)
@@ -2115,6 +2124,284 @@ fn extract_inline_scripts(
             limit: limits.max_heredocs,
         });
     }
+}
+
+/// Whether the inline launcher whose interpreter word starts at
+/// `launcher_start` is prose inside another command's quoted argument rather
+/// than a command any shell runs (#510).
+///
+/// The inline-script patterns match a launcher anywhere in the text, so
+/// `tracker comment 1 "example: bash -c 'git reset --hard' is refused"` was
+/// denied as if it ran `git reset --hard`. It does not, under either reading
+/// of that quoted word:
+///
+/// - as data (what dcg already assumes for an unknown program's operands:
+///   `tracker comment 1 "git reset --hard"` is allowed), nothing runs it;
+/// - as a shell string some program hands to `sh -c`, its command word is
+///   `example:`, and `bash` is an operand of that program, not a launcher.
+///
+/// So a launcher is dropped only when BOTH hold: it sits inside single or
+/// double quotes (not inside a `$(…)` or backquote substitution, which run
+/// whatever their quoting), and inside that quoted text the simple command
+/// it belongs to starts with a plain word that is not a shell, interpreter,
+/// wrapper, command runner or reserved word. A launcher that opens the
+/// quoted text (`tmux new "bash -c '…'"`, `"bash" -c '…'`), follows a
+/// separator inside it (`"x; bash -c '…'"`), or follows a wrapper
+/// (`"sudo bash -c '…'"`) is kept, because a program that runs its operand
+/// as a shell string would run that launcher.
+///
+/// Anything this walk cannot follow keeps the launcher: a heredoc (its body
+/// is not shell-quoted, so one apostrophe in it would flip the quote state),
+/// a comment, a `${…}` expansion, an ANSI-C `$'…'` string, or an escaped
+/// interpreter word.
+fn inline_launcher_is_quoted_prose(command: &str, launcher_start: usize) -> bool {
+    if command.contains("<<") {
+        return false;
+    }
+    let Some(quote_open) = innermost_shell_quote_at(command, launcher_start) else {
+        return false;
+    };
+    command
+        .get(quote_open + 1..launcher_start)
+        .is_some_and(quoted_launcher_prefix_is_prose)
+}
+
+/// The byte offset of the quote that opens the innermost single- or
+/// double-quoted string containing `position`, when that string is the
+/// innermost shell context there. `None` when `position` is unquoted, sits
+/// inside a `$(…)`/backquote substitution, or the text before it uses a
+/// construct this walk does not model (see [`inline_launcher_is_quoted_prose`]).
+fn innermost_shell_quote_at(command: &str, position: usize) -> Option<usize> {
+    #[derive(Clone, Copy)]
+    enum Context {
+        Single(usize),
+        Double(usize),
+        Substitution(usize),
+        Backquote,
+    }
+    let bytes = command.as_bytes();
+    if position > bytes.len() {
+        return None;
+    }
+    let mut stack: Vec<Context> = Vec::new();
+    let mut index = 0usize;
+    while index < position {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        match stack.last().copied() {
+            Some(Context::Single(_)) => {
+                if byte == b'\'' {
+                    stack.pop();
+                }
+                index += 1;
+            }
+            Some(Context::Double(_)) => match byte {
+                b'\\' => index += 2,
+                b'"' => {
+                    stack.pop();
+                    index += 1;
+                }
+                b'$' if next == Some(b'(') => {
+                    stack.push(Context::Substitution(1));
+                    index += 2;
+                }
+                b'$' if next == Some(b'{') => return None,
+                b'`' => {
+                    stack.push(Context::Backquote);
+                    index += 1;
+                }
+                _ => index += 1,
+            },
+            top => match byte {
+                b'\\' => index += 2,
+                b'\'' => {
+                    if index > 0 && bytes[index - 1] == b'$' {
+                        return None;
+                    }
+                    stack.push(Context::Single(index));
+                    index += 1;
+                }
+                b'"' => {
+                    stack.push(Context::Double(index));
+                    index += 1;
+                }
+                b'`' => {
+                    if matches!(top, Some(Context::Backquote)) {
+                        stack.pop();
+                    } else {
+                        stack.push(Context::Backquote);
+                    }
+                    index += 1;
+                }
+                b'$' if next == Some(b'(') => {
+                    stack.push(Context::Substitution(1));
+                    index += 2;
+                }
+                b'$' if next == Some(b'{') => return None,
+                b'(' => {
+                    if let Some(Context::Substitution(depth)) = stack.last_mut() {
+                        *depth += 1;
+                    }
+                    index += 1;
+                }
+                b')' => {
+                    if let Some(Context::Substitution(depth)) = stack.last_mut() {
+                        *depth -= 1;
+                        if *depth == 0 {
+                            stack.pop();
+                        }
+                    }
+                    index += 1;
+                }
+                b'#' if index == 0
+                    || matches!(
+                        bytes[index - 1],
+                        b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b'`'
+                    ) =>
+                {
+                    return None;
+                }
+                _ => index += 1,
+            },
+        }
+    }
+    // An escape that swallowed the interpreter's first byte: not a plain word.
+    if index != position {
+        return None;
+    }
+    match stack.last() {
+        Some(Context::Single(open) | Context::Double(open)) => Some(*open),
+        _ => None,
+    }
+}
+
+/// Whether, in the quoted text before a launcher, the simple command the
+/// launcher belongs to starts with a plain prose word that runs nothing (see
+/// [`inline_launcher_is_quoted_prose`]).
+///
+/// The simple command is found by cutting at the LAST separator byte, quoted
+/// or not. Over-cutting can only shorten the prefix and so make the launcher
+/// look like a command word, which keeps it: the conservative direction.
+fn quoted_launcher_prefix_is_prose(prefix: &str) -> bool {
+    let segment_start = prefix
+        .rfind(|c: char| {
+            matches!(
+                c,
+                ';' | '&' | '|' | '\n' | '\r' | '(' | ')' | '{' | '}' | '`'
+            )
+        })
+        .map_or(0, |at| at + 1);
+    let segment = &prefix[segment_start..];
+    let mut words: Vec<&str> = segment.split_ascii_whitespace().collect();
+    // Text glued to the interpreter word (`/usr/bin/` of `/usr/bin/bash`, an
+    // opening quote) is part of the launcher's own word.
+    if !segment.ends_with(|c: char| c.is_ascii_whitespace()) {
+        words.pop();
+    }
+    let Some(first) = words
+        .into_iter()
+        .find(|word| !crate::normalize::is_env_assignment(word))
+    else {
+        // Nothing but assignments before it: the launcher is the command word.
+        return false;
+    };
+    let plain = !first.starts_with('-')
+        && first.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        && first.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'-' | b'.' | b',' | b':' | b'/' | b'+' | b'@' | b'?'
+                )
+        });
+    if !plain {
+        return false;
+    }
+    let basename = first
+        .rsplit('/')
+        .next()
+        .unwrap_or(first)
+        .to_ascii_lowercase();
+    let basename = basename.strip_suffix(".exe").unwrap_or(&basename);
+    !word_may_run_its_operands(basename)
+}
+
+/// Whether a command word names something that may run another command among
+/// its operands: a shell, an interpreter, a wrapper, a command runner, a
+/// remote or sandboxed executor, a build or package runner, or a shell
+/// reserved word. Deliberately broad; see [`inline_launcher_is_quoted_prose`].
+fn word_may_run_its_operands(name: &str) -> bool {
+    is_code_runner_name(name)
+        || COMMAND_WRAPPERS.contains(&name)
+        || PRIMARY_COMMAND_WRAPPERS.contains(&name)
+        || matches!(
+            name,
+            "if" | "then"
+                | "else"
+                | "elif"
+                | "fi"
+                | "do"
+                | "done"
+                | "while"
+                | "until"
+                | "case"
+                | "esac"
+                | "for"
+                | "in"
+                | "select"
+                | "function"
+                | "coproc"
+                | "find"
+                | "fd"
+                | "git"
+                | "make"
+                | "gmake"
+                | "just"
+                | "task"
+                | "npm"
+                | "npx"
+                | "pnpm"
+                | "yarn"
+                | "bunx"
+                | "uv"
+                | "uvx"
+                | "poetry"
+                | "pipx"
+                | "cargo"
+                | "direnv"
+                | "nix"
+                | "nix-shell"
+                | "devbox"
+                | "firejail"
+                | "bwrap"
+                | "unshare"
+                | "proot"
+                | "fakeroot"
+                | "strace"
+                | "ltrace"
+                | "valgrind"
+                | "perf"
+                | "hyperfine"
+                | "entr"
+                | "runuser"
+                | "sg"
+                | "newgrp"
+                | "pkexec"
+                | "gosu"
+                | "su-exec"
+                | "setpriv"
+                | "sshpass"
+                | "xvfb-run"
+                | "dbus-run-session"
+                | "vagrant"
+                | "ansible"
+                | "pdsh"
+                | "clush"
+                | "pssh"
+                | "parallel-ssh"
+                | "winpty"
+                | "wsl"
+        )
 }
 
 /// Whether a `c` is followed by blanks and then `-` or `+`, optionally behind
@@ -3195,7 +3482,8 @@ fn extract_awk_inline_scripts(
             let Some(program_text) = command.get(program.clone()) else {
                 continue;
             };
-            for payload in awk_shell_payload_ranges(program_text, program.start) {
+            let payloads = awk_shell_payload_ranges(program_text, program.start);
+            for payload in payloads.commands {
                 let Some(content) = command.get(payload.clone()) else {
                     continue;
                 };
@@ -3206,6 +3494,37 @@ fn extract_awk_inline_scripts(
                     content,
                     program.clone(),
                     Some(payload),
+                    "awk",
+                ) {
+                    return;
+                }
+            }
+            for printed in payloads.printed {
+                // A variable the command line can reassign (`-v cmd=…`, a
+                // `cmd=…` operand) is not the literal the program assigns.
+                let reassignable = printed.variable.as_deref().is_some_and(|name| {
+                    let assignment = format!("{name}=");
+                    command
+                        .get(..program.start)
+                        .is_some_and(|head| head.contains(&assignment))
+                        || command
+                            .get(program.end..)
+                            .is_some_and(|tail| tail.contains(&assignment))
+                });
+                let script = match printed.script {
+                    Some(script) if !reassignable => script,
+                    // Computed at run time: a script whose whole source is an
+                    // expansion, which the evaluator fails closed exactly as it
+                    // does `bash -c "$X"`.
+                    _ => AWK_COMPUTED_PRINT_SCRIPT.to_string(),
+                };
+                if !push_windows_inner(
+                    extracted,
+                    skip_reasons,
+                    limits,
+                    &script,
+                    program.clone(),
+                    Some(printed.range),
                     "awk",
                 ) {
                     return;
@@ -3423,6 +3742,324 @@ fn awk_program_tokens(
     programs
 }
 
+/// The script extracted for a computed `print … | "sh"`: a single expansion,
+/// so it is code chosen at run time. The evaluator recognises it and denies it
+/// under `heredoc.posix:pipeline-consumer`, the rule the shell-level
+/// `awk '{print "mv " $1}' f | sh` already gets.
+pub(crate) const AWK_COMPUTED_PRINT_SCRIPT: &str = "$dcg_awk_printed_value";
+
+/// What an awk program hands to a shell.
+struct AwkShellPayloads {
+    /// Byte ranges (whole-command coordinates) of the literal commands the
+    /// program runs: `system("…")`, `… | "…"`, `"…" | getline`.
+    commands: Vec<Range<usize>>,
+    /// Text printed into a shell that runs its stdin as a script.
+    printed: Vec<AwkPrintedScript>,
+}
+
+/// The expression a `print`/`printf` writes into a shell that runs its stdin
+/// (`print "git reset --hard" | "sh"`), which that shell executes (#511).
+#[derive(Debug, PartialEq, Eq)]
+struct AwkPrintedScript {
+    /// Byte range of the printed expression, in whole-command coordinates.
+    range: Range<usize>,
+    /// The script the shell receives, when the expression is literal strings
+    /// (or one variable assigned exactly one literal). `None` when it is
+    /// computed: a field, a concatenation with a variable, a format.
+    script: Option<String>,
+    /// The awk variable the script was read through, if any. An assignment to
+    /// it on awk's command line (`-v name=…`, a `name=…` operand) would replace
+    /// the value, so the caller must check the rest of the command.
+    variable: Option<String>,
+}
+
+/// Whether an awk pipe's command string is a shell that reads its script from
+/// standard input: `sh`, `bash -e`, `/bin/sh -s arg`, `sudo sh`, `bash -`.
+/// Not one given `-c` (`sh -c cat` just runs `cat`) or a script operand
+/// (`sh run.sh`), whose stdin is only data.
+fn awk_pipe_target_runs_stdin_as_script(target: &str) -> bool {
+    let normalized = crate::normalize::strip_wrapper_prefixes(target);
+    let mut words = normalized.normalized.split_ascii_whitespace();
+    let Some(program) = words.next() else {
+        return false;
+    };
+    let basename = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    let basename = basename.strip_suffix(".exe").unwrap_or(&basename);
+    if !SHELL_PROGRAMS.contains(&basename) {
+        return false;
+    }
+    while let Some(word) = words.next() {
+        match word {
+            // `-s`: the script is stdin, the rest are positional parameters.
+            // `-`: the same, POSIX spelling.
+            "-s" | "-" => return true,
+            // After `--` the next operand is a script file.
+            "--" => return words.next().is_none(),
+            "-o" | "+o" | "--rcfile" | "--init-file" => {
+                words.next();
+            }
+            _ if word.starts_with("--") => {}
+            _ if word.starts_with(['-', '+']) => {
+                if word.contains('c') {
+                    return false;
+                }
+                if word[1..].contains('s') {
+                    return true;
+                }
+            }
+            // A script file operand: stdin is that script's input, not code.
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The expression printed by the `print`/`printf` statement that occupies
+/// `program[statement_start..pipe_at]`, read as the script a stdin shell runs.
+fn awk_printed_script(
+    program: &str,
+    statement_start: usize,
+    pipe_at: usize,
+    offset: usize,
+) -> AwkPrintedScript {
+    let computed = |range: Range<usize>| AwkPrintedScript {
+        range: offset + range.start..offset + range.end,
+        script: None,
+        variable: None,
+    };
+    let Some(statement) = program.get(statement_start..pipe_at) else {
+        return computed(statement_start.min(pipe_at)..pipe_at);
+    };
+    let Some((keyword_end, is_printf)) = awk_print_keyword_end(statement) else {
+        // No print keyword found: nothing provable about what is written.
+        return computed(statement_start..pipe_at);
+    };
+    let expression_start = statement_start + keyword_end;
+    let raw = &program[expression_start..pipe_at];
+    let lead = raw.len() - raw.trim_start().len();
+    let range = expression_start + lead..expression_start + raw.trim_end().len();
+    let mut expression = raw.trim();
+    if expression.starts_with('(') && expression.ends_with(')') && expression.len() >= 2 {
+        expression = expression[1..expression.len() - 1].trim();
+    }
+
+    if let Some(items) = awk_literal_list(expression) {
+        let script = if is_printf {
+            items
+                .first()
+                .and_then(|(format, _)| awk_static_printf(format))
+        } else {
+            let mut joined = String::new();
+            for (text, comma_before) in &items {
+                if *comma_before {
+                    // print's default output field separator.
+                    joined.push(' ');
+                }
+                joined.push_str(text);
+            }
+            Some(joined)
+        };
+        return AwkPrintedScript {
+            range: offset + range.start..offset + range.end,
+            script,
+            variable: None,
+        };
+    }
+
+    let is_identifier = !expression.is_empty()
+        && expression
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && expression
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if is_identifier && !is_printf {
+        if let Some(value) = awk_single_literal_assignment(program, expression) {
+            return AwkPrintedScript {
+                range: offset + range.start..offset + range.end,
+                script: Some(value),
+                variable: Some(expression.to_string()),
+            };
+        }
+    }
+    computed(range)
+}
+
+/// The end of the `print`/`printf` keyword in `statement` (outside string
+/// literals), and whether it is `printf`.
+fn awk_print_keyword_end(statement: &str) -> Option<(usize, bool)> {
+    let bytes = statement.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                index = awk_string_literal_end(statement, index).map_or(bytes.len(), |end| end + 1);
+            }
+            b'\\' if bytes.get(index + 1) == Some(&b'"') => {
+                index = escaped_string_literal_end(statement, index + 2)
+                    .map_or(bytes.len(), |end| end + 2);
+            }
+            b'p' if statement[index..].starts_with("print")
+                && (index == 0 || !is_awk_identifier_byte(bytes[index - 1])) =>
+            {
+                let is_printf = statement[index..].starts_with("printf");
+                let end = index + if is_printf { 6 } else { 5 };
+                if bytes.get(end).is_none_or(|b| !is_awk_identifier_byte(*b)) {
+                    return Some((end, is_printf));
+                }
+                index = end;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+const fn is_awk_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// A list of awk string literals joined by commas or by juxtaposition
+/// (concatenation), decoded, each with whether a comma preceded it. `None`
+/// when anything else appears (a variable, a field, an operator).
+fn awk_literal_list(expression: &str) -> Option<Vec<(String, bool)>> {
+    let bytes = expression.as_bytes();
+    let mut items = Vec::new();
+    let mut index = 0usize;
+    let mut comma_before = false;
+    loop {
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        if bytes[index] == b',' {
+            if items.is_empty() || comma_before {
+                return None;
+            }
+            comma_before = true;
+            index += 1;
+            continue;
+        }
+        let literal = inline_string_literal_at(expression, index)?;
+        if literal.start != index + 1 && literal.start != index + 2 {
+            return None;
+        }
+        let escaped = literal.start == index + 2;
+        items.push((
+            decode_awk_string(&expression[literal.clone()]),
+            std::mem::take(&mut comma_before),
+        ));
+        index = literal.end + if escaped { 2 } else { 1 };
+    }
+    (!items.is_empty() && !comma_before).then_some(items)
+}
+
+/// An awk string literal's value: its escape sequences decoded.
+fn decode_awk_string(literal: &str) -> String {
+    let mut out = String::with_capacity(literal.len());
+    let mut chars = literal.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// A `printf` format that prints itself: no conversion other than `%%`.
+fn awk_static_printf(format: &str) -> Option<String> {
+    let mut out = String::with_capacity(format.len());
+    let mut chars = format.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            if chars.next() != Some('%') {
+                return None;
+            }
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
+/// The value of awk variable `name` when the program assigns it exactly once,
+/// a single string literal, and otherwise only prints it into a pipe. Any
+/// other use (another assignment, `name = name "x"`, `getline name`,
+/// `sub(…, name)`, `split(…, name)`, a field) answers `None`.
+fn awk_single_literal_assignment(program: &str, name: &str) -> Option<String> {
+    let bytes = program.as_bytes();
+    let mut value: Option<String> = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                index = awk_string_literal_end(program, index).map_or(bytes.len(), |end| end + 1);
+                continue;
+            }
+            b'\\' if bytes.get(index + 1) == Some(&b'"') => {
+                index = escaped_string_literal_end(program, index + 2)
+                    .map_or(bytes.len(), |end| end + 2);
+                continue;
+            }
+            _ => {}
+        }
+        // Bytes, not `str` slicing: `index` may sit inside a multi-byte
+        // character, and a match of the ASCII name starts on a boundary.
+        let at_word = bytes[index..].starts_with(name.as_bytes())
+            && (index == 0
+                || !(is_awk_identifier_byte(bytes[index - 1]) || bytes[index - 1] == b'$'))
+            && bytes
+                .get(index + name.len())
+                .is_none_or(|b| !is_awk_identifier_byte(*b));
+        if !at_word {
+            index += 1;
+            continue;
+        }
+        let after = index + name.len();
+        let rest = program[after..].trim_start();
+        let before = program[..index].trim_end();
+        if rest.starts_with('=') && !rest.starts_with("==") {
+            if value.is_some() {
+                return None;
+            }
+            let rhs_at = program.len() - rest.len() + 1;
+            let literal = inline_string_literal_at(program, rhs_at)?;
+            let escaped = program.as_bytes().get(literal.start - 1) == Some(&b'"')
+                && program.as_bytes().get(literal.start.wrapping_sub(2)) == Some(&b'\\');
+            let close_end = literal.end + if escaped { 2 } else { 1 };
+            let tail = program[close_end..].trim_start_matches([' ', '\t']);
+            if !(tail.is_empty() || tail.starts_with([';', '}', '\n'])) {
+                return None;
+            }
+            value = Some(decode_awk_string(&program[literal]));
+            index = close_end;
+            continue;
+        }
+        let printed = (before.ends_with("print") || before.ends_with("printf"))
+            && rest.starts_with('|')
+            && !rest.starts_with("||");
+        if !printed {
+            return None;
+        }
+        index = after;
+    }
+    value
+}
+
 /// Byte ranges (in whole-command coordinates) of every shell command an awk
 /// program hands to `/bin/sh`.
 ///
@@ -3430,10 +4067,19 @@ fn awk_program_tokens(
 /// command), and `<string> | getline`. Only a literal awk string supplies a
 /// payload: a concatenation or a variable is not statically known, and guessing
 /// at one would evaluate text that never reaches a shell.
-fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
+///
+/// When a print pipe's command is a shell reading its script from stdin
+/// (`| "sh"`), the printed expression is reported too, in
+/// [`AwkShellPayloads::printed`] (#511).
+fn awk_shell_payload_ranges(program: &str, offset: usize) -> AwkShellPayloads {
     let bytes = program.as_bytes();
     let mut payloads = Vec::new();
+    let mut printed = Vec::new();
     let mut index = 0usize;
+    // Where the statement the scan is in began: just past the last `;`, `{`,
+    // `}` or newline outside a string, regex or comment. A `print … | "sh"`
+    // reads its printed expression from here (#511).
+    let mut statement_start = 0usize;
     // Byte offset of the `/` that closed the most recently skipped regex
     // literal. `awk_slash_opens_regex` needs it to tell a regex CLOSE (a value,
     // so the next `/` divides) from the division OPERATOR (after which a regex
@@ -3454,6 +4100,7 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
                 index = program[index..]
                     .find('\n')
                     .map_or(bytes.len(), |newline| index + newline + 1);
+                statement_start = index;
             }
             b'"' => {
                 let Some(end) = awk_string_literal_end(program, index) else {
@@ -3538,12 +4185,25 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
                 };
                 if let Some(literal) = awk_leading_string_literal(program, after) {
                     payloads.push(offset + literal.start..offset + literal.end);
+                    // `print "git reset --hard" | "sh"` writes the printed text
+                    // to a shell that runs its stdin as a script, exactly as
+                    // `echo "…" | sh` does, so the printed text is a payload as
+                    // well as the pipe target (#511).
+                    if program
+                        .get(literal.clone())
+                        .is_some_and(awk_pipe_target_runs_stdin_as_script)
+                    {
+                        printed.push(awk_printed_script(program, statement_start, index, offset));
+                    }
                     index = literal.end + 1;
                 } else {
                     index = after;
                 }
             }
             _ => {
+                if matches!(bytes[index], b';' | b'{' | b'}' | b'\n') {
+                    statement_start = index + 1;
+                }
                 if let Some(rest) = program.get(index..)
                     && rest.starts_with("system")
                     && !index
@@ -3568,7 +4228,10 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
             }
         }
     }
-    payloads
+    AwkShellPayloads {
+        commands: payloads,
+        printed,
+    }
 }
 
 /// Whether the `/` at `index` opens an awk regex literal rather than being the
@@ -15325,6 +15988,206 @@ EOF";
             };
             let reads = contents.iter().filter(|c| c.content == payload).count();
             assert_eq!(reads, 1, "{command:?}: {contents:?}");
+        }
+    }
+
+    /// #510: a launcher quoted as prose in another command's argument.
+    mod quoted_launcher_prose {
+        use super::*;
+
+        /// Ask the predicate about the first `bash`/`sh`/`python3` word.
+        fn prose(command: &str) -> bool {
+            let start = ["bash", "sh ", "python3"]
+                .iter()
+                .filter_map(|needle| command.find(needle))
+                .min()
+                .unwrap_or_else(|| panic!("no launcher in {command:?}"));
+            inline_launcher_is_quoted_prose(command, start)
+        }
+
+        #[test]
+        fn prose_inside_a_quoted_argument_is_not_a_launcher() {
+            for command in [
+                "t c 1 \"example: bash -c 'git reset --hard' is refused\"",
+                "t c 1 'example: bash -c \"git reset --hard\"'",
+                "t c 1 \"run /usr/bin/bash -c 'x'\"",
+                "t c 1 \"note, python3 -c 'import os'\"",
+                "t --body=\"the hook blocks bash -c 'x'\"",
+                "t \"a 'b' bash -c 'x'\"",
+                "t \"$(echo 'note: bash -c x')\"",
+            ] {
+                assert!(prose(command), "{command}");
+            }
+        }
+
+        #[test]
+        #[allow(clippy::literal_string_with_formatting_args)] // shell `${…}`, not a format
+        fn launchers_that_may_run_are_kept() {
+            for command in [
+                // Unquoted, or the quoted text opens with the launcher.
+                "bash -c 'x'",
+                "t bash -c 'x'",
+                "\"bash\" -c 'x'",
+                "t \"bash -c 'x'\"",
+                "t \"  bash -c 'x'\"",
+                "t \"FOO=1 bash -c 'x'\"",
+                // A separator, wrapper, runner or reserved word before it.
+                "t \"x; bash -c 'x'\"",
+                "t \"x && bash -c 'x'\"",
+                "t \"x\nbash -c 'x'\"",
+                "t \"sudo bash -c 'x'\"",
+                "t \"timeout 5 bash -c 'x'\"",
+                "t \"xargs bash -c 'x'\"",
+                "t \"ssh host bash -c 'x'\"",
+                "t \"then bash -c 'x'\"",
+                "t \"/usr/bin/env bash -c 'x'\"",
+                // Inside a substitution, whatever the quoting.
+                "t \"note $(bash -c 'x')\"",
+                "t \"note `bash -c 'x'`\"",
+                "t 'x' $(bash -c 'y')",
+                // A first word that is not plain prose.
+                "t \"$X bash -c 'x'\"",
+                "t \"-v bash -c 'x'\"",
+                // Constructs the walk does not follow.
+                "cat <<EOF\nnote: bash -c 'x'\nEOF",
+                "t \"${A:-note} bash -c 'x'\"",
+                "t $'note bash -c x'",
+                "# note \"x bash -c 'y'\"",
+                "t \\\"note bash -c 'x'",
+            ] {
+                assert!(!prose(command), "{command}");
+            }
+        }
+
+        #[test]
+        fn extraction_skips_only_the_prose_launcher() {
+            let limits = ExtractionLimits::default();
+            let contents = |command: &str| match extract_content(command, &limits) {
+                ExtractionResult::Extracted(contents) => contents,
+                ExtractionResult::NoContent => Vec::new(),
+                other => panic!("{command:?}: {other:?}"),
+            };
+            assert!(contents("t c \"example: bash -c 'git reset --hard'\"").is_empty());
+            let live = contents("t c \"example\" && bash -c 'git reset --hard'");
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(live[0].content, "git reset --hard");
+        }
+    }
+
+    /// #511: what an awk program prints into a shell that runs its stdin.
+    mod awk_printed_into_shell {
+        use super::*;
+
+        fn printed(program: &str) -> Vec<AwkPrintedScript> {
+            awk_shell_payload_ranges(program, 0).printed
+        }
+
+        fn script(program: &str) -> Option<String> {
+            let found = printed(program);
+            assert_eq!(found.len(), 1, "{program:?}: {found:?}");
+            found.into_iter().next().and_then(|p| p.script)
+        }
+
+        #[test]
+        fn stdin_shells_are_recognised() {
+            for target in [
+                "sh",
+                "bash",
+                "/bin/sh",
+                "dash",
+                "zsh",
+                "bash -e",
+                "sh -s",
+                "sh -s arg",
+                "bash -",
+                "bash -o pipefail",
+                "sudo sh",
+                "env bash",
+                "bash --norc",
+            ] {
+                assert!(awk_pipe_target_runs_stdin_as_script(target), "{target}");
+            }
+            for target in [
+                "cat",
+                "sort -u",
+                "sh -c cat",
+                "bash -ec 'x'",
+                "sh run.sh",
+                "sh -- run.sh",
+                "python3",
+                "",
+            ] {
+                assert!(!awk_pipe_target_runs_stdin_as_script(target), "{target}");
+            }
+        }
+
+        #[test]
+        fn literal_prints_become_the_script() {
+            assert_eq!(
+                script("BEGIN{print \"git reset --hard\" | \"sh\"}").as_deref(),
+                Some("git reset --hard")
+            );
+            assert_eq!(
+                script("BEGIN{print(\"a\", \"b\") | \"sh\"}").as_deref(),
+                Some("a b")
+            );
+            assert_eq!(
+                script("BEGIN{print \"a\" \"b\" | \"sh\"}").as_deref(),
+                Some("ab")
+            );
+            assert_eq!(
+                script("BEGIN{printf \"rm x\\n100%%\" | \"sh\"}").as_deref(),
+                Some("rm x\n100%")
+            );
+            assert_eq!(
+                script("BEGIN{x=1; print \"q;}\" | \"sh\"}").as_deref(),
+                Some("q;}")
+            );
+            assert_eq!(
+                script("BEGIN{print \\\"git reset --hard\\\" | \\\"sh\\\"}").as_deref(),
+                Some("git reset --hard")
+            );
+        }
+
+        #[test]
+        fn a_variable_assigned_one_literal_is_resolved() {
+            let found = printed("BEGIN{cmd=\"git reset --hard\"; print cmd | \"sh\"}");
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].script.as_deref(), Some("git reset --hard"));
+            assert_eq!(found[0].variable.as_deref(), Some("cmd"));
+        }
+
+        #[test]
+        fn computed_prints_are_reported_without_a_script() {
+            for program in [
+                "{print \"rm \" $1 | \"sh\"}",
+                "{print $0 | \"sh\"}",
+                "BEGIN{c=\"ls\"; c=c \" -l\"; print c | \"sh\"}",
+                "BEGIN{c=\"ls\"; c=\"rm\"; print c | \"sh\"}",
+                "{getline c; print c | \"sh\"}",
+                "BEGIN{printf \"%s\\n\", \"ls\" | \"sh\"}",
+                "BEGIN{print toupper(\"ls\") | \"sh\"}",
+            ] {
+                assert_eq!(script(program), None, "{program}");
+            }
+        }
+
+        #[test]
+        fn pipes_into_non_shells_report_nothing_printed() {
+            for program in [
+                "{print $1 | \"sort\"}",
+                "BEGIN{print \"x\" | \"sh -c cat\"}",
+                "BEGIN{print \"x\" > \"out\"}",
+                "BEGIN{if (a || b) print \"x\"}",
+            ] {
+                assert!(printed(program).is_empty(), "{program}");
+            }
+        }
+
+        #[test]
+        fn non_ascii_programs_do_not_panic() {
+            let _ = printed("BEGIN{é=\"ü\"; cmd=\"ls\"; print cmd | \"sh\"} # ß");
+            let _ = printed("BEGIN{print \"日本\" | \"sh\"}");
         }
     }
 }
