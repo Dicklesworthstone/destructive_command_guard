@@ -21,13 +21,24 @@ yet.
 - **A heredoc with an unquoted delimiter that only stores text was judged as
   commands.** `cat <<EOF > notes.md` documenting `watch '…'`, `sh -c '…'`,
   `ssh host '…'` or `eval "$x"` was denied, while the same note behind
-  `<<'EOF'` was allowed. Only the parts the shell runs while reading such a
-  body — `$(…)`, backquotes, and arithmetic that may be a subshell — are
-  judged now; a body whose substitutions cannot be bounded is judged whole,
-  as before. A body that a shell runs is still judged: piped or fed to one,
-  read as an awk or sed program (`awk -f - <<EOF`), and now also written to
-  a file the same command then runs (`tee x.sh <<EOF … EOF; sh x.sh`), which
-  was allowed with either delimiter.
+  `<<'EOF'` was allowed. When the data sink's output provably stays put —
+  shown on the terminal, written to a plain file, or piped only through
+  read-only text tools (`wc`, `grep`, `sort`, `tee`, …) — only the parts the
+  shell runs while reading such a body are judged now: `$(…)`, backquotes and
+  arithmetic. Every other unquoted body is judged whole, as in v0.15.1: one
+  whose output goes anywhere dcg cannot follow (`>&2`, `> "$f"`, a command
+  substitution, an unrecognized pipeline stage, a parse it is unsure of), and
+  one whose substitutions cannot be bounded. A body is also judged when it is
+  read as an awk or sed program (`awk -f - <<EOF`), and now when it is
+  written to a file the same command then runs (`tee x.sh <<EOF … EOF; sh
+  x.sh`), which was allowed with either delimiter.
+
+- **A heredoc whose output reaches a program that runs it was judged as
+  data.** `cat <<'EOF' | ssh host`, `| docker exec -i c sh`, `| sudo sh`,
+  `| at now`, `| su`, `| $SHELL`, `2>&1 | sh`, `(cat <<'EOF') | sh`,
+  `tee >(sh) <<'EOF'`, `eval "$(cat <<'EOF' …)"` and the same with an
+  unquoted delimiter were allowed on v0.15.1 whatever the body held. Such a
+  body is judged as commands now, with either delimiter.
 
 - **More spellings that hid a command.** A quoted option around a shell's
   `-c` (`bash -c -o 'errexit' '…'`, `bash '-c' '…'`); a runner named through

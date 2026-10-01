@@ -776,6 +776,49 @@ fn expanding_data_heredoc_bodies_judge_only_what_the_shell_runs() {
     }
 }
 
+/// Review of 6158ee7: a data sink's body is data only while the sink's
+/// output stays put. An unquoted body piped or otherwise fed to a program
+/// that runs it was masked like a contained one and allowed, where v0.15.1
+/// denied it; a quoted one was allowed by both. Both are now judged as
+/// commands. Contained output, and quoted bodies that only reach data
+/// consumers, decide as before.
+#[test]
+fn heredoc_bodies_whose_output_may_run_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    let runs = [
+        "cat <<{d} | sh\n{b}\nEOF",
+        "cat <<{d} 2>&1 | sh\n{b}\nEOF",
+        "cat <<{d} >&2 | sh\n{b}\nEOF",
+        "(cat <<{d}) | sh\n{b}\nEOF",
+        "cat <<{d} | ssh host\n{b}\nEOF",
+        "cat <<{d} | ssh host -- bash -s\n{b}\nEOF",
+        "cat <<{d} | docker exec -i c sh\n{b}\nEOF",
+        "cat <<{d} | kubectl exec -i p -- sh\n{b}\nEOF",
+        "cat <<{d} | at now\n{b}\nEOF",
+        "cat <<{d} | su\n{b}\nEOF",
+        "cat <<{d} | $SHELL\n{b}\nEOF",
+        "cat <<{d} | while read -r l; do eval \"$l\"; done\n{b}\nEOF",
+    ];
+    for delimiter in ["EOF", "'EOF'"] {
+        for body in ["watch 'git reset --hard'", "git reset --hard"] {
+            for template in runs {
+                let command = template.replace("{d}", delimiter).replace("{b}", body);
+                assert!(lab.claude_hook_denies(&command), "{command:?}");
+            }
+        }
+    }
+    for command in [
+        "cat <<EOF > notes.md\nwatch 'git reset --hard'\nEOF",
+        "cat <<EOF | wc -l\nwatch 'git reset --hard'\nEOF",
+        "cd docs && cat <<EOF > notes.md\nssh h 'git reset --hard'\nEOF",
+        "cat <<'EOF' | git commit -F -\nfix: stop running git reset --hard\nEOF",
+        "cat <<'EOF' | sudo tee /etc/motd >/dev/null\nnever run rm -rf ~/src here\nEOF",
+        "git commit -m \"$(cat <<'EOF'\nfix: document git reset --hard\nEOF\n)\"",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
 /// Eighth review (A14): spellings that still hid a command from the rules
 /// (all allowed on v0.14.4 and v0.15.1).
 #[test]

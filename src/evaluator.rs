@@ -11391,6 +11391,7 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
         collect_posix_eval_sinks(eval_view.as_ref(), &mut sinks);
         collect_posix_pipeline_executable_sinks(command, &mut sinks);
         collect_posix_process_substitution_sinks(command, &mut sinks);
+        collect_data_heredoc_output_sinks(command, &mut sinks);
     }
     if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown) {
         collect_powershell_iex_sinks(command, &mut sinks);
@@ -11404,6 +11405,31 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
         collect_dialect_pipeline_stdin_sinks(command, dialect, &mut sinks);
     }
     sinks
+}
+
+/// A data-sink heredoc whose output reaches a program that may run it is
+/// that program's source: `cat <<'EOF' | ssh host`, `cat <<EOF 2>&1 | sh`,
+/// `(cat <<'EOF') | sh`, `tee >(sh) <<'EOF'`. The masked views treat such a
+/// body as data (its target only copies it), so judge each one here as a
+/// POSIX command, quoted delimiter or not. Shapes the pipeline collector
+/// already resolves are judged twice, to the same answer.
+fn collect_data_heredoc_output_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
+    for body in crate::heredoc::data_heredoc_bodies_whose_output_may_run(command) {
+        let Some(source) = command.get(body) else {
+            continue;
+        };
+        let sink = ExecutableTextSink::Payload {
+            source: source.to_string(),
+            dialect: ShellDialect::Posix,
+            context: "a heredoc's output reaches a program that runs it",
+        };
+        if !sinks.contains(&sink) {
+            sinks.push(sink);
+        }
+        if sinks.len() > MAX_EXECUTABLE_TEXT_SINKS {
+            return;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

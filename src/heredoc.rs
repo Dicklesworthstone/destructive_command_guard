@@ -6101,7 +6101,8 @@ fn quoted_non_shell_heredoc_ranges(command: &str, limit: usize) -> Vec<Range<usi
     let ast = AstGrep::new(command, SupportLang::Bash);
     let mut heredocs = Vec::new();
     let mut parse_error = false;
-    collect_active_heredocs(ast.root(), &mut heredocs, &mut parse_error);
+    // Only the bodies are wanted here, not where their command's output goes.
+    collect_active_heredocs(ast.root(), &mut heredocs, &mut parse_error, true);
     if parse_error {
         return Vec::new();
     }
@@ -7619,6 +7620,20 @@ fn mask_non_executing_heredocs_with_policy(
             ActiveHeredocBody::HereString => None,
         })
         .collect();
+    // Where each command's output goes, when the parse tree did not prove
+    // it: decided once, from the text outside every body.
+    let mut unproven_output: Option<HeredocOutput> = None;
+    let mut output_of = |heredoc: &ActiveHeredoc| -> HeredocOutput {
+        heredoc.output.unwrap_or_else(|| {
+            *unproven_output.get_or_insert_with(|| {
+                if command_may_run_heredoc_output(&blank_ranges(command, &bodies)) {
+                    HeredocOutput::Executes
+                } else {
+                    HeredocOutput::Escapes
+                }
+            })
+        })
+    };
 
     let mut result = String::new();
     let mut pos = 0;
@@ -7694,8 +7709,22 @@ fn mask_non_executing_heredocs_with_policy(
         // runs while reading it stay verbatim (`None`: they cannot be bounded,
         // so the body stays whole). The full mask erases them too; its callers
         // judge substitutions from the expansion-aware view instead.
+        //
+        // The prose around those spans is only data when the target's output
+        // provably stays put: the terminal, a plain file, read-only text
+        // tools. Any other unquoted body stays whole in this view, as in
+        // v0.15.1: `cat <<EOF 2>&1 | sh`, `(cat <<EOF) | sh`, `cat <<EOF | ssh
+        // h` and `x=$(cat <<EOF …)` run or may run the text. (A body whose
+        // output reaches a program that runs it is also judged as commands,
+        // quoted or not, through [`data_heredoc_bodies_whose_output_may_run`];
+        // the views keep their masks so its quotes cannot regroup the text
+        // around it.)
         let keep_spans = if require_quoted_delimiter && !delimiter_quoted {
-            active_heredoc.live_spans.clone()
+            if output_of(&active_heredoc) == HeredocOutput::Contained {
+                active_heredoc.live_spans.clone()
+            } else {
+                None
+            }
         } else {
             Some(Vec::new())
         };
@@ -7769,6 +7798,76 @@ fn mask_non_executing_heredocs_with_policy(
     } else {
         Cow::Owned(result)
     }
+}
+
+/// The bodies of data-sink heredocs (`cat`, `tee`, `grep`, … — targets the
+/// masks treat as data) whose command's output reaches a program that may
+/// run it: `cat <<'EOF' | ssh host`, `cat <<EOF 2>&1 | sh`, `(cat <<'EOF') |
+/// sh`, `tee >(sh) <<'EOF'`, `eval "$(cat <<'EOF' …)"`. The caller judges each
+/// one as commands, whatever its delimiter's quoting. Interpreter targets
+/// (`python3 - <<'EOF' | sh`) are left out: their output is not their body.
+pub(crate) fn data_heredoc_bodies_whose_output_may_run(command: &str) -> Vec<Range<usize>> {
+    if !command.contains("<<") {
+        return Vec::new();
+    }
+    let Some(heredocs) = active_heredocs(command) else {
+        return Vec::new();
+    };
+    let bodies: Vec<Range<usize>> = heredocs
+        .iter()
+        .filter_map(|heredoc| match heredoc.body {
+            ActiveHeredocBody::Heredoc {
+                body_start,
+                body_end,
+                ..
+            } => Some(body_start..body_end),
+            ActiveHeredocBody::HereString => None,
+        })
+        .collect();
+    let mut unproven_runs: Option<bool> = None;
+    let mut found = Vec::new();
+    for heredoc in &heredocs {
+        let ActiveHeredocBody::Heredoc {
+            body_start,
+            body_end,
+            ..
+        } = heredoc.body
+        else {
+            continue;
+        };
+        if body_start >= body_end
+            || !extract_heredoc_target_command(command, heredoc.operator_start)
+                .as_deref()
+                .is_some_and(is_non_executing_heredoc_command)
+        {
+            continue;
+        }
+        let runs = match heredoc.output {
+            Some(output) => output == HeredocOutput::Executes,
+            None => *unproven_runs.get_or_insert_with(|| {
+                command_may_run_heredoc_output(&blank_ranges(command, &bodies))
+            }),
+        };
+        if runs {
+            found.push(body_start..body_end);
+        }
+    }
+    found
+}
+
+/// `command` with every byte inside `ranges` (other than newlines) blanked.
+fn blank_ranges(command: &str, ranges: &[Range<usize>]) -> String {
+    let mut outside = command.as_bytes().to_vec();
+    for range in ranges {
+        if let Some(bytes) = outside.get_mut(range.clone()) {
+            for byte in bytes.iter_mut().filter(|byte| **byte != b'\n') {
+                *byte = b' ';
+            }
+        }
+    }
+    // A body range holds whole UTF-8 sequences, so blanking it byte by byte
+    // leaves valid UTF-8; keep the raw text if that ever stopped holding.
+    String::from_utf8(outside).unwrap_or_else(|_| command.to_string())
 }
 
 /// A program that runs its operands or its standard input as code: a shell,
@@ -7976,6 +8075,28 @@ struct ActiveHeredoc {
     /// (see [`expanding_body_live_spans`]), and `None` when those cannot be
     /// bounded — such a body must stay whole in any view that judges it.
     live_spans: Option<Vec<Range<usize>>>,
+    /// Where the output of the command reading the body goes, when the parse
+    /// tree proves it; `None` when it does not, and the masker falls back to
+    /// [`command_may_run_heredoc_output`] over the text outside the bodies.
+    output: Option<HeredocOutput>,
+}
+
+/// Where the standard output of the command that reads a heredoc goes.
+///
+/// A data sink such as `cat` or `tee` copies its body to standard output, so
+/// the body is only as inert as the place that output ends up: `cat <<EOF >
+/// notes.md` files it away, `cat <<EOF | sh` runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeredocOutput {
+    /// Provably contained: the terminal, a plain file, or through read-only
+    /// text tools ([`READ_ONLY_PIPE_STAGES`]) into one of those.
+    Contained,
+    /// Not provably contained, and nothing seen that runs it: an unknown
+    /// pipeline stage, a descriptor duplication, a command substitution.
+    Escapes,
+    /// Into something that may run it as code: a shell, an interpreter, a
+    /// remote or privileged shell, `xargs`, a process substitution, `eval`.
+    Executes,
 }
 
 fn active_heredocs(command: &str) -> Option<Vec<ActiveHeredoc>> {
@@ -7987,7 +8108,8 @@ fn active_heredocs(command: &str) -> Option<Vec<ActiveHeredoc>> {
     let ast = AstGrep::new(command, SupportLang::Bash);
     let mut heredocs = Vec::new();
     let mut parse_error = false;
-    collect_active_heredocs(ast.root(), &mut heredocs, &mut parse_error);
+    let plumbed = output_may_be_replumbed(&ast.root());
+    collect_active_heredocs(ast.root(), &mut heredocs, &mut parse_error, plumbed);
     if parse_error {
         return active_single_heredoc_fallback(command);
     }
@@ -8111,6 +8233,8 @@ fn active_single_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
             delimiter_quoted: candidate.quoted,
         },
         live_spans,
+        // No parse tree, so nothing about the output is proven.
+        output: None,
     }])
 }
 
@@ -8119,6 +8243,7 @@ fn collect_active_heredocs<D: ast_grep_core::Doc>(
     node: ast_grep_core::Node<'_, D>,
     heredocs: &mut Vec<ActiveHeredoc>,
     parse_error: &mut bool,
+    plumbed: bool,
 ) {
     let kind = node.kind();
     if kind == "ERROR" {
@@ -8132,6 +8257,7 @@ fn collect_active_heredocs<D: ast_grep_core::Doc>(
                 operator_start: node.range().start + offset,
                 body: ActiveHeredocBody::HereString,
                 live_spans: None,
+                output: (!plumbed).then(|| heredoc_output(&node)).flatten(),
             });
         } else {
             *parse_error = true;
@@ -8190,12 +8316,918 @@ fn collect_active_heredocs<D: ast_grep_core::Doc>(
                 delimiter_quoted,
             },
             live_spans,
+            output: (!plumbed).then(|| heredoc_output(&node)).flatten(),
         });
         return;
     }
     for child in node.children() {
-        collect_active_heredocs(child, heredocs, parse_error);
+        collect_active_heredocs(child, heredocs, parse_error, plumbed);
     }
+}
+
+/// Pipeline stages that only read, count, filter or file text and pass it on
+/// as text: a body piped through them is as contained as their own output.
+/// `sed` and `awk` are absent on purpose (`e`, `system()`), as are pagers
+/// (`!` runs a shell).
+const READ_ONLY_PIPE_STAGES: &[&str] = &[
+    "cat",
+    "tac",
+    "nl",
+    "wc",
+    "head",
+    "tail",
+    "sort",
+    "uniq",
+    "cut",
+    "tr",
+    "fold",
+    "fmt",
+    "column",
+    "paste",
+    "expand",
+    "unexpand",
+    "rev",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "tee",
+    "md5sum",
+    "sha1sum",
+    "sha224sum",
+    "sha256sum",
+    "sha384sum",
+    "sha512sum",
+    "shasum",
+    "b2sum",
+    "cksum",
+    "base64",
+    "base32",
+    "od",
+    "xxd",
+    "hexdump",
+    "strings",
+    "comm",
+    "pr",
+    "jq",
+];
+
+/// Shells: they run their standard input unless given a script file or a
+/// literal `-c` string.
+const SHELL_PROGRAMS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh", "ash", "yash", "posh",
+    "rbash",
+];
+
+/// Programs that run what they read on standard input, or turn it into
+/// commands, whatever their operands: `xargs`, `at`, `su`, `ed`, `gdb`, ….
+const STDIN_COMMAND_RUNNERS: &[&str] = &[
+    "source", ".", "eval", "xargs", "parallel", "at", "batch", "crontab", "su", "ed", "ex", "gdb",
+    "lldb",
+];
+
+/// Script interpreters: like shells, they run standard input unless given a
+/// script file, a literal code string, or a module.
+fn is_interpreter_program(name: &str) -> bool {
+    matches!(
+        name,
+        "deno" | "bun" | "tclsh" | "wish" | "expect" | "julia" | "Rscript" | "osascript" | "cmd"
+    ) || [
+        "python",
+        "perl",
+        "ruby",
+        "node",
+        "php",
+        "lua",
+        "pwsh",
+        "powershell",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+}
+
+/// Programs that run another program named among their operands
+/// (`sudo -u x sh`, `timeout 5 bash`, `docker exec -i c sh`,
+/// `kubectl exec -i p -- sh`). What such a stage does with its input is
+/// what that program does.
+const COMMAND_WRAPPERS: &[&str] = &[
+    "sudo",
+    "doas",
+    "env",
+    "nohup",
+    "timeout",
+    "nice",
+    "ionice",
+    "stdbuf",
+    "setsid",
+    "time",
+    "command",
+    "builtin",
+    "chrt",
+    "taskset",
+    "unbuffer",
+    "flock",
+    "caffeinate",
+    "exec",
+    "busybox",
+    "toybox",
+    "watch",
+    "docker",
+    "podman",
+    "kubectl",
+    "oc",
+    "lxc",
+    "incus",
+    "nsenter",
+    "chroot",
+    "systemd-run",
+    "machinectl",
+    "tmux",
+    "screen",
+    "script",
+];
+
+/// Whether `name` is a program [`stage_runs_received_text`] judges by its
+/// operands rather than dismissing: a shell, an interpreter, a remote shell,
+/// or a program that runs its standard input.
+fn is_code_runner_name(name: &str) -> bool {
+    SHELL_PROGRAMS.contains(&name)
+        || STDIN_COMMAND_RUNNERS.contains(&name)
+        || is_interpreter_program(name)
+        || matches!(name, "ssh" | "mosh")
+}
+
+/// Whether a command word is a literal name rather than one the shell
+/// computes, and the basename it names.
+fn literal_program_name(word: &str) -> Option<&str> {
+    if word.is_empty()
+        || !word.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b'+')
+        })
+    {
+        return None;
+    }
+    Some(word.rsplit('/').next().unwrap_or(word))
+}
+
+/// A word the shell computes at run time.
+fn is_computed_word(word: &str) -> bool {
+    word.contains(['$', '`'])
+}
+
+/// A word with one layer of surrounding quotes removed (coarse: enough to
+/// read an option, a program name or a script operand).
+fn unquoted_word(word: &str) -> &str {
+    word.trim_matches(['\'', '"'])
+}
+
+/// An operand that names standard input as a file.
+fn names_stdin(word: &str) -> bool {
+    matches!(
+        unquoted_word(word),
+        "-" | "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0"
+    )
+}
+
+/// Whether a stage named `program` with operands `operands` runs the text it
+/// receives on standard input (or a substitution that reads it). A computed
+/// name (`$SHELL`, `$(…)`) may be anything, so it does.
+fn stage_runs_received_text(program: &str, operands: &[String]) -> bool {
+    let Some(name) = literal_program_name(program) else {
+        return true;
+    };
+    if SHELL_PROGRAMS.contains(&name) {
+        return shell_reads_its_input(operands);
+    }
+    if is_interpreter_program(name) {
+        return interpreter_reads_its_input(operands);
+    }
+    if STDIN_COMMAND_RUNNERS.contains(&name) {
+        // `su -c 'cmd' user` runs its literal command, not its input.
+        return !(name == "su"
+            && operands.iter().enumerate().any(|(at, operand)| {
+                matches!(operand.as_str(), "-c" | "--command")
+                    && operands
+                        .get(at + 1)
+                        .is_some_and(|code| !is_computed_word(code))
+            }));
+    }
+    if matches!(name, "ssh" | "mosh") {
+        return remote_shell_reads_its_input(operands);
+    }
+    if !COMMAND_WRAPPERS.contains(&name) {
+        return false;
+    }
+    // `sudo -s`, `sudo -i`, a bare `sudo`: a root shell reading the text.
+    if matches!(name, "sudo" | "doas")
+        && (operands.iter().all(|operand| operand.starts_with('-'))
+            || operands
+                .iter()
+                .any(|operand| matches!(operand.as_str(), "-s" | "-i" | "--shell" | "--login")))
+    {
+        return true;
+    }
+    // The first operand that names a code runner (or a piece of a
+    // split-string operand, `env -S 'sh -e'`) is the program run, with the
+    // operands after it; one computed at run time may be anything.
+    for (at, operand) in operands.iter().enumerate() {
+        if is_computed_word(operand) && !is_shell_env_assignment(operand) {
+            return true;
+        }
+        let pieces: Vec<&str> = unquoted_word(operand).split_whitespace().collect();
+        if let Some((first, rest)) = pieces.split_first()
+            && literal_program_name(first).is_some_and(is_code_runner_name)
+        {
+            let mut tail: Vec<String> = rest.iter().map(ToString::to_string).collect();
+            tail.extend(operands[at + 1..].iter().cloned());
+            return stage_runs_received_text(first, &tail);
+        }
+    }
+    false
+}
+
+/// A shell's operands: does it read its program from standard input? It
+/// does with no script operand, with `-s`, or with `-`; a script file or a
+/// literal `-c` string leaves the input as data, a computed one may not.
+fn shell_reads_its_input(operands: &[String]) -> bool {
+    let mut at = 0;
+    while let Some(operand) = operands.get(at) {
+        if is_computed_word(operand) || names_stdin(operand) {
+            return true;
+        }
+        let word = unquoted_word(operand);
+        if word == "--" {
+            return operands
+                .get(at + 1)
+                .is_none_or(|next| is_computed_word(next) || names_stdin(next));
+        }
+        if word.starts_with("--") {
+            at += if matches!(word, "--rcfile" | "--init-file") {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        if let Some(letters) = word.strip_prefix(['-', '+']) {
+            if letters.contains('s') {
+                return true;
+            }
+            if letters.contains('c') {
+                return operands
+                    .get(at + 1)
+                    .is_none_or(|code| is_computed_word(code));
+            }
+            at += if letters.ends_with(['o', 'O']) { 2 } else { 1 };
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// An interpreter's operands: does it read its program from standard input?
+/// It does with no script operand or with `-`; a script file, a literal code
+/// string (`-c`, `-e`, `--eval`, …) or a module that is not a console leaves
+/// the input as data.
+fn interpreter_reads_its_input(operands: &[String]) -> bool {
+    let mut at = 0;
+    while let Some(operand) = operands.get(at) {
+        if is_computed_word(operand) || names_stdin(operand) {
+            return true;
+        }
+        let word = unquoted_word(operand);
+        if word == "--" {
+            at += 1;
+            continue;
+        }
+        let Some(rest) = word.strip_prefix('-') else {
+            return false;
+        };
+        let code = matches!(
+            word,
+            "--eval" | "--print" | "-Command" | "-command" | "-c" | "-e" | "-E" | "-r" | "-p"
+        ) || (!rest.starts_with('-')
+            && rest.len() <= 3
+            && rest.bytes().all(|byte| byte.is_ascii_alphabetic())
+            && rest.contains(['c', 'e', 'E']));
+        if code || matches!(word, "-File" | "-file") {
+            return operands
+                .get(at + 1)
+                .is_none_or(|value| is_computed_word(value) || names_stdin(value));
+        }
+        if word == "-m" {
+            return operands.get(at + 1).is_none_or(|module| {
+                matches!(
+                    unquoted_word(module),
+                    "code" | "pdb" | "ipdb" | "IPython" | "asyncio" | "idlelib"
+                )
+            });
+        }
+        at += 1;
+    }
+    true
+}
+
+/// `ssh`'s operands: with no remote command the remote login shell runs the
+/// input; otherwise the remote command decides, read like a stage.
+fn remote_shell_reads_its_input(operands: &[String]) -> bool {
+    let mut at = 0;
+    while let Some(operand) = operands.get(at) {
+        if !operand.starts_with('-') {
+            break;
+        }
+        at += match classify_ssh_option(operand) {
+            SshOptionShape::TakesSeparateValue => 2,
+            SshOptionShape::FlagsOnly | SshOptionShape::ValueAttached => 1,
+            SshOptionShape::Unknown => return true,
+        };
+    }
+    // `operands[at]` is the host; the rest is the remote command line.
+    let remote = operands.get(at + 1..).unwrap_or_default();
+    let remote = match remote.first() {
+        Some(first) if first == "--" => &remote[1..],
+        _ => remote,
+    };
+    let words: Vec<String> = remote
+        .iter()
+        .flat_map(|operand| {
+            unquoted_word(operand)
+                .split_whitespace()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let Some((first, rest)) = words.split_first() else {
+        return true;
+    };
+    stage_runs_received_text(first, rest)
+}
+
+/// Whether anything in the parse tree can send a command's standard output
+/// somewhere the tree does not show at that command: a process substitution
+/// (`exec > >(sh)`, `tee >(sh)`), an `exec` that rewires descriptors, a
+/// function whose output goes where it is called, or an alias that renames a
+/// pipeline stage. Any of them leaves every heredoc's output unproven.
+fn output_may_be_replumbed<D: ast_grep_core::Doc>(root: &ast_grep_core::Node<'_, D>) -> bool {
+    root.dfs().any(|node| match node.kind().as_ref() {
+        "process_substitution" | "function_definition" => true,
+        "command_name" => matches!(
+            node.text().as_ref(),
+            "exec" | "alias" | "enable" | "hash" | "coproc"
+        ),
+        _ => false,
+    })
+}
+
+/// Where a `file_redirect` sends standard output, if it redirects it.
+enum StdoutRedirect {
+    /// It does not touch standard output.
+    Untouched,
+    /// To a plain, literal file (or `/dev/null`).
+    File,
+    /// Anywhere else: another descriptor, a device, a computed name.
+    Elsewhere,
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn stdout_redirect<D: ast_grep_core::Doc>(redirect: ast_grep_core::Node<'_, D>) -> StdoutRedirect {
+    stdout_redirect_parts(redirect.children())
+}
+
+/// [`stdout_redirect`] over a redirect's children (or a prefix of them).
+fn stdout_redirect_parts<'r, D: ast_grep_core::Doc + 'r>(
+    children: impl Iterator<Item = ast_grep_core::Node<'r, D>>,
+) -> StdoutRedirect {
+    let mut descriptor: Option<String> = None;
+    let mut operator: Option<String> = None;
+    let mut destinations = Vec::new();
+    for child in children {
+        let kind = child.kind();
+        match kind.as_ref() {
+            "file_descriptor" => descriptor = Some(child.text().to_string()),
+            ">" | ">>" | ">|" | "&>" | "&>>" | ">&" | "<" | "<&" | "<>" | ">&-" | "<&-" => {
+                operator = Some(kind.to_string());
+            }
+            _ => destinations.push(child),
+        }
+    }
+    let Some(operator) = operator else {
+        return StdoutRedirect::Elsewhere;
+    };
+    let to_stdout = match operator.as_str() {
+        ">" | ">>" | ">|" | ">&" | ">&-" => descriptor.as_deref().is_none_or(|fd| fd == "1"),
+        "&>" | "&>>" => true,
+        // An input redirect only matters when it names descriptor 1.
+        _ => descriptor.as_deref() == Some("1"),
+    };
+    if !to_stdout {
+        return StdoutRedirect::Untouched;
+    }
+    if !matches!(operator.as_str(), ">" | ">>" | ">|" | "&>" | "&>>" | ">&") {
+        return StdoutRedirect::Elsewhere;
+    }
+    let [destination] = destinations.as_slice() else {
+        return StdoutRedirect::Elsewhere;
+    };
+    let text = destination.text();
+    let path = match destination.kind().as_ref() {
+        "word" => text.as_ref(),
+        "raw_string" => text.trim_matches('\''),
+        "string"
+            if destination
+                .children()
+                .all(|part| part.kind() == "string_content" || !part.is_named()) =>
+        {
+            text.trim_matches('"')
+        }
+        _ => return StdoutRedirect::Elsewhere,
+    };
+    let plain = !path.is_empty()
+        && !path.contains(['$', '`', '\\', '*', '?', '[', '{', '~'])
+        && !path.starts_with(['-', '&'])
+        && !path.bytes().all(|byte| byte.is_ascii_digit())
+        // A device or descriptor path (`/dev/stdout`, `/dev/fd/1`,
+        // `/proc/self/fd/1`, or one reached through `..`) is not a file.
+        && (path == "/dev/null" || !(path.contains("dev/") || path.contains("proc/")));
+    if plain {
+        StdoutRedirect::File
+    } else {
+        StdoutRedirect::Elsewhere
+    }
+}
+
+/// What one pipeline stage after a heredoc's command does with the text.
+enum PipeStage {
+    /// Reads and passes it on ([`READ_ONLY_PIPE_STAGES`]).
+    PassesOn,
+    /// Reads it and files its own output in a plain file.
+    Files,
+    /// May run it ([`stage_runs_received_text`], or a compound stage).
+    Runs,
+    /// Consumes it some other way, or sends it somewhere unproven.
+    Other,
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn classify_pipe_stage<D: ast_grep_core::Doc>(stage: ast_grep_core::Node<'_, D>) -> PipeStage {
+    let (command, mut redirects): (_, Vec<_>) = match stage.kind().as_ref() {
+        "command" => (stage.clone(), Vec::new()),
+        "redirected_statement" => {
+            let mut children = stage.children();
+            let Some(first) = children.next() else {
+                return PipeStage::Runs;
+            };
+            let mut redirects = Vec::new();
+            for child in children {
+                if child.kind() != "file_redirect" {
+                    // A heredoc or here-string of its own replaces the text.
+                    return PipeStage::Other;
+                }
+                redirects.push(child);
+            }
+            match first.kind().as_ref() {
+                "command" => (first, redirects),
+                // `| grep x | sort > out` parses as the rest of the pipeline
+                // under one redirect: follow its stages, then the redirect.
+                "pipeline" => {
+                    let mut stages = Vec::new();
+                    pipeline_stages_after(&first, 0, &mut stages);
+                    return match follow_pipe_stages(stages) {
+                        Some(HeredocOutput::Executes) => PipeStage::Runs,
+                        Some(HeredocOutput::Escapes) => PipeStage::Other,
+                        Some(HeredocOutput::Contained) => PipeStage::Files,
+                        None => stage_redirects_outcome(redirects),
+                    };
+                }
+                _ => return PipeStage::Runs,
+            }
+        }
+        // `| while read l; do eval "$l"; done`, `| (sh)`, `| { …; }`: a
+        // compound stage may run anything it reads.
+        _ => return PipeStage::Runs,
+    };
+    let mut program = None;
+    let mut operands = Vec::new();
+    for child in command.children() {
+        match child.kind().as_ref() {
+            "command_name" => program = Some(child.text().to_string()),
+            "variable_assignment" => {}
+            "file_redirect" => redirects.push(child),
+            _ if program.is_some() => operands.push(child.text().to_string()),
+            _ => {}
+        }
+    }
+    let Some(program) = program else {
+        return PipeStage::Runs;
+    };
+    if stage_runs_received_text(&program, &operands) {
+        return PipeStage::Runs;
+    }
+    if !literal_program_name(&program).is_some_and(|name| READ_ONLY_PIPE_STAGES.contains(&name)) {
+        return PipeStage::Other;
+    }
+    stage_redirects_outcome(redirects)
+}
+
+/// What a read-only stage's own redirects make of the text it passes on.
+fn stage_redirects_outcome<D: ast_grep_core::Doc>(
+    redirects: Vec<ast_grep_core::Node<'_, D>>,
+) -> PipeStage {
+    let mut filed = false;
+    for redirect in redirects {
+        match stdout_redirect(redirect) {
+            StdoutRedirect::Untouched => {}
+            StdoutRedirect::File => filed = true,
+            StdoutRedirect::Elsewhere => return PipeStage::Other,
+        }
+    }
+    if filed {
+        PipeStage::Files
+    } else {
+        PipeStage::PassesOn
+    }
+}
+
+/// The stages of `pipeline` (nested pipelines flattened) that start at or
+/// after `from`.
+fn pipeline_stages_after<'r, D: ast_grep_core::Doc>(
+    pipeline: &ast_grep_core::Node<'r, D>,
+    from: usize,
+    stages: &mut Vec<ast_grep_core::Node<'r, D>>,
+) {
+    for child in pipeline.children() {
+        if !child.is_named() || child.range().start < from {
+            continue;
+        }
+        if child.kind() == "pipeline" {
+            pipeline_stages_after(&child, from, stages);
+        } else {
+            stages.push(child);
+        }
+    }
+}
+
+/// Where the text reaching `stages` in order ends up: `None` when it passes
+/// through all of them still contained (it continues to whatever receives
+/// the pipeline's output), otherwise the answer.
+fn follow_pipe_stages<D: ast_grep_core::Doc>(
+    stages: Vec<ast_grep_core::Node<'_, D>>,
+) -> Option<HeredocOutput> {
+    let mut escapes = false;
+    for stage in stages {
+        match classify_pipe_stage(stage) {
+            PipeStage::PassesOn => {}
+            PipeStage::Files if !escapes => return Some(HeredocOutput::Contained),
+            PipeStage::Files | PipeStage::Other => escapes = true,
+            PipeStage::Runs => return Some(HeredocOutput::Executes),
+        }
+    }
+    escapes.then_some(HeredocOutput::Escapes)
+}
+
+/// Where the standard output of the command that owns `redirect` (a
+/// `heredoc_redirect` or `herestring_redirect`) goes, when the parse tree
+/// proves it. `None` whenever it does not — an unexpected node, a parse
+/// recovery in the operator's line, a delimiter the grammar read past a
+/// metacharacter, a descriptor duplication, a substitution — and the caller
+/// then decides from the text instead.
+///
+/// tree-sitter-bash hangs the rest of the heredoc's line under the
+/// `heredoc_redirect` node (`<<EOF > notes.md`, `<<EOF | sh`, `<<EOF && x`),
+/// so those children are read as the owning command's redirects and pipe up
+/// to the first list operator.
+fn heredoc_output<D: ast_grep_core::Doc>(
+    redirect: &ast_grep_core::Node<'_, D>,
+) -> Option<HeredocOutput> {
+    let statement = redirect.parent()?;
+    if statement.kind() != "redirected_statement" {
+        return None;
+    }
+    let mut children = statement.children();
+    let first = children.next()?;
+    // `cd d && cat <<EOF > f` and `x | cat <<EOF` parse as a list or pipeline
+    // whose LAST command owns the heredoc and the redirects after it.
+    let command = match first.kind().as_ref() {
+        "command" => first,
+        "list" | "pipeline" => {
+            let last = first
+                .children()
+                .filter(ast_grep_core::Node::is_named)
+                .last()?;
+            if last.kind() != "command" {
+                return None;
+            }
+            last
+        }
+        _ => return None,
+    };
+    let mut filed = false;
+    let mut account = |stdout: StdoutRedirect| -> Option<()> {
+        match stdout {
+            StdoutRedirect::Untouched => Some(()),
+            StdoutRedirect::File => {
+                filed = true;
+                Some(())
+            }
+            StdoutRedirect::Elsewhere => None,
+        }
+    };
+    for child in command.children() {
+        if child.kind() == "file_redirect" {
+            account(stdout_redirect(child))?;
+        }
+    }
+    let mut redirects_seen = 0usize;
+    for child in children {
+        match child.kind().as_ref() {
+            "file_redirect" => account(stdout_redirect(child))?,
+            "heredoc_redirect" | "herestring_redirect" => redirects_seen += 1,
+            _ => return None,
+        }
+    }
+    // Two heredocs on one command share a header the grammar splits
+    // arbitrarily between them.
+    if redirects_seen != 1 {
+        return None;
+    }
+
+    let mut piped_into = None;
+    // The words of a pipeline stage the grammar swallowed into a redirect.
+    let mut swallowed_stage: Option<Vec<String>> = None;
+    if redirect.kind() == "heredoc_redirect" {
+        let line_end = redirect_line_end(redirect);
+        let mut list_ended = false;
+        for child in redirect.children() {
+            let kind = child.kind();
+            if matches!(kind.as_ref(), "<<" | "<<-" | "heredoc_body" | "heredoc_end") {
+                continue;
+            }
+            // The header is the operator's own line. A child reaching past it
+            // means the grammar mis-split the line (`cat <<EOF |` continues
+            // after the body, but parses as a pipe into the body's first
+            // line), and a recovery anywhere in it means the same — except the
+            // one the grammar makes of `cat <<EOF >log | sh` and `<<EOF 2>&1 |
+            // sh`, a redirect that swallowed the pipe and the next stage.
+            if child.range().end > line_end {
+                return None;
+            }
+            if child.dfs().any(|node| node.is_error()) {
+                if kind != "file_redirect"
+                    || list_ended
+                    || piped_into.is_some()
+                    || swallowed_stage.is_some()
+                {
+                    return None;
+                }
+                let (stdout, stage) = redirect_with_swallowed_pipe(&child)?;
+                account(stdout)?;
+                swallowed_stage = Some(stage);
+                continue;
+            }
+            if kind == "heredoc_start" {
+                // `<<A; sh <<B` parses with `A;` as the delimiter.
+                if child
+                    .text()
+                    .contains([';', '&', '|', '<', '>', '(', ')', ' ', '\t'])
+                {
+                    return None;
+                }
+                continue;
+            }
+            if list_ended {
+                continue;
+            }
+            match kind.as_ref() {
+                "file_redirect" if piped_into.is_none() && swallowed_stage.is_none() => {
+                    account(stdout_redirect(child))?;
+                }
+                "pipeline"
+                    if piped_into.is_none()
+                        && swallowed_stage.is_none()
+                        && child
+                            .children()
+                            .next()
+                            .is_some_and(|first| matches!(first.kind().as_ref(), "|" | "|&")) =>
+                {
+                    piped_into = Some(child);
+                }
+                "&&" | "||" | ";" | "&" => list_ended = true,
+                _ => return None,
+            }
+        }
+    }
+    if filed {
+        return Some(HeredocOutput::Contained);
+    }
+    if let Some(stage) = swallowed_stage {
+        // Only the stage's own words survived the recovery: answer when it
+        // runs the text, and leave anything else to the text-level check.
+        let (program, operands) = stage.split_first()?;
+        return stage_runs_received_text(program, operands).then_some(HeredocOutput::Executes);
+    }
+    if let Some(pipeline) = piped_into {
+        let mut stages = Vec::new();
+        pipeline_stages_after(&pipeline, 0, &mut stages);
+        if let Some(answer) = follow_pipe_stages(stages) {
+            return Some(answer);
+        }
+    }
+
+    // The statement's output is its enclosing construct's.
+    let mut node = statement;
+    loop {
+        let parent = node.parent()?;
+        match parent.kind().as_ref() {
+            "program" => return Some(HeredocOutput::Contained),
+            "list"
+            | "subshell"
+            | "compound_statement"
+            | "if_statement"
+            | "elif_clause"
+            | "else_clause"
+            | "while_statement"
+            | "for_statement"
+            | "c_style_for_statement"
+            | "do_group"
+            | "case_statement"
+            | "case_item"
+            | "negated_command" => {}
+            "pipeline" => {
+                let mut stages = Vec::new();
+                pipeline_stages_after(&parent, node.range().end, &mut stages);
+                if let Some(answer) = follow_pipe_stages(stages) {
+                    return Some(answer);
+                }
+            }
+            "redirected_statement" => {
+                let mut filed = false;
+                for child in parent.children() {
+                    if child.range() == node.range() {
+                        continue;
+                    }
+                    if child.kind() != "file_redirect" {
+                        return None;
+                    }
+                    match stdout_redirect(child) {
+                        StdoutRedirect::Untouched => {}
+                        StdoutRedirect::File => filed = true,
+                        StdoutRedirect::Elsewhere => return None,
+                    }
+                }
+                if filed {
+                    return Some(HeredocOutput::Contained);
+                }
+            }
+            _ => return None,
+        }
+        node = parent;
+    }
+}
+
+/// Split the redirect tree-sitter-bash makes of `>log | sh` (or `2>&1 |
+/// sh`): the redirect proper, then an `ERROR` holding the pipe, then the next
+/// stage's words. `None` for any other recovery.
+fn redirect_with_swallowed_pipe<D: ast_grep_core::Doc>(
+    redirect: &ast_grep_core::Node<'_, D>,
+) -> Option<(StdoutRedirect, Vec<String>)> {
+    let children: Vec<_> = redirect.children().collect();
+    let error_at = children.iter().position(|child| child.kind() == "ERROR")?;
+    let error = &children[error_at];
+    if !matches!(error.text().trim(), "|" | "|&")
+        || error.dfs().filter(ast_grep_core::Node::is_error).count() != 1
+    {
+        return None;
+    }
+    let mut stage = Vec::new();
+    for child in &children[error_at + 1..] {
+        if !matches!(
+            child.kind().as_ref(),
+            "word"
+                | "string"
+                | "raw_string"
+                | "number"
+                | "simple_expansion"
+                | "expansion"
+                | "concatenation"
+        ) || child.dfs().any(|node| node.is_error())
+        {
+            return None;
+        }
+        stage.push(child.text().to_string());
+    }
+    if stage.is_empty() {
+        return None;
+    }
+    Some((
+        stdout_redirect_parts(children[..error_at].iter().cloned()),
+        stage,
+    ))
+}
+
+/// The end of the line holding the start of `node`.
+fn redirect_line_end<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> usize {
+    let start = node.range().start;
+    let text = node.text();
+    text.find(['\n', '\r'])
+        .map_or(start + text.len(), |at| start + at)
+}
+
+/// Whether `outside` — the command with its heredoc bodies blanked — may run
+/// the output of a heredoc's command, for when the parse tree could not show
+/// where that output goes. Coarse in the strict direction: a pipe into a
+/// program that runs what it receives ([`stage_runs_received_text`]), a line
+/// that ends in a pipe (the pipeline continues past the body), a process
+/// substitution, `eval`/`source`/`.`/`exec`/`xargs`/…, or such a program fed
+/// a computed operand (`sh -c "$x"`, `bash "$(cat <<EOF …)"`) or a redirect.
+fn command_may_run_heredoc_output(outside: &str) -> bool {
+    use crate::normalize::NormalizeTokenKind;
+    if outside.contains(">(") || outside.contains("<(") {
+        return true;
+    }
+    let tokens = crate::normalize::tokenize_for_normalization(outside);
+    let mut trailing_pipe = false;
+    let mut previous_separator: Option<&str> = None;
+    let mut words: Vec<&str> = Vec::new();
+    let segment_runs = |separator: Option<&str>, words: &[&str], trailing_pipe: bool| -> bool {
+        // Redirect words are neither the program nor operands (`sh < x` reads
+        // `x`, and a stdin redirect on a runner is input it may run); a group
+        // brace, an assignment or a reserved word before the program is not
+        // the program either.
+        let mut program = None;
+        let mut operands: Vec<String> = Vec::new();
+        let mut redirected_input = false;
+        let mut redirect_target = false;
+        for word in words.iter().copied() {
+            if std::mem::take(&mut redirect_target) {
+                continue;
+            }
+            let operator = word.trim_start_matches(|c: char| c.is_ascii_digit());
+            if operator.starts_with(['<', '>']) || operator.starts_with("&>") {
+                redirected_input |= operator.starts_with('<');
+                redirect_target = operator.trim_start_matches(['<', '>', '&', '|']).is_empty();
+                continue;
+            }
+            if program.is_some() {
+                operands.push(word.to_string());
+            } else if !is_shell_env_assignment(word)
+                && !matches!(
+                    word,
+                    "{" | "}"
+                        | "!"
+                        | "if"
+                        | "then"
+                        | "do"
+                        | "else"
+                        | "elif"
+                        | "while"
+                        | "until"
+                        | "fi"
+                        | "done"
+                        | "esac"
+                )
+            {
+                program = Some(dequoted_executable_word(word));
+            }
+        }
+        let Some(program) = program else {
+            return false;
+        };
+        if !stage_runs_received_text(&program, &operands) {
+            return false;
+        }
+        let name = literal_program_name(&program).unwrap_or("");
+        let piped = matches!(separator, Some("|" | "|&")) || trailing_pipe;
+        piped
+            || matches!(
+                name,
+                "eval" | "source" | "." | "exec" | "xargs" | "parallel" | "watch" | "at" | "batch"
+            )
+            || literal_program_name(&program).is_none()
+            || redirected_input
+            || operands.iter().any(|operand| is_computed_word(operand))
+    };
+    for token in &tokens {
+        let Some(text) = token.text(outside) else {
+            continue;
+        };
+        if token.kind == NormalizeTokenKind::Word {
+            words.push(text);
+            continue;
+        }
+        if segment_runs(previous_separator, &words, trailing_pipe) {
+            return true;
+        }
+        // A line that ends in a pipe continues on a later one — after the
+        // heredoc's body, in `cat <<EOF |` — so from there on every program
+        // may be the one it feeds.
+        if text == "\n" && words.is_empty() && matches!(previous_separator, Some("|" | "|&")) {
+            trailing_pipe = true;
+        }
+        words.clear();
+        previous_separator = Some(text);
+    }
+    segment_runs(previous_separator, &words, trailing_pipe)
 }
 
 /// Whether an expanding (unquoted-delimiter) heredoc body holds syntax the
@@ -8267,8 +9299,8 @@ fn contains_bash_funsub(text: &str) -> bool {
 /// the target only stores the text. Everything else in the body — the prose
 /// of a note or a commit message — is data for a data sink, exactly as a
 /// quoted body is. The spans returned are the outermost `command_substitution`
-/// and `arithmetic_expansion` nodes the grammar parsed in the body (arithmetic
-/// is kept visible because bash re-reads an unparsable `$((…))` as a command
+/// and `arithmetic_expansion` nodes the grammar parsed in the body (all
+/// arithmetic is kept visible: bash re-reads some `$((…))` as a command
 /// substitution holding a subshell) plus the backquoted substitutions the
 /// grammar leaves as plain text, found with the here-document escape rules.
 ///
@@ -8310,32 +9342,28 @@ fn expanding_body_live_spans<D: ast_grep_core::Doc>(
     {
         return None;
     }
-    // Relative to the body from here on. A numeric `$((…))` is text, but its
-    // `$((` is no substitution either.
-    let (mut inert, mut spans): (Vec<Range<usize>>, Vec<Range<usize>>) = spans
+    // Relative to the body from here on. Every arithmetic expansion is kept,
+    // even one that looks numeric: what bash makes of an unparsable `$((…))`
+    // (a subshell, or an error) is not decided here, and v0.15.1 judged a
+    // multi-line one as a command.
+    let mut spans: Vec<Range<usize>> = spans
         .into_iter()
         .map(|span| span.start - base..span.end - base)
         .filter(|span| !escaped(span.start))
-        .partition(|span| is_inert_arithmetic(&text[span.clone()]));
-    inert.sort_by_key(|span| span.start);
+        .collect();
     spans.sort_by_key(|span| span.start);
     let opaque: Vec<(usize, usize)> = spans.iter().map(|span| (span.start, span.end)).collect();
     let backquoted = scan_backquoted_substitutions(text, 0, &opaque).ok()?;
     spans.extend(backquoted.into_iter().map(|found| found.start..found.end));
     spans.sort_by_key(|span| span.start);
-    // Every live `$(` must sit inside a kept span or open a numeric one;
-    // the lists are sorted, so one forward pass checks them all.
+    // Every live `$(` must sit inside a kept span; the list is sorted, so one
+    // forward pass checks them all.
     let mut next = 0usize;
-    let mut next_inert = 0usize;
     for (at, _) in text.match_indices("$(") {
         while spans.get(next).is_some_and(|span| span.end <= at) {
             next += 1;
         }
-        while inert.get(next_inert).is_some_and(|span| span.end <= at) {
-            next_inert += 1;
-        }
-        let covered = spans.get(next).is_some_and(|span| span.start <= at)
-            || inert.get(next_inert).is_some_and(|span| span.start == at);
+        let covered = spans.get(next).is_some_and(|span| span.start <= at);
         if !covered && !escaped(at) {
             return None;
         }
@@ -8346,16 +9374,6 @@ fn expanding_body_live_spans<D: ast_grep_core::Doc>(
             .map(|span| span.start + base..span.end + base)
             .collect(),
     )
-}
-
-/// An arithmetic expansion that can only compute a number: `$((…))` with no
-/// parenthesis, backquote or `$` substitution inside. Bash re-reads a `$((`
-/// whose inner parentheses do not close as `))` as a command substitution
-/// holding a subshell, so anything with an inner parenthesis stays live.
-fn is_inert_arithmetic(span: &str) -> bool {
-    span.strip_prefix("$((")
-        .and_then(|inner| inner.strip_suffix("))"))
-        .is_some_and(|inner| !inner.contains(['(', ')', '`']))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -9252,11 +10270,16 @@ mod tests {
         let around = mask_non_expanding_data_heredocs("cat <<EOF > n\nrun ($(date)) x\nEOF");
         assert!(around.contains("___ _$(date)_ _"), "{around:?}");
 
-        // A purely numeric span is text. (An escaped `\$(…)` defeats the
-        // grammar, and the recovery path keeps such a body whole.)
+        // Arithmetic is kept, numeric or not, and the prose around it is
+        // still masked. (An escaped `\$(…)` defeats the grammar, and the
+        // recovery path keeps such a body whole.)
         let numeric = "cat <<EOF > n\n$((1+2)) git reset --hard\nEOF";
         let masked = mask_non_expanding_data_heredocs(numeric);
+        assert!(masked.contains("$((1+2))"), "{masked:?}");
         assert!(!masked.contains("git reset"), "{masked:?}");
+        let multiline = "cat <<EOF > n\n$((\nrm -rf ~/a\n))\nEOF";
+        let masked = mask_non_expanding_data_heredocs(multiline);
+        assert!(masked.contains("rm -rf ~/a"), "{masked:?}");
 
         // Unbounded: a continuation that forms `$(`, a bash 5.3 `${ …; }`,
         // an unterminated backquote. The whole body stays.
@@ -9275,12 +10298,249 @@ mod tests {
         );
         assert!(extract_posix_command_substitutions("cat <<EOF > n\na \\\nb\nEOF").is_ok());
 
-        // An executing target keeps the whole body, quoted or not. (A body a
-        // data sink pipes into a shell, `cat <<EOF | sh`, is masked here like
-        // the quoted one; the pipeline reader judges it from the raw text.)
-        let executed = "bash <<EOF\nwatch 'git reset --hard'\nEOF";
-        let masked = mask_non_expanding_data_heredocs(executed);
-        assert!(masked.contains("git reset --hard"), "{masked:?}");
+        // An executing target keeps the whole body, quoted or not, and so
+        // does an unquoted data sink whose output is not contained
+        // (`cat <<EOF | sh`; its body is also judged as commands, see
+        // `data_heredoc_bodies_are_masked_only_where_their_output_stays`).
+        for executed in [
+            "bash <<EOF\nwatch 'git reset --hard'\nEOF",
+            "bash <<'EOF'\nwatch 'git reset --hard'\nEOF",
+            "cat <<EOF | sh\nwatch 'git reset --hard'\nEOF",
+        ] {
+            let masked = mask_non_expanding_data_heredocs(executed);
+            assert!(masked.contains("git reset --hard"), "{masked:?}");
+        }
+    }
+
+    /// The output of each heredoc's command, as the parse tree proves it.
+    fn heredoc_outputs(command: &str) -> Vec<Option<HeredocOutput>> {
+        active_heredocs(command)
+            .expect("parses")
+            .into_iter()
+            .map(|heredoc| heredoc.output)
+            .collect()
+    }
+
+    /// Where a data sink's output goes decides whether its body is data.
+    /// The parse tree proves containment only for the terminal, a plain file
+    /// and read-only text tools; it proves execution for a pipe into a
+    /// program that runs text; anything it cannot follow is `None`.
+    #[test]
+    fn heredoc_output_is_proven_from_the_parse_tree() {
+        use HeredocOutput::{Contained, Escapes, Executes};
+        for (command, expected) in [
+            // Contained.
+            ("cat <<EOF\nx\nEOF", Some(Contained)),
+            ("cat <<EOF > notes.md\nx\nEOF", Some(Contained)),
+            ("cat > notes.md <<EOF\nx\nEOF", Some(Contained)),
+            ("FOO=1 cat <<EOF >> log.txt\nx\nEOF", Some(Contained)),
+            ("cat <<EOF > 'my notes.md'\nx\nEOF", Some(Contained)),
+            ("cat <<EOF >/dev/null\nx\nEOF", Some(Contained)),
+            ("cat <<EOF 2>/dev/null > n\nx\nEOF", Some(Contained)),
+            ("cat <<EOF 2>&1\nx\nEOF", Some(Contained)),
+            ("cat <<EOF | wc -l\nx\nEOF", Some(Contained)),
+            (
+                "cat <<EOF | grep -v x | sort > out.txt\nx\nEOF",
+                Some(Contained),
+            ),
+            ("cat <<EOF | tee a.txt | wc\nx\nEOF", Some(Contained)),
+            (
+                "cd d && cat <<EOF > n.md && git add n.md\nx\nEOF",
+                Some(Contained),
+            ),
+            ("git commit -F - <<EOF\nx\nEOF", Some(Contained)),
+            ("if true; then\ncat <<EOF\nx\nEOF\nfi", Some(Contained)),
+            // The grammar swallows `| bash` into the redirect; stdout is filed.
+            ("cat <<'EOF' >log | bash\nx\nEOF", Some(Contained)),
+            // Into a program that runs text.
+            ("cat <<EOF | sh\nx\nEOF", Some(Executes)),
+            ("cat <<'EOF' | bash -s -- a\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | grep x | sh\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | tee x | python3\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | ssh host\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | ssh -T host -- bash -s\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | docker exec -i c sh\nx\nEOF", Some(Executes)),
+            (
+                "cat <<EOF | kubectl exec -i p -- sh\nx\nEOF",
+                Some(Executes),
+            ),
+            ("cat <<EOF | sudo -u root sh\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | sudo\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | sudo -s\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | timeout 5 sh\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | env -i sh\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | su\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | at now\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | xargs -0 sh -c\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | $SHELL\nx\nEOF", Some(Executes)),
+            (
+                "cat <<EOF | while read -r l; do eval \"$l\"; done\nx\nEOF",
+                Some(Executes),
+            ),
+            ("cat <<EOF 2>&1 | sh\nx\nEOF", Some(Executes)),
+            ("cat <<EOF 2>/dev/null | sh\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | sh -c \"$(cat)\"\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | python3 -\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | ssh host 'bash -s'\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | sudo env sh\nx\nEOF", Some(Executes)),
+            // Not contained, nothing seen that runs it.
+            ("cat <<EOF | git commit -F -\nx\nEOF", Some(Escapes)),
+            ("cat <<EOF | kubectl apply -f -\nx\nEOF", Some(Escapes)),
+            (
+                "cat <<EOF | sudo tee /etc/x >/dev/null\nx\nEOF",
+                Some(Escapes),
+            ),
+            ("cat <<EOF | sed s/a/b/\nx\nEOF", Some(Escapes)),
+            // A script file or a literal `-c` string reads the text as data.
+            ("cat <<EOF | bash deploy.sh\nx\nEOF", Some(Escapes)),
+            ("cat <<EOF | sh -c 'cat > out'\nx\nEOF", Some(Escapes)),
+            ("cat <<EOF | python3 -m json.tool\nx\nEOF", Some(Escapes)),
+            ("cat <<EOF | ssh host 'cat > f'\nx\nEOF", Some(Escapes)),
+            ("cat <<EOF | docker exec -i c tee /f\nx\nEOF", Some(Escapes)),
+            ("cat <<EOF | su -c 'cat > f' u\nx\nEOF", Some(Escapes)),
+            // Unproven: the tree cannot follow the output.
+            ("cat <<EOF >&2\nx\nEOF", None),
+            ("cat <<EOF >/dev/stdout\nx\nEOF", None),
+            ("cat <<EOF >/dev/stdout | sh\nx\nEOF", None),
+            ("cat <<EOF >&2 | sh\nx\nEOF", None),
+            ("cat <<EOF > ../../dev/fd/1\nx\nEOF", None),
+            ("cat <<EOF > \"$f\"\nx\nEOF", None),
+            ("cat <<EOF |\nx\nEOF\nsh", None),
+            ("x=$(cat <<EOF\nx\nEOF\n)", None),
+            ("tee >(sh) <<EOF\nx\nEOF", None),
+            ("cat <<EOF > >(sh)\nx\nEOF", None),
+            ("exec 3>&1; cat <<EOF\nx\nEOF", None),
+            ("f() { cat <<EOF\nx\nEOF\n}; f | sh", None),
+            ("cat <<A; sh <<B\nhi\nA\nx\nB", None),
+        ] {
+            let outputs = heredoc_outputs(command);
+            assert_eq!(outputs.first().copied().flatten(), expected, "{command:?}");
+        }
+    }
+
+    /// Without a proof from the tree, the text outside the bodies decides,
+    /// in the strict direction.
+    #[test]
+    fn unproven_heredoc_output_is_judged_from_the_text() {
+        for command in [
+            "cat <<EOF 2>&1 | sh\n\nEOF",
+            "(cat <<EOF) | sh\n\nEOF",
+            "{ cat <<EOF; } | sh\n\nEOF",
+            "cat <<EOF |\n\nEOF\nsh",
+            "x=$(cat <<EOF\n\nEOF\n); eval \"$x\"",
+            "x=$(cat <<EOF\n\nEOF\n)\nsh -c \"$x\"",
+            "eval \"$(cat <<EOF\n\nEOF\n)\"",
+            "bash -c \"$(cat <<EOF\n\nEOF\n)\"",
+            "tee >(sh) <<EOF\n\nEOF",
+            "f() { cat <<EOF\n\nEOF\n}; f | sh",
+            "cat <<A; sh <<B\nhi\nA\n\nB",
+            "cat <<EOF | $SHELL\n\nEOF",
+            "exec 3> >(sh)\ncat <<EOF >&3\n\nEOF",
+            "cat <<EOF > x\n\nEOF\nexec sh < x",
+        ] {
+            assert!(command_may_run_heredoc_output(command), "{command:?}");
+        }
+        for command in [
+            "cat <<EOF >&2\n\nEOF\nexit 1",
+            "git commit -m \"$(cat <<EOF\n\nEOF\n)\"",
+            "x=$(cat <<EOF\n\nEOF\n)\ngit commit -m \"$x\"",
+            "cat <<EOF > \"$f\"\n\nEOF\nbash build.sh",
+            "cat <<EOF | sudo tee /etc/x\n\nEOF",
+            "exec 2>&1\ncat <<EOF > n\n\nEOF",
+            "{ cat <<EOF; } > n\n\nEOF",
+            "if true; then cat <<EOF > n\n\nEOF\nfi",
+        ] {
+            assert!(!command_may_run_heredoc_output(command), "{command:?}");
+        }
+    }
+
+    /// An unquoted data body keeps only its substitutions in the
+    /// expansion-aware view when its output is provably contained; any other
+    /// unquoted body stays whole there, as in v0.15.1, and quoted bodies keep
+    /// their v0.15.1 mask. A body whose output reaches a program that runs it
+    /// is handed to the caller to judge as commands, quoted or not.
+    #[test]
+    fn data_heredoc_bodies_are_masked_only_where_their_output_stays() {
+        let body = "watch 'git reset --hard'";
+        let contained = [
+            "cat <<{d} > notes.md\n{b}\nEOF",
+            "cat <<{d}\n{b}\nEOF",
+            "cat <<{d} | wc -l\n{b}\nEOF",
+            "cd d && cat <<{d} > n.md\n{b}\nEOF",
+        ];
+        let escapes = [
+            "cat <<{d} >&2\n{b}\nEOF",
+            "cat <<{d} | git commit -F -\n{b}\nEOF",
+            "cat <<{d} | sudo tee /etc/x\n{b}\nEOF",
+            "git commit -m \"$(cat <<{d}\n{b}\nEOF\n)\"",
+        ];
+        let executes = [
+            "cat <<{d} | sh\n{b}\nEOF",
+            "cat <<{d} 2>&1 | sh\n{b}\nEOF",
+            "cat <<{d} 2>/dev/null | sh\n{b}\nEOF",
+            "cat <<{d} >&2 | sh\n{b}\nEOF",
+            "(cat <<{d}) | sh\n{b}\nEOF",
+            "cat <<{d} | ssh host\n{b}\nEOF",
+            "cat <<{d} | ssh host bash\n{b}\nEOF",
+            "cat <<{d} | docker exec -i c sh\n{b}\nEOF",
+            "cat <<{d} | kubectl exec -i p -- sh\n{b}\nEOF",
+            "cat <<{d} | sudo sh\n{b}\nEOF",
+            "cat <<{d} | at now\n{b}\nEOF",
+            "cat <<{d} | su\n{b}\nEOF",
+            "cat <<{d} | $SHELL\n{b}\nEOF",
+            "cat <<{d} | tee /dev/null | sh\n{b}\nEOF",
+            "cat <<{d} |\n{b}\nEOF\nsh",
+            "cat <<{d} > >(sh)\n{b}\nEOF",
+            "tee >(sh) <<{d}\n{b}\nEOF",
+            "eval \"$(cat <<{d}\n{b}\nEOF\n)\"",
+            "x=$(cat <<{d}\n{b}\nEOF\n); eval \"$x\"",
+        ];
+        for delimiter in ["EOF", "'EOF'"] {
+            let quoted = delimiter.starts_with('\'');
+            let render = |template: &str| template.replace("{d}", delimiter).replace("{b}", body);
+            let judged = |command: &str| -> Vec<String> {
+                data_heredoc_bodies_whose_output_may_run(command)
+                    .into_iter()
+                    .map(|body| command[body].to_string())
+                    .collect()
+            };
+            for template in contained {
+                let command = render(template);
+                let view = mask_non_expanding_data_heredocs(&command);
+                assert!(!view.contains("git reset"), "{command:?} -> {view:?}");
+                let full = mask_non_executing_heredocs(&command);
+                assert!(!full.contains("git reset"), "{command:?} -> {full:?}");
+                assert!(judged(&command).is_empty(), "{command:?}");
+            }
+            for template in escapes {
+                let command = render(template);
+                let view = mask_non_expanding_data_heredocs(&command);
+                // v0.15.1: a quoted body masked, an unquoted one whole.
+                assert_eq!(
+                    view.contains("git reset"),
+                    !quoted,
+                    "{command:?} -> {view:?}"
+                );
+                let full = mask_non_executing_heredocs(&command);
+                assert!(!full.contains("git reset"), "{command:?} -> {full:?}");
+                assert!(judged(&command).is_empty(), "{command:?}");
+            }
+            for template in executes {
+                let command = render(template);
+                if !quoted {
+                    let view = mask_non_expanding_data_heredocs(&command);
+                    assert!(view.contains("git reset"), "{command:?} -> {view:?}");
+                }
+                // Judged as commands — or, where the grammar mis-splits the
+                // line (`cat <<EOF |` continued after the body), never masked.
+                let bodies = judged(&command);
+                assert!(
+                    bodies.iter().any(|judged| judged.contains(body))
+                        || mask_non_executing_heredocs(&command).contains(body),
+                    "{command:?} -> {bodies:?}"
+                );
+            }
+        }
     }
 
     /// A body written to a file the same command then runs is code.
