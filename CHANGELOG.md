@@ -26,6 +26,27 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   on every row the hook writes, because the hook runs before the command and
   cannot know how it ended. NULL means unknown, not success (#515).
 
+### Detection
+
+- An inline-shell launcher quoted as prose inside another command's argument
+  (`tracker comment 1 "example: bash -c 'git reset --hard' is refused"`) is no
+  longer judged as if it ran. A launcher that opens the quoted text, follows a
+  separator or wrapper inside it, sits in a substitution, or is in a string
+  that eval/ssh/watch run is still judged (#510).
+- awk printing into a shell that reads its stdin (`print "git reset --hard" |
+  "sh"`) now has the printed text judged as the command it is, including
+  through a variable the program assigns one literal. A computed print into
+  such a shell is denied as `heredoc.posix:pipeline-consumer`, like the
+  shell-level `awk '…' | sh` (#511).
+- A single string given to a shell sink is now judged by every pack, not only
+  the few `rm`/`git` payloads the per-language catalogue knows:
+  `perl -e 'system("git push --force origin main")'` and `system("find .
+  -delete")` are denied, as are the same strings through Python `os.system`,
+  Ruby `system`, PHP `system`/`shell_exec` and Node `child_process.execSync`.
+  Perl backtick commands go the same way, and `qx` is recognised with any
+  delimiter (`qx{…}`, `qx(…)`, `qx[…]`, …), not only `qx/…/`. Payloads the
+  catalogue already reports keep their `heredoc.*` rule ids (#512).
+
 ## [v0.15.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.2) -- 2026-10-01 [Release]
 
 **This is a security fix release. v0.15.1 can fail open under load: upgrade.**
