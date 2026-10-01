@@ -48,6 +48,19 @@ yet.
   `curl … | bash` install line) and panicked, so the command ran. A span that
   does not address the command now leaves the confidence high and the deny in
   place.
+- **`[confidence]` scored some matches against the wrong text.** A match
+  found on the raw command was scored at the same offsets of the normalized
+  command (quotes and wrappers such as `time` removed), and a match inside an
+  unwrapped inner command carried the inner command's offsets. Either way the
+  score described unrelated text and could downgrade a deny to a warning. A
+  span is now checked against the matched text first. One measured on the raw
+  command is moved onto the normalized command when normalizing only stripped
+  a leading wrapper (`time`, `sudo`), which leaves the text in the same
+  surroundings. Any other span keeps the deny: removed quotes change what the
+  surroundings look like, and the outer command presents an inner command as
+  the quoted argument it runs, which the scorer would read as data. The
+  hook's reported `confidence` is omitted when the span does not address the
+  command.
 
 - **A heredoc with an unquoted delimiter that only stores text was judged as
   commands.** `cat <<EOF > notes.md` documenting `watch '…'`, `sh -c '…'`,

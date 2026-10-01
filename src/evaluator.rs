@@ -27985,22 +27985,75 @@ fn configured_policy_mode(
     })
 }
 
+/// Whether `info`'s match span addresses the matched text in `command`.
+///
+/// A span is a pair of byte offsets into whatever string the rule matched,
+/// and that is not always the command being judged: a match inside an
+/// unwrapped inner command (`env -S '…'`, `watch '…'`, `bash -c '…'`), a
+/// heredoc body, or a `curl … | bash` payload carries the inner string's
+/// offsets, and a match on the raw command carries raw offsets while
+/// confidence scores the normalized form. The match preview was cut from the
+/// string the span was measured on, so the span addresses `command` exactly
+/// when the same offsets cut the same preview from it. Without a preview
+/// there is nothing to check against, and the answer is `false`.
+#[must_use]
+pub fn span_addresses_command(command: &str, info: &PatternMatch) -> bool {
+    let (Some(span), Some(preview)) = (
+        info.matched_span.as_ref(),
+        info.matched_text_preview.as_deref(),
+    ) else {
+        return false;
+    };
+    command.get(span.start..span.end).is_some() && extract_match_preview(command, span) == preview
+}
+
+/// `info`'s span, measured on `measured_on`, re-expressed in `target`'s
+/// coordinates: possible only when one string ends with the other, so that
+/// every byte of the shorter sits a fixed distance into the longer. The
+/// moved span must still cut the matched text from `target`.
+fn span_shifted_onto(target: &str, measured_on: &str, info: &PatternMatch) -> Option<MatchSpan> {
+    let span = info.matched_span?;
+    let moved = if target.len() >= measured_on.len() && target.ends_with(measured_on) {
+        let shift = target.len() - measured_on.len();
+        MatchSpan {
+            start: span.start + shift,
+            end: span.end + shift,
+        }
+    } else if measured_on.ends_with(target) {
+        let shift = measured_on.len() - target.len();
+        MatchSpan {
+            start: span.start.checked_sub(shift)?,
+            end: span.end.checked_sub(shift)?,
+        }
+    } else {
+        return None;
+    };
+    let mut moved_info = info.clone();
+    moved_info.matched_span = Some(moved);
+    span_addresses_command(target, &moved_info).then_some(moved)
+}
+
 fn apply_effective_confidence(
     config: &Config,
     command: &str,
     result: &EvaluationResult,
     mode: crate::packs::DecisionMode,
 ) -> ConfidenceResult {
-    let applies = result
+    let unchanged = ConfidenceResult {
+        mode,
+        score: None,
+        downgraded: false,
+    };
+    let Some(info) = result
         .pattern_info
         .as_ref()
-        .is_some_and(|info| matches!(info.source, MatchSource::Pack | MatchSource::HeredocAst));
-    if !applies {
-        return ConfidenceResult {
-            mode,
-            score: None,
-            downgraded: false,
-        };
+        .filter(|info| matches!(info.source, MatchSource::Pack | MatchSource::HeredocAst))
+    else {
+        return unchanged;
+    };
+    // Disabled scoring changes nothing; skip the sanitize/normalize passes.
+    if !config.confidence.enabled {
+        return unchanged;
     }
 
     let sanitized = sanitize_for_pattern_matching(command);
@@ -28014,10 +28067,41 @@ fn apply_effective_confidence(
             confidence_sanitized = Some(normalized_sanitized.as_ref());
         }
     }
+    // A downgrade reads the context around the span, so the span has to
+    // address the string being scored, and it may have been measured on the
+    // other form of the command (raw or normalized). It maps across only when
+    // one form ends with the other, as when normalizing strips a leading
+    // `time` or `sudo`: the same text then sits a fixed distance away, in the
+    // same surroundings. Any other difference moved text unevenly (removed
+    // quotes), so the old surroundings are gone, and a span from an unwrapped
+    // inner command (`env -S '…'`, `watch '…'`, a heredoc body) has no place
+    // in the outer command at all: its text appears there only inside the
+    // quoted argument that runs it, which the scorer reads as data. Such a
+    // match keeps the strict verdict.
+    let shifted;
+    let scored_result =
+        if info.matched_span.is_some() && !span_addresses_command(confidence_command, info) {
+            let other_form = if confidence_command == command {
+                normalized_command.as_ref()
+            } else {
+                command
+            };
+            let Some(span) = span_shifted_onto(confidence_command, other_form, info) else {
+                return unchanged;
+            };
+            let mut moved = result.clone();
+            if let Some(moved_info) = moved.pattern_info.as_mut() {
+                moved_info.matched_span = Some(span);
+            }
+            shifted = moved;
+            &shifted
+        } else {
+            result
+        };
     let scored = apply_confidence_scoring(
         confidence_command,
         confidence_sanitized,
-        result,
+        scored_result,
         mode,
         &config.confidence,
     );
@@ -28025,7 +28109,7 @@ fn apply_effective_confidence(
         && let Some(score) = confident_repeat_of_rule(
             confidence_command,
             confidence_sanitized,
-            result,
+            scored_result,
             config.confidence.warn_threshold,
         )
     {
@@ -40931,6 +41015,190 @@ mod tests {
             detailed.confidence.as_ref().map(|result| result.mode),
             Some(crate::packs::DecisionMode::Ask)
         );
+    }
+
+    fn confidence_config() -> Config {
+        let mut config = default_config();
+        config.confidence.enabled = true;
+        config.confidence.warn_threshold = 0.7;
+        config
+    }
+
+    fn rm_rf_result(measured_on: &str, span: MatchSpan) -> EvaluationResult {
+        EvaluationResult::denied_by_pack_pattern_with_span(
+            "core.filesystem",
+            "rm-rf-general",
+            "rm -rf",
+            None,
+            crate::packs::Severity::High,
+            &[],
+            measured_on,
+            span,
+        )
+    }
+
+    #[test]
+    fn span_addresses_command_only_where_it_cuts_the_matched_text() {
+        let inner = "rm -rf ./build";
+        let outer = "echo 'zzzzzzzzzzzzz'; env -S 'rm -rf ./build'";
+        let span = MatchSpan { start: 7, end: 14 };
+        let info = rm_rf_result(inner, span).pattern_info.unwrap();
+        assert!(span_addresses_command(inner, &info));
+        assert!(
+            !span_addresses_command(outer, &info),
+            "outer[7..14] is not ./build"
+        );
+        assert!(!span_addresses_command("rm -rf", &info), "past the end");
+        let mut no_preview = info;
+        no_preview.matched_text_preview = None;
+        assert!(
+            !span_addresses_command(inner, &no_preview),
+            "nothing to check against"
+        );
+    }
+
+    /// `[confidence]` reads the context around a match's span. A match found
+    /// inside an unwrapped inner command carries the inner command's offsets;
+    /// read on the outer command they land on unrelated text, here an echo's
+    /// quoted data, which the scorer rates low. That downgraded the deny of a
+    /// command that runs to a warning.
+    #[test]
+    fn confidence_keeps_the_deny_for_a_span_measured_on_an_inner_command() {
+        let config = confidence_config();
+        let inner = "rm -rf ./build";
+        // No quotes or wrappers, so normalizing leaves the outer command as
+        // it is and the control below is scored where it was measured.
+        let outer = "echo zzzzzzzzzzzzzz zzzz && git status";
+        let span = MatchSpan { start: 7, end: 14 };
+        assert_eq!(&inner[7..14], "./build");
+        assert_eq!(&outer[7..14], "zzzzzzz");
+        assert_eq!(crate::normalize::normalize_command(outer).as_ref(), outer);
+
+        // Control: the same offsets measured on the outer command itself are
+        // echo data, and that occurrence is rightly downgraded.
+        let measured_on_outer = rm_rf_result(outer, span);
+        let control = apply_effective_confidence(
+            &config,
+            outer,
+            &measured_on_outer,
+            crate::packs::DecisionMode::Deny,
+        );
+        assert!(control.downgraded, "control must downgrade: {control:?}");
+
+        let measured_on_inner = rm_rf_result(inner, span);
+        let resolved = apply_effective_confidence(
+            &config,
+            outer,
+            &measured_on_inner,
+            crate::packs::DecisionMode::Deny,
+        );
+        assert_eq!(
+            resolved.mode,
+            crate::packs::DecisionMode::Deny,
+            "{resolved:?}"
+        );
+        assert!(!resolved.downgraded);
+        assert!(resolved.score.is_none(), "no score from unrelated text");
+    }
+
+    /// A span measured on the raw command maps onto the normalized command
+    /// that confidence reads only when normalizing stripped a leading wrapper,
+    /// so the same text sits a fixed distance away in the same surroundings.
+    #[test]
+    fn confidence_maps_a_raw_span_across_a_stripped_wrapper() {
+        let config = confidence_config();
+        let raw = "time rm -rf ./build";
+        let normalized = crate::normalize::normalize_command(raw);
+        assert_eq!(normalized.as_ref(), "rm -rf ./build");
+        assert_eq!(sanitize_for_pattern_matching(raw).as_ref(), raw);
+
+        let at = raw.find("-rf").unwrap();
+        let result = rm_rf_result(
+            raw,
+            MatchSpan {
+                start: at,
+                end: at + 3,
+            },
+        );
+        assert!(!span_addresses_command(
+            normalized.as_ref(),
+            result.pattern_info.as_ref().unwrap()
+        ));
+        let resolved =
+            apply_effective_confidence(&config, raw, &result, crate::packs::DecisionMode::Deny);
+        let expected =
+            crate::confidence::compute_match_confidence(&crate::confidence::ConfidenceContext {
+                command: normalized.as_ref(),
+                sanitized_command: None,
+                match_start: 3,
+                match_end: 6,
+            });
+        assert_eq!(
+            resolved.score.as_ref().map(|score| score.value),
+            Some(expected.value),
+            "scored at the moved span of the normalized command: {resolved:?}"
+        );
+    }
+
+    /// When normalizing moved text unevenly (it removed quotes), a raw span
+    /// has no clean place in the normalized command, and scoring it on the raw
+    /// command reads the wrong surroundings: in
+    /// `f() { rm '-rf' './b; }; a=(rm -rf ./build); "${a[@]}"` the executed
+    /// array sits inside what the scorer takes for a quoted string, and a
+    /// downgrade let the command through. The strict verdict stands.
+    #[test]
+    fn confidence_keeps_the_deny_when_normalizing_moved_the_text() {
+        let config = confidence_config();
+        let raw = "f() { rm '-rf' './b; }; a=(rm -rf ./build); \"${a[@]}\"";
+        let at = raw.find("(rm -rf").unwrap();
+        let result = rm_rf_result(
+            raw,
+            MatchSpan {
+                start: at,
+                end: at + 7,
+            },
+        );
+        let resolved =
+            apply_effective_confidence(&config, raw, &result, crate::packs::DecisionMode::Deny);
+        assert_eq!(
+            resolved.mode,
+            crate::packs::DecisionMode::Deny,
+            "{resolved:?}"
+        );
+        assert!(resolved.score.is_none(), "{resolved:?}");
+    }
+
+    /// End to end: `[confidence]` leaves the verdict of an unwrapped command
+    /// exactly as it is without it, whatever precedes it on the line.
+    #[test]
+    fn confidence_keeps_unwrapped_commands_denied() {
+        let config = confidence_config();
+        let strict = default_config();
+        for prefix in [
+            "",
+            "echo 'hello there friend'; ",
+            "grep -n 'a quoted pattern' notes.txt; ",
+        ] {
+            for wrapped in [
+                "env -S 'rm -rf ./build'",
+                "env --split-string='rm -rf ./build'",
+                "nice -n 5 watch 'rm -rf ./build'",
+                "env -S 'git push --force origin main'",
+                "sudo sh -c 'git reset --hard'",
+                "timeout 5 sh -c 'git clean -fdx'",
+                "f() { rm '-rf' './b; }; a=(rm -rf ./build); \"${a[@]}\"",
+                "time cat <<'EOF' | sh\nrm -rf ~/proj\nEOF",
+            ] {
+                let command = format!("{prefix}{wrapped}");
+                let detailed = evaluate_detailed(&command, &config);
+                assert!(detailed.result.is_denied(), "{command:?}: {detailed:?}");
+                assert_eq!(
+                    detailed.result.effective_mode,
+                    evaluate_detailed(&command, &strict).result.effective_mode,
+                    "{command:?}: {detailed:?}"
+                );
+            }
+        }
     }
 
     // =========================================================================
