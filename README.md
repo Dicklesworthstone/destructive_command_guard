@@ -706,6 +706,7 @@ Environment variables override config files (highest priority):
 - `DCG_PACKS="containers.docker,kubernetes"`: enable packs (comma-separated)
 - `DCG_DISABLE="kubernetes.helm"`: disable packs/sub-packs (comma-separated)
 - `DCG_VERBOSE=0-3`: verbosity level (0 = quiet, 3 = trace)
+- `DCG_LOG=<filter>`: hook-mode diagnostics; sends the evaluator's tracing events to stderr (`DCG_LOG=debug`, or a `tracing` filter such as `destructive_command_guard::heredoc=trace`). Unset by default.
 - `DCG_QUIET=1`: suppress non-error output
 - `DCG_COLOR=auto|always|never`: color mode
 - `DCG_NO_RICH=1`: disable rich terminal formatting and use plain rendering

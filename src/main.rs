@@ -819,7 +819,107 @@ fn install_broken_pipe_backstop() {
             std::process::exit(EXIT_BROKEN_PIPE);
         }
         default_hook(info);
+        fail_closed_on_hook_panic();
     }));
+}
+
+/// How hook mode answers if the process panics before it has published a
+/// verdict. Armed by the hook path once it knows the protocol, and cleared once
+/// the command is known to be allowed.
+#[derive(Clone, Copy)]
+struct HookPanicPolicy {
+    protocol: hook::HookProtocol,
+    deny_unverified: bool,
+}
+
+static HOOK_PANIC_POLICY: std::sync::Mutex<Option<HookPanicPolicy>> = std::sync::Mutex::new(None);
+
+fn set_hook_panic_policy(policy: Option<HookPanicPolicy>) {
+    let mut guard = match HOOK_PANIC_POLICY.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = policy;
+}
+
+const HOOK_PANIC_REASON: &str = "DCG hit an internal error while evaluating this command, \
+     so the command was not verified. Review it manually; the error is on stderr.";
+
+/// Turn a panic in hook mode into a blocking verdict instead of a crash.
+///
+/// The release profile aborts on panic, and a hook killed by `SIGABRT` (or,
+/// in an unwinding build, one that exits 101) is a non-blocking hook error to
+/// every supported host: the tool call proceeds. A panic anywhere in the
+/// evaluation (the main thread, or an analysis worker thread, which under
+/// `panic = "abort"` takes the whole process with it) was therefore an allow.
+///
+/// Armed, this publishes the indeterminate verdict for the request's protocol
+/// (ask, or deny under `unverified_decision = deny`) and exits with the status
+/// that verdict needs. If a verdict was already being written when the panic
+/// struck, the document on stdout may be incomplete, so the protocol's blocking
+/// exit status carries the decision instead.
+fn fail_closed_on_hook_panic() {
+    let policy = match HOOK_PANIC_POLICY.try_lock() {
+        Ok(guard) => *guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => *poisoned.into_inner(),
+        // Only `set_hook_panic_policy` takes this lock, and it holds it for an
+        // assignment, so contention means a panic inside that assignment.
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    let Some(policy) = policy else {
+        return;
+    };
+    let exit_code = match hook::output_indeterminate_from_panic(
+        policy.protocol,
+        HOOK_PANIC_REASON,
+        policy.deny_unverified,
+    ) {
+        Some(delivery) => blocking_verdict_exit_code(policy.protocol, delivery),
+        None => policy.protocol.undeliverable_block_exit_code(),
+    };
+    std::process::exit(exit_code);
+}
+
+/// Fault injection for the panic backstop's end-to-end tests.
+///
+/// Debug builds only (the integration tests run the debug binary); release
+/// builds compile this to nothing. `DCG_TEST_HOOK_PANIC=main` panics on the
+/// hook thread, `=worker` on a spawned analysis-style thread, both at the
+/// point a command is about to be evaluated.
+#[cfg(debug_assertions)]
+fn inject_test_hook_panic() {
+    match std::env::var("DCG_TEST_HOOK_PANIC").as_deref() {
+        Ok("main") => panic!("injected hook panic (DCG_TEST_HOOK_PANIC=main)"),
+        Ok("worker") => {
+            let _ = std::thread::spawn(|| {
+                panic!("injected hook panic (DCG_TEST_HOOK_PANIC=worker)");
+            })
+            .join();
+        }
+        _ => {}
+    }
+}
+
+#[cfg(not(debug_assertions))]
+const fn inject_test_hook_panic() {}
+
+/// Opt-in diagnostics for hook mode: `DCG_LOG=<filter>` (for example
+/// `DCG_LOG=debug`, or `DCG_LOG=destructive_command_guard::heredoc=trace`)
+/// sends the evaluator's tracing events to stderr. Unset, nothing is installed
+/// and the hot path pays nothing.
+fn init_hook_tracing() {
+    let Some(filter) = std::env::var_os("DCG_LOG") else {
+        return;
+    };
+    let Ok(filter) = tracing_subscriber::EnvFilter::try_new(filter.to_string_lossy().trim()) else {
+        emit_stderr!("[dcg] Warning: ignoring DCG_LOG: not a valid tracing filter");
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .with_ansi(false)
+        .try_init();
 }
 
 fn install_history_shutdown_handler(
@@ -1847,10 +1947,18 @@ fn main() {
         return;
     }
 
+    init_hook_tracing();
+
     // Load configuration
     let config = Config::load();
     destructive_command_guard::output::install_theme_config(&config);
     let detected_agent = detect_agent();
+    // Armed with the detected agent's protocol until the payload names its own
+    // (below); a panic before then still fails closed.
+    set_hook_panic_policy(Some(HookPanicPolicy {
+        protocol: payloadless_hook_protocol(&detected_agent, None),
+        deny_unverified: config.unverified_denies(),
+    }));
 
     // Read hook input FIRST, before the deadline starts: how long the client
     // takes to write stdin is outside dcg's control and must not eat the
@@ -1968,6 +2076,8 @@ fn main() {
     }
 
     let Some(extracted_command) = hook::extract_command_with_context(&hook_input) else {
+        // Not a shell tool call: dcg has no opinion, and that is the answer.
+        set_hook_panic_policy(None);
         return;
     };
     let hook::ExtractedHookCommand {
@@ -1976,6 +2086,12 @@ fn main() {
         dialect: shell_dialect,
         additional_commands,
     } = extracted_command;
+    // From here until the request is known to be allowed, a panic publishes
+    // a blocking verdict instead of crashing open.
+    set_hook_panic_policy(Some(HookPanicPolicy {
+        protocol: hook_protocol,
+        deny_unverified: config.unverified_denies(),
+    }));
     let history_agent_type = history_agent_type_for_protocol(hook_protocol, &detected_agent);
     let effective_agent = effective_agent_for_hook_protocol(hook_protocol, &detected_agent);
     let max_command_bytes = config.general.max_command_bytes();
@@ -2134,6 +2250,7 @@ fn main() {
         .chain(additional_commands)
         .enumerate()
     {
+        inject_test_hook_panic();
         let outcome = resolve_hook_command(
             &eval_context,
             &entry_command,
@@ -2164,9 +2281,16 @@ fn main() {
         }
     }
 
+    tracing::debug!(
+        decisive_rank = decisive.as_ref().map_or(RANK_ALLOW, outcome_rank),
+        "hook request resolved"
+    );
     let exit_code = if let Some(outcome) = decisive {
         publish_decisive_response(&eval_context, outcome, &mut history_writer)
     } else {
+        // Every entry was evaluated and allowed: a later panic (history
+        // flush) must not turn that into a block.
+        set_hook_panic_policy(None);
         // All-allow request: record exactly one history Allow row, for the
         // primary command, matching the single-command flow.
         if let Some(entry) = primary_allow_row {
@@ -2342,6 +2466,10 @@ fn print_help() {
     emit_stderr!(
         "    {}=0-3     Verbosity level (0 = quiet, 3 = trace)",
         "DCG_VERBOSE".green()
+    );
+    emit_stderr!(
+        "    {}=<filter>    Hook-mode tracing to stderr (e.g. debug)",
+        "DCG_LOG".green()
     );
     emit_stderr!(
         "    {}=1       Suppress non-error output",

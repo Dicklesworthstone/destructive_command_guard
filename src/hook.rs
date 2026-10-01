@@ -779,10 +779,32 @@ impl HookProtocol {
 /// [`HookProtocol::undeliverable_block_exit_code`] for blocking verdicts and
 /// ignores it for warnings, whose command was going to proceed anyway.
 fn deliver_verdict(payload: &[u8]) -> io::Result<()> {
+    if !claim_verdict_output() {
+        // The panic backstop already owns stdout and is about to exit with
+        // its own fail-closed verdict; a second document would corrupt it.
+        return Ok(());
+    }
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     handle.write_all(payload)?;
     handle.flush()
+}
+
+/// Set once something has begun writing this process's single verdict
+/// document to stdout.
+static VERDICT_OUTPUT_CLAIMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Claim the right to write this process's verdict document to stdout.
+///
+/// Hook protocols read one JSON document. The normal publication path and the
+/// hook binary's panic backstop both claim before writing, and only the first
+/// claim succeeds, so a panic can never append a second document to (or
+/// interleave with) a verdict already on its way out. Returns `true` exactly
+/// once per process.
+#[must_use]
+pub fn claim_verdict_output() -> bool {
+    !VERDICT_OUTPUT_CLAIMED.swap(true, std::sync::atomic::Ordering::SeqCst)
 }
 
 /// A shell command extracted from a hook request together with its execution
@@ -3760,6 +3782,29 @@ pub fn write_indeterminate_to(
     // before any caller performs optional audit I/O.
     let _ = stdout.flush();
     let _ = stderr.flush();
+}
+
+/// Emit the indeterminate response from the hook binary's panic backstop.
+///
+/// Same document as [`output_indeterminate_for_protocol`], but it takes the
+/// stdout claim itself: `None` means a verdict was already being written when
+/// the panic struck, so nothing is written and the caller must fall back to
+/// the protocol's blocking exit status.
+#[cold]
+#[inline(never)]
+pub fn output_indeterminate_from_panic(
+    protocol: HookProtocol,
+    reason: &str,
+    deny: bool,
+) -> Option<io::Result<()>> {
+    if !claim_verdict_output() {
+        return None;
+    }
+    let mut verdict = Vec::new();
+    write_indeterminate_to(&mut verdict, &mut io::stderr(), protocol, reason, deny);
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    Some(handle.write_all(&verdict).and_then(|()| handle.flush()))
 }
 
 /// Emit a safety-evaluation indeterminate response on process stdout/stderr.

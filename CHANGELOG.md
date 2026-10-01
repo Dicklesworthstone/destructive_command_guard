@@ -18,6 +18,37 @@ yet.
 
 ### Fixed
 
+- **Under load, the hook allowed some destructive commands silently.** With
+  about sixteen hook processes running at once, 3-9% of requests for commands
+  that only the embedded-code extractor can judge (`watch 'git reset' --hard`,
+  a heredoc run by `sed …/e` or piped to `nc`) exited 0 with nothing on stdout,
+  which every host reads as "allow". The extractor's 50 ms budget ran out on
+  the busy machine, the bounded fallback found nothing, and the unextracted
+  script was then treated as quoted data. A timed-out extraction is now read
+  again with the time the hook has left, so the verdict depends on the
+  command and not on the load; if even that cannot finish, the answer is the
+  unverified-command response (ask, or deny under
+  `unverified_decision = "deny"`), never a silent allow. The 20 ms AST
+  matcher gets the same second reading when it times out or its worker
+  thread cannot start, and a body it still cannot read is unverified rather
+  than clean.
+- **Control characters could hide an embedded command.** A command whose
+  text looks binary (a NUL byte, or mostly control characters) skipped
+  embedded-code extraction, and the skip read as "nothing embedded":
+  `watch 'git reset' --hard` followed by a comment of control characters was
+  allowed. It is now denied under the incomplete-analysis rule, which can be
+  allowlisted after review.
+- **A panic in hook mode let the command through.** Release builds abort on
+  panic, and a crashed hook is a non-blocking error to every host. In hook
+  mode a panic now publishes the unverified-command response for the
+  request's protocol before exiting.
+- **`[confidence] enabled = true` crashed the hook on some wrapped commands.**
+  The confidence scorer sliced the command with a match span measured on the
+  unwrapped inner command (`env --split-string='rm -rf ./build'`, a
+  `curl … | bash` install line) and panicked, so the command ran. A span that
+  does not address the command now leaves the confidence high and the deny in
+  place.
+
 - **A heredoc with an unquoted delimiter that only stores text was judged as
   commands.** `cat <<EOF > notes.md` documenting `watch '…'`, `sh -c '…'`,
   `ssh host '…'` or `eval "$x"` was denied, while the same note behind
@@ -74,6 +105,11 @@ yet.
 - **A long run of option-like words before a shell's `-c` took seconds.**
   Each inline-code flag rescanned its segment, so `c -c -c … sh -c '…'` took
   7-16 s at 60 KB; it is linear now (under 0.2 s).
+
+### Added
+
+- `DCG_LOG=<filter>` sends hook-mode tracing to stderr (for example
+  `DCG_LOG=debug`), to see which path a request took.
 
 ## [v0.15.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.1) -- 2026-09-29 [Release]
 

@@ -26548,6 +26548,115 @@ fn record_nested_allowlist_hit(
     }
 }
 
+/// Whether an extraction stopped because it ran out of wall-clock time.
+fn extraction_timed_out(result: &ExtractionResult) -> bool {
+    match result {
+        ExtractionResult::Skipped(reasons)
+        | ExtractionResult::Partial {
+            skipped: reasons, ..
+        } => reasons
+            .iter()
+            .any(|reason| matches!(reason, SkipReason::Timeout { .. })),
+        ExtractionResult::NoContent
+        | ExtractionResult::Extracted(_)
+        | ExtractionResult::Failed(_) => false,
+    }
+}
+
+/// The configured extraction limits with only the clock relaxed: at least the
+/// structural budget (#443), but never past the hook's remaining deadline.
+///
+/// `None` when the hook deadline is already spent, so there is no time left
+/// to read the command at all.
+fn extraction_limits_past_hot_path_budget(
+    configured: &crate::heredoc::ExtractionLimits,
+    deadline: Option<&Deadline>,
+) -> Option<crate::heredoc::ExtractionLimits> {
+    let mut limits = *configured;
+    limits.timeout_ms = limits
+        .timeout_ms
+        .max(crate::heredoc::ExtractionLimits::structural_scan().timeout_ms);
+    if let Some(deadline) = deadline {
+        let remaining = deadline.remaining()?;
+        let remaining_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+        limits.timeout_ms = limits.timeout_ms.min(remaining_ms);
+    }
+    Some(limits)
+}
+
+/// Tier-2 extraction for [`evaluate_heredoc`], where a hot-path timeout can no
+/// longer decide the verdict.
+///
+/// The hot-path budget is 50 ms. On a loaded host — sixteen hook processes on
+/// ten cores was enough — extraction ran past it, and the fallback branch ran
+/// the bounded name-based scanners and then returned `None`, "no embedded
+/// code finding". That `None` is an allow for any command whose dangerous part
+/// only the extractor can see: once the inline script of `watch 'git reset'
+/// --hard`, or the heredoc a `sed …/e` executes, is not extracted, the
+/// sanitizer masks it as quoted data, quick-reject finds no keyword, and the
+/// hook exits 0 with nothing on stdout. The same command denied every time on
+/// an idle machine.
+///
+/// So a timeout under `fallback_on_timeout = true` (the default) now means
+/// "read it again with time to finish": the bounded fallbacks still run first
+/// for a fully skipped extraction (they are cheap and keep their rule ids),
+/// then the command is re-extracted with the configured size caps and a clock
+/// relaxed to the structural budget, capped by the hook deadline. A complete
+/// re-read goes through the normal analysis, so the verdict follows the
+/// command. If even that runs out of time, the analysis is incomplete and the
+/// answer is indeterminate (ask, or deny under `unverified_decision = deny`),
+/// never a silent allow. `fallback_on_timeout = false` keeps its strict
+/// immediate block, which the caller applies to the hot-path result.
+///
+/// `Err` carries a verdict decided here; `Ok` is the extraction to analyse.
+fn extract_heredoc_contents(
+    command: &str,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Result<ExtractionResult, Box<EvaluationResult>> {
+    let hot = extract_content(command, &context.heredoc_settings.limits);
+    if !extraction_timed_out(&hot) || !context.heredoc_settings.fallback_on_timeout {
+        return Ok(hot);
+    }
+    tracing::debug!(
+        budget_ms = context.heredoc_settings.limits.timeout_ms,
+        "heredoc extraction exceeded its hot-path budget; re-extracting"
+    );
+
+    let run_fallbacks =
+        |first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>| {
+            check_fallback_patterns(command, context, first_allowlist_hit)
+                .or_else(|| check_credential_write_fallback(command, context, first_allowlist_hit))
+                .or_else(|| check_exec_sink_fallback(command, context, first_allowlist_hit))
+        };
+
+    let fully_skipped = matches!(hot, ExtractionResult::Skipped(_));
+    if fully_skipped {
+        if let Some(blocked) = run_fallbacks(first_allowlist_hit) {
+            return Err(Box::new(blocked));
+        }
+    }
+
+    let retried =
+        extraction_limits_past_hot_path_budget(&context.heredoc_settings.limits, context.deadline)
+            .map(|limits| extract_content(command, &limits));
+    match retried {
+        Some(retried) if !extraction_timed_out(&retried) => Ok(retried),
+        _ => {
+            tracing::warn!(
+                "heredoc extraction did not complete within the hook deadline; \
+                 the command is unverified"
+            );
+            if !fully_skipped {
+                if let Some(blocked) = run_fallbacks(first_allowlist_hit) {
+                    return Err(Box::new(blocked));
+                }
+            }
+            Err(Box::new(EvaluationResult::indeterminate_due_to_budget()))
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn evaluate_heredoc(
     command: &str,
@@ -26570,124 +26679,128 @@ fn evaluate_heredoc(
         }
     }
 
-    let (contents, fallback_needed) =
-        match extract_content(command, &context.heredoc_settings.limits) {
-            ExtractionResult::Extracted(contents) => (contents, false),
-            ExtractionResult::NoContent => return None,
-            ExtractionResult::Skipped(reasons) => {
-                let is_timeout = reasons
-                    .iter()
-                    .any(|r| matches!(r, SkipReason::Timeout { .. }));
+    let extraction = match extract_heredoc_contents(command, context, first_allowlist_hit) {
+        Ok(extraction) => extraction,
+        Err(decided) => return Some(*decided),
+    };
 
-                // `fallback_on_* = true` means use the bounded conservative
-                // scanner, not silently skip embedded-code analysis. Run it
-                // for every incomplete extraction class so scheduler stalls,
-                // malformed syntax, and size limits cannot turn an obvious
-                // catastrophic sink into a quick-rejected allow.
-                if let Some(blocked) =
-                    check_fallback_patterns(command, context, first_allowlist_hit)
-                {
-                    return Some(blocked);
-                }
-                if let Some(blocked) =
-                    check_credential_write_fallback(command, context, first_allowlist_hit)
-                {
-                    return Some(blocked);
-                }
-                if let Some(blocked) =
-                    check_exec_sink_fallback(command, context, first_allowlist_hit)
-                {
-                    return Some(blocked);
-                }
+    let (contents, fallback_needed) = match extraction {
+        ExtractionResult::Extracted(contents) => (contents, false),
+        ExtractionResult::NoContent => return None,
+        ExtractionResult::Skipped(reasons) => {
+            let is_timeout = reasons
+                .iter()
+                .any(|r| matches!(r, SkipReason::Timeout { .. }));
 
-                let strict_timeout = is_timeout && !context.heredoc_settings.fallback_on_timeout;
-                let strict_other = !is_timeout && !context.heredoc_settings.fallback_on_parse_error;
-                if strict_timeout || strict_other {
-                    let summary = reasons
-                        .iter()
-                        .map(std::string::ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    let reason = if strict_timeout {
-                        format!(
-                            "Embedded code blocked: extraction exceeded timeout and \
-                         fallback_on_timeout=false ({summary})"
-                        )
-                    } else {
-                        format!(
-                            "Embedded code blocked: extraction skipped and \
-                         fallback_on_parse_error=false ({summary})"
-                        )
-                    };
-                    return Some(EvaluationResult::denied_by_legacy(&reason));
-                }
-
-                return None;
+            // `fallback_on_* = true` means use the bounded conservative
+            // scanner, not silently skip embedded-code analysis. Run it
+            // for every incomplete extraction class so scheduler stalls,
+            // malformed syntax, and size limits cannot turn an obvious
+            // catastrophic sink into a quick-rejected allow.
+            if let Some(blocked) = check_fallback_patterns(command, context, first_allowlist_hit) {
+                return Some(blocked);
             }
-            ExtractionResult::Partial { extracted, skipped } => {
-                // Check strict mode settings for skipped items
-                let is_timeout = skipped
-                    .iter()
-                    .any(|r| matches!(r, SkipReason::Timeout { .. }));
-
-                let strict_timeout = is_timeout && !context.heredoc_settings.fallback_on_timeout;
-                let strict_other = !is_timeout && !context.heredoc_settings.fallback_on_parse_error;
-                if strict_timeout || strict_other {
-                    let summary = skipped
-                        .iter()
-                        .map(std::string::ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    let reason = if strict_timeout {
-                        format!(
-                            "Embedded code blocked: extraction exceeded timeout (partial) and \
-                         fallback_on_timeout=false ({summary})"
-                        )
-                    } else {
-                        format!(
-                            "Embedded code blocked: extraction partial and \
-                         fallback_on_parse_error=false ({summary})"
-                        )
-                    };
-                    return Some(EvaluationResult::denied_by_legacy(&reason));
-                }
-
-                // Analyze extracted content first (high fidelity), then run
-                // the bounded fallback over the complete command whenever
-                // any source was skipped.
-                let fallback_needed = !skipped.is_empty();
-
-                (extracted, fallback_needed)
+            if let Some(blocked) =
+                check_credential_write_fallback(command, context, first_allowlist_hit)
+            {
+                return Some(blocked);
             }
-            ExtractionResult::Failed(err) => {
-                if let Some(blocked) =
-                    check_fallback_patterns(command, context, first_allowlist_hit)
-                {
-                    return Some(blocked);
-                }
-                if let Some(blocked) =
-                    check_credential_write_fallback(command, context, first_allowlist_hit)
-                {
-                    return Some(blocked);
-                }
-                if let Some(blocked) =
-                    check_exec_sink_fallback(command, context, first_allowlist_hit)
-                {
-                    return Some(blocked);
-                }
+            if let Some(blocked) = check_exec_sink_fallback(command, context, first_allowlist_hit) {
+                return Some(blocked);
+            }
 
-                if !context.heredoc_settings.fallback_on_parse_error {
-                    let reason = format!(
-                        "Embedded code blocked: extraction failed and \
+            let strict_timeout = is_timeout && !context.heredoc_settings.fallback_on_timeout;
+            let strict_other = !is_timeout && !context.heredoc_settings.fallback_on_parse_error;
+            if strict_timeout || strict_other {
+                let summary = reasons
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let reason = if strict_timeout {
+                    format!(
+                        "Embedded code blocked: extraction exceeded timeout and \
+                         fallback_on_timeout=false ({summary})"
+                    )
+                } else {
+                    format!(
+                        "Embedded code blocked: extraction skipped and \
+                         fallback_on_parse_error=false ({summary})"
+                    )
+                };
+                return Some(EvaluationResult::denied_by_legacy(&reason));
+            }
+
+            if reasons
+                .iter()
+                .any(|reason| matches!(reason, SkipReason::BinaryContent { .. }))
+            {
+                return unreadable_embedded_code_verdict(context, first_allowlist_hit);
+            }
+
+            return None;
+        }
+        ExtractionResult::Partial { extracted, skipped } => {
+            // Check strict mode settings for skipped items
+            let is_timeout = skipped
+                .iter()
+                .any(|r| matches!(r, SkipReason::Timeout { .. }));
+
+            let strict_timeout = is_timeout && !context.heredoc_settings.fallback_on_timeout;
+            let strict_other = !is_timeout && !context.heredoc_settings.fallback_on_parse_error;
+            if strict_timeout || strict_other {
+                let summary = skipped
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let reason = if strict_timeout {
+                    format!(
+                        "Embedded code blocked: extraction exceeded timeout (partial) and \
+                         fallback_on_timeout=false ({summary})"
+                    )
+                } else {
+                    format!(
+                        "Embedded code blocked: extraction partial and \
+                         fallback_on_parse_error=false ({summary})"
+                    )
+                };
+                return Some(EvaluationResult::denied_by_legacy(&reason));
+            }
+
+            // Analyze extracted content first (high fidelity), then run
+            // the bounded fallback over the complete command whenever
+            // any source was skipped.
+            let fallback_needed = !skipped.is_empty();
+
+            (extracted, fallback_needed)
+        }
+        ExtractionResult::Failed(err) => {
+            if let Some(blocked) = check_fallback_patterns(command, context, first_allowlist_hit) {
+                return Some(blocked);
+            }
+            if let Some(blocked) =
+                check_credential_write_fallback(command, context, first_allowlist_hit)
+            {
+                return Some(blocked);
+            }
+            if let Some(blocked) = check_exec_sink_fallback(command, context, first_allowlist_hit) {
+                return Some(blocked);
+            }
+
+            if !context.heredoc_settings.fallback_on_parse_error {
+                let reason = format!(
+                    "Embedded code blocked: extraction failed and \
                      fallback_on_parse_error=false ({err})"
-                    );
-                    return Some(EvaluationResult::denied_by_legacy(&reason));
-                }
-
-                return None;
+                );
+                return Some(EvaluationResult::denied_by_legacy(&reason));
             }
-        };
 
+            return None;
+        }
+    };
+
+    let mut ast_left_body_unanalysed = false;
     for content in contents {
         if deadline_exceeded(context.deadline) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
@@ -26921,7 +27034,10 @@ fn evaluate_heredoc(
             } // body_has_keywords
         }
 
-        let matches = match DEFAULT_MATCHER.find_matches(&content.content, content.language) {
+        let matches = match DEFAULT_MATCHER
+            .find_matches(&content.content, content.language)
+            .or_else(|err| retry_transient_ast_failure(err, &content, context))
+        {
             Ok(matches) => matches,
             Err(err) => {
                 if let Some(blocked) =
@@ -26930,7 +27046,11 @@ fn evaluate_heredoc(
                     return Some(blocked);
                 }
 
-                let is_timeout = matches!(err, crate::ast_matcher::MatchError::Timeout { .. });
+                // A timeout or a matcher that could not run is the host's
+                // failure, not the code's: the strict timeout policy governs
+                // it, and under the fallback policy the body stays unanalysed.
+                let is_timeout = err.is_transient();
+                ast_left_body_unanalysed |= is_timeout;
                 let strict_timeout = is_timeout && !context.heredoc_settings.fallback_on_timeout;
                 let strict_other = !is_timeout && !context.heredoc_settings.fallback_on_parse_error;
                 if strict_timeout || strict_other {
@@ -27090,7 +27210,83 @@ fn evaluate_heredoc(
         }
     }
 
+    // Every backstop has had its say and none proved a deny, but a body the
+    // AST matcher never finished reading is not a clean body: answering `None`
+    // here would let the caller's quick-reject allow it.
+    if ast_left_body_unanalysed {
+        return Some(EvaluationResult::indeterminate_due_to_budget());
+    }
+
     None
+}
+
+/// The verdict for a command whose embedded code the extractor refused to read
+/// because it looks binary (a NUL byte, or mostly control characters).
+///
+/// Answering `None` there meant "no embedded code", and the caller's sanitizer
+/// then masked the quoted script as data: `watch 'git reset' --hard` followed
+/// by a comment of forty `\x01` bytes was ALLOWED, deterministically, while
+/// the same command without the comment denied. The script still runs (bash
+/// ignores the comment), so the reading cannot be skipped and the command
+/// called clean. It is denied under the incomplete-analysis rule, the one the
+/// bounded fallback uses, so an operator who has reviewed such a command can
+/// allowlist it the same way.
+fn unreadable_embedded_code_verdict(
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    let denial = EvaluationResult::denied_by_incomplete_analysis(
+        "Embedded code could not be analysed: the command contains binary or control \
+         characters, so dcg cannot verify what it runs",
+    );
+    let (pack_id, pattern_name) = split_ast_rule_id(INCOMPLETE_ANALYSIS_RULE);
+    if let Some(allow_hit) =
+        context
+            .allowlists
+            .match_rule_at_path(&pack_id, &pattern_name, context.project_path)
+    {
+        if first_allowlist_hit.is_none() {
+            if let Some(info) = denial.pattern_info {
+                *first_allowlist_hit =
+                    Some((info, allow_hit.layer, allow_hit.entry.reason.clone()));
+            }
+        }
+        return None;
+    }
+    Some(denial)
+}
+
+/// A second AST reading for a body whose first one the host cut short.
+///
+/// The hot-path AST budget is 20 ms and the matcher runs on a worker thread.
+/// On a loaded host the budget expires, or the worker cannot be spawned, and
+/// the body used to fall through to the name-based backstops alone. A failure
+/// that says nothing about the code ([`MatchError::is_transient`]) gets one
+/// retry here, under the structural budget capped by the hook deadline, so the
+/// verdict follows the code. Deterministic failures (a parse error, an
+/// unsupported language) and the strict `fallback_on_timeout = false` policy
+/// are returned unchanged.
+///
+/// [`MatchError::is_transient`]: crate::ast_matcher::MatchError::is_transient
+fn retry_transient_ast_failure(
+    err: crate::ast_matcher::MatchError,
+    content: &crate::heredoc::ExtractedContent,
+    context: HeredocEvaluationContext<'_>,
+) -> Result<Vec<crate::ast_matcher::PatternMatch>, crate::ast_matcher::MatchError> {
+    if !err.is_transient() || !context.heredoc_settings.fallback_on_timeout {
+        return Err(err);
+    }
+    let mut retry = std::time::Duration::from_millis(
+        crate::heredoc::ExtractionLimits::structural_scan().timeout_ms,
+    );
+    if let Some(deadline) = context.deadline {
+        let Some(remaining) = deadline.remaining() else {
+            return Err(err);
+        };
+        retry = retry.min(remaining);
+    }
+    tracing::debug!(error = %err, retry_ms = retry.as_millis(), "AST matching cut short; retrying");
+    DEFAULT_MATCHER.find_matches_with_timeout(&content.content, content.language, retry)
 }
 
 /// The exec-sink backstop's verdict on one extracted body.
@@ -41434,6 +41630,269 @@ mod tests {
             })
         }
 
+        /// The hook flake: under parallel load the 50 ms hot-path extraction
+        /// budget expired, the bounded name-based fallbacks found nothing, and
+        /// `evaluate_heredoc` answered `None`. For a command whose danger only
+        /// the extractor can see (a `watch` inline script, a heredoc that
+        /// `sed …/e` or a network sink runs), the sanitizer then masked that
+        /// text as data, quick-reject found no keyword, and the hook exited 0
+        /// with nothing on stdout. Each row below was ALLOWED with extraction
+        /// forced to time out, and denied on an idle machine.
+        #[test]
+        fn extraction_timeout_rereads_extractor_only_commands_instead_of_allowing() {
+            for cmd in [
+                "watch 'git reset' --hard",
+                "nc h 4444 <<EOF\nwatch 'git reset --hard'\nEOF",
+                "sed 's/^/ /e' <<EOF\nwatch 'git reset --hard'\nEOF",
+                "find ~/src -de\\lete",
+            ] {
+                let completed = eval_with_heredoc(cmd, &completed_extraction());
+                assert!(
+                    completed.is_denied(),
+                    "idle baseline: {cmd:?} -> {completed:?}"
+                );
+                let timed_out = eval_with_heredoc(cmd, &forced_extraction_timeout());
+                assert!(
+                    timed_out.is_denied(),
+                    "a hot-path extraction timeout must not allow: {cmd:?} -> {timed_out:?}"
+                );
+                let rule = |result: &EvaluationResult| {
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .map(|info| (info.pack_id.clone(), info.pattern_name.clone()))
+                };
+                assert_eq!(
+                    rule(&timed_out),
+                    rule(&completed),
+                    "the verdict must follow the command, not the clock: {cmd:?}"
+                );
+            }
+        }
+
+        /// The strict policy is unchanged: `fallback_on_timeout = false` still
+        /// blocks on the hot-path timeout itself rather than re-reading.
+        #[test]
+        fn strict_timeout_policy_still_blocks_without_rereading() {
+            let mut settings = forced_extraction_timeout();
+            settings.fallback_on_timeout = false;
+            let result = eval_with_heredoc("watch 'git reset' --hard", &settings);
+            assert!(result.is_denied(), "{result:?}");
+            assert!(
+                result
+                    .reason()
+                    .is_some_and(|reason| reason.contains("fallback_on_timeout=false")),
+                "{result:?}"
+            );
+        }
+
+        #[test]
+        fn extraction_timed_out_is_only_about_the_clock() {
+            use crate::heredoc::SkipReason;
+            let timeout = || SkipReason::Timeout {
+                elapsed_ms: 60,
+                budget_ms: 50,
+            };
+            assert!(extraction_timed_out(&ExtractionResult::Skipped(vec![
+                timeout()
+            ])));
+            assert!(extraction_timed_out(&ExtractionResult::Partial {
+                extracted: Vec::new(),
+                skipped: vec![SkipReason::ExceededHeredocLimit { limit: 10 }, timeout()],
+            }));
+            assert!(!extraction_timed_out(&ExtractionResult::Skipped(vec![
+                SkipReason::ExceededHeredocLimit { limit: 10 }
+            ])));
+            assert!(!extraction_timed_out(&ExtractionResult::Failed("x".into())));
+            assert!(!extraction_timed_out(&ExtractionResult::NoContent));
+            assert!(!extraction_timed_out(&ExtractionResult::Extracted(
+                Vec::new()
+            )));
+        }
+
+        #[test]
+        fn extraction_reread_relaxes_only_the_clock_and_stays_inside_the_deadline() {
+            let configured = crate::heredoc::ExtractionLimits {
+                max_body_bytes: 7,
+                max_body_lines: 3,
+                max_heredocs: 2,
+                timeout_ms: 50,
+            };
+            let structural = crate::heredoc::ExtractionLimits::structural_scan().timeout_ms;
+
+            let unbounded = extraction_limits_past_hot_path_budget(&configured, None).unwrap();
+            assert_eq!(unbounded.timeout_ms, structural);
+            assert_eq!(
+                (
+                    unbounded.max_body_bytes,
+                    unbounded.max_body_lines,
+                    unbounded.max_heredocs
+                ),
+                (7, 3, 2),
+                "the size caps are the configured ones"
+            );
+
+            let generous = crate::heredoc::ExtractionLimits {
+                timeout_ms: structural * 2,
+                ..configured
+            };
+            assert_eq!(
+                extraction_limits_past_hot_path_budget(&generous, None)
+                    .unwrap()
+                    .timeout_ms,
+                structural * 2,
+                "a configured budget above the structural one is never lowered"
+            );
+
+            let tight = Deadline::new(std::time::Duration::from_millis(200));
+            assert!(
+                extraction_limits_past_hot_path_budget(&configured, Some(&tight))
+                    .unwrap()
+                    .timeout_ms
+                    <= 200
+            );
+
+            let spent = Deadline::new(std::time::Duration::ZERO);
+            assert!(extraction_limits_past_hot_path_budget(&configured, Some(&spent)).is_none());
+        }
+
+        fn timeout_test_context<'a>(
+            settings: &'a crate::config::HeredocSettings,
+            allowlists: &'a LayeredAllowlist,
+            compiled: &'a crate::config::CompiledOverrides,
+            deadline: Option<&'a Deadline>,
+        ) -> HeredocEvaluationContext<'a> {
+            HeredocEvaluationContext {
+                allowlists,
+                heredoc_settings: settings,
+                project_path: None,
+                deadline,
+                enabled_keywords: &[],
+                ordered_packs: &[],
+                keyword_index: None,
+                compiled_overrides: compiled,
+                allow_once_audit: None,
+                shell_dialect: ShellDialect::Posix,
+                nested_command_depth: 0,
+                inherited_automated_stdin: false,
+            }
+        }
+
+        /// With no time left to re-read, a timed-out extraction is unverified:
+        /// it must come back as a decision, never as an extraction for the
+        /// caller to treat as "nothing embedded".
+        #[test]
+        fn extraction_timeout_with_no_time_left_is_indeterminate_not_empty() {
+            let settings = forced_extraction_timeout();
+            let allowlists = default_allowlists();
+            let compiled = default_compiled_overrides();
+            let spent = Deadline::new(std::time::Duration::ZERO);
+            let context = timeout_test_context(&settings, &allowlists, &compiled, Some(&spent));
+            let mut grant = None;
+            let decided = extract_heredoc_contents("watch 'git reset' --hard", context, &mut grant)
+                .expect_err("a timed-out extraction with no time left must decide");
+            assert!(decided.is_indeterminate(), "{decided:?}");
+        }
+
+        #[test]
+        fn extraction_timeout_rereads_to_a_complete_extraction() {
+            let settings = forced_extraction_timeout();
+            let allowlists = default_allowlists();
+            let compiled = default_compiled_overrides();
+            let context = timeout_test_context(&settings, &allowlists, &compiled, None);
+            let mut grant = None;
+            match extract_heredoc_contents("watch 'git reset' --hard", context, &mut grant) {
+                Ok(ExtractionResult::Extracted(contents)) => assert!(
+                    contents
+                        .iter()
+                        .any(|content| content.content.contains("git reset")),
+                    "{contents:?}"
+                ),
+                other => panic!("expected a complete re-read, got {other:?}"),
+            }
+        }
+
+        /// A body whose AST match the host cut short (time, or a worker thread
+        /// that could not start) gets a second reading; deterministic failures
+        /// and the strict policy are passed through unchanged.
+        #[test]
+        fn transient_ast_failure_is_retried_not_treated_as_no_match() {
+            use crate::ast_matcher::MatchError;
+            let settings = completed_extraction();
+            let allowlists = default_allowlists();
+            let compiled = default_compiled_overrides();
+            let context = timeout_test_context(&settings, &allowlists, &compiled, None);
+            let content = crate::heredoc::ExtractedContent {
+                content: "import shutil\nshutil.rmtree('/home/example/project')\n".to_string(),
+                language: crate::heredoc::ScriptLanguage::Python,
+                delimiter: Some("PY".to_string()),
+                byte_range: 0..0,
+                content_range: None,
+                quoted: true,
+                heredoc_type: Some(crate::heredoc::HeredocType::Standard),
+                target_command: Some("python3".to_string()),
+            };
+            for transient in [
+                MatchError::Timeout {
+                    elapsed_ms: 21,
+                    budget_ms: 20,
+                },
+                MatchError::Unavailable {
+                    language: content.language,
+                    detail: "failed to start AST parser worker".into(),
+                },
+            ] {
+                assert!(transient.is_transient());
+                let matches = retry_transient_ast_failure(transient, &content, context)
+                    .expect("a transient failure gets a second reading");
+                assert!(
+                    matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "{matches:?}"
+                );
+            }
+
+            let parse = MatchError::ParseError {
+                language: content.language,
+                detail: "syntax".into(),
+            };
+            assert!(!parse.is_transient());
+            assert!(matches!(
+                retry_transient_ast_failure(parse, &content, context),
+                Err(MatchError::ParseError { .. })
+            ));
+
+            let mut strict = completed_extraction();
+            strict.fallback_on_timeout = false;
+            let strict_context = timeout_test_context(&strict, &allowlists, &compiled, None);
+            assert!(matches!(
+                retry_transient_ast_failure(
+                    MatchError::Timeout {
+                        elapsed_ms: 21,
+                        budget_ms: 20
+                    },
+                    &content,
+                    strict_context
+                ),
+                Err(MatchError::Timeout { .. })
+            ));
+
+            let spent = Deadline::new(std::time::Duration::ZERO);
+            let spent_context =
+                timeout_test_context(&settings, &allowlists, &compiled, Some(&spent));
+            assert!(
+                retry_transient_ast_failure(
+                    MatchError::Timeout {
+                        elapsed_ms: 21,
+                        budget_ms: 20
+                    },
+                    &content,
+                    spent_context
+                )
+                .is_err(),
+                "no time left: the failure stands and the caller marks the body unanalysed"
+            );
+        }
+
         /// Allowing one protected-write rule must not hide the other in the
         /// same body on the timeout path.
         ///
@@ -42098,15 +42557,36 @@ mod tests {
             );
         }
 
+        /// Binary-looking input is skipped by the extractor, and that skip used
+        /// to read as "no embedded code": the script it hid was then masked as
+        /// quoted data and the command ALLOWED. Control characters in a comment
+        /// were enough to hide `watch 'git reset' --hard`, which bash still runs.
+        /// The reading is incomplete, so it is never an allow.
         #[test]
-        fn binary_content_allows_in_failopen_mode() {
+        fn binary_content_is_never_read_as_no_embedded_code() {
             let settings = heredoc_config(true, true);
-            let cmd = "python3 -c '\x00\x01\x02\x03\x04\x05\x06\x07'";
-            let result = eval_with_heredoc(cmd, &settings);
-            assert!(
-                result.is_allowed(),
-                "binary content should fail-open with default settings"
-            );
+            let (_, incomplete_rule) = split_ast_rule_id(INCOMPLETE_ANALYSIS_RULE);
+            let hidden = format!("watch 'git reset' --hard # {}", "\x01".repeat(40));
+            for cmd in [
+                "python3 -c '\x00\x01\x02\x03\x04\x05\x06\x07'",
+                "watch 'git reset' --hard # \x00",
+                hidden.as_str(),
+            ] {
+                let result = eval_with_heredoc(cmd, &settings);
+                assert!(result.is_denied(), "{cmd:?} -> {result:?}");
+                assert_eq!(
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref()),
+                    Some(incomplete_rule.as_str()),
+                    "denied under the allowlistable incomplete-analysis rule: {cmd:?}"
+                );
+            }
+            // Control characters that trigger no embedded-code analysis are not
+            // affected: there is no reading to be incomplete.
+            let plain = format!("echo hi # {}", "\x01".repeat(40));
+            assert!(eval_with_heredoc(&plain, &settings).is_allowed());
         }
 
         #[test]

@@ -186,6 +186,16 @@ pub struct ConfidenceContext<'a> {
 pub fn compute_match_confidence(ctx: &ConfidenceContext<'_>) -> ConfidenceScore {
     let mut score = ConfidenceScore::high();
 
+    // A span that does not address this command (past its end, or off a
+    // character boundary) was measured on another string, typically the
+    // unwrapped inner command of `env -S '…'` or a `curl … | bash` payload.
+    // Slicing with it panicked, and in hook mode a panic is a crash the host
+    // lets through. It says nothing about this command, so it cannot lower
+    // the confidence of the match: the score stays high and the deny stands.
+    if ctx.command.get(ctx.match_start..ctx.match_end).is_none() {
+        return score;
+    }
+
     // Signal 1: Check if match is in a sanitized region
     if let Some(sanitized) = ctx.sanitized_command {
         if ctx.match_start < sanitized.len()
@@ -388,6 +398,29 @@ pub fn should_downgrade_to_warn(ctx: &ConfidenceContext<'_>) -> (ConfidenceScore
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The confidence scorer used to slice the command with a span measured
+    /// on a different string and panic: `env --split-string='rm -rf ./build'`
+    /// under `[confidence] enabled = true` aborted the hook, which the host
+    /// treats as a pass. Such a span cannot lower confidence.
+    #[test]
+    fn a_span_outside_the_command_keeps_high_confidence_without_panicking() {
+        for (command, start, end) in [
+            ("rm -rf ./build", 9, 23),
+            ("rm -rf ./build", 23, 30),
+            ("rm -rf ./build", 5, 2),
+            // Byte 1 is inside the two-byte `é`.
+            ("é rm -rf ./build", 1, 5),
+        ] {
+            let score = compute_match_confidence(&ConfidenceContext {
+                command,
+                sanitized_command: Some(command),
+                match_start: start,
+                match_end: end,
+            });
+            assert!(!score.is_low(0.99), "{command:?} {start}..{end}: {score:?}");
+        }
+    }
 
     fn score_at(command: &str, needle: &str) -> f32 {
         let start = command.find(needle).expect("needle in command");

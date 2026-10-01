@@ -172,6 +172,25 @@ pub enum MatchError {
     Timeout { elapsed_ms: u64, budget_ms: u64 },
     /// Pattern compilation failed (should not happen with static patterns).
     PatternError { pattern: String, detail: String },
+    /// The matcher could not run at all: its worker thread could not be
+    /// started (thread or memory limits on a loaded host) or exited without
+    /// reporting. Like [`Self::Timeout`] this says nothing about the code, only
+    /// about the machine, so it is never evidence that the code is clean.
+    Unavailable {
+        language: ScriptLanguage,
+        detail: String,
+    },
+}
+
+impl MatchError {
+    /// Whether the failure is a property of the host (time, threads) rather
+    /// than of the code. A transient failure leaves the code unanalysed, so a
+    /// caller must retry it or treat the analysis as incomplete; it can never
+    /// stand for "no match".
+    #[must_use]
+    pub const fn is_transient(&self) -> bool {
+        matches!(self, Self::Timeout { .. } | Self::Unavailable { .. })
+    }
 }
 
 impl std::fmt::Display for MatchError {
@@ -194,6 +213,9 @@ impl std::fmt::Display for MatchError {
             }
             Self::PatternError { pattern, detail } => {
                 write!(f, "pattern compilation error for '{pattern}': {detail}")
+            }
+            Self::Unavailable { language, detail } => {
+                write!(f, "AST matching unavailable for {language:?}: {detail}")
             }
         }
     }
@@ -346,12 +368,30 @@ impl AstMatcher {
         code: &str,
         language: ScriptLanguage,
     ) -> Result<Vec<PatternMatch>, MatchError> {
+        self.find_matches_with_timeout(code, language, self.timeout)
+    }
+
+    /// [`Self::find_matches`] with an explicit time budget for this one call.
+    ///
+    /// The evaluator uses it to give a body whose hot-path match was cut short
+    /// by the host, not by the code, a second reading bounded by the hook
+    /// deadline instead of the 20 ms hot-path budget.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::find_matches`].
+    pub fn find_matches_with_timeout(
+        &self,
+        code: &str,
+        language: ScriptLanguage,
+        timeout: Duration,
+    ) -> Result<Vec<PatternMatch>, MatchError> {
         let start_time = Instant::now();
-        let budget_ms = self.timeout.as_millis() as u64;
+        let budget_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
 
         // Perl is not supported by ast-grep-language; use a conservative regex fallback.
         if language == ScriptLanguage::Perl {
-            return find_matches_perl(code, start_time, self.timeout, budget_ms);
+            return find_matches_perl(code, start_time, timeout, budget_ms);
         }
 
         // Check language support FIRST (before patterns, so we report unsupported properly)
@@ -365,7 +405,7 @@ impl AstMatcher {
             _ => return Ok(Vec::new()), // No patterns = no matches
         };
 
-        if self.timeout.is_zero() || code.len() > MAX_AST_INPUT_BYTES {
+        if timeout.is_zero() || code.len() > MAX_AST_INPUT_BYTES {
             return Err(timeout_error(start_time, budget_ms));
         }
 
@@ -374,7 +414,7 @@ impl AstMatcher {
             language,
             ast_lang,
             patterns.clone(),
-            self.timeout,
+            timeout,
             budget_ms,
         )
     }
@@ -1325,7 +1365,7 @@ fn run_ast_match_with_timeout(
             );
             let _ = tx.send(result);
         })
-        .map_err(|err| MatchError::ParseError {
+        .map_err(|err| MatchError::Unavailable {
             language,
             detail: format!("failed to start AST parser worker: {err}"),
         })?;
@@ -1338,7 +1378,7 @@ fn run_ast_match_with_timeout(
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             cancel.store(true, Ordering::Relaxed);
-            Err(MatchError::ParseError {
+            Err(MatchError::Unavailable {
                 language,
                 detail: "AST parser worker exited without a result".to_string(),
             })
@@ -4402,6 +4442,60 @@ fn precompile_patterns(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// A per-call budget overrides the matcher's own, in both directions: an
+    /// exhausted one reports a transient failure (never an empty match list),
+    /// and a generous one reads the body the hot-path budget could not.
+    #[test]
+    fn per_call_timeout_overrides_the_matcher_budget() {
+        let code = "import shutil\nshutil.rmtree('/home/example/project')\n";
+        let starved = AstMatcher::new().with_timeout(Duration::ZERO);
+        let err = starved
+            .find_matches(code, ScriptLanguage::Python)
+            .expect_err("a zero budget cannot report a clean body");
+        assert!(err.is_transient(), "{err:?}");
+
+        let matches = starved
+            .find_matches_with_timeout(code, ScriptLanguage::Python, Duration::from_secs(5))
+            .expect("the per-call budget replaces the starved one");
+        assert!(
+            matches.iter().any(|m| m.severity.blocks_by_default()),
+            "{matches:?}"
+        );
+    }
+
+    #[test]
+    fn only_host_failures_are_transient() {
+        assert!(
+            MatchError::Timeout {
+                elapsed_ms: 1,
+                budget_ms: 0
+            }
+            .is_transient()
+        );
+        assert!(
+            MatchError::Unavailable {
+                language: ScriptLanguage::Python,
+                detail: "thread limit".into()
+            }
+            .is_transient()
+        );
+        assert!(
+            !MatchError::ParseError {
+                language: ScriptLanguage::Python,
+                detail: "syntax".into()
+            }
+            .is_transient()
+        );
+        assert!(!MatchError::UnsupportedLanguage(ScriptLanguage::Unknown).is_transient());
+        assert!(
+            !MatchError::PatternError {
+                pattern: "p".into(),
+                detail: "d".into()
+            }
+            .is_transient()
+        );
+    }
 
     /// #438: `DCG_AST_TIMEOUT_MS` may raise the budget and never lower it.
     #[test]

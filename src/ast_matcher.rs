@@ -46,17 +46,23 @@ impl DefaultPolicyMatcher {
         code: &str,
         language: ScriptLanguage,
     ) -> Result<Vec<PatternMatch>, MatchError> {
-        let protected = protected_matches(code, language);
-        let mut matches = engine::DEFAULT_MATCHER.find_matches(code, language)?;
-        match protected {
-            Ok(protected) => matches.extend(protected),
-            // A new classifier's limit must not suppress a deletion/exec
-            // denial the existing engine has already established.
-            Err(_) if matches.iter().any(|hit| hit.severity.blocks_by_default()) => {}
-            Err(error) => return Err(error),
-        }
-        matches.sort_by_key(|hit| hit.start);
-        Ok(matches)
+        let protected = protected_matches(code, language, protected_scan_budget());
+        let matches = engine::DEFAULT_MATCHER.find_matches(code, language);
+        compose_policy_matches(matches, protected)
+    }
+
+    /// [`Self::find_matches`] with one explicit time budget for both the
+    /// pattern corpus and the protected-write classifier: the second reading
+    /// the evaluator gives a body whose first one the host cut short.
+    pub fn find_matches_with_timeout(
+        &self,
+        code: &str,
+        language: ScriptLanguage,
+        timeout: Duration,
+    ) -> Result<Vec<PatternMatch>, MatchError> {
+        let protected = protected_matches(code, language, timeout);
+        let matches = engine::DEFAULT_MATCHER.find_matches_with_timeout(code, language, timeout);
+        compose_policy_matches(matches, protected)
     }
 
     /// Return the first blocking match from the composed default matcher.
@@ -69,6 +75,23 @@ impl DefaultPolicyMatcher {
     }
 }
 
+/// Merge the pattern corpus's matches with the protected-write classifier's.
+fn compose_policy_matches(
+    matches: Result<Vec<PatternMatch>, MatchError>,
+    protected: Result<Vec<PatternMatch>, MatchError>,
+) -> Result<Vec<PatternMatch>, MatchError> {
+    let mut matches = matches?;
+    match protected {
+        Ok(protected) => matches.extend(protected),
+        // A new classifier's limit must not suppress a deletion/exec
+        // denial the existing engine has already established.
+        Err(_) if matches.iter().any(|hit| hit.severity.blocks_by_default()) => {}
+        Err(error) => return Err(error),
+    }
+    matches.sort_by_key(|hit| hit.start);
+    Ok(matches)
+}
+
 /// Deletion backstop plus protected-write detection on extracted source.
 ///
 /// Retains the existing deletion backstop and adds protected writes on the SAME
@@ -79,7 +102,8 @@ impl DefaultPolicyMatcher {
 #[must_use]
 pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Vec<PatternMatch> {
     let existing = engine::scan_filesystem_sink_fallback(code, language);
-    let mut matches = protected_matches(code, language).unwrap_or_default();
+    let mut matches =
+        protected_matches(code, language, protected_scan_budget()).unwrap_or_default();
     // Keep the established deletion precedence, but do not discard another
     // policy finding before the evaluator has applied per-rule allowlists.
     if let Some(existing) = existing {
@@ -107,6 +131,7 @@ fn protected_scan_budget() -> Duration {
 fn protected_matches(
     code: &str,
     language: ScriptLanguage,
+    budget: Duration,
 ) -> Result<Vec<PatternMatch>, MatchError> {
     if !credential_files::source_scan_required(code, language) {
         return Ok(Vec::new());
@@ -117,7 +142,6 @@ fn protected_matches(
             detail: "protected-write source exceeds the byte limit".into(),
         });
     }
-    let budget = protected_scan_budget();
     let started = Instant::now();
     // Do not parse another language AST unbounded on the hook thread. The
     // worker owns its input, has byte/node/depth caps, and never executes code.
@@ -129,7 +153,7 @@ fn protected_matches(
         .spawn(move || {
             let _ = sender.send(credential_files::scan_extracted(&source, language));
         })
-        .map_err(|error| MatchError::ParseError {
+        .map_err(|error| MatchError::Unavailable {
             language,
             detail: format!("could not start protected-write analysis: {error}"),
         })?;
@@ -145,7 +169,7 @@ fn protected_matches(
             });
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            return Err(MatchError::ParseError {
+            return Err(MatchError::Unavailable {
                 language,
                 detail: "protected-write analysis did not complete".into(),
             });
