@@ -37,6 +37,13 @@ yet.
   written to a file the same command then runs (`tee x.sh <<EOF … EOF; sh
   x.sh`), which was allowed with either delimiter.
 
+- **The hook aborted on a deeply nested command.** A list of about 13,500
+  `true &&` (or deeply nested braces) before a heredoc overflowed the stack
+  while the command's dialect was being checked, before the size limit
+  applied; an aborted hook is a non-blocking error to the agent, which then
+  ran the command. v0.15.1 failed the same way on larger inputs. The heredoc
+  walks no longer recurse.
+
 - **A heredoc whose output reaches a program that runs it was judged as
   data.** `cat <<'EOF' | ssh host`, `| docker exec -i c sh`, `| sudo sh`,
   `| at now`, `| su`, `| $SHELL`, `2>&1 | sh`, `(cat <<'EOF') | sh`,

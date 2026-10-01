@@ -6697,30 +6697,51 @@ fn is_trusted_os_data_sink_path(lexical_target: &str, basename: &str) -> bool {
 
 #[allow(clippy::needless_pass_by_value)]
 fn find_visible_shell_name_override<D: ast_grep_core::Doc>(
-    node: ast_grep_core::Node<'_, D>,
+    root: ast_grep_core::Node<'_, D>,
     target: &str,
     overridden: &mut bool,
     parse_error: &mut bool,
 ) {
-    if *overridden || *parse_error {
-        return;
+    // An explicit stack, not recursion (see [`collect_active_heredocs`]):
+    // a list nests one level per `&&`, and this walks the whole command.
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if *overridden || *parse_error {
+            return;
+        }
+        if shell_name_override_node(&node, target, overridden, parse_error) {
+            // Children reversed onto the stack, so they pop in order.
+            let first_child = pending.len();
+            pending.extend(node.children());
+            pending[first_child..].reverse();
+        }
     }
+}
+
+/// [`find_visible_shell_name_override`] for one node: set the flags it
+/// proves, and answer whether to descend into its children.
+fn shell_name_override_node<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    target: &str,
+    overridden: &mut bool,
+    parse_error: &mut bool,
+) -> bool {
     match node.kind().as_ref() {
         "ERROR" => {
             *parse_error = true;
-            return;
+            return false;
         }
         "function_definition" => {
             let Some(name) = node.field("name") else {
                 // A function definition whose binding cannot be resolved is
                 // exactly the case where proving a later bare sink is unsafe.
                 *overridden = true;
-                return;
+                return false;
             };
             let name = name.text();
             if name.as_ref() == target || !is_static_shell_name(name.as_ref()) {
                 *overridden = true;
-                return;
+                return false;
             }
             // Keep descending into a differently named function body. A later
             // invocation can make an `eval`/`source` inside it mutate the
@@ -6731,7 +6752,7 @@ fn find_visible_shell_name_override<D: ast_grep_core::Doc>(
             let text = node.text();
             if shell_assignment_name(text.as_ref()) == Some("PATH") {
                 *overridden = true;
-                return;
+                return false;
             }
         }
         "command" => {
@@ -6740,28 +6761,26 @@ fn find_visible_shell_name_override<D: ast_grep_core::Doc>(
                 Ok(tokens) => {
                     if shell_command_may_override_name(&tokens, target) {
                         *overridden = true;
-                        return;
+                        return false;
                     }
                     // The complete simple command was resolved above. Its
                     // assignment children are temporary environment state
                     // unless the command itself is a modeled mutator; do not
                     // reclassify `PATH=/tmp printf ...` as persistent state.
-                    return;
+                    return false;
                 }
                 Err(_) => {
                     // AST-valid shell that the secondary word splitter cannot
                     // resolve must never establish a data-only proof.
                     *parse_error = true;
                     *overridden = true;
-                    return;
+                    return false;
                 }
             }
         }
         _ => {}
     }
-    for child in node.children() {
-        find_visible_shell_name_override(child, target, overridden, parse_error);
-    }
+    true
 }
 
 #[must_use]
@@ -8243,15 +8262,40 @@ fn active_single_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn collect_active_heredocs<D: ast_grep_core::Doc>(
-    node: ast_grep_core::Node<'_, D>,
+    root: ast_grep_core::Node<'_, D>,
     heredocs: &mut Vec<ActiveHeredoc>,
     parse_error: &mut bool,
     plumbed: bool,
 ) {
+    // An explicit stack, not recursion: this runs on every hook payload
+    // before the size gate (dialect refinement masks the command first), and
+    // a list of some ten thousand `true &&` nests that deep in the parse
+    // tree. Recursing overflowed the stack and aborted the hook, which the
+    // agent treats as a non-blocking error and runs the command.
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if collect_active_heredoc_node(&node, heredocs, parse_error, plumbed) {
+            // Children reversed onto the stack, so they pop in order.
+            let first_child = pending.len();
+            pending.extend(node.children());
+            pending[first_child..].reverse();
+        }
+    }
+}
+
+/// [`collect_active_heredocs`] for one node: record it if it is a heredoc or
+/// here-string (or flag a parse error), and answer whether to descend into
+/// its children.
+fn collect_active_heredoc_node<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    heredocs: &mut Vec<ActiveHeredoc>,
+    parse_error: &mut bool,
+    plumbed: bool,
+) -> bool {
     let kind = node.kind();
     if kind == "ERROR" {
         *parse_error = true;
-        return;
+        return false;
     }
     if kind == "herestring_redirect" {
         let text = node.text();
@@ -8260,18 +8304,18 @@ fn collect_active_heredocs<D: ast_grep_core::Doc>(
                 operator_start: node.range().start + offset,
                 body: ActiveHeredocBody::HereString,
                 live_spans: None,
-                output: (!plumbed).then(|| heredoc_output(&node)).flatten(),
+                output: (!plumbed).then(|| heredoc_output(node)).flatten(),
             });
         } else {
             *parse_error = true;
         }
-        return;
+        return false;
     }
     if kind == "heredoc_redirect" {
         let text = node.text();
         let Some(offset) = text.find("<<") else {
             *parse_error = true;
-            return;
+            return false;
         };
         let mut body_range = None;
         let mut body_node = None;
@@ -8299,11 +8343,11 @@ fn collect_active_heredocs<D: ast_grep_core::Doc>(
             body_range.or_else(|| end_start.map(|start| std::ops::Range { start, end: start }));
         let Some(body_range) = body_range else {
             *parse_error = true;
-            return;
+            return false;
         };
         if body_range.start > body_range.end || body_range.end > node.range().end {
             *parse_error = true;
-            return;
+            return false;
         }
         let live_spans = if delimiter_quoted {
             Some(Vec::new())
@@ -8319,13 +8363,11 @@ fn collect_active_heredocs<D: ast_grep_core::Doc>(
                 delimiter_quoted,
             },
             live_spans,
-            output: (!plumbed).then(|| heredoc_output(&node)).flatten(),
+            output: (!plumbed).then(|| heredoc_output(node)).flatten(),
         });
-        return;
+        return false;
     }
-    for child in node.children() {
-        collect_active_heredocs(child, heredocs, parse_error, plumbed);
-    }
+    true
 }
 
 /// Pipeline stages that only read, count, filter or file text and pass it on

@@ -864,6 +864,38 @@ fn unquoted_bodies_whose_owner_uses_them_stay_whole() {
     }
 }
 
+/// Review of 6976885: dialect refinement masks heredocs before the size
+/// gate, and the heredoc collector recursed once per level of the parse
+/// tree. A list of 13,500 `true &&` before a heredoc (108 KB) overflowed the
+/// stack and aborted the hook; v0.15.1 lasted to about 240 KB. An aborted
+/// hook is a non-blocking error to the agent, which then runs the command.
+#[test]
+fn a_deeply_nested_list_before_a_heredoc_still_gets_a_verdict() {
+    let lab = Lab::new(DEFAULTS);
+    for (prefix, repeat) in [
+        ("true && ", 15_000),
+        ("true && ", 30_000),
+        ("x || ", 40_000),
+    ] {
+        let command = format!(
+            "{}cat <<EOF | sh\nwatch 'git reset --hard'\nEOF",
+            prefix.repeat(repeat)
+        );
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+            "cwd": lab.dir.path(),
+        });
+        let (stdout, stderr) = lab.run_with_stdin(&[], &format!("{payload}\n"));
+        assert!(
+            stdout.contains("\"ask\"") || stdout.contains("\"deny\""),
+            "{prefix:?} x {repeat}: no verdict\nstdout: {stdout}\nstderr: {}",
+            stderr.chars().take(400).collect::<String>()
+        );
+    }
+}
+
 /// Eighth review (A14): spellings that still hid a command from the rules
 /// (all allowed on v0.14.4 and v0.15.1).
 #[test]
