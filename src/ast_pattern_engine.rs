@@ -624,9 +624,11 @@ pub struct ReconstructedCommand {
 /// evaluating THAT is the only way it reaches its pack rule. This is the #459
 /// gap generalized past `rm`.
 ///
-/// Only a multi-literal argv is reconstructed: a single-string sink argument
-/// (`execSync('dd if=… of=…')`) is contiguous command text the raw-shell rescan
-/// already sees, so re-evaluating it would add nothing.
+/// A single-string sink argument (`execSync('dd if=… of=…')`) is reconstructed
+/// too, but only for a sink that hands that string to a shell
+/// ([`single_string_sink_runs_shell`]). The raw-shell rescan sees such text in a
+/// heredoc body, never inside an inline `-e`/`-c` program, which is one quoted
+/// shell word (#512). Perl's backtick and `qx` commands are added the same way.
 #[must_use]
 pub fn exec_sink_reconstructed_commands(
     code: &str,
@@ -680,17 +682,153 @@ pub fn exec_sink_reconstructed_commands(
         // reconstructing `dd` from `"d"+"d"` as two argv words would not be the
         // command the call actually runs (#474).
         let operands = concatenated_operands(exec_argv_region(region));
-        if operands.len() < 2 {
-            continue;
-        }
+        let command = match operands.as_slice() {
+            [] => continue,
+            // One string handed to a shell (#512): see below.
+            [script] => {
+                if !single_string_sink_runs_shell(
+                    language,
+                    caps.name("sink")
+                        .or_else(|| caps.name("call"))
+                        .map_or("", |s| s.as_str()),
+                    haystack,
+                    m.start(),
+                    region,
+                ) {
+                    continue;
+                }
+                script.to_string()
+            }
+            _ => operands.join(" "),
+        };
         out.push(ReconstructedCommand {
-            command: operands.join(" "),
+            command,
             start: m.start(),
             end: m.end(),
         });
     }
+    if language == ScriptLanguage::Perl {
+        // Backticks and `qx` hand their text to the shell as well. A payload the
+        // rm/git catalogue flags (`heredoc.perl.backticks.*`, `….qx.*`) is left
+        // to it, as above, so allowlisting the reported id still allows it.
+        let backticks = PERL_BACKTICKS_LITERAL
+            .captures_iter(haystack)
+            .filter_map(|caps| {
+                let whole = caps.get(0)?;
+                let payload = caps.name("cmd")?;
+                Some((whole.start()..whole.end(), payload.as_str().to_string()))
+            });
+        for (span, payload) in backticks.chain(perl_qx_literals(haystack)) {
+            if payload.trim().is_empty() || detect_shell_payload(&payload).is_some() {
+                continue;
+            }
+            out.push(ReconstructedCommand {
+                command: payload,
+                start: span.start,
+                end: span.end,
+            });
+        }
+    }
     out
 }
+
+/// Whether an exec sink handed exactly one string runs that string through a
+/// shell, so the string is a whole command line the packs should judge (#512).
+///
+/// Only a single-string call is asked: an argv-split call is reconstructed
+/// whatever its sink. The string forms were left to the raw-shell rescan, which
+/// sees a heredoc body's text but never an inline `perl -e '…'` body, where the
+/// whole program is one quoted shell word: `perl -e 'system("find . -delete")'`
+/// and `system("git push --force origin main")` were allowed while the bare
+/// commands denied, because the per-language catalogue knows only `rm` and
+/// `git reset`-style payloads.
+///
+/// Each language answers only for sinks whose single string certainly reaches
+/// `/bin/sh` (or, without shell metacharacters, is split and run the same way):
+///
+/// - Perl `system`/`exec`; Ruby `system`/`exec`/`spawn` (not as a method of
+///   some other receiver, which would be an unrelated method);
+/// - Python `os.system`/`os.popen`/`subprocess.getoutput`/`getstatusoutput`,
+///   and `subprocess.run`/`call`/`Popen`/`check_*` only with `shell=True`
+///   (without it the string is a program NAME, not a command line);
+/// - PHP `shell_exec`/`passthru`/`system`/`exec`/`popen`/`proc_open` as plain
+///   functions (`$pdo->exec("…")` runs SQL, not a shell);
+/// - JavaScript `execSync`, `exec` on `child_process` (not `RegExp.exec` or a
+///   database handle's `exec`), and `spawn`/`execFile` family with
+///   `shell: true`.
+///
+/// Go's `exec.Command` never uses a shell, so it answers false.
+fn single_string_sink_runs_shell(
+    language: ScriptLanguage,
+    sink: &str,
+    code: &str,
+    sink_start: usize,
+    region: &str,
+) -> bool {
+    let receiver = code[..sink_start].trim_end();
+    let is_method = receiver.ends_with('.') || receiver.ends_with("->") || receiver.ends_with("::");
+    let receiver_name = || {
+        receiver
+            .trim_end_matches(['.', '-', '>', ':'])
+            .trim_end()
+            .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+            .next()
+            .unwrap_or("")
+    };
+    match language {
+        ScriptLanguage::Perl => matches!(sink, "system" | "exec") && !is_method,
+        ScriptLanguage::Ruby => {
+            matches!(sink, "system" | "exec" | "spawn")
+                && (!is_method || matches!(receiver_name(), "Kernel" | "Process"))
+        }
+        ScriptLanguage::Python => match sink {
+            "system" | "popen" => !is_method || matches!(receiver_name(), "os" | "posix"),
+            "getoutput" | "getstatusoutput" => {
+                !is_method || matches!(receiver_name(), "subprocess" | "commands")
+            }
+            "call" | "run" | "Popen" | "check_call" | "check_output" => {
+                PY_SHELL_TRUE.is_match(region) && (!is_method || receiver_name() == "subprocess")
+            }
+            _ => false,
+        },
+        ScriptLanguage::Php => {
+            matches!(
+                sink,
+                "shell_exec" | "passthru" | "system" | "exec" | "popen" | "proc_open"
+            ) && !is_method
+        }
+        ScriptLanguage::JavaScript | ScriptLanguage::TypeScript => {
+            let child_process_receiver = !is_method
+                || matches!(receiver_name(), "child_process" | "childProcess" | "cp")
+                || JS_REQUIRE_CHILD_PROCESS_RECEIVER.is_match(receiver);
+            match sink {
+                "execSync" | "exec" => child_process_receiver,
+                "spawn" | "spawnSync" | "execFile" | "execFileSync" => {
+                    child_process_receiver && JS_SHELL_TRUE.is_match(region)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// `shell=True` among a Python call's arguments.
+static PY_SHELL_TRUE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\bshell\s*=\s*True\b").expect("python shell=True regex compiles")
+});
+
+/// `shell: true` (or a shell path) in a JavaScript spawn options object.
+static JS_SHELL_TRUE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\bshell\s*:\s*(?:true\b|["'][^"']+["'])"#)
+        .expect("js shell option regex compiles")
+});
+
+/// A receiver that is `require("child_process")` itself.
+static JS_REQUIRE_CHILD_PROCESS_RECEIVER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"require\s*\(\s*["'](?:node:)?child_process["']\s*\)\s*\.$"#)
+        .expect("js require child_process receiver regex compiles")
+});
 
 /// High-signal filesystem sink fallback for cases where the full AST pass is
 /// unavailable or too close to the hook deadline.
@@ -2224,10 +2362,93 @@ static PERL_SYSTEM_EXEC_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
 static PERL_BACKTICKS_LITERAL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)`(?P<cmd>[^`\n]*)`").expect("perl backticks regex compiles"));
 
-static PERL_QX_SLASH_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    // Matches qx/.../ (slash delimiter only, v1).
-    Regex::new(r"(?m)\bqx\s*/(?P<cmd>(?:\\.|[^/\n])*)/").expect("perl qx// regex compiles")
-});
+/// Each Perl `qx` quote-like operator in `code`: the span of the whole
+/// operator and the command text it runs, with escaped delimiters unescaped.
+///
+/// `qx` is Perl's backtick operator with a delimiter of the writer's choice,
+/// and `qx{…}`, `qx(…)` and `qx[…]` are its common spellings. Only `qx/…/` was
+/// read, so `perl -e 'qx{git reset --hard}'` was allowed while the backtick
+/// form denied (#512). Any ASCII punctuation delimits; the four bracket pairs
+/// close with their partner and nest, every other delimiter closes with
+/// itself. After whitespace a `#` starts a comment instead, and `qx =>` is a
+/// hash key, not an operator. A body may span lines, as Perl allows.
+fn perl_qx_literals(code: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    let bytes = code.as_bytes();
+    let mut out = Vec::new();
+    for (at, _) in code.match_indices("qx") {
+        if at > 0
+            && (is_perl_identifier_byte(bytes[at - 1])
+                || matches!(bytes[at - 1], b'$' | b'@' | b'%' | b'&' | b'>' | b':'))
+        {
+            continue;
+        }
+        let mut open_at = at + 2;
+        while bytes.get(open_at).is_some_and(u8::is_ascii_whitespace) {
+            open_at += 1;
+        }
+        let Some(&open) = bytes.get(open_at) else {
+            continue;
+        };
+        let spaced = open_at > at + 2;
+        if !open.is_ascii_punctuation()
+            || open == b'_'
+            || (spaced && open == b'#')
+            || matches!(open, b',' | b';' | b')' | b']' | b'}' | b'>')
+            || (open == b'=' && bytes.get(open_at + 1) == Some(&b'>'))
+        {
+            continue;
+        }
+        let close = match open {
+            b'(' => b')',
+            b'[' => b']',
+            b'{' => b'}',
+            b'<' => b'>',
+            other => other,
+        };
+        let mut depth = 0usize;
+        let mut index = open_at + 1;
+        let mut end = None;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if byte == b'\\' {
+                index += 2;
+                continue;
+            }
+            if open != close && byte == open {
+                depth += 1;
+            } else if byte == close {
+                if depth == 0 {
+                    end = Some(index);
+                    break;
+                }
+                depth -= 1;
+            }
+            index += 1;
+        }
+        let Some(end) = end else {
+            continue;
+        };
+        let body = &code[open_at + 1..end];
+        let mut command = String::with_capacity(body.len());
+        let mut chars = body.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\'
+                && chars.peek().is_some_and(|next| {
+                    u32::from(*next) == u32::from(open) || u32::from(*next) == u32::from(close)
+                })
+            {
+                continue;
+            }
+            command.push(c);
+        }
+        out.push((at..end + 1, command));
+    }
+    out
+}
+
+const fn is_perl_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
 
 /// The `File::Path::` qualifier is optional because the documented way to use
 /// this module imports the function and calls it bare (#453):
@@ -2270,7 +2491,6 @@ fn precompile_perl_patterns() {
     // absolute hook deadline.
     LazyLock::force(&PERL_SYSTEM_EXEC_LITERAL);
     LazyLock::force(&PERL_BACKTICKS_LITERAL);
-    LazyLock::force(&PERL_QX_SLASH_LITERAL);
     LazyLock::force(&PERL_FILE_PATH_RMTREE_LITERAL);
     LazyLock::force(&PERL_UNLINK_LITERAL);
     LazyLock::force(&PERL_RMDIR_LITERAL);
@@ -2469,34 +2689,20 @@ fn scan_perl_qx(
     timeout: Duration,
     budget_ms: u64,
 ) -> Result<(), MatchError> {
-    for caps in PERL_QX_SLASH_LITERAL.captures_iter(haystack) {
+    for (span, payload) in perl_qx_literals(haystack) {
         perl_check_timeout(start_time, timeout, budget_ms)?;
-        let Some(m) = caps.get(0) else {
-            continue;
-        };
-        let Some(payload) = caps.name("cmd").map(|m| m.as_str()) else {
-            continue;
-        };
-
         push_perl_shell_payload_match(
             out,
             code,
             newline_positions,
             PerlShellCall::Qx,
-            unescape_perl_qx_payload(payload).as_ref(),
-            m.start(),
-            m.end(),
+            &payload,
+            span.start,
+            span.end,
         );
     }
 
     Ok(())
-}
-
-fn unescape_perl_qx_payload(payload: &str) -> std::borrow::Cow<'_, str> {
-    if payload.contains("\\/") {
-        return std::borrow::Cow::Owned(payload.replace("\\/", "/"));
-    }
-    std::borrow::Cow::Borrowed(payload)
 }
 
 fn scan_perl_file_path(
@@ -8091,11 +8297,20 @@ def cleanup():
                 .is_empty()
             );
             assert!(lines("system('git', 'reset', '--hard')", ScriptLanguage::Ruby).is_empty());
-            // A single-string sink argument is contiguous command text the raw
-            // rescan already sees, so it is not reconstructed.
-            assert!(
+            // A single string handed to a shell is a whole command line. The
+            // raw rescan never sees it inside an inline `-e` program, which is
+            // one quoted shell word (#512), so it is reconstructed too...
+            assert_eq!(
                 lines(
                     "cp.execSync('dd if=/dev/zero of=/dev/sda')",
+                    ScriptLanguage::JavaScript
+                ),
+                vec!["dd if=/dev/zero of=/dev/sda".to_string()]
+            );
+            // ...but not one a sink runs as a program NAME, without a shell.
+            assert!(
+                lines(
+                    "cp.spawnSync('dd if=/dev/zero of=/dev/sda')",
                     ScriptLanguage::JavaScript
                 )
                 .is_empty()
@@ -8553,6 +8768,109 @@ def cleanup():
                 scan_executing_sink_fallback(&code, ScriptLanguage::Python).is_none(),
                 "inert list literal must not fire the python backstop"
             );
+        }
+    }
+
+    /// #512: shell sinks handed one string, and Perl's `qx` with any delimiter.
+    mod single_string_shell_sinks {
+        use super::*;
+
+        fn commands(code: &str, language: ScriptLanguage) -> Vec<String> {
+            exec_sink_reconstructed_commands(code, language)
+                .into_iter()
+                .map(|c| c.command)
+                .collect()
+        }
+
+        #[test]
+        fn qx_reads_every_delimiter() {
+            for (code, payload) in [
+                ("qx{git status}", "git status"),
+                ("qx(git status)", "git status"),
+                ("qx[git status]", "git status"),
+                ("qx<git status>", "git status"),
+                ("qx/git status/", "git status"),
+                ("qx!git status!", "git status"),
+                ("qx'git status'", "git status"),
+                ("qx {git status}", "git status"),
+                ("qx{echo {a,b}}", "echo {a,b}"),
+                ("qx(echo \\) x)", "echo ) x"),
+                ("qx/a\\/b/", "a/b"),
+                ("my $x = qx{ls\n-la};", "ls\n-la"),
+            ] {
+                let found = perl_qx_literals(code);
+                assert_eq!(found.len(), 1, "{code:?}: {found:?}");
+                assert_eq!(found[0].1, payload, "{code:?}");
+            }
+            for code in [
+                "my %h = (qx => 1);",
+                "$qx{key}",
+                "@qx",
+                "$o->qx(1)",
+                "qxfoo(1)",
+                "qx #comment",
+                "qx{unterminated",
+            ] {
+                assert!(perl_qx_literals(code).is_empty(), "{code:?}");
+            }
+        }
+
+        #[test]
+        fn one_string_given_to_a_shell_sink_is_a_command() {
+            for (code, language) in [
+                ("system(\"find . -delete\");", ScriptLanguage::Perl),
+                ("system \"find . -delete\";", ScriptLanguage::Perl),
+                ("exec('find . -delete');", ScriptLanguage::Perl),
+                ("print `find . -delete`;", ScriptLanguage::Perl),
+                ("print qx{find . -delete};", ScriptLanguage::Perl),
+                ("system(\"find . -delete\")", ScriptLanguage::Ruby),
+                ("Kernel.system(\"find . -delete\")", ScriptLanguage::Ruby),
+                ("os.system(\"find . -delete\")", ScriptLanguage::Python),
+                ("os.popen('find . -delete')", ScriptLanguage::Python),
+                (
+                    "subprocess.run(\"find . -delete\", shell=True)",
+                    ScriptLanguage::Python,
+                ),
+                ("system(\"find . -delete\");", ScriptLanguage::Php),
+                ("shell_exec('find . -delete');", ScriptLanguage::Php),
+                (
+                    "require(\"child_process\").execSync(\"find . -delete\")",
+                    ScriptLanguage::JavaScript,
+                ),
+                ("cp.exec('find . -delete')", ScriptLanguage::JavaScript),
+                (
+                    "spawn('find . -delete', { shell: true })",
+                    ScriptLanguage::JavaScript,
+                ),
+            ] {
+                assert_eq!(
+                    commands(code, language),
+                    vec!["find . -delete".to_string()],
+                    "{code:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn strings_that_reach_no_shell_are_not_commands() {
+            for (code, language) in [
+                // The string is a program name, not a command line.
+                ("subprocess.run(\"find . -delete\")", ScriptLanguage::Python),
+                ("spawn('find . -delete')", ScriptLanguage::JavaScript),
+                ("exec.Command(\"find . -delete\")", ScriptLanguage::Go),
+                // A method of something else.
+                ("$pdo->exec(\"find . -delete\");", ScriptLanguage::Php),
+                ("db.exec('find . -delete')", ScriptLanguage::JavaScript),
+                ("/x/.exec('find . -delete')", ScriptLanguage::JavaScript),
+                ("obj.system(\"find . -delete\")", ScriptLanguage::Ruby),
+                ("$o->system(\"find . -delete\");", ScriptLanguage::Perl),
+                // The rm/git catalogue owns these, so allowlisting its id works.
+                ("system(\"git reset --hard\");", ScriptLanguage::Perl),
+                ("print `git reset --hard`;", ScriptLanguage::Perl),
+                ("print qx{git reset --hard};", ScriptLanguage::Perl),
+            ] {
+                assert!(commands(code, language).is_empty(), "{code:?}");
+            }
         }
     }
 }
