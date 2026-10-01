@@ -7577,11 +7577,14 @@ pub fn mask_non_executing_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
 /// to `cat`, `tee`, or another data sink as executable; such a body is masked
 /// whole. An unquoted delimiter makes the shell expand the body before the
 /// data sink runs, so its `$(…)`, backquoted and arithmetic spans stay
-/// verbatim and only the text around them is masked — that text is as inert
-/// as a quoted body's (`cat <<EOF > notes.md` documenting `watch '…'` runs no
-/// `watch`). A body whose substitutions cannot be bounded stays whole.
-/// Shell/interpreter targets are left intact because they may execute the
-/// body after receiving it.
+/// verbatim; the text around them is masked only when the sink's output
+/// provably stays put (the terminal, a plain file, read-only text tools), and
+/// is then as inert as a quoted body's (`cat <<EOF > notes.md` documenting
+/// `watch '…'` runs no `watch`). Any other unquoted body, and one whose
+/// substitutions cannot be bounded, stays whole. Shell/interpreter targets
+/// are left intact because they may execute the body after receiving it; a
+/// data body whose output reaches one is judged separately
+/// (`data_heredoc_bodies_whose_output_may_run`).
 #[must_use]
 pub fn mask_non_expanding_data_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
     mask_non_executing_heredocs_with_policy(command, true)
