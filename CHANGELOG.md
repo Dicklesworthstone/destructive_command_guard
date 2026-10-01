@@ -11,138 +11,196 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## Unreleased
+## [v0.15.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.2) -- 2026-10-01 [Release]
 
-Work on `main` after the v0.15.1 tag. Nothing here is in a published binary
-yet.
+**This is a security fix release. v0.15.1 can fail open under load: upgrade.**
+On a busy machine the v0.15.1 hook could exit without printing a verdict for
+some destructive commands, and every agent reads a hook that exits silently
+as "allow". With about sixteen hook processes running at once, 3-9% of
+requests for commands such as `watch 'git reset' --hard` ran this way. Run
+one at a time, the same commands were always denied. v0.15.2 answers ask or
+deny whenever its analysis is cut short, and a panic in the hook now
+produces an answer instead of a silent exit.
+
+**OpenCode and Oh My Pi users: refresh the plugin or bridge after
+upgrading.** Both now block a command when dcg crashes, is killed or exits
+without a verdict. That change lives in the generated plugin and bridge
+files, so an existing file keeps the old fail-open behaviour until it is
+rewritten. Run `dcg install --opencode --force` or `dcg install --omp
+--force`, or let `dcg update` do it (it does when its installer detects the
+agent, unless you pass `--no-configure`). Set
+`DCG_BRIDGE_CRASH_DECISION=allow` to keep the old fail-open behaviour for
+crashes.
+
+This release also changes how dcg reads heredocs, catches more disguised
+spellings of dangerous commands and fixes a crash on very deeply nested
+input. Apart from the plugin and bridge refresh above, no configuration
+changes are needed.
+
+### Behaviour changes you may notice
+
+- **Commands are no longer allowed because the machine was busy.** When
+  dcg's time budget for reading an embedded script or matching a pattern
+  runs out, it now reads the command again with the time the hook has left.
+  If that still cannot finish, the answer is the unverified-command
+  response (ask, or deny under `unverified_decision = "deny"`), not allow.
+
+- **Command text that looks binary is denied.** A command with a NUL byte,
+  or made up mostly of control characters, skipped embedded-code checks and
+  was allowed. It is now denied under the incomplete-analysis rule, which
+  can be allowlisted after review.
+
+- **The OpenCode plugin and the Oh My Pi bridge block when dcg gives no
+  verdict** (after the refresh described above). A dcg that cannot be
+  started at all still fails open, and `DCG_UNVERIFIED_DECISION=deny` still
+  blocks that case.
+
+- **Fewer false denials on notes and documentation written through a
+  heredoc.** If an agent writes text to a file or to the screen with an
+  unquoted heredoc (`<<EOF` rather than `<<'EOF'`), dcg no longer treats the
+  prose in the body as commands when it can prove that the output only lands
+  in a plain file, on the terminal, or in read-only text tools. Only the
+  parts the shell actually runs while reading the body (command
+  substitutions, backquotes and arithmetic) are still checked. A note that
+  mentions a dangerous command used to be denied with an unquoted delimiter
+  and allowed with a quoted one. It is now allowed either way.
+
+- **New denials for text that is fed to something that runs it.** If a
+  heredoc body is piped or redirected into a shell, a remote shell, a
+  privileged shell, a container shell, a job scheduler or an `eval` loop,
+  dcg now judges the body as commands. This applies with either delimiter.
+  The same is true when the body is written to a file that the same command
+  then runs, or when the command reading the body can run part of it itself
+  (for example, editors' execute commands or a program's preprocessor
+  hook). These were allowed before, whatever the body contained.
+
+- **New denials for disguised commands.** dcg now sees through several
+  more ways of hiding a dangerous command, all of which were allowed on
+  v0.15.1. These include commands assembled by brace expansion and commands
+  the shell is told to run later, such as exit traps and prompt hooks. They
+  also include program names spelled with escape codes, built from
+  variables or printed by a command substitution, and options that are
+  quoted or split so they no longer look like options. dcg now follows
+  relative file writes after changing to the root directory, Git commands
+  run through helpers that launch other programs, and `eval` inside a loop.
+  It also decodes Windows cmd.exe caret escapes inside a command name even
+  when the rest of the line contains unrelated keywords (#499, #500). Each
+  of these is now judged exactly like the plain command it stands for. A
+  workflow that relied on one of these spellings to get past dcg will now
+  be denied.
+
+- **No more silent pass on very deeply nested commands.** A very long chain
+  of `&&` or deeply nested braces before a heredoc could crash the hook.
+  When the hook crashes, the agent treats it as a non-blocking error and runs
+  the command anyway. Such input now gets a normal verdict.
 
 ### Fixed
 
-- **Under load, the hook allowed some destructive commands silently.** With
-  about sixteen hook processes running at once, 3-9% of requests for commands
-  that only the embedded-code extractor can judge (`watch 'git reset' --hard`,
-  a heredoc run by `sed …/e` or piped to `nc`) exited 0 with nothing on stdout,
-  which every host reads as "allow". The extractor's 50 ms budget ran out on
-  the busy machine, the bounded fallback found nothing, and the unextracted
-  script was then treated as quoted data. A timed-out extraction is now read
-  again with the time the hook has left, so the verdict depends on the
-  command and not on the load; if even that cannot finish, the answer is the
-  unverified-command response (ask, or deny under
-  `unverified_decision = "deny"`), never a silent allow. The 20 ms AST
-  matcher gets the same second reading when it times out or its worker
-  thread cannot start, and a body it still cannot read is unverified rather
-  than clean.
-- **Control characters could hide an embedded command.** A command whose
-  text looks binary (a NUL byte, or mostly control characters) skipped
-  embedded-code extraction, and the skip read as "nothing embedded":
-  `watch 'git reset' --hard` followed by a comment of control characters was
-  allowed. It is now denied under the incomplete-analysis rule, which can be
-  allowlisted after review.
+- **Under load, the hook allowed some destructive commands silently.** The
+  embedded-code extractor has a 50 ms budget. On a busy machine it ran out,
+  the bounded fallback found nothing, and the unread script was then treated
+  as quoted data, so the hook exited 0 with nothing on stdout. A timed-out
+  extraction is now read again with the time the hook has left, so the
+  verdict depends on the command and not on the load; if even that cannot
+  finish, the answer is the unverified-command response, never a silent
+  allow. The 20 ms AST matcher gets the same second reading when it times
+  out or its worker thread cannot start, and a body it still cannot read is
+  unverified rather than clean. (18be8e9)
+
 - **A panic in hook mode let the command through.** Release builds abort on
   panic, and a crashed hook is a non-blocking error to every host. In hook
-  mode a panic now publishes the unverified-command response for the
-  request's protocol before exiting.
-- **`[confidence] enabled = true` crashed the hook on some wrapped commands.**
-  The confidence scorer sliced the command with a match span measured on the
-  unwrapped inner command (`env --split-string='rm -rf ./build'`, a
-  `curl … | bash` install line) and panicked, so the command ran. A span that
-  does not address the command now leaves the confidence high and the deny in
-  place.
+  mode a panic, on the main thread or a worker thread, now publishes the
+  unverified-command response for the request's protocol before exiting.
+  (18be8e9)
+
+- **Control characters could hide an embedded command.** Binary-looking
+  input skipped embedded-code extraction, and the skip read as "nothing
+  embedded": `watch 'git reset' --hard` followed by a comment of control
+  characters was allowed. It is now denied under the incomplete-analysis
+  rule. (18be8e9)
+
+- **`[confidence] enabled = true` crashed the hook on some wrapped
+  commands.** The confidence scorer cut the command with a match span
+  measured on the unwrapped inner command (`env --split-string='rm -rf
+  ./build'`, a `curl … | bash` install line) and panicked, so the command
+  ran. A span that does not address the command now leaves the confidence
+  high and the deny in place. (18be8e9)
+
 - **`[confidence]` scored some matches against the wrong text.** A match
   found on the raw command was scored at the same offsets of the normalized
-  command (quotes and wrappers such as `time` removed), and a match inside an
-  unwrapped inner command carried the inner command's offsets. Either way the
-  score described unrelated text and could downgrade a deny to a warning. A
-  span is now checked against the matched text first. One measured on the raw
-  command is moved onto the normalized command when normalizing only stripped
-  a leading wrapper (`time`, `sudo`), which leaves the text in the same
-  surroundings. Any other span keeps the deny: removed quotes change what the
-  surroundings look like, and the outer command presents an inner command as
-  the quoted argument it runs, which the scorer would read as data. The
-  hook's reported `confidence` is omitted when the span does not address the
-  command.
-- **The OpenCode plugin let a command through when dcg died.** It read
-  dcg's empty stdout as "allow", so a dcg killed by a signal (including the
-  plugin's own timeout), one that exited non-zero, or one that exited 0
-  without answering, allowed the command. The plugin now asks dcg for an
-  explicit `{"dcg_verdict":"allow"}` line and blocks when there is none, with
-  the reason in the error. A dcg that cannot be started at all still fails
-  open, and `DCG_BRIDGE_CRASH_DECISION=allow` restores fail-open for crashes.
-- **The Oh My Pi bridge let a command through when dcg crashed or was
-  killed.** A signal (including the bridge's own timeout kill) or an exit
-  status dcg never uses for a verdict now blocks, unless a deny was already
-  written or `DCG_BRIDGE_CRASH_DECISION=allow` is set. A dcg that cannot be
-  started still fails open, and `DCG_UNVERIFIED_DECISION=deny` still blocks
-  both.
+  command (quotes and wrappers such as `time` removed), and a match inside
+  an unwrapped inner command carried the inner command's offsets. Either
+  way the score described unrelated text and could downgrade a deny to a
+  warning. A span is now checked against the matched text first. One
+  measured on the raw command is moved onto the normalized command only
+  when normalizing stripped a leading wrapper (`time`, `sudo`); any other
+  span keeps the deny. The hook's reported `confidence` is omitted when the
+  span does not address the command. (42414a6)
 
-**OpenCode and Oh My Pi users: refresh the plugin or bridge after upgrading**
-(`dcg install --opencode --force`, `dcg install --omp --force`; `dcg update`
-does it for you when its installer detects the agent, unless you pass
-`--no-configure`). The fixes live in the
-generated files. An old file keeps working with the new dcg, without the new
-blocking.
+- **The OpenCode plugin and the Oh My Pi bridge let a command through when
+  dcg crashed or gave no verdict.** The OpenCode plugin read dcg's empty
+  stdout as "allow", so a dcg killed by a signal (including the plugin's own
+  timeout), one that exited non-zero, or one that exited 0 without
+  answering, allowed the command. The plugin now asks dcg for an explicit
+  `{"dcg_verdict":"allow"}` line and blocks, with the reason, when there is
+  none. The Oh My Pi bridge treated a signal (including its own timeout
+  kill) or an exit status dcg never uses for a verdict as an infrastructure
+  failure and let the command run; it now blocks unless a deny was already
+  written. In both, `DCG_BRIDGE_CRASH_DECISION=allow` restores fail-open
+  for crashes. Regenerate the files with `dcg install --opencode --force`,
+  `dcg install --omp --force` or `dcg update`. (8fa6aeb)
 
-- **A heredoc with an unquoted delimiter that only stores text was judged as
-  commands.** `cat <<EOF > notes.md` documenting `watch '…'`, `sh -c '…'`,
-  `ssh host '…'` or `eval "$x"` was denied, while the same note behind
-  `<<'EOF'` was allowed. When the command reading such a body only passes it
-  on as text (`cat`, `grep`, `sort`, `tee` to plain files, …) and its output
-  provably stays put — shown on the terminal, written to a plain file, or
-  piped only through read-only text tools (`wc`, `grep`, `sort`, `tee`, …) —
-  only the parts the shell runs while reading the body are judged now:
-  `$(…)`, backquotes and arithmetic. A body read by a command that uses it
-  (`read c` then `$c`, sed's `e`, awk's `system()`, `nc`, `curl`,
-  `sort --compress-program`, `rg --pre`, `tee /dev/stderr` behind
-  `2>&1 >/dev/null | sh`) is judged whole. Every other unquoted body is judged whole, as in v0.15.1: one
-  whose output goes anywhere dcg cannot follow (`>&2`, `> "$f"`, a command
-  substitution, an unrecognized pipeline stage, a parse it is unsure of), and
-  one whose substitutions cannot be bounded. A body is also judged when it is
-  read as an awk or sed program (`awk -f - <<EOF`), and now when it is
-  written to a file the same command then runs (`tee x.sh <<EOF … EOF; sh
-  x.sh`), which was allowed with either delimiter.
+- **Data heredocs with an unquoted delimiter were judged as live
+  commands.** dcg now works out from the parse tree where the heredoc's
+  output goes. It masks the body only when that output provably stays
+  contained and the command reading the body only passes it along as text.
+  Every other unquoted body is judged as a whole, as in v0.15.1. (6158ee7,
+  6976885, 7c9a032)
 
-- **The hook aborted on a deeply nested command.** A list of about 13,500
-  `true &&` (or deeply nested braces) before a heredoc overflowed the stack
-  while the command's dialect was being checked, before the size limit
-  applied; an aborted hook is a non-blocking error to the agent, which then
-  ran the command. v0.15.1 failed the same way on larger inputs. The heredoc
-  walks no longer recurse.
+- **Heredoc bodies whose output reaches a program that runs it were judged
+  as data**, with either delimiter. They are now judged as commands.
+  (6976885)
 
-- **A heredoc whose output reaches a program that runs it was judged as
-  data.** `cat <<'EOF' | ssh host`, `| docker exec -i c sh`, `| sudo sh`,
-  `| at now`, `| su`, `| $SHELL`, `2>&1 | sh`, `(cat <<'EOF') | sh`,
-  `tee >(sh) <<'EOF'`, `eval "$(cat <<'EOF' …)"` and the same with an
-  unquoted delimiter were allowed on v0.15.1 whatever the body held. Such a
-  body is judged as commands now, with either delimiter.
+- **More obfuscated spellings that hid a command**: quoted shell options,
+  escaped or assembled program names, substitution-made command words,
+  quoted `find` actions, relative writes after `cd /`, dashed Git built-ins
+  behind `xargs`/`find -exec`, and `eval` after a reserved word. (6158ee7)
 
-- **More spellings that hid a command.** A quoted option around a shell's
-  `-c` (`bash -c -o 'errexit' '…'`, `bash '-c' '…'`); a runner named through
-  `$'…'` escapes (`$'\x77atch' '…'`) or assembled at run time
-  (`w${x}atch '…'`, `sudo $W '…'`); a command word that is a substitution
-  printing the command (`$(echo git reset --hard)`); a quoted `find` action
-  (`find ~ '-delete'`, `find ~ -de''lete`); a relative write after `cd` to `/`
-  or another ancestor of a protected directory (`cd / && echo x >>
-  etc/sudoers`); a dashed Git built-in behind `xargs` or `find -exec`
-  (`xargs git-reset --hard`); `$\<newline>(…)`; and an `eval` after a
-  reserved word (`… | while read l; do eval "$l"; done`). All of these were
-  allowed on v0.14.4 and v0.15.1.
+- **Brace-list command words, and commands the shell runs later**
+  (`trap` handlers, `PROMPT_COMMAND`, substitutions in the prompt
+  variables, `BASH_ENV`). These are judged even when the `trap` sits behind
+  `builtin`/`command`, inside a group, a subshell or a function body.
+  (e15a560, 03c5121)
 
-- **A brace list that makes the command, and commands the shell runs later,
-  were judged as data.** `{rm,-rf,~}` and `{git,reset,--hard}` run `rm -rf ~`
-  and `git reset --hard` once bash expands them, and `rm {-rf,~}` expands to
-  the same options. A `trap` handler (`trap 'rm -rf ~' EXIT` runs when the
-  tool call's shell exits), `PROMPT_COMMAND`, a prompt's substitutions
-  (`PS1='$(…)'`, `PS4` under `set -x`) and `BASH_ENV=<(…)` hold a command the
-  shell runs later. All were allowed; each is judged now. (bd-2bm3, bd-v9hh)
+- **cmd.exe caret obfuscation (#499, #500).** dcg used to replay a command
+  under its caret-decoded form only when decoding exposed a pack keyword
+  that was missing from the raw text. Any unrelated keyword in the raw text
+  could therefore suppress the replay, so `g^it reset --hard` was allowed
+  by the hook while `dcg explain` denied it, and `d^d`/`mkf^s` were allowed
+  everywhere. Each decoded keyword is now compared on its own. (f1c32fe)
 
-- **A long run of option-like words before a shell's `-c` took seconds.**
-  Each inline-code flag rescanned its segment, so `c -c -c … sh -c '…'` took
-  7-16 s at 60 KB; it is linear now (under 0.2 s).
+- **The hook aborted on deeply nested input.** Two parse-tree walks used
+  recursion and overflowed the stack at about 13,500 list elements before
+  a heredoc. Both now use an explicit stack. (929cce8)
+
+- **A long run of option-like words before a shell's `-c` took several
+  seconds** to evaluate. It now runs in linear time.
+
+- Test and lint fixes: the project-allowlist path tests are now limited to
+  their own temp directory, plus formatting, a clippy lint and a hook-stdin
+  race in an end-to-end test. Runtime behaviour is unchanged. (d4b0e44)
 
 ### Added
 
 - `DCG_LOG=<filter>` sends hook-mode tracing to stderr (for example
-  `DCG_LOG=debug`), to see which path a request took.
+  `DCG_LOG=debug`), to see which path a request took. (18be8e9)
+
+### Windows build
+
+- The Windows binaries for this release were cross-compiled on macOS with
+  `cargo-xwin` (MSVC targets), because the native Windows build hosts were
+  unreachable. The native PowerShell end-to-end suite was not run for this
+  release.
 
 ## [v0.15.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.1) -- 2026-09-29 [Release]
 
