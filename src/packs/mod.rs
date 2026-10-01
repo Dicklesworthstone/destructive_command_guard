@@ -5411,7 +5411,7 @@ destructive_patterns:
     /// unrelated keyword in the baseline cannot answer it.
     #[test]
     fn exposes_keyword_absent_from_is_per_keyword_not_any_keyword() {
-        let enabled: HashSet<String> = ["system.disk".to_string()].into_iter().collect();
+        let enabled: HashSet<String> = std::iter::once("system.disk".to_string()).collect();
         let ordered = REGISTRY.expand_enabled_ordered(&enabled);
         let index = REGISTRY
             .build_enabled_keyword_index(&ordered)

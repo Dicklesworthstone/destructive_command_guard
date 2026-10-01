@@ -1841,14 +1841,22 @@ pub(crate) fn user_allowlist_path() -> PathBuf {
 /// directory tree. The CLI separately enforces the explicit project-policy
 /// trust requirement before any project-layer mutation.
 pub(crate) fn project_allowlist_path(start: &Path) -> PathBuf {
-    if let Some(root) =
-        crate::config::find_repo_root(start, crate::config::REPO_ROOT_SEARCH_MAX_HOPS)
-    {
+    project_allowlist_path_within(start, crate::config::REPO_ROOT_SEARCH_MAX_HOPS)
+}
+
+/// [`project_allowlist_path`] with the upward search limited to `max_hops`
+/// parents of `start` (both for the repository root and for an existing
+/// allowlist). Tests pass the depth of their temporary tree so the answer
+/// does not depend on what lies above it: a temporary directory created
+/// inside a checkout (as a remote build worker's `TMPDIR` can be) would
+/// otherwise resolve to that checkout's root.
+fn project_allowlist_path_within(start: &Path, max_hops: usize) -> PathBuf {
+    if let Some(root) = crate::config::find_repo_root(start, max_hops) {
         return root.join(".dcg").join("allowlist.toml");
     }
 
     let mut current = Some(start);
-    for _ in 0..=crate::config::REPO_ROOT_SEARCH_MAX_HOPS {
+    for _ in 0..=max_hops {
         let Some(dir) = current else {
             break;
         };
@@ -2150,11 +2158,16 @@ fn get_timestamp_string(tbl: &toml::value::Table, key: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    // These tests bound the upward search to their temporary tree: the
+    // system temporary directory can itself sit inside a Git checkout (a
+    // remote build worker points `TMPDIR` at `<checkout>/.rch-tmp`), and an
+    // unbounded search then answers with that checkout's root.
+
     #[test]
     fn project_allowlist_path_falls_back_to_cwd_outside_git() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            project_allowlist_path(tmp.path()),
+            project_allowlist_path_within(tmp.path(), 0),
             tmp.path().join(".dcg").join("allowlist.toml")
         );
     }
@@ -2168,7 +2181,12 @@ mod tests {
         let nested = tmp.path().join("a").join("b");
         std::fs::create_dir_all(&nested).unwrap();
 
-        assert_eq!(project_allowlist_path(&nested), root_allowlist);
+        assert_eq!(project_allowlist_path_within(&nested, 2), root_allowlist);
+        // Below the bound, the nested directory governs itself.
+        assert_eq!(
+            project_allowlist_path_within(&nested, 1),
+            nested.join(".dcg").join("allowlist.toml")
+        );
     }
 
     #[test]
@@ -2176,6 +2194,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
         let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            project_allowlist_path_within(&nested, 2),
+            tmp.path().join(".dcg").join("allowlist.toml")
+        );
+    }
+
+    /// The production entry point searches the full default depth.
+    #[test]
+    fn project_allowlist_path_searches_the_default_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let nested = tmp.path().join("a").join("b").join("c");
         std::fs::create_dir_all(&nested).unwrap();
 
         assert_eq!(

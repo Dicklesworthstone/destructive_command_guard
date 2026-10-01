@@ -300,12 +300,20 @@ fn run_dcg(
     });
 
     if let Some(input) = stdin {
-        child
+        let written = child
             .stdin
             .as_mut()
             .expect("child stdin should be piped")
-            .write_all(input.as_bytes())
-            .expect("failed to write hook JSON to stdin");
+            .write_all(input.as_bytes());
+        // A bypassed hook exits without reading its input, so the write can
+        // lose the race with that exit; the run's output is what is judged.
+        if let Err(error) = written {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe,
+                "failed to write hook JSON to stdin: {error}"
+            );
+        }
     }
 
     let output = child.wait_with_output().expect("failed to wait for dcg");

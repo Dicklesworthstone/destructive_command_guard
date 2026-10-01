@@ -44047,11 +44047,7 @@ mod tests {
             "wipe^fs /dev/sda",
         ] {
             assert!(
-                dialect_view_may_expose_hidden_execution(
-                    command,
-                    ShellDialect::Cmd,
-                    Some(&index)
-                ),
+                dialect_view_may_expose_hidden_execution(command, ShellDialect::Cmd, Some(&index)),
                 "{command:?} hides its command word behind a caret; the `/dev/` \
                  operand belongs to a different rule and cannot stand in for it"
             );
@@ -44061,11 +44057,7 @@ mod tests {
         // that exposes no keyword the POSIX view lacked does not replay.
         for command in ["echo he^llo", "git log --oneline -5"] {
             assert!(
-                !dialect_view_may_expose_hidden_execution(
-                    command,
-                    ShellDialect::Cmd,
-                    Some(&index)
-                ),
+                !dialect_view_may_expose_hidden_execution(command, ShellDialect::Cmd, Some(&index)),
                 "{command:?} exposes no keyword its POSIX view did not already have"
             );
         }
