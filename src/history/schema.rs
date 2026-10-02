@@ -5383,7 +5383,10 @@ mod tests {
     #[test]
     fn a_category_counts_as_active_when_one_of_its_packs_matched_513() {
         let db = HistoryDb::open_in_memory().unwrap();
-        let now = Utc::now();
+        // A minute back: analyze counts rows strictly before its own `now`, at
+        // millisecond precision, so a row stamped in the same millisecond was
+        // not counted and the test failed intermittently.
+        let now = Utc::now() - Duration::minutes(1);
         insert_analysis_entry(&db, "reset-hard", "core.git", Outcome::Deny, now);
 
         let analysis = db
@@ -5404,7 +5407,7 @@ mod tests {
     #[test]
     fn quiet_packs_are_listed_but_never_recommended_for_removal_513() {
         let db = HistoryDb::open_in_memory().unwrap();
-        let now = Utc::now();
+        let now = Utc::now() - Duration::minutes(1);
         for _ in 0..200 {
             insert_analysis_entry(&db, "reset-hard", "core.git", Outcome::Deny, now);
         }
