@@ -651,8 +651,11 @@ fn detect_from_environment() -> Option<DetectionResult> {
     }
 
     // OpenCode detection. dcg's generated OpenCode plugin
-    // (`dcg install --opencode`) spawns dcg with `OPENCODE=1` (#318).
-    // Presence-only, like the markers above.
+    // (`dcg install --opencode`) spawns dcg with `OPENCODE=1` (#318), and
+    // OpenCode itself now sets it for its shell-tool commands (#508,
+    // anomalyco/opencode#51975). Presence-only, like the markers above. The
+    // generic `AI_AGENT=opencode` is not consulted: OpenCode keeps an outer
+    // agent's value there, so it can name another tool.
     if std::env::var("OPENCODE").is_ok() {
         return Some(DetectionResult::new(
             Agent::OpenCode,

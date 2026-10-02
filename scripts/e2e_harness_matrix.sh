@@ -293,6 +293,14 @@ assert_case claude-code allow "$CLAUDE_ALLOW" allow '.' ''
 assert_case claude-code powershell-tool-denies-on-any-host \
   "$(jq -nc --arg c 'Remove-Item -Recurse -Force C:\\src' '{tool_name:"PowerShell",tool_input:{command:$c}}')" \
   deny '.hookSpecificOutput.permissionDecision' deny
+# Cursor runs the Claude Code hooks in ~/.claude/settings.json and renames
+# `Bash` to `Shell` (#518); it reads the Claude-shaped answer.
+assert_case cursor-claude-compat deny \
+  "$(jq -nc --arg c "$DENY_CMD" '{hook_event_name:"PreToolUse",cursor_version:"2026.09.28",conversation_id:"c",tool_name:"Shell",tool_input:{command:$c}}')" \
+  deny '.hookSpecificOutput.permissionDecision' deny
+assert_case cursor-claude-compat allow \
+  "$(jq -nc --arg c "$ALLOW_CMD" '{hook_event_name:"PreToolUse",cursor_version:"2026.09.28",conversation_id:"c",tool_name:"Shell",tool_input:{command:$c}}')" \
+  allow '.' ''
 # The agent-facing metadata contract other tools key on:
 for field in ruleId packId severity; do
   got="$(printf '%s' "$CLAUDE_DENY" | run_dcg 2>/dev/null | jq -r ".hookSpecificOutput.$field // empty")"

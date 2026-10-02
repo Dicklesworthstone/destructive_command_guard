@@ -3266,11 +3266,45 @@ def ask(reason):
         "agent_message": reason,
     })
 
-def main():
-    try:
-        payload = json.load(sys.stdin)
-    except Exception:
+# dcg ran but gave no verdict, or the payload could not be read: that is not an
+# allow (#517). Block, unless the operator opted out with
+# DCG_BRIDGE_CRASH_DECISION=allow.
+def no_verdict(detail):
+    if (os.environ.get("DCG_BRIDGE_CRASH_DECISION") or "").strip().lower() == "allow":
+        sys.stderr.write(
+            "[dcg] Cursor bridge got no verdict (%s); allowed because "
+            "DCG_BRIDGE_CRASH_DECISION=allow\n" % detail
+        )
         allow()
+        return
+    deny(
+        "Blocked by dcg: the command could not be verified (%s). Set "
+        "DCG_BRIDGE_CRASH_DECISION=allow to let commands through when dcg fails."
+        % detail
+    )
+
+def main():
+    if (os.environ.get("DCG_BYPASS") or "").strip().lower() in ("1", "true", "yes", "y", "on"):
+        allow()
+        return 0
+
+    # Raw bytes, so a UTF-8 BOM (cursor-agent sends one) is dropped instead of
+    # failing the JSON parse.
+    try:
+        raw = sys.stdin.buffer.read().decode("utf-8-sig")
+    except Exception:
+        no_verdict("the hook payload could not be read")
+        return 0
+    if not raw.strip():
+        no_verdict("the hook payload was empty")
+        return 0
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        no_verdict("the hook payload was not JSON")
+        return 0
+    if not isinstance(payload, dict):
+        no_verdict("the hook payload was not a JSON object")
         return 0
 
     command = payload.get("command") or ""
@@ -3281,12 +3315,18 @@ def main():
         except Exception:
             pass
 
-    if not command:
+    if not isinstance(command, str) or not command:
         allow()
         return 0
 
     dcg_bin = os.environ.get("DCG_BIN") or DCG_BIN_FALLBACK
-    hook_input = {"tool_name": "Bash", "tool_input": {"command": command}}
+    # dcg answers an allowed command with {"dcg_verdict":"allow"} when asked,
+    # so silence means it never answered.
+    hook_input = {
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "dcg_explicit_verdict": True,
+    }
 
     env = os.environ.copy()
     env["CURSOR_IDE"] = "1"
@@ -3294,43 +3334,53 @@ def main():
     try:
         proc = subprocess.run(
             [dcg_bin],
-            input=json.dumps(hook_input),
-            text=True,
+            input=json.dumps(hook_input).encode("utf-8"),
             capture_output=True,
             env=env,
+            timeout=30,
         )
-    except Exception:
+    except (FileNotFoundError, PermissionError, NotADirectoryError) as err:
+        # dcg could not be started at all: fail open so a broken install does
+        # not block every command, and say so.
+        sys.stderr.write("[dcg] Cursor bridge could not run dcg: %s; command allowed unchecked\n" % err)
         allow()
         return 0
-
-    output = (proc.stdout or "").strip()
-    if not output:
-        allow()
+    except subprocess.TimeoutExpired:
+        no_verdict("dcg timed out")
+        return 0
+    except Exception as err:
+        no_verdict("dcg could not be run: %s" % err)
         return 0
 
-    try:
-        dcg_out = json.loads(output)
-    except Exception:
-        allow()
-        return 0
+    output = (proc.stdout or b"").decode("utf-8", "replace").strip()
+    dcg_out = None
+    if output:
+        try:
+            dcg_out = json.loads(output)
+        except Exception:
+            dcg_out = None
+    hso = dcg_out.get("hookSpecificOutput") if isinstance(dcg_out, dict) else None
+    hso = hso if isinstance(hso, dict) else {}
+    decision = hso.get("permissionDecision")
+    reason = hso.get("permissionDecisionReason") or "Blocked by dcg"
 
-    decision = (
-        dcg_out.get("hookSpecificOutput", {})
-        .get("permissionDecision")
-    )
-    reason = (
-        dcg_out.get("hookSpecificOutput", {})
-        .get("permissionDecisionReason", "Blocked by dcg")
-    )
-
+    # A blocking verdict stands whatever happened to the process afterwards.
     if decision == "deny":
         deny(reason)
         return 0
     if decision == "ask":
         ask(reason)
         return 0
-
-    allow()
+    if proc.returncode != 0:
+        no_verdict("dcg exited %d" % proc.returncode)
+        return 0
+    if isinstance(dcg_out, dict) and dcg_out.get("dcg_verdict") == "allow":
+        allow()
+        return 0
+    if not output:
+        no_verdict("dcg exited 0 with nothing on stdout")
+        return 0
+    no_verdict("dcg stdout was not a verdict")
     return 0
 
 if __name__ == "__main__":

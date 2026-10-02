@@ -1614,9 +1614,12 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // classify Codex separately because its JSON parser is strict
     // (`deny_unknown_fields`) and would silently drop dcg's standard deny
     // payload, letting the destructive command through.
+    // `shell` is Cursor's name for Claude Code's `Bash` when Cursor runs the
+    // `PreToolUse` hooks from `~/.claude/settings.json`; it reads the
+    // Claude-shaped answer (#518).
     let is_claude_compatible_shell_tool = matches!(
         tool_name.as_str(),
-        "bash" | "launch-process" | "powershell" | "pwsh" | "cmd" | "cmd.exe"
+        "bash" | "launch-process" | "powershell" | "pwsh" | "cmd" | "cmd.exe" | "shell"
     ) || is_vscode_terminal_tool(&tool_name);
     let has_codex_turn_id = input
         .turn_id
@@ -1782,6 +1785,12 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             | "cmd.exe"
             | "run_shell_command"
             | "run-shell-command"
+            // Cursor's shell tool. Cursor runs Claude Code's `PreToolUse`
+            // hooks from `~/.claude/settings.json` and renames `Bash` to
+            // `Shell` on the way (its "third-party hooks" mapping), so a dcg
+            // installed for Claude Code that did not know the name let every
+            // Cursor command through unjudged (#518).
+            | "shell"
             // Hermes Agent shell tool. Distinct from Cursor's "terminal"
             // wrapper script which translates upstream to "Bash" before
             // invoking dcg, so the only path here is genuine Hermes input.
@@ -6041,6 +6050,39 @@ mod tests {
         }"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(detect_protocol(&input), HookProtocol::Grok);
+    }
+
+    #[test]
+    fn test_cursor_shell_tool_from_claude_hooks_is_judged_518() {
+        // Cursor runs `~/.claude/settings.json` PreToolUse hooks and renames
+        // `Bash` to `Shell`; it reads the Claude-shaped answer. The tool
+        // could be bash, zsh or PowerShell, so the dialect stays the
+        // fail-closed union.
+        let json = r#"{
+            "conversation_id":"c-518","generation_id":"g-518",
+            "hook_event_name":"PreToolUse","cursor_version":"2026.09.28",
+            "workspace_roots":["/repo"],"transcript_path":null,
+            "tool_name":"Shell",
+            "tool_input":{"command":"git stash clear","cwd":"/repo"},
+            "tool_use_id":"call_1","cwd":"/repo"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert!(is_supported_shell_tool(input.tool_name.as_deref()));
+        assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+        let extracted = extract_command_with_context(&input).expect("shell command");
+        assert_eq!(extracted.command, "git stash clear");
+        assert_eq!(extracted.protocol, HookProtocol::ClaudeCompatible);
+        assert_eq!(
+            shell_dialect_for_tool_name(Some("Shell")),
+            ShellDialect::Unknown
+        );
+
+        for name in ["shell", "SHELL"] {
+            assert!(is_supported_shell_tool(Some(name)), "{name}");
+        }
+        // Cursor's MCP tools are named `MCP:<tool>`; one called `shell` is
+        // not Cursor's shell tool.
+        assert!(!is_supported_shell_tool(Some("MCP:shell")));
     }
 
     #[test]

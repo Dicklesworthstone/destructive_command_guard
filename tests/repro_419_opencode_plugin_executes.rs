@@ -12,8 +12,13 @@
 //! JavaScript runtimes are present, and drives both plugin contracts against the
 //! real dcg binary:
 //!
-//! * **v1** — named `DcgGuard` export returning a `"tool.execute.before"` hook
-//!   map, called as `(input, output)` with the command in `output.args.command`.
+//! * **v1** — a `"tool.execute.before"` hook map, called as `(input, output)`
+//!   with the command in `output.args.command`. OpenCode from 1.3.4 gets it
+//!   from the default export's `server()`; it treats a default export with an
+//!   `id` as a plugin module and refuses the whole file without `server()`
+//!   (#516). Up to 1.3.3 it calls every export, so the named `DcgGuard`
+//!   export serves there. The driver transcribes both loaders' checks rather
+//!   than calling the export it expects a loader to use.
 //! * **v2** — default export `{ id, setup(ctx) }`, registering through
 //!   `ctx.tool.hook("execute.before", cb)` with the command in
 //!   `event.input.command`.
@@ -47,8 +52,90 @@ check("default export is an object", mod.default && typeof mod.default === "obje
 check("default.id is dcg-guard", mod.default?.id === "dcg-guard", String(mod.default?.id));
 check("default.setup is a function", typeof mod.default?.setup === "function");
 
-// v1: named export, hook map, command in output.args.
-const v1map = await mod.DcgGuard();
+// The loaders below transcribe OpenCode's own module checks, because asserting
+// the export shape we *think* a loader wants is how #516 shipped: the v1
+// loader from 1.3.4 rejects a default export that has an `id` but no
+// `server()`, and the whole plugin failed to load.
+const isRecord = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+const isFn = (v) => typeof v === "function";
+
+// v1 >= 1.3.4: packages/opencode/src/plugin/index.ts `applyPlugin` with
+// shared.ts `readV1Plugin(mod, spec, "server", "detect")`.
+async function loadV1(m, input) {
+  const value = m.default;
+  const detected = isRecord(value) && ("id" in value || "server" in value || "tui" in value);
+  if (detected) {
+    const server = "server" in value ? value.server : undefined;
+    const tui = "tui" in value ? value.tui : undefined;
+    if (server !== undefined && !isFn(server)) throw new TypeError("invalid server export");
+    if (tui !== undefined && !isFn(tui)) throw new TypeError("invalid tui export");
+    if (server !== undefined && tui !== undefined) throw new TypeError("either server() or tui(), not both");
+    if (server === undefined) throw new TypeError("must default export an object with server()");
+    if (value.id !== undefined && (typeof value.id !== "string" || !value.id.trim())) throw new TypeError("invalid id");
+    if (value.id === undefined) throw new TypeError("Path plugin must export id");
+    return [await server(input, undefined)];
+  }
+  const seen = new Set();
+  const hooks = [];
+  for (const entry of Object.values(m)) {
+    if (seen.has(entry)) continue;
+    seen.add(entry);
+    const fn = isFn(entry) ? entry : isRecord(entry) && isFn(entry.server) ? entry.server : undefined;
+    if (!fn) throw new TypeError("Plugin export is not a function");
+    hooks.push(await fn(input, undefined));
+  }
+  return hooks;
+}
+
+// v1 <= 1.3.3: every export is called; a throw is logged by OpenCode, and the
+// hooks registered before it stay registered.
+async function loadV1Legacy(m, input) {
+  const seen = new Set();
+  const hooks = [];
+  try {
+    for (const [, fn] of Object.entries(m)) {
+      if (seen.has(fn)) continue;
+      seen.add(fn);
+      hooks.push(await fn(input));
+    }
+  } catch {}
+  return hooks;
+}
+
+// v2: packages/core/src/plugin/module.ts decodes `default` as
+// `{ id: string, effect: fn } | { id: string, setup: fn }` (a function is not
+// an object there, and unknown keys are dropped).
+function loadV2(m) {
+  const value = m.default;
+  if (!isRecord(value) || typeof value.id !== "string") {
+    throw new Error("Plugin must export a default definition with an id and an effect or setup function.");
+  }
+  if (!isFn(value.effect) && !isFn(value.setup)) {
+    throw new Error("Plugin must export a default definition with an id and an effect or setup function.");
+  }
+  return value;
+}
+
+let v1hooks = [];
+const v1LoadError = await threw(async () => { v1hooks = await loadV1(mod, {}); });
+check("the v1 (>= 1.3.4) loader accepts the plugin (#516)", v1LoadError === null, String(v1LoadError?.message));
+check("the v1 loader registers exactly one hook map", v1hooks.length === 1, `got ${v1hooks.length}`);
+const legacyHooks = await loadV1Legacy(mod, {});
+check(
+  "the v1 (<= 1.3.3) loader registers a tool.execute.before hook",
+  legacyHooks.some((h) => h && typeof h["tool.execute.before"] === "function"),
+);
+const legacy = legacyHooks.find((h) => h && typeof h["tool.execute.before"] === "function");
+if (legacy) {
+  check(
+    "the v1 (<= 1.3.3) hook denies destructive",
+    (await threw(() => legacy["tool.execute.before"]({ tool: "bash" }, { args: { command: DESTRUCTIVE } }))) !== null,
+  );
+}
+check("the v2 loader accepts the plugin", (await threw(async () => loadV2(mod))) === null);
+
+// v1: hook map, command in output.args.
+const v1map = v1hooks[0];
 const v1 = v1map && v1map["tool.execute.before"];
 check("v1 exposes tool.execute.before", typeof v1 === "function", typeof v1);
 if (typeof v1 === "function") {
@@ -60,7 +147,7 @@ if (typeof v1 === "function") {
 
 // v2: default export registers one hook, command in event.input.
 const registered = [];
-await mod.default.setup({ tool: { hook: async (name, cb) => registered.push([name, cb]) } });
+await loadV2(mod).setup({ tool: { hook: async (name, cb) => registered.push([name, cb]) } });
 check("v2 registered one hook", registered.length === 1, `got ${registered.length}`);
 check("v2 hook is execute.before", registered[0]?.[0] === "execute.before", String(registered[0]?.[0]));
 const v2 = registered[0]?.[1];
@@ -329,4 +416,233 @@ fn generated_opencode_plugin_loads_and_denies_under_both_contracts() {
         );
         println!("repro_419: contracts verified under {runtime}");
     }
+}
+
+/// A one-shot OpenAI-compatible chat endpoint for [`real_opencode_blocks_through_the_plugin_516`]:
+/// the first request that offers tools gets one `bash` tool call carrying
+/// `command`; every other request (the tool result, a title request) gets
+/// plain text. Returns the port and the bodies of every request it served.
+fn spawn_fake_llm(
+    command: &str,
+) -> (
+    u16,
+    std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) {
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the fake LLM");
+    let port = listener.local_addr().expect("fake LLM address").port();
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = std::sync::Arc::clone(&requests);
+    let arguments = serde_json::json!({ "command": command, "description": "probe" }).to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().expect("clone the stream"));
+            let mut length = 0usize;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            let mut body = vec![0u8; length];
+            if reader.read_exact(&mut body).is_err() {
+                continue;
+            }
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            let offers_tools = request["tools"].as_array().is_some_and(|t| !t.is_empty());
+            let has_tool_result = request["messages"]
+                .as_array()
+                .is_some_and(|m| m.iter().any(|m| m["role"] == "tool"));
+            seen.lock().expect("request log").push(request);
+            let chunk = |delta: serde_json::Value, finish: serde_json::Value| {
+                serde_json::json!({
+                    "id": "c1", "object": "chat.completion.chunk", "created": 0, "model": "m",
+                    "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
+                })
+            };
+            let events = if offers_tools && !has_tool_result {
+                vec![
+                    chunk(
+                        serde_json::json!({ "role": "assistant", "content": null, "tool_calls": [{
+                            "index": 0, "id": "call_1", "type": "function",
+                            "function": { "name": "bash", "arguments": arguments },
+                        }]}),
+                        serde_json::Value::Null,
+                    ),
+                    chunk(serde_json::json!({}), "tool_calls".into()),
+                ]
+            } else {
+                vec![
+                    chunk(
+                        serde_json::json!({ "role": "assistant", "content": "done" }),
+                        serde_json::Value::Null,
+                    ),
+                    chunk(serde_json::json!({}), "stop".into()),
+                ]
+            };
+            let mut response = String::from(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            );
+            for event in events {
+                response.push_str("data: ");
+                response.push_str(&event.to_string());
+                response.push_str("\n\n");
+            }
+            response.push_str("data: [DONE]\n\n");
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (port, requests)
+}
+
+/// #516 end to end: a real OpenCode, the plugin `dcg install --opencode`
+/// writes, and a model that asks bash to delete a branch. OpenCode 1.18.33
+/// refused the #419 plugin at load time ("must default export an object with
+/// server()"), so the deletion ran. The canary branch must survive, and a
+/// harmless command must still run.
+///
+/// Needs an OpenCode binary (`DCG_TEST_OPENCODE_BIN`), git, and network access
+/// the first time (OpenCode installs `@ai-sdk/openai-compatible`), so it is
+/// ignored by default: `DCG_TEST_OPENCODE_BIN=/path/to/opencode cargo test
+/// --test repro_419_opencode_plugin_executes -- --ignored`.
+#[test]
+#[ignore = "needs a real OpenCode binary in DCG_TEST_OPENCODE_BIN"]
+fn real_opencode_blocks_through_the_plugin_516() {
+    let Some(opencode) = std::env::var_os("DCG_TEST_OPENCODE_BIN") else {
+        println!(
+            "real_opencode_blocks_through_the_plugin_516: SKIPPED (DCG_TEST_OPENCODE_BIN unset)"
+        );
+        return;
+    };
+
+    let run = |command: &str| {
+        let temp = tempfile::tempdir().expect("create a temporary HOME");
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create the repo dir");
+        std::fs::create_dir_all(&home).expect("create the HOME dir");
+        install_plugin(&home);
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("HOME", &home)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        git(&["branch", "dcg-516-canary"]);
+
+        let (port, requests) = spawn_fake_llm(command);
+        let config = serde_json::json!({
+            "$schema": "https://opencode.ai/config.json",
+            "model": "fake/m",
+            "small_model": "fake/m",
+            "permission": { "bash": "allow", "edit": "allow" },
+            "provider": { "fake": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Fake",
+                "options": { "baseURL": format!("http://127.0.0.1:{port}/v1"), "apiKey": "x" },
+                "models": { "m": { "name": "m", "tool_call": true } },
+            }},
+        });
+        std::fs::write(
+            home.join(".config/opencode/opencode.json"),
+            config.to_string(),
+        )
+        .expect("write the OpenCode config");
+
+        let mut child = Command::new(&opencode);
+        child
+            .args([
+                "run",
+                "--print-logs",
+                "--log-level",
+                "INFO",
+                "run the probe",
+            ])
+            .current_dir(&repo)
+            // OpenCode's bash tool runs in `$PWD`, not the process's working
+            // directory; an inherited PWD would point the probe at the
+            // checkout running this test.
+            .env("PWD", &repo)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .env("DCG_NO_SELF_HEAL", "1")
+            .env("DCG_SELF_HEAL_HOOK", "0")
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "");
+        for (key, _) in std::env::vars_os() {
+            let key = key.to_string_lossy().into_owned();
+            if (key.starts_with("DCG_") && key != "DCG_TEST_OPENCODE_BIN")
+                || key.starts_with("OPENCODE")
+            {
+                if !matches!(
+                    key.as_str(),
+                    "DCG_NO_SELF_HEAL" | "DCG_SELF_HEAL_HOOK" | "DCG_ALLOWLIST_SYSTEM_PATH"
+                ) {
+                    child.env_remove(&key);
+                }
+            }
+        }
+        let output = child.output().expect("run opencode");
+        let log = String::from_utf8_lossy(&output.stderr).into_owned();
+        let canary = Command::new("git")
+            .args(["rev-parse", "-q", "--verify", "refs/heads/dcg-516-canary"])
+            .current_dir(&repo)
+            .status()
+            .expect("check the canary")
+            .success();
+        let tool_result = requests
+            .lock()
+            .expect("request log")
+            .iter()
+            .flat_map(|r| r["messages"].as_array().cloned().unwrap_or_default())
+            .find(|m| m["role"] == "tool")
+            .map(|m| m["content"].to_string())
+            .unwrap_or_default();
+        (log, canary, tool_result, repo.join("ran.marker").exists())
+    };
+
+    let (log, canary, tool_result, _) = run("git branch -D dcg-516-canary");
+    assert!(
+        !log.contains("failed to load plugin"),
+        "OpenCode refused the plugin:\n{log}"
+    );
+    assert!(
+        canary,
+        "the canary branch was deleted, so the plugin did not block; tool result: {tool_result}\n{log}"
+    );
+    assert!(tool_result.contains("dcg"), "tool result: {tool_result}");
+
+    let (log, canary, tool_result, ran) =
+        run("git branch --list dcg-516-canary && touch ran.marker");
+    assert!(
+        canary && ran,
+        "a harmless command must run through the plugin; tool result: {tool_result}\n{log}"
+    );
 }

@@ -14746,14 +14746,21 @@ fn build_opencode_plugin_source(executable: &std::path::Path) -> std::io::Result
 // Guard) before execution. Remove with `uninstall.sh` or by deleting this
 // file. Docs: https://github.com/Dicklesworthstone/destructive_command_guard
 //
-// One file serves both plugin contracts (#419). OpenCode v1 loads the named
-// `DcgGuard` export and calls `tool.execute.before(input, output)`; v2 loads
-// the default export and requires `{{ id, setup(ctx) }}`, registering through
-// `ctx.tool.hook("execute.before", cb)` with a single `event` argument. An ES
-// module may carry both, and each loader reads only the shape it knows, so
-// the plugin does not depend on detecting the runtime — which matters because
+// One file serves every OpenCode plugin loader (#419, #516), because
 // `dcg update` regenerates this file and the installed OpenCode may have
-// changed major version since `dcg install` ran.
+// changed version since `dcg install` ran:
+//
+// - OpenCode v1 from 1.3.4 reads a default export that has an `id` as a
+//   plugin module and requires `server(input, options)` to return the hook
+//   map; without `server()` it rejects the whole file ("must default export an
+//   object with server()") and the bash tool runs unguarded. It then ignores
+//   the named export.
+// - OpenCode v1 up to 1.3.3 calls every export as a plugin function, so it
+//   registers the named `DcgGuard` export (and logs an error for the default
+//   object, which it cannot call).
+// - OpenCode v2 requires a default export `{{ id, setup(ctx) }}` and registers
+//   through `ctx.tool.hook("execute.before", cb)` with a single `event`
+//   argument; it drops keys it does not know, such as `server`.
 //
 // `node:child_process` rather than `Bun.spawn`: v2 migrated Bun -> Node, so
 // `Bun` is undefined there, while Bun implements the `node:` modules — so the
@@ -14841,8 +14848,8 @@ function dcgDenyReason(command) {{
   return noVerdict("dcg stdout was not a verdict");
 }}
 
-// OpenCode v1: named export, hook map, command in `output.args`.
-export const DcgGuard = async () => {{
+// OpenCode v1 hook map, command in `output.args`.
+function v1Hooks() {{
   return {{
     "tool.execute.before": async (input, output) => {{
       if (!input || input.tool !== "bash") return;
@@ -14850,11 +14857,16 @@ export const DcgGuard = async () => {{
       if (reason) throw new Error(reason);
     }},
   }};
-}};
+}}
 
-// OpenCode v2: default export with `id` + `setup`, command in `event.input`.
+// OpenCode v1 up to 1.3.3: every export is called as a plugin function.
+export const DcgGuard = async () => v1Hooks();
+
 export default {{
   id: "dcg-guard",
+  // OpenCode v1 from 1.3.4: `server(input, options)` returns the hook map.
+  server: async () => v1Hooks(),
+  // OpenCode v2: `setup(ctx)` registers the hook, command in `event.input`.
   async setup(ctx) {{
     await ctx.tool.hook("execute.before", async (event) => {{
       if (!event || event.tool !== "bash") return;
@@ -24191,7 +24203,8 @@ if ($errors.Count -ne 0) {
     /// #419: the generated plugin must load under BOTH OpenCode plugin
     /// contracts.
     ///
-    /// v1 reads the named `DcgGuard` export and calls
+    /// v1 up to 1.3.3 calls the named `DcgGuard` export, v1 from 1.3.4 calls
+    /// the default export's `server()` (#516), and both then call
     /// `tool.execute.before(input, output)`; v2 requires a default export
     /// `{ id, setup(ctx) }` and registers through
     /// `ctx.tool.hook("execute.before", cb)`. A v1-only file fails v2's loader
@@ -24216,6 +24229,13 @@ if ($errors.Count -ne 0) {
         assert!(
             source.contains("\"tool.execute.before\""),
             "v1 registers a tool.execute.before hook map"
+        );
+        // #516: OpenCode v1 from 1.3.4 treats a default export with an `id`
+        // as a plugin module and rejects it without `server()`, so the v2
+        // shape alone made v1 refuse the whole file.
+        assert!(
+            source.contains("server: async () => v1Hooks()"),
+            "v1 (>= 1.3.4) needs the default export's server() to return the hook map"
         );
 
         // v2 contract.

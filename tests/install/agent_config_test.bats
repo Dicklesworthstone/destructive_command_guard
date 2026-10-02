@@ -1448,6 +1448,78 @@ JSON
     [[ "$output" == *'could not verify'* ]]
 }
 
+@test "configure_cursor: generated hook fails closed when dcg gives no verdict (#517)" {
+    log_test "Testing Cursor hook no-verdict handling..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_cursor
+    printf '#!/bin/sh\nexit 0\n' > "$DEST/dcg"
+    chmod +x "$DEST/dcg"
+    configure_cursor
+
+    local python_bin fakes
+    python_bin="$(command -v python3)"
+    fakes="$HOME/fakes"
+    mkdir -p "$fakes"
+    printf '#!/bin/sh\ncat >/dev/null\nexit 3\n' > "$fakes/exit-nonzero"
+    printf '#!/bin/sh\ncat >/dev/null\nexit 0\n' > "$fakes/exit-zero-silent"
+    printf '#!/bin/sh\ncat >/dev/null\necho not-a-verdict\n' > "$fakes/exit-zero-garbage"
+    printf '#!/bin/sh\ncat >/dev/null\nkill -9 $$\n' > "$fakes/killed"
+    printf '#!/bin/sh\ncat >/dev/null\nprintf %%s\\\\n %s\n' "'{\"dcg_verdict\":\"allow\"}'" > "$fakes/explicit-allow"
+    chmod +x "$fakes"/*
+
+    local fake output
+    for fake in exit-nonzero exit-zero-silent exit-zero-garbage killed; do
+        output=$(DCG_BIN="$fakes/$fake" "$python_bin" "$CURSOR_HOOK_SCRIPT" <<<'{"command":"git status","cwd":""}')
+        log_test "$fake: $output"
+        [[ "$output" == *'"permission": "deny"'* ]]
+        [[ "$output" == *'could not be verified'* ]]
+        output=$(DCG_BRIDGE_CRASH_DECISION=allow DCG_BIN="$fakes/$fake" "$python_bin" "$CURSOR_HOOK_SCRIPT" <<<'{"command":"git status","cwd":""}' 2>/dev/null)
+        [[ "$output" == *'"permission": "allow"'* ]]
+    done
+
+    output=$(DCG_BIN="$fakes/explicit-allow" "$python_bin" "$CURSOR_HOOK_SCRIPT" <<<'{"command":"git status","cwd":""}')
+    log_test "explicit allow: $output"
+    [[ "$output" == *'"permission": "allow"'* ]]
+
+    # An unreadable payload is not an allow either.
+    output=$(DCG_BIN="$fakes/explicit-allow" "$python_bin" "$CURSOR_HOOK_SCRIPT" <<<'{ not json')
+    [[ "$output" == *'"permission": "deny"'* ]]
+
+    # A dcg that cannot be started fails open, and says so.
+    output=$(DCG_BIN="$HOME/no-such-dcg" "$python_bin" "$CURSOR_HOOK_SCRIPT" <<<'{"command":"git status","cwd":""}' 2>"$HOME/stderr")
+    [[ "$output" == *'"permission": "allow"'* ]]
+    grep -q 'could not run dcg' "$HOME/stderr"
+}
+
+@test "configure_cursor: generated hook reads a BOM payload and sends dcg UTF-8 (#517)" {
+    log_test "Testing Cursor hook BOM handling..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_cursor
+    cat > "$DEST/dcg" << 'MOCKEOF'
+#!/bin/sh
+cat > "$DCG_FAKE_CAPTURE"
+printf '%s\n' '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"blocked by mock dcg"}}'
+MOCKEOF
+    chmod +x "$DEST/dcg"
+    configure_cursor
+
+    local python_bin output
+    python_bin="$(command -v python3)"
+    output=$(printf '\357\273\277{"command":"echo caf\303\251 && git stash clear","cwd":""}' \
+        | DCG_BIN= DCG_FAKE_CAPTURE="$HOME/sent.json" "$python_bin" "$CURSOR_HOOK_SCRIPT")
+    log_test "Cursor hook output: $output"
+    [[ "$output" == *'"permission": "deny"'* ]]
+    [[ "$output" == *'blocked by mock dcg'* ]]
+    python3 - "$HOME/sent.json" <<'PYEOF'
+import json, sys
+sent = json.loads(open(sys.argv[1], "rb").read().decode("utf-8"))
+assert sent["tool_input"]["command"] == "echo café && git stash clear", sent
+assert sent["dcg_explicit_verdict"] is True, sent
+PYEOF
+}
+
 @test "configure_cursor: does not treat hook script path outside entries as installed" {
     log_test "Testing Cursor exact hook entry detection..."
     command -v python3 &>/dev/null || skip "python3 not available"
