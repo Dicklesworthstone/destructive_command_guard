@@ -68,6 +68,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Read;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -6665,6 +6666,8 @@ const WINDOWS_LAUNCHER_UNVERIFIED_RULE: &str = "heredoc.shell.launcher-unverifie
 /// A POSIX inline interpreter launcher (`sh -c`, `python -c`, …) whose payload
 /// is assembled dynamically and cannot be statically verified (#316/bd-l9jf).
 const POSIX_INLINE_LAUNCHER_UNVERIFIED_RULE: &str = "heredoc.posix.inline-launcher-unverified";
+const POSIX_SUBSTITUTION_UNVERIFIED_RULE: &str = "heredoc.posix.substitution-unverified";
+const POWERSHELL_SUBSTITUTION_UNVERIFIED_RULE: &str = "heredoc.powershell.substitution-unverified";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExecutableTextSink {
@@ -9520,7 +9523,11 @@ fn collect_posix_process_substitution_sinks(command: &str, sinks: &mut Vec<Execu
 /// interpreter. Pipeline bytes are executable source, not inert
 /// `echo`/`printf` argv, so they must recurse through the full evaluator before
 /// safe-string masking can hide them.
-fn collect_posix_pipeline_executable_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
+fn collect_posix_pipeline_executable_sinks(
+    command: &str,
+    sinks: &mut Vec<ExecutableTextSink>,
+    interpreter_heredocs: &mut Vec<(Range<usize>, crate::heredoc::ScriptLanguage)>,
+) {
     if !command.as_bytes().contains(&b'|') {
         return;
     }
@@ -9535,7 +9542,7 @@ fn collect_posix_pipeline_executable_sinks(command: &str, sinks: &mut Vec<Execut
         return;
     }
     let ast = AstGrep::new(command, SupportLang::Bash);
-    if ast_contains_error(ast.root()) {
+    if ast.root().get_inner_node().has_error() {
         return;
     }
     let mut pending = vec![ast.root()];
@@ -9590,11 +9597,43 @@ fn collect_posix_pipeline_executable_sinks(command: &str, sinks: &mut Vec<Execut
                 let nonlocal_filesystem = script_segment_is_nonlocal(consumer);
                 match pipeline_shell_input_mode(consumer) {
                     PipelineShellInputMode::ReadsStdin(kind) => {
+                        if leading_pipe
+                            && stages.len() == 2
+                            && let PipelineSourceKind::Interpreter(language) = kind
+                            && let Some(consumer_span) = consumer_span
+                            && let Some(body) = direct_interpreter_heredoc_body(
+                                command,
+                                &node,
+                                consumer,
+                                *consumer_span,
+                            )
+                        {
+                            interpreter_heredocs.push((body, language));
+                        }
                         let mut producer_index = consumer_index - 1;
                         while producer_index > 0
                             && is_literal_pipeline_passthrough(&stages[producer_index].0)
                         {
                             producer_index -= 1;
+                        }
+                        if leading_pipe && producer_index == 0 {
+                            let operator = node.parent().and_then(|redirect| {
+                                redirect
+                                    .text()
+                                    .find("<<")
+                                    .map(|offset| redirect.range().start + offset)
+                            });
+                            if operator.is_none_or(|operator| {
+                                crate::heredoc::stdin_data_sink_may_be_overridden(
+                                    command, operator, "cat",
+                                )
+                            }) {
+                                sinks.push(ExecutableTextSink::Unverified {
+                                    rule: PIPELINE_CONSUMER_RULE,
+                                    reason: "heredoc pipeline producer lookup is mutable or cannot be verified",
+                                });
+                                continue;
+                            }
                         }
                         push_posix_pipeline_source(
                             &stages[producer_index].0,
@@ -9629,6 +9668,76 @@ fn collect_posix_pipeline_executable_sinks(command: &str, sinks: &mut Vec<Execut
             return;
         }
     }
+}
+
+/// Preserve the language of a quoted body copied by a plain `cat` directly
+/// into a concrete interpreter (#522). This is an exact source relationship,
+/// not text-based deduplication: a same-text shell/remote sink remains separate.
+/// Transforms, wrappers, multiple inputs and mutable executable lookup retain
+/// the conservative shell-source fallback.
+fn direct_interpreter_heredoc_body<D: Doc>(
+    command: &str,
+    pipeline: &ast_grep_core::Node<'_, D>,
+    consumer: &str,
+    consumer_span: MatchSpan,
+) -> Option<Range<usize>> {
+    let redirect = pipeline.parent()?;
+    if redirect.kind().as_ref() != "heredoc_redirect" {
+        return None;
+    }
+    let statement = redirect.parent()?;
+    if statement.kind().as_ref() != "redirected_statement"
+        || statement
+            .children()
+            .filter(ast_grep_core::Node::is_named)
+            .any(|child| !matches!(child.kind().as_ref(), "command" | "heredoc_redirect"))
+        || statement
+            .children()
+            .filter(|child| child.kind().as_ref() == "heredoc_redirect")
+            .count()
+            != 1
+        || redirect
+            .children()
+            .filter(ast_grep_core::Node::is_named)
+            .any(|child| {
+                !matches!(
+                    child.kind().as_ref(),
+                    "heredoc_start" | "heredoc_body" | "heredoc_end" | "pipeline"
+                )
+            })
+    {
+        return None;
+    }
+    let owner = statement
+        .children()
+        .find(|child| child.kind().as_ref() == "command")?;
+    let producer_words = shell_words::split(owner.text().as_ref()).ok()?;
+    let (producer, arguments) = producer_words.split_first()?;
+    if !matches!(producer.as_str(), "cat" | "/bin/cat" | "/usr/bin/cat")
+        || (!arguments.is_empty() && !matches!(arguments, [arg] if arg == "-"))
+    {
+        return None;
+    }
+    let consumer_words = shell_words::split(consumer).ok()?;
+    let receiver = consumer_words.first()?;
+    let receiver_name = receiver.rsplit('/').next().unwrap_or(receiver);
+    if !matches!(
+        crate::heredoc::ScriptLanguage::from_command(receiver_name),
+        crate::heredoc::ScriptLanguage::Python
+            | crate::heredoc::ScriptLanguage::JavaScript
+            | crate::heredoc::ScriptLanguage::Ruby
+            | crate::heredoc::ScriptLanguage::Perl
+            | crate::heredoc::ScriptLanguage::Php
+    ) {
+        return None;
+    }
+    let operator_start = redirect.range().start + redirect.text().find("<<")?;
+    if crate::heredoc::stdin_data_sink_may_be_overridden(command, operator_start, "cat")
+        || crate::heredoc::stdin_data_sink_may_be_overridden(command, consumer_span.end, receiver)
+    {
+        return None;
+    }
+    crate::heredoc::quoted_heredoc_body_at(command, operator_start)
 }
 
 /// The producer of a pipeline that tree-sitter-bash nested inside a
@@ -11441,9 +11550,10 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
         // collector recursively evaluates that body, where the eval is seen again.
         let eval_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
         collect_posix_eval_sinks(eval_view.as_ref(), &mut sinks);
-        collect_posix_pipeline_executable_sinks(command, &mut sinks);
+        let mut interpreter_heredocs = Vec::new();
+        collect_posix_pipeline_executable_sinks(command, &mut sinks, &mut interpreter_heredocs);
         collect_posix_process_substitution_sinks(command, &mut sinks);
-        collect_data_heredoc_output_sinks(command, &mut sinks);
+        collect_data_heredoc_output_sinks(command, &interpreter_heredocs, &mut sinks);
     }
     if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown) {
         collect_powershell_iex_sinks(command, &mut sinks);
@@ -11462,17 +11572,25 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
 /// A data-sink heredoc whose output reaches a program that may run it is
 /// that program's source: `cat <<'EOF' | ssh host`, `cat <<EOF 2>&1 | sh`,
 /// `(cat <<'EOF') | sh`, `tee >(sh) <<'EOF'`. The masked views treat such a
-/// body as data (its target only copies it), so judge each one here as a
-/// POSIX command, quoted delimiter or not. Shapes the pipeline collector
-/// already resolves are judged twice, to the same answer.
-fn collect_data_heredoc_output_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
+/// body as data (its target only copies it), so judge each one here as source.
+/// A proven direct non-shell interpreter consumer keeps its language; other
+/// routes retain the conservative POSIX fallback, quoted delimiter or not.
+fn collect_data_heredoc_output_sinks(
+    command: &str,
+    interpreter_heredocs: &[(Range<usize>, crate::heredoc::ScriptLanguage)],
+    sinks: &mut Vec<ExecutableTextSink>,
+) {
     for body in crate::heredoc::data_heredoc_bodies_whose_output_may_run(command) {
         let nonlocal_filesystem = heredoc_output_is_nonlocal(command, body.start);
-        let Some(source) = command.get(body) else {
+        let Some(source) = command.get(body.clone()) else {
             continue;
         };
+        let interpreter_source = interpreter_heredocs
+            .iter()
+            .find(|(range, _)| *range == body)
+            .and_then(|(_, language)| interpreter_pipeline_heredoc(source, *language));
         let sink = ExecutableTextSink::Payload {
-            source: source.to_string(),
+            source: interpreter_source.unwrap_or_else(|| source.to_string()),
             dialect: ShellDialect::Posix,
             context: "a heredoc's output reaches a program that runs it",
             nonlocal_filesystem,
@@ -11724,7 +11842,9 @@ fn evaluate_command_substitutions(
 ) -> Option<EvaluationResult> {
     let substitutions: Vec<(String, ShellDialect, Option<usize>, bool)> = match shell_dialect {
         ShellDialect::Posix => {
-            let substitution_source = crate::heredoc::mask_non_expanding_data_heredocs(command);
+            let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+            let substitution_source =
+                crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
             match crate::heredoc::extract_posix_command_substitutions(substitution_source.as_ref())
             {
                 Ok(substitutions) => substitutions
@@ -11739,7 +11859,8 @@ fn evaluate_command_substitutions(
                     })
                     .collect(),
                 Err(_) => {
-                    return Some(EvaluationResult::denied_by_legacy(
+                    return Some(EvaluationResult::denied_by_embedded_sink(
+                        POSIX_SUBSTITUTION_UNVERIFIED_RULE,
                         "POSIX command substitution could not be parsed without shell-grammar recovery",
                     ));
                 }
@@ -11749,7 +11870,8 @@ fn evaluate_command_substitutions(
             let executable_bodies = match collect_powershell_substitution_bodies(command) {
                 Ok(bodies) => bodies,
                 Err(()) => {
-                    return Some(EvaluationResult::denied_by_legacy(
+                    return Some(EvaluationResult::denied_by_embedded_sink(
+                        POWERSHELL_SUBSTITUTION_UNVERIFIED_RULE,
                         "PowerShell substitution contains comment syntax that dcg cannot statically disambiguate",
                     ));
                 }
@@ -11758,7 +11880,8 @@ fn evaluate_command_substitutions(
                 match collect_powershell_verbatim_here_string_substitution_bodies(command) {
                     Ok(bodies) => bodies,
                     Err(()) => {
-                        return Some(EvaluationResult::denied_by_legacy(
+                        return Some(EvaluationResult::denied_by_embedded_sink(
+                            POWERSHELL_SUBSTITUTION_UNVERIFIED_RULE,
                             "PowerShell verbatim here-string contains syntax that dcg cannot statically disambiguate",
                         ));
                     }
@@ -11774,14 +11897,17 @@ fn evaluate_command_substitutions(
                 .collect()
         }
         ShellDialect::Unknown => {
-            let substitution_source = crate::heredoc::mask_non_expanding_data_heredocs(command);
+            let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+            let substitution_source =
+                crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
             let posix_view = mask_powershell_block_comments(substitution_source.as_ref());
             let posix_substitutions = match crate::heredoc::extract_posix_command_substitutions(
                 posix_view.as_ref(),
             ) {
                 Ok(substitutions) => substitutions,
                 Err(_) => {
-                    return Some(EvaluationResult::denied_by_legacy(
+                    return Some(EvaluationResult::denied_by_embedded_sink(
+                        POSIX_SUBSTITUTION_UNVERIFIED_RULE,
                         "ambiguous command substitution could not be parsed as POSIX shell syntax",
                     ));
                 }
@@ -11791,7 +11917,8 @@ fn evaluate_command_substitutions(
             ) {
                 Ok(bodies) => bodies,
                 Err(()) => {
-                    return Some(EvaluationResult::denied_by_legacy(
+                    return Some(EvaluationResult::denied_by_embedded_sink(
+                        POWERSHELL_SUBSTITUTION_UNVERIFIED_RULE,
                         "PowerShell substitution contains comment syntax that dcg cannot statically disambiguate",
                     ));
                 }
@@ -11820,12 +11947,14 @@ fn evaluate_command_substitutions(
         return None;
     }
     if nested_command_depth >= MAX_EMBEDDED_SHELL_DEPTH {
-        return Some(EvaluationResult::denied_by_legacy(
+        return Some(EvaluationResult::denied_by_embedded_sink(
+            SINK_ANALYSIS_BOUNDS_RULE,
             "command-substitution nesting exceeds dcg's static-analysis limit",
         ));
     }
     if substitutions.len() > MAX_INDIRECT_INPUT_FLOWS {
-        return Some(EvaluationResult::denied_by_legacy(
+        return Some(EvaluationResult::denied_by_embedded_sink(
+            SINK_ANALYSIS_BOUNDS_RULE,
             "command contains too many substitutions for bounded static analysis",
         ));
     }
@@ -11835,7 +11964,8 @@ fn evaluate_command_substitutions(
             total.checked_add(body.len())
         });
     if total_bytes.is_none_or(|bytes| bytes > MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES) {
-        return Some(EvaluationResult::denied_by_legacy(
+        return Some(EvaluationResult::denied_by_embedded_sink(
+            SINK_ANALYSIS_BOUNDS_RULE,
             "command-substitution payload exceeds dcg's static-analysis limit",
         ));
     }
@@ -17033,6 +17163,33 @@ fn literal_heredoc_producer_source(command: &str) -> Option<IndirectInputSource>
     if cat_inputs.next().is_some() {
         return Some(IndirectInputSource::Unverified(
             "pipeline producer contains multiple heredoc inputs".to_string(),
+        ));
+    }
+    // The entire producer must be this one statement. Selecting the first
+    // heredoc from `(cat <<EOF ... EOF; printf more_code)` would discard
+    // executable bytes emitted by the rest of the subshell.
+    let ast = AstGrep::new(command, SupportLang::Bash);
+    let statements: Vec<_> = ast
+        .root()
+        .children()
+        .filter(|node| node.is_named() && node.kind().as_ref() != "comment")
+        .collect();
+    let whole_plain_statement = !ast.root().get_inner_node().has_error()
+        && matches!(statements.as_slice(), [node] if node.kind().as_ref() == "redirected_statement");
+    let simple_stdin_copy = whole_plain_statement
+        && crate::heredoc::heredoc_bodies_with_operators(command)
+            .first()
+            .and_then(|(_, operator)| crate::heredoc::plain_heredoc_command_at(command, *operator))
+            .and_then(|owner| shell_words::split(&owner).ok())
+            .is_some_and(|words| {
+                words.split_first().is_some_and(|(program, arguments)| {
+                    matches!(program.as_str(), "cat" | "/bin/cat" | "/usr/bin/cat")
+                        && (arguments.is_empty() || matches!(arguments, [arg] if arg == "-"))
+                })
+            });
+    if !simple_stdin_copy {
+        return Some(IndirectInputSource::Unverified(
+            "heredoc producer is not a plain cat stdin copy; file operands, transforms or redirections may change its output".to_string(),
         ));
     }
     if !content.quoted && contains_dynamic_shell_output(&content.content) {
@@ -29460,6 +29617,57 @@ pub fn apply_branch_strictness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heredoc_pipeline_language_is_bound_to_its_own_source() {
+        let command =
+            "cat <<'PY' | python3 -\nprint(\"```\")\nPY\ncat <<'SH' | bash\nprint(\"```\")\nSH";
+        let sinks = collect_executable_text_sinks(command, ShellDialect::Posix);
+        assert!(
+            sinks.iter().any(|sink| matches!(sink,
+                ExecutableTextSink::Payload { source, .. }
+                    if source.starts_with("python3 <<'") && source.contains("print(\"```\")")
+            )),
+            "{sinks:?}"
+        );
+        assert!(
+            sinks.iter().any(|sink| matches!(sink,
+                ExecutableTextSink::Payload { source, dialect: ShellDialect::Posix, .. }
+                    if source.trim() == "print(\"```\")"
+            )),
+            "the independent shell source must retain its dialect: {sinks:?}"
+        );
+    }
+
+    #[test]
+    fn heredoc_pipeline_sources_require_a_literal_stdin_copy() {
+        for command in [
+            "cat <<'PY'\nprint('safe')\nPY",
+            "cat - <<'PY'\nprint('safe')\nPY",
+        ] {
+            assert!(
+                matches!(
+                    literal_heredoc_producer_source(command),
+                    Some(IndirectInputSource::StaticProducer(_))
+                ),
+                "{command}"
+            );
+        }
+        for command in [
+            "cat injected.py <<'PY'\nprint('safe')\nPY",
+            "cat - injected.py <<'PY'\nprint('safe')\nPY",
+            "cat <<'PY' injected.py\nprint('safe')\nPY",
+            "cat -n <<'PY'\nprint('safe')\nPY",
+        ] {
+            assert!(
+                matches!(
+                    literal_heredoc_producer_source(command),
+                    Some(IndirectInputSource::Unverified(_))
+                ),
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn deferred_commands_and_brace_commands_are_viewed_after_their_prefix() {

@@ -543,7 +543,7 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
         // opening paren of this match to the balanced close paren (bounded to the
         // remainder of the source), descending into bracketed list elements.
         let arg_region = exec_sink_arg_region(code, m.start());
-        let Some(hit) = detect_destructive_in_args(arg_region) else {
+        let Some(hit) = detect_destructive_in_args(arg_region, language) else {
             continue;
         };
 
@@ -602,7 +602,7 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
 
 /// One exec-sink call reconstructed as the shell command line it runs.
 pub struct ReconstructedCommand {
-    /// The command word and its arguments, space-joined — e.g.
+    /// The command word and its arguments, quoted to preserve argv — e.g.
     /// `dd if=/dev/zero of=/dev/sda`.
     pub command: String,
     /// Byte span of the sink call in the scanned `code`, for span mapping.
@@ -675,13 +675,17 @@ pub fn exec_sink_reconstructed_commands(
         // A call the rm/git backstop owns (any `detect_destructive_in_args`
         // hit) is left to it, so an allowlisted `rm`/`git` is not re-denied
         // here under a pack rule id.
-        if detect_destructive_in_args(region).is_some() {
+        if detect_destructive_in_args(region, language).is_some() {
             continue;
         }
         // Operands, for the same reason `detect_destructive_in_args` uses them:
         // reconstructing `dd` from `"d"+"d"` as two argv words would not be the
         // command the call actually runs (#474).
-        let operands = concatenated_operands(exec_argv_region(region));
+        let argv = exec_argv_operands(region, language);
+        if argv.unverified {
+            continue;
+        }
+        let operands = argv.values;
         let command = match operands.as_slice() {
             [] => continue,
             // One string handed to a shell (#512): see below.
@@ -699,7 +703,19 @@ pub fn exec_sink_reconstructed_commands(
                 }
                 script.to_string()
             }
-            _ => operands.join(" "),
+            _ if matches!(
+                language,
+                ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
+            ) && JS_SHELL_TRUE.is_match(region)
+                || language == ScriptLanguage::Python && PY_SHELL_TRUE.is_match(region) =>
+            {
+                operands.join(" ")
+            }
+            _ => operands
+                .iter()
+                .map(|operand| quote_exec_operand(operand))
+                .collect::<Vec<_>>()
+                .join(" "),
         };
         out.push(ReconstructedCommand {
             command,
@@ -1181,7 +1197,7 @@ fn scan_ruby_exec_sink_matches(code: &str, newline_positions: &[usize]) -> Vec<P
     for caps in RUBY_QUOTED_EXEC_SINK_LITERAL.captures_iter(code) {
         let Some(m) = caps.get(0) else { continue };
         let arg_region = exec_sink_arg_region(code, m.start());
-        if let Some(hit) = detect_destructive_in_args(arg_region) {
+        if let Some(hit) = detect_destructive_in_args(arg_region, ScriptLanguage::Ruby) {
             let sink = caps.name("sink").map_or("exec", |s| s.as_str());
             keep(ruby_exec_sink_match(code, newline_positions, m, sink, &hit));
         }
@@ -1827,7 +1843,7 @@ fn refine_python_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMat
         // into list/tuple literal elements. This catches the list-arg form
         // `subprocess.run(["sh", "-c", "rm -rf /etc"])` whose first literal
         // (`"sh"`) is inert but which genuinely executes `rm -rf` (#136).
-        if let Some(hit) = detect_destructive_in_args(matched_text) {
+        if let Some(hit) = detect_destructive_in_args(matched_text, ScriptLanguage::Python) {
             // Carry the payload's own severity, as the generic sink pass and
             // Ruby/JavaScript/Perl do (#485). It is High for every
             // non-temp target and Critical for a catastrophic one; only a
@@ -1923,7 +1939,7 @@ fn refine_go_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMatchMe
     // argv they are, and its own docstring names `exec.Command("rm","-rf","/x")`
     // as a shape it handles; nothing had ever called it for Go.
     if is_go_exec_sink_rule(&meta.rule_id) {
-        if let Some(hit) = detect_destructive_in_args(matched_text) {
+        if let Some(hit) = detect_destructive_in_args(matched_text, ScriptLanguage::Go) {
             // Carry the payload's own severity (#485), as in
             // `refine_python_match`.
             return RefinedMatchMeta {
@@ -1995,7 +2011,7 @@ fn refine_php_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMatchM
         return unchanged();
     }
 
-    let Some(hit) = detect_destructive_in_args(matched_text) else {
+    let Some(hit) = detect_destructive_in_args(matched_text, ScriptLanguage::Php) else {
         return unchanged();
     };
 
@@ -2630,7 +2646,7 @@ fn scan_perl_system_exec(
         // the one-string form blocked. JavaScript, Python and Ruby already
         // read the list this way.
         let region = exec_sink_arg_region(haystack, m.start());
-        let Some(hit) = detect_destructive_in_args(region) else {
+        let Some(hit) = detect_destructive_in_args(region, ScriptLanguage::Perl) else {
             continue;
         };
 
@@ -3057,12 +3073,15 @@ fn exec_sink_arg_region(code: &str, match_start: usize) -> &str {
 /// Most severe, not first: a harmless first finding used to end the search,
 /// so `spawnSync('rm', ['-rf', 'rm -rf /tmp/y', '/'])` reported the `Medium`
 /// payload in its third literal and never weighed the argv that deletes `/`.
-fn detect_destructive_in_args(call_text: &str) -> Option<ShellPayloadHit> {
+fn detect_destructive_in_args(
+    call_text: &str,
+    language: ScriptLanguage,
+) -> Option<ShellPayloadHit> {
     // Operands, not literals. A token split across a concatenation operator is
     // one operand the call really builds, and reading its halves separately hid
     // it from both views below in every language at once (#474).
-    let operands = concatenated_operands(exec_argv_region(call_text));
-    let literals: Vec<&str> = operands.iter().map(Cow::as_ref).collect();
+    let argv = exec_argv_operands(call_text, language);
+    let literals: Vec<&str> = argv.values.iter().map(Cow::as_ref).collect();
 
     // 1) Each literal on its own (catches `subprocess.run(["sh","-c","rm -rf /etc"])`
     //    where the destructive command lives in a single literal).
@@ -3071,51 +3090,471 @@ fn detect_destructive_in_args(call_text: &str) -> Option<ShellPayloadHit> {
         found = more_severe(found, detect_shell_payload(literal));
     }
 
+    // Retain the prior rm/git denial evidence for expressions whose result is
+    // not a scalar literal, such as a conditional choosing between "rm" and
+    // "echo". This fragment view can only add a blocking result. It cannot
+    // reconstruct a command, justify a temp exemption, or shift Git's options.
+    let fragments = literal_fragment_operands(exec_argv_region(call_text));
+    let fragment_words: Vec<&str> = fragments.iter().map(Cow::as_ref).collect();
+    let mut fragment_hit = None;
+    for fragment in &fragment_words {
+        fragment_hit = more_severe(fragment_hit, detect_shell_payload(fragment));
+    }
+    if fragment_words.len() > 1 {
+        fragment_hit = more_severe(fragment_hit, detect_argv_payload(&fragment_words));
+    }
+    found = more_severe(
+        found,
+        fragment_hit.filter(|hit| hit.severity.blocks_by_default()),
+    );
+
     // 2) Argv: a destructive command split across separate literals
     //    (`spawnSync("rm", ["-rf", "/etc/x"])`, `exec.Command("rm","-rf","/x")`)
     //    has no single literal that flags, so read the literals as the argv
     //    they are (#136). Safe because this runs ONLY after the call is
     //    confirmed to be a real exec sink, so inert literals never reach here.
-    if literals.len() > 1 {
+    if argv.unverified {
+        // A spread can supply zero, one, or many words, including options and
+        // targets. Never grant a fixed-argv proof to that shape. A wholly
+        // opaque command retains the existing warn-only posture; this finding
+        // applies when the executable itself is visible.
+        if literals
+            .first()
+            .is_some_and(|program| !program.is_empty() && !program.contains(RUNTIME_VALUE))
+        {
+            found = more_severe(
+                found,
+                Some(ShellPayloadHit {
+                    rule_suffix: "argv_unverified",
+                    reason: "Exec-sink argument count cannot be statically verified",
+                    severity: Severity::High,
+                    suggestion: Some("Use an explicit argument list with one value per argument"),
+                }),
+            );
+        }
+    } else if literals.len() > 1 {
         found = more_severe(found, detect_argv_payload(&literals));
     }
 
     found
 }
 
-/// The string operands of a call's argument region, with concatenated literals
-/// folded into the single operand they build (#474).
+/// An argv vector whose scalar positions are preserved. `unverified` means
+/// a spread, computed argument list, or parsing bound prevents that claim.
+struct ExecArgv<'a> {
+    values: Vec<Cow<'a, str>>,
+    unverified: bool,
+}
+
+const MAX_EXEC_ARGV_DEPTH: usize = 64;
+const MAX_EXEC_ARGV_OPERANDS: usize = 1_024;
+
+/// Read operands, rather than harvesting quoted fragments (#527). In
+/// `['git', '-C', choose('/tmp/a', p), 'diff', 'HEAD']`, the call expression
+/// contributes one unknown value; neither its nested literal nor its comma
+/// is an argv element. Only the list that actually supplies argv is flattened.
+fn exec_argv_operands(call_text: &str, language: ScriptLanguage) -> ExecArgv<'_> {
+    let region = exec_argv_region(call_text);
+    let Some(arguments) = split_exec_operands(region, b",", language) else {
+        return unverified_exec_argv(region, language);
+    };
+    let sink = call_text
+        .split(['(', ' ', '\t', '\n'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('.')
+        .next()
+        .unwrap_or_default();
+    let skip_context = language == ScriptLanguage::Go && sink == "CommandContext";
+    let mut argv = ExecArgv {
+        values: Vec::new(),
+        unverified: false,
+    };
+
+    for (index, argument) in arguments.into_iter().enumerate() {
+        // These APIs take a command (string or argv) in their first parameter;
+        // later parameters are modes, output references, options, or callbacks.
+        // Preserving *their* positions as command arguments would invent argv.
+        if index > 0
+            && (language == ScriptLanguage::Python
+                || matches!(
+                    language,
+                    ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
+                ) && matches!(sink, "exec" | "execSync")
+                || language == ScriptLanguage::Php && sink != "pcntl_exec")
+        {
+            break;
+        }
+        if skip_context && index == 0 {
+            continue;
+        }
+        let mut argument = skip_exec_trivia(argument, language).trim_end();
+        if argument.is_empty() {
+            continue;
+        }
+        if argv.values.is_empty()
+            && let Some(value) = argument.strip_prefix("args")
+            && let Some(value) = value.trim_start().strip_prefix('=')
+        {
+            argument = value.trim_start();
+        }
+        let Some(argument) = ungroup_exec_operand(argument, language) else {
+            return unverified_exec_argv(region, language);
+        };
+
+        let tuple_argv = argv.values.is_empty()
+            && matches!(language, ScriptLanguage::Python | ScriptLanguage::Unknown)
+            && argument.starts_with('(');
+        let list_argv = argument.starts_with('[');
+        if tuple_argv || list_argv {
+            let close = if list_argv { ']' } else { ')' };
+            let Some(inner) = argument
+                .rfind(close)
+                .filter(|&end| skip_exec_trivia(&argument[end + 1..], language).is_empty())
+                .and_then(|end| argument.get(1..end))
+            else {
+                return unverified_exec_argv(region, language);
+            };
+            let Some(elements) = split_exec_operands(inner, b",", language) else {
+                return unverified_exec_argv(region, language);
+            };
+            for element in elements {
+                if element.trim().is_empty() {
+                    continue;
+                }
+                push_exec_operand(&mut argv, element, language);
+            }
+        } else {
+            // Node's second positional argument is an entire argv array.
+            // `spawnSync('git', flags)` cannot borrow the scalar proof used
+            // for a Ruby `system('git', flag)` call.
+            if index == 1
+                && exec_literal_operand(argument, language).is_none()
+                && (matches!(
+                    language,
+                    ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
+                ) && matches!(
+                    sink,
+                    "spawn" | "spawnSync" | "execFile" | "execFileSync" | "fork"
+                ) || language == ScriptLanguage::Php && sink == "pcntl_exec")
+            {
+                argv.unverified = true;
+            }
+            push_exec_operand(&mut argv, argument, language);
+        }
+    }
+    argv
+}
+
+/// Parentheses around a value do not turn an argv list into a scalar. A comma
+/// at this level still denotes a tuple, so only transparent groups unwrap.
+fn ungroup_exec_operand(mut expression: &str, language: ScriptLanguage) -> Option<&str> {
+    for _ in 0..MAX_EXEC_ARGV_DEPTH {
+        expression = skip_exec_trivia(expression, language).trim_end();
+        let Some(inner) = expression
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+        else {
+            return Some(expression);
+        };
+        if split_exec_operands(inner, b",", language)?.len() != 1 {
+            return Some(expression);
+        }
+        expression = inner;
+    }
+    None
+}
+
+/// Keep an initial literal executable for a conservative finding if a bound or
+/// unsupported list shape prevents parsing. Never borrow a nested literal from
+/// `subprocess.run(argv)` or `subprocess.run([program_for('git'), ...])`.
+fn unverified_exec_argv(region: &str, language: ScriptLanguage) -> ExecArgv<'_> {
+    let region = skip_exec_trivia(region, language);
+    let region = region
+        .strip_prefix("args")
+        .and_then(|value| value.trim_start().strip_prefix('='))
+        .unwrap_or(region)
+        .trim_start()
+        .trim_start_matches(['[', '('])
+        .trim_start();
+    let region = skip_exec_trivia(region, language);
+    let value = exec_literal_end(region)
+        .filter(|&end| skip_exec_trivia(&region[end..], language).starts_with([',', ']', ')']))
+        .and_then(|end| exec_literal_operand(&region[..end], language))
+        .unwrap_or(Cow::Borrowed(RUNTIME_VALUE));
+    ExecArgv {
+        values: vec![value],
+        unverified: true,
+    }
+}
+
+fn push_exec_operand<'a>(argv: &mut ExecArgv<'a>, expression: &'a str, language: ScriptLanguage) {
+    let expression = skip_exec_trivia(expression, language).trim_end();
+    if argv.values.len() >= MAX_EXEC_ARGV_OPERANDS {
+        argv.unverified = true;
+        return;
+    }
+    if expression.starts_with(['*', '@'])
+        || expression.starts_with("...")
+        || expression
+            .rfind("...")
+            .is_some_and(|start| skip_exec_trivia(&expression[start + 3..], language).is_empty())
+        || split_exec_operands(expression, b" \t\r\n", language)
+            .is_some_and(|words| words.contains(&"for"))
+    {
+        argv.unverified = true;
+    }
+    argv.values
+        .push(concatenated_operand(expression, language, 0));
+}
+
+fn skip_exec_trivia(mut expression: &str, language: ScriptLanguage) -> &str {
+    loop {
+        expression = expression.trim_start();
+        if expression.starts_with('#')
+            || expression.starts_with("//")
+                && matches!(
+                    language,
+                    ScriptLanguage::JavaScript
+                        | ScriptLanguage::TypeScript
+                        | ScriptLanguage::Go
+                        | ScriptLanguage::Php
+                )
+        {
+            expression = expression.split_once('\n').map_or("", |(_, rest)| rest);
+        } else if let Some(comment) = expression.strip_prefix("/*")
+            && let Some((_, rest)) = comment.split_once("*/")
+        {
+            expression = rest;
+        } else {
+            return expression;
+        }
+    }
+}
+
+/// Split only at the current expression level, checking delimiter kinds as
+/// well as their depth. Nested calls, containers, and escaped quotes must not
+/// manufacture argv positions. All recursion and operand counts are bounded.
+fn split_exec_operands<'a>(
+    region: &'a str,
+    separators: &[u8],
+    language: ScriptLanguage,
+) -> Option<Vec<&'a str>> {
+    let bytes = region.as_bytes();
+    let mut stack = Vec::new();
+    let mut quote = None;
+    let mut start = 0;
+    let mut i = 0;
+    let mut parts = Vec::new();
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' && delimiter != b'`' {
+                i += 2;
+                continue;
+            }
+            if byte == delimiter {
+                quote = None;
+            }
+        } else if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+        } else if byte == b'#'
+            || byte == b'/'
+                && bytes.get(i + 1) == Some(&b'/')
+                && matches!(
+                    language,
+                    ScriptLanguage::JavaScript
+                        | ScriptLanguage::TypeScript
+                        | ScriptLanguage::Go
+                        | ScriptLanguage::Php
+                )
+        {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        } else if byte == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let end = memchr::memmem::find(&bytes[i + 2..], b"*/")?;
+            i += end + 4;
+            continue;
+        } else if matches!(byte, b'(' | b'[' | b'{') {
+            if stack.len() == MAX_EXEC_ARGV_DEPTH {
+                return None;
+            }
+            stack.push(byte);
+        } else if matches!(byte, b')' | b']' | b'}') {
+            let open = stack.pop()?;
+            if !matches!((open, byte), (b'(', b')') | (b'[', b']') | (b'{', b'}')) {
+                return None;
+            }
+        } else if stack.is_empty() && separators.contains(&byte) {
+            if parts.len() == MAX_EXEC_ARGV_OPERANDS {
+                return None;
+            }
+            parts.push(&region[start..i]);
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if quote.is_some() || !stack.is_empty() {
+        return None;
+    }
+    parts.push(&region[start..]);
+    Some(parts)
+}
+
+/// Fold literal concatenations as one scalar (#474), retaining an unknown
+/// marker for every dynamic term (#485). A string inside an arbitrary call or
+/// conditional is not a literal value of the surrounding expression.
+fn concatenated_operand(expression: &str, language: ScriptLanguage, depth: usize) -> Cow<'_, str> {
+    if depth == MAX_EXEC_ARGV_DEPTH {
+        return Cow::Borrowed(RUNTIME_VALUE);
+    }
+    let expression = skip_exec_trivia(expression, language).trim_end();
+    if let Some(value) = exec_literal_operand(expression, language) {
+        return value;
+    }
+    let Some(terms) = split_exec_operands(expression, b"+.", language) else {
+        return Cow::Borrowed(RUNTIME_VALUE);
+    };
+    if terms.len() > 1 {
+        if terms.iter().any(|term| term.trim().is_empty()) {
+            return Cow::Borrowed(RUNTIME_VALUE);
+        }
+        let mut value = String::new();
+        for term in terms {
+            let term = concatenated_operand(term, language, depth + 1);
+            if term != RUNTIME_VALUE || !value.ends_with(RUNTIME_VALUE) {
+                value.push_str(&term);
+            }
+        }
+        return Cow::Owned(value);
+    }
+    if let Some(inner) = expression
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        && split_exec_operands(inner, b",", language).is_some_and(|parts| parts.len() == 1)
+    {
+        return concatenated_operand(inner, language, depth + 1);
+    }
+    Cow::Borrowed(RUNTIME_VALUE)
+}
+
+/// End of one complete quoted literal, including escaped delimiters.
+fn exec_literal_end(expression: &str) -> Option<usize> {
+    let bytes = expression.as_bytes();
+    let &quote = bytes.first()?;
+    if !matches!(quote, b'\'' | b'"' | b'`') {
+        return None;
+    }
+    let mut i = 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && quote != b'`' {
+            i += 2;
+        } else if bytes[i] == quote {
+            return Some(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn exec_literal_operand(expression: &str, language: ScriptLanguage) -> Option<Cow<'_, str>> {
+    let expression = skip_exec_trivia(expression, language);
+    let end = exec_literal_end(expression)?;
+    if !skip_exec_trivia(&expression[end..], language).is_empty() {
+        return None;
+    }
+    let quote = expression.as_bytes()[0];
+    if quote == b'`' && language != ScriptLanguage::Go {
+        return None;
+    }
+    let literal = &expression[1..end - 1];
+    let interpolated = quote == b'"'
+        && match language {
+            ScriptLanguage::Ruby => {
+                literal.contains("#{") || literal.contains("#@") || literal.contains("#$")
+            }
+            ScriptLanguage::Perl => literal.contains(['$', '@']),
+            ScriptLanguage::Php => literal.contains('$'),
+            _ => false,
+        };
+    if interpolated {
+        // Retain visible destructive prefixes without claiming the complete
+        // interpolated value is literal (including Ruby's `"/tmp/#{name}"`).
+        return Some(Cow::Owned(format!("{literal}{RUNTIME_VALUE}")));
+    }
+    if quote == b'`' || !literal.contains('\\') {
+        return Some(Cow::Borrowed(literal));
+    }
+    let mut decoded = String::new();
+    let mut chars = literal.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+        let next = chars.next()?;
+        let single_quoted = quote == b'\''
+            && matches!(
+                language,
+                ScriptLanguage::Ruby | ScriptLanguage::Perl | ScriptLanguage::Php
+            );
+        match next {
+            '\\' | '\'' => decoded.push(next),
+            _ if single_quoted => {
+                decoded.push('\\');
+                decoded.push(next);
+            }
+            '"' => decoded.push('"'),
+            'n' => decoded.push('\n'),
+            'r' => decoded.push('\r'),
+            't' => decoded.push('\t'),
+            _ => decoded.push_str(RUNTIME_VALUE),
+        }
+    }
+    Some(Cow::Owned(decoded))
+}
+
+/// Ordinary argv text is quoted so spaces or metacharacters stay in their
+/// argument. Unknown scalar markers use double quotes, retaining expansion
+/// uncertainty for the shell policy while still occupying exactly one word.
+fn quote_exec_operand(operand: &str) -> String {
+    if !operand.contains(RUNTIME_VALUE) {
+        return shell_words::quote(operand).into_owned();
+    }
+    operand
+        .split(RUNTIME_VALUE)
+        .map(|literal| {
+            if literal.is_empty() {
+                Cow::Borrowed("")
+            } else {
+                shell_words::quote(literal)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(&format!("\"{RUNTIME_VALUE}\""))
+}
+
+/// What an operand carries in place of a value only known at run time.
 ///
-/// `detect_destructive_in_args` read each *literal*, never each *operand*, so
-/// splitting a token across a `+` hid it from both of its views: no single
-/// literal is destructive, and the argv view saw `r`, `m`, `-rf` instead of
-/// `rm`, `-rf`. Measured before this, `subprocess.run(["r"+"m","-rf",T])` was
-/// allowed in Python, Ruby, JavaScript, Go and PHP alike.
-///
-/// The fold is driven by the operator, never by adjacency. Comma-separated
-/// literals stay separate operands, or the argv view would start manufacturing
-/// commands the source never builds — `["echo", "rm", "-rf"]` must remain three
-/// operands. So the gap between two literals folds only when it is whitespace
-/// plus exactly one `+` or `.`, which is also what keeps a dynamic operand
-/// (`"rm -rf " + dir`) fail-open: the identifier in the gap stops the fold.
-///
-/// `.` is PHP's concatenation operator and `+` is the other four languages'.
-/// Accepting both everywhere is safe because neither is valid *between two
-/// string literals* in a language that does not use it that way, and a method
-/// call like `"a".freeze` leaves letters in the gap, which blocks the fold.
-///
-/// Borrowed until something is actually joined, so the common no-concatenation
-/// case allocates nothing beyond the operand vector.
-fn concatenated_operands(region: &str) -> Vec<Cow<'_, str>> {
+/// `"/tmp/" + name` is not the path `/tmp/`: `name` may be `../home/user`. The
+/// operand keeps its literal text, so a catastrophic or protected prefix still
+/// reads as one, and gains an expansion, which is exactly what the shell's
+/// `rm -rf /tmp/$name` looks like and what disqualifies a temp target (#485).
+const RUNTIME_VALUE: &str = "${dcg_runtime_value}";
+
+/// The older literal-fragment scan, retained solely as denial evidence. The
+/// positional parser above is the only source for reconstructed command text.
+fn literal_fragment_operands(region: &str) -> Vec<Cow<'_, str>> {
     let mut operands: Vec<Cow<'_, str>> = Vec::new();
     let mut previous_end: Option<usize> = None;
-
     for caps in ANY_STRING_LITERAL.captures_iter(region) {
         let Some(whole) = caps.get(0) else { continue };
         let Some(literal) = string_literal_from_caps(&caps) else {
             continue;
         };
-
         let folds = previous_end.is_some_and(|end| {
             region
                 .get(end..whole.start())
@@ -3137,51 +3576,29 @@ fn concatenated_operands(region: &str) -> Vec<Cow<'_, str>> {
         }
         previous_end = Some(whole.end());
     }
-
     operands
 }
 
-/// What an operand carries in place of a value only known at run time.
-///
-/// `"/tmp/" + name` is not the path `/tmp/`: `name` may be `../home/user`. The
-/// operand keeps its literal text, so a catastrophic or protected prefix still
-/// reads as one, and gains an expansion, which is exactly what the shell's
-/// `rm -rf /tmp/$name` looks like and what disqualifies a temp target (#485).
-const RUNTIME_VALUE: &str = "${dcg_runtime_value}";
-
-/// Whether a concatenation operator right after `end` joins a non-literal.
 fn joins_runtime_value_after(region: &str, end: usize) -> bool {
-    let Some(rest) = region.get(end..).map(str::trim_start) else {
-        return false;
-    };
-    let Some(operand) = rest.strip_prefix(['+', '.']).map(str::trim_start) else {
-        return false;
-    };
-    operand
-        .chars()
-        .next()
+    region
+        .get(end..)
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix(['+', '.']))
+        .map(str::trim_start)
+        .and_then(|operand| operand.chars().next())
         .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '('))
 }
 
-/// Whether a concatenation operator right before `start` joins a non-literal.
 fn joins_runtime_value_before(region: &str, start: usize) -> bool {
-    let Some(before) = region.get(..start).map(str::trim_end) else {
-        return false;
-    };
-    let Some(operand) = before.strip_suffix(['+', '.']).map(str::trim_end) else {
-        return false;
-    };
-    operand
-        .chars()
-        .next_back()
+    region
+        .get(..start)
+        .map(str::trim_end)
+        .and_then(|before| before.strip_suffix(['+', '.']))
+        .map(str::trim_end)
+        .and_then(|operand| operand.chars().next_back())
         .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | ')' | ']'))
 }
 
-/// Whether the text between two string literals is exactly one concatenation.
-///
-/// Exactly one operator, because `"a" + + "b"` is not concatenation in any of
-/// these languages, and because requiring a count rather than "contains an
-/// operator" is what makes a stray token in the gap block the fold.
 fn is_concatenation_gap(gap: &str) -> bool {
     let mut operators = 0_usize;
     for ch in gap.chars() {
@@ -3270,7 +3687,11 @@ fn exec_argv_region(call_text: &str) -> &str {
                     return &call_text[begin..i];
                 };
                 depth = inner;
-                if depth == 0 && list_arg && b == b']' {
+                if depth == 0
+                    && list_arg
+                    && b == b']'
+                    && call_text[i + 1..].trim_start().starts_with([',', ')'])
+                {
                     return &call_text[begin..=i];
                 }
             }
@@ -3737,7 +4158,7 @@ fn is_temp_scratch_path(path: &str) -> bool {
     let candidate = path.strip_prefix("/private").unwrap_or(path);
     // Only a literal path is a temp target. An expansion anywhere can climb
     // out (`/tmp/$name` with `name=../home/user`), which is why the shell
-    // rules deny `rm -rf /tmp/$x`; `concatenated_operands` marks a literal
+    // rules deny `rm -rf /tmp/$x`; `concatenated_operand` marks a literal
     // joined to a runtime value the same way (#485).
     (has_path_prefix(candidate, "/tmp") || has_path_prefix(candidate, "/var/tmp"))
         && !contains_path_traversal(candidate)
@@ -5387,7 +5808,9 @@ mod tests {
         /// used to count, so a temp decoy in front laundered the rest.
         #[test]
         fn exec_sink_rm_rf_weighs_every_operand() {
-            let severity = |call: &str| detect_destructive_in_args(call).map(|hit| hit.severity);
+            let severity = |call: &str| {
+                detect_destructive_in_args(call, ScriptLanguage::Unknown).map(|hit| hit.severity)
+            };
             for (call, expected) in [
                 (
                     "spawnSync('rm', ['-rf', '/tmp/x', '/'])",
@@ -5448,7 +5871,8 @@ mod tests {
                 "execSync('rm -rf /tmp/x > /dev/null')",
             ] {
                 assert_eq!(
-                    detect_destructive_in_args(call).map(|hit| hit.severity),
+                    detect_destructive_in_args(call, ScriptLanguage::Unknown)
+                        .map(|hit| hit.severity),
                     Some(Severity::Medium),
                     "{call}"
                 );
@@ -6764,7 +7188,11 @@ mod tests {
     #[test]
     fn only_a_single_operator_gap_folds_issue_474() {
         for gap in [" + ", "+", " . ", ".", "\n  + ", " +\n"] {
-            assert!(is_concatenation_gap(gap), "{gap:?} should fold");
+            assert_eq!(
+                concatenated_operand(&format!("\"a\"{gap}\"b\""), ScriptLanguage::Python, 0),
+                "ab",
+                "{gap:?} should fold"
+            );
         }
         for gap in [
             ", ",        // an argv separator, not a concatenation
@@ -6775,7 +7203,268 @@ mod tests {
             " ",         // whitespace alone is adjacency, not concatenation
             ") ,(",
         ] {
-            assert!(!is_concatenation_gap(gap), "{gap:?} must not fold");
+            assert_ne!(
+                concatenated_operand(&format!("\"a\"{gap}\"b\""), ScriptLanguage::Python, 0),
+                "ab",
+                "{gap:?} must not fold"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_argv_preserves_dynamic_scalar_positions_issue_527() {
+        for (language, call) in [
+            (
+                ScriptLanguage::Python,
+                r#"subprocess.run(["git", "-C", p, "diff", "HEAD"])"#,
+            ),
+            (
+                ScriptLanguage::Python,
+                r#"subprocess.run(args=["git", "-C", str(var), "diff", "HEAD"], text=True)"#,
+            ),
+            (
+                ScriptLanguage::Python,
+                r#"subprocess.run(("git", "-C", choose("a,b", nested(1, 2)), "diff", "HEAD"))"#,
+            ),
+            (
+                ScriptLanguage::Python,
+                r#"subprocess.run((["git", "-C", p, "diff", "HEAD"]))"#,
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r#"cp.spawnSync("git", ["-C", choose("a,b", { path: nested(1, 2) }), "diff", "HEAD"])"#,
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r#"cp.spawnSync("git", (["-C", p, "diff", "HEAD"]))"#,
+            ),
+            (
+                ScriptLanguage::Python,
+                "subprocess.run([\"git\", # directory follows\n\"-C\", p, \"diff\", \"HEAD\"])",
+            ),
+            (
+                ScriptLanguage::Ruby,
+                r#"system("git", "-C", File.join(root, "a,b"), "diff", "HEAD")"#,
+            ),
+            (
+                ScriptLanguage::Go,
+                r#"exec.CommandContext(ctx, "git", "-C", filepath.Join(root, "a,b"), "diff", "HEAD")"#,
+            ),
+            (
+                ScriptLanguage::Php,
+                r#"pcntl_exec("git", ["-C", choose("a,b", $p), "diff", "HEAD"])"#,
+            ),
+        ] {
+            let argv = exec_argv_operands(call, language);
+            assert!(!argv.unverified, "{language:?}: {call}");
+            assert_eq!(
+                argv.values.iter().map(Cow::as_ref).collect::<Vec<_>>(),
+                ["git", "-C", RUNTIME_VALUE, "diff", "HEAD"],
+                "{language:?}: {call}"
+            );
+            let commands = exec_sink_reconstructed_commands(call, language);
+            assert_eq!(commands.len(), 1, "{language:?}: {call}");
+            assert_eq!(
+                commands[0].command,
+                format!("git -C \"{RUNTIME_VALUE}\" diff HEAD"),
+                "{language:?}: {call}"
+            );
+        }
+
+        let argv = exec_argv_operands(
+            r#"subprocess.run([program_for("git"), "-C", p, "diff", revision])"#,
+            ScriptLanguage::Python,
+        );
+        assert_eq!(
+            argv.values.iter().map(Cow::as_ref).collect::<Vec<_>>(),
+            [RUNTIME_VALUE, "-C", RUNTIME_VALUE, "diff", RUNTIME_VALUE],
+            "neither the executable nor a trailing dynamic value may disappear"
+        );
+    }
+
+    #[test]
+    fn exec_argv_quotes_literal_arguments_issue_527() {
+        for (source, expected) in [
+            (
+                r#"subprocess.run(["git", "-C", "/tmp/repo with spaces", "diff", "HEAD"])"#,
+                "/tmp/repo with spaces",
+            ),
+            (
+                r#"subprocess.run(["git", "-C", "/tmp/quo\"te, path", "diff", "HEAD"])"#,
+                "/tmp/quo\"te, path",
+            ),
+            (
+                r#"subprocess.run(["git", "-C", "/tmp/for loop", "diff", "HEAD"])"#,
+                "/tmp/for loop",
+            ),
+            (
+                r#"subprocess.run(["git", "-C", "/tmp/a; git reset --hard", "diff", "HEAD"])"#,
+                "/tmp/a; git reset --hard",
+            ),
+        ] {
+            let argv = exec_argv_operands(source, ScriptLanguage::Python);
+            assert!(!argv.unverified, "{source}");
+            assert_eq!(argv.values[2], expected, "{source}");
+            let reconstructed = argv
+                .values
+                .iter()
+                .map(|operand| quote_exec_operand(operand))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(
+                shell_words::split(&reconstructed).unwrap(),
+                ["git", "-C", expected, "diff", "HEAD"],
+                "literal metacharacters and whitespace stay inside their own argument"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_argv_dynamic_targets_cannot_borrow_temp_exemption_issue_527() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                r#"subprocess.run(["rm", "-rf", "/tmp/a", target])"#,
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r#"cp.spawnSync("rm", ["-rf", "/tmp/a", target])"#,
+            ),
+            (
+                ScriptLanguage::Ruby,
+                r#"system("rm", "-rf", "/tmp/a", target)"#,
+            ),
+            (
+                ScriptLanguage::Python,
+                r#"subprocess.run(["rm", "-rf", choose("/tmp/a", target)])"#,
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r#"cp.spawnSync("rm", ["-rf", "/tmp/" + choose("a", target)])"#,
+            ),
+            (
+                ScriptLanguage::Ruby,
+                r#"system("rm", "-rf", "/tmp/#{target}")"#,
+            ),
+            (
+                ScriptLanguage::Python,
+                r#"subprocess.run(["rm" if condition else "echo", "-rf", "/etc"])"#,
+            ),
+        ] {
+            assert!(
+                detect_destructive_in_args(source, language)
+                    .is_some_and(|hit| hit.severity.blocks_by_default()),
+                "{language:?}: an unknown target can escape /tmp: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_sink_non_argv_parameters_stay_out_of_reconstruction_issue_527() {
+        for (language, call) in [
+            (
+                ScriptLanguage::JavaScript,
+                r#"cp.exec("wipefs -a /dev/sda", callback)"#,
+            ),
+            (
+                ScriptLanguage::Php,
+                r#"exec("wipefs -a /dev/sda", $output, $status)"#,
+            ),
+            (ScriptLanguage::Php, r#"popen("wipefs -a /dev/sda", "r")"#),
+            (
+                ScriptLanguage::Python,
+                r#"os.popen("wipefs -a /dev/sda", "r")"#,
+            ),
+        ] {
+            let commands = exec_sink_reconstructed_commands(call, language);
+            assert_eq!(commands.len(), 1, "{language:?}: {call}");
+            assert_eq!(
+                commands[0].command, "wipefs -a /dev/sda",
+                "{language:?}: {call}"
+            );
+        }
+        let source = r#"cp.spawnSync("echo", ["x;", "wipefs", "-a", "/dev/sda"], {shell: true})"#;
+        let commands = exec_sink_reconstructed_commands(source, ScriptLanguage::JavaScript);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command, "echo x; wipefs -a /dev/sda");
+    }
+
+    #[test]
+    fn exec_argv_spreads_are_not_single_scalar_proofs_issue_527() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                r#"subprocess.run(["git", "-C", *paths, "diff", "HEAD"])"#,
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r#"cp.spawnSync("git", ["-C", ...paths, "diff", "HEAD"])"#,
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r#"cp.spawnSync("git", ["-C", /* directory values */ ...paths, "diff", "HEAD"])"#,
+            ),
+            (ScriptLanguage::JavaScript, r#"cp.spawnSync("git", args)"#),
+            (
+                ScriptLanguage::Ruby,
+                r#"system("git", "-C", *paths, "diff", "HEAD")"#,
+            ),
+            (
+                ScriptLanguage::Python,
+                r#"subprocess.run(["rm", "-rf", "/tmp/a", *targets])"#,
+            ),
+            (
+                ScriptLanguage::Python,
+                r#"subprocess.run(["rm", "-rf", "/tmp/a"] + targets)"#,
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r#"cp.spawnSync("rm", ["-rf", "/tmp/a"].concat(targets))"#,
+            ),
+        ] {
+            assert!(exec_argv_operands(source, language).unverified, "{source}");
+            assert!(
+                exec_sink_reconstructed_commands(source, language).is_empty(),
+                "unknown cardinality cannot be represented as a fixed shell argv: {source}"
+            );
+            assert!(
+                detect_destructive_in_args(source, language)
+                    .is_some_and(|hit| hit.severity.blocks_by_default()),
+                "{source}"
+            );
+        }
+        for source in [
+            "subprocess.run(argv)",
+            "subprocess.run([*argv])",
+            "subprocess.run([program, *args])",
+        ] {
+            assert!(
+                detect_destructive_in_args(source, ScriptLanguage::Python).is_none(),
+                "a wholly opaque executable retains the existing posture: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_argv_parsing_bounds_do_not_authorize_a_partial_vector_issue_527() {
+        let many = format!(
+            "subprocess.run([\"git\", {}])",
+            std::iter::repeat_n("p", MAX_EXEC_ARGV_OPERANDS + 1)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let deep = format!(
+            "subprocess.run([\"git\", \"-C\", {}p{}, \"diff\", \"HEAD\"])",
+            "(".repeat(MAX_EXEC_ARGV_DEPTH + 1),
+            ")".repeat(MAX_EXEC_ARGV_DEPTH + 1)
+        );
+        for source in [&many, &deep] {
+            assert!(exec_argv_operands(source, ScriptLanguage::Python).unverified);
+            assert!(
+                detect_destructive_in_args(source, ScriptLanguage::Python)
+                    .is_some_and(|hit| hit.severity.blocks_by_default()),
+                "a partial argv must not become permission evidence"
+            );
         }
     }
 

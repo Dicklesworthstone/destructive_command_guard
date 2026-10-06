@@ -1915,7 +1915,8 @@ pub(crate) fn codex_host_shell_dialect(
     }
     // The same masked view the POSIX evaluation path parses, so the verdict
     // here matches the one that path would reach.
-    let posix_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    let posix_view = crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
     match crate::heredoc::extract_posix_command_substitutions(posix_view.as_ref()) {
         Ok(_) => ShellDialect::Unknown,
         Err(crate::heredoc::PosixCommandSubstitutionParseError) => ShellDialect::PowerShell,
@@ -2261,7 +2262,24 @@ fn segment_command_word_is_cmd_assembled(segment: &str) -> bool {
     if first.starts_with(['"', '\'']) {
         return false;
     }
-    first.contains('^') || is_percent_expansion(first)
+    // A quote can begin inside a word: Python's r"^" is one such token
+    // when the conservative heredoc scan encounters re.compile(r"^").
+    // Only an unquoted caret can assemble a cmd executable; a quoted caret
+    // is literal text. Keep real g^it / doc^ker evidence, including inside
+    // interpreter strings passed through an opaque shell sink.
+    let mut quote = None;
+    for byte in first.bytes() {
+        if let Some(delimiter) = quote {
+            if byte == delimiter {
+                quote = None;
+            }
+        } else if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+        } else if byte == b'^' {
+            return true;
+        }
+    }
+    is_percent_expansion(first)
 }
 
 fn is_windows_path_token(token: &str) -> bool {
@@ -2385,20 +2403,62 @@ fn segment_is_format_drive_invocation(segment: &str) -> bool {
 /// argument (`rm -Recurse -Force …`, `del /s /q …`), or a cmd writer carrying a
 /// Windows path (`copy nul .git\config`).
 fn command_has_powershell_shape(command: &str) -> bool {
-    command
-        .split(['|', ';', '&', '\n', '\r', '(', '{'])
-        .any(|segment| {
-            segment
-                .split_whitespace()
-                .next()
-                .is_some_and(is_powershell_cmdlet_token)
-                || segment_is_windows_alias_invocation(segment)
-                || segment_is_cmd_writer_invocation(segment)
-                || segment_is_windows_file_delete_invocation(segment)
-                || segment_is_windows_only_executable(segment)
-                || segment_command_word_is_cmd_assembled(segment)
-                || segment_is_format_drive_invocation(segment)
-        })
+    use ast_grep_core::AstGrep;
+    use ast_grep_language::SupportLang;
+
+    let has_candidate = |source: &str| {
+        source
+            .split(['|', ';', '&', '\n', '\r', '(', '{'])
+            .any(segment_has_windows_shape)
+    };
+    if !has_candidate(command) {
+        return false;
+    }
+    // The cheap scan sees separators inside quoted arguments too: sed's
+    // 's|^\./||' appeared to start a command with a cmd caret (#524). Only
+    // withdraw that evidence when a complete, bounded Bash parse establishes
+    // the actual command positions. Real substitutions, process substitutions,
+    // groups and control-flow bodies are all visited, including inside quotes.
+    // An invalid or oversized parse retains the conservative candidate.
+    if command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
+        || crate::heredoc::longest_pipeline_stages(command)
+            > crate::heredoc::MAX_PARSED_PIPELINE_STAGES
+    {
+        return true;
+    }
+    let Ok(ast) = AstGrep::try_new(command, SupportLang::Bash) else {
+        return true;
+    };
+    if ast.root().get_inner_node().has_error() {
+        return true;
+    }
+    let mut pending = vec![ast.root()];
+    while let Some(node) = pending.pop() {
+        match node.kind().as_ref() {
+            "ERROR" => return true,
+            "command" if segment_has_windows_shape(node.text().as_ref()) => return true,
+            // Interpreter source retains conservative Windows evidence:
+            // an opaque or aliased sink can pass these strings to a shell.
+            // Only the separately proven data bodies have been masked.
+            "heredoc_body" if has_candidate(node.text().as_ref()) => return true,
+            _ => {}
+        }
+        pending.extend(node.children());
+    }
+    false
+}
+
+fn segment_has_windows_shape(segment: &str) -> bool {
+    segment
+        .split_whitespace()
+        .next()
+        .is_some_and(is_powershell_cmdlet_token)
+        || segment_is_windows_alias_invocation(segment)
+        || segment_is_cmd_writer_invocation(segment)
+        || segment_is_windows_file_delete_invocation(segment)
+        || segment_is_windows_only_executable(segment)
+        || segment_command_word_is_cmd_assembled(segment)
+        || segment_is_format_drive_invocation(segment)
 }
 
 /// Down-trust a `Bash`-labeled dialect when the command itself is
@@ -4770,6 +4830,44 @@ mod tests {
                 ShellDialect::Posix,
                 "a caret outside the command word must not widen: {command:?}"
             );
+        }
+    }
+
+    #[test]
+    fn windows_shape_requires_executable_command_positions() {
+        for command in [
+            "for x in a b; do\nls | sed 's|^\\./||'\ndone",
+            "printf '%s\\n' 'text; Remove-Item -Recurse -Force C:\\x'",
+            "echo \"text|g^it reset --hard\"",
+            "echo foo\\;^bar",
+            "python3 - <<'PY'\na = 'it\\'s'\nb = '#'\nc = re.compile(r\"^\")\nPY",
+            "python3 -c 'print(\"text|^prefix\")'",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "{command}"
+            );
+            assert!(!command_is_windows_shell_payload(command), "{command}");
+        }
+        for command in [
+            "g^it reset --hard",
+            "g\"\"^it reset --hard",
+            "echo \"$(Remove-Item -Recurse -Force C:\\x)\"",
+            "cat <(Remove-Item -Recurse -Force C:\\x)",
+            "{ Remove-Item -Recurse -Force C:\\x; }",
+            "bash <<'SH'\nRemove-Item -Recurse -Force C:\\x\nSH",
+            "python3 - <<PY\n$(Remove-Item -Recurse -Force C:\\x)\nPY",
+            "python3 script.py <<'PY'\ncopy nul .git\\config\nPY",
+            // A missing closing token cannot certify quoted data boundaries.
+            "echo \"$(true; g^it reset --hard)",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "{command}"
+            );
+            assert!(command_is_windows_shell_payload(command), "{command}");
         }
     }
 

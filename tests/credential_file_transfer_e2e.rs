@@ -9,6 +9,156 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 #[test]
+fn archive_extraction_destinations_reach_hook_and_cli() {
+    let home = home();
+    for (command, rule) in [
+        ("tar xf payload.tar -C ~/.ssh", "credential-file-write"),
+        ("tar xfC payload.tar ~/.ssh", "credential-file-write"),
+        ("tar xCf ~/.ssh payload.tar", "credential-file-write"),
+        ("bsdtar xfC payload.tar ~/.ssh", "credential-file-write"),
+        (
+            "tar -x -s ',^,prefix/,' -f payload.tar -C .git/",
+            "git-internals-write",
+        ),
+        (
+            "tar --get -f payload.tar -C ~/.ssh",
+            "credential-file-write",
+        ),
+        (
+            "tar -xC/home/user/.ssh -fpayload.tar",
+            "credential-file-write",
+        ),
+        (
+            "tar --directory=/home/user/.ssh --extract -f payload.tar",
+            "credential-file-write",
+        ),
+        ("tar -xf payload.tar -C .git", "git-internals-write"),
+        (
+            "bsdtar -xf payload.tar -C project/.git",
+            "git-internals-write",
+        ),
+        ("unzip payload.zip -d .git", "git-internals-write"),
+        (
+            "unzip -od/home/user/.ssh payload.zip",
+            "credential-file-write",
+        ),
+        (
+            "unzip -Pptvlcz payload.zip -d ~/.ssh",
+            "credential-file-write",
+        ),
+        ("7z x payload.7z -o.git", "git-internals-write"),
+        (
+            "7za e payload.7z -o/home/user/.ssh",
+            "credential-file-write",
+        ),
+        (
+            "7zr x -p-so payload.7z -o/home/user/.ssh",
+            "credential-file-write",
+        ),
+        (
+            "env nice -n 5 tar xf payload.tar -C ~/.ssh",
+            "credential-file-write",
+        ),
+        (
+            "true && tar -x -fpayload.tar -C/home/user/.ssh",
+            "credential-file-write",
+        ),
+        ("cat payload.tar | tar xf - -C .git", "git-internals-write"),
+    ] {
+        assert_decision(command, home.path(), Some(rule));
+    }
+}
+
+#[test]
+fn archive_extraction_respects_directory_scope_and_real_modes() {
+    let home = home();
+    for command in [
+        "tar -xf payload.tar -C /tmp -C ~/.ssh",
+        "tar -xf payload.tar -C /home/user -C .ssh",
+        "tar -xf payload.tar -C /tmp first -C /home/user/.ssh second",
+        "tar -xf payload.tar -C /home/user/.ssh first -C /tmp second",
+        "tar -xf payload.tar -C /home/user/.ssh -T members.txt -C /tmp",
+        "tar -xf payload.tar -C /home/user/.ssh --files-from=members.txt -C /tmp",
+        "tar -xf payload.tar -C /home/user/.ssh --add-file=member -C /tmp",
+        "tar -xf payload.tar -C /tmp $EMPTY -C /home/user/.ssh",
+        "tar -xf payload.tar --exclude -O -C ~/.ssh",
+        "tar -xf -O -C ~/.ssh",
+        "unzip payload.zip -l -d ~/.ssh",
+        "unzip -l --l payload.zip -d ~/.ssh",
+        "unzip -- payload.zip -d ~/.ssh",
+    ] {
+        assert_decision(command, home.path(), Some("credential-file-write"));
+    }
+    for command in [
+        "tar -xf payload.tar -C ~/.ssh -C /tmp",
+        "tar -xf payload.tar -C /home/user/.ssh -C ..",
+        "tar -xf payload.tar -C /tmp first -C /home/user/.ssh",
+        "tar -xf payload.tar -C /tmp -T members.txt -C ./build",
+        "tar -tf payload.tar -C ~/.ssh -T members.txt -C /tmp",
+        "tar -xOf payload.tar -C ~/.ssh",
+        "tar xOfC payload.tar ~/.ssh",
+        "tar -xf payload.tar --to-stdout -C ~/.ssh",
+        "bsdtar -xOf payload.tar -C .git",
+        "tar -tf payload.tar -C ~/.ssh",
+        "tar -cf -x -C ~/.ssh file",
+        "tar -tf payload.tar -- -x -C ~/.ssh",
+        "tar -xf payload.tar -- -C ~/.ssh",
+        "tar -xfC ~/.ssh",
+        "unzip -l payload.zip -d ~/.ssh",
+        "unzip -t payload.zip -d ~/.ssh",
+        "unzip -p payload.zip -d ~/.ssh",
+        "unzip -Z payload.zip -d ~/.ssh",
+        "7z x -so payload.7z -o/home/user/.ssh",
+        "7z t payload.7z -o.git",
+        "7z x -- -o.git",
+        "tar -xf payload.tar -C /etc",
+        "unzip payload.zip -d ./build",
+        "7z x payload.7z -o/tmp/scratch",
+        "tar xf payload.tar",
+        "printf '%s\\n' 'tar xf payload.tar -C .git'",
+    ] {
+        assert_decision(command, home.path(), None);
+    }
+}
+
+#[test]
+fn archive_destination_rule_grants_remain_separate() {
+    for (granted, allowed_directory, denied_directory, denied_rule) in [
+        (
+            "credential-file-write",
+            "~/.ssh",
+            ".git",
+            "git-internals-write",
+        ),
+        (
+            "git-internals-write",
+            ".git",
+            "~/.ssh",
+            "credential-file-write",
+        ),
+    ] {
+        let home = home();
+        fs::write(
+            home.path().join("xdg/dcg/allowlist.toml"),
+            format!("[[allow]]\nrule = \"core.filesystem:{granted}\"\nreason = \"one destination rule only\"\n"),
+        )
+        .unwrap();
+        assert_decision(
+            &format!("tar xf payload.tar -C {allowed_directory}"),
+            home.path(),
+            None,
+        );
+        assert_decision(
+            &format!(
+                "tar xf payload.tar -C {allowed_directory}; unzip payload.zip -d {denied_directory}"
+            ),
+            home.path(),
+            Some(denied_rule),
+        );
+    }
+}
+
+#[test]
 fn opaque_ruby_options_cannot_suppress_hook_or_cli_writes() {
     let home = home();
     for (source, rule) in [

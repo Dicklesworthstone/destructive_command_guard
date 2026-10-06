@@ -2189,6 +2189,40 @@ bash -c "git reset --hard"
 
 Without context classification, the first three examples would trigger false positives. The context classifier analyzes the AST (abstract syntax tree) structure to understand where patterns appear and only flags genuinely dangerous occurrences.
 
+**Interpreter source and process arguments**
+
+Shell substitution analysis preserves the boundary around a quoted heredoc
+supplied as a program to a proven non-shell interpreter, such as
+`python3 - <<'PY'` or `node - <<'JS'`. JavaScript backticks and other source
+bytes inside that body do not become outer shell substitutions. Quoted carets
+in Python regular expressions do not select a Windows shell dialect. The body
+still receives language-specific analysis and conservative destructive-pattern
+scanning, including Windows command evidence in opaque or aliased shell sinks.
+An unquoted delimiter, a
+rebound or wrapped interpreter, and stdin supplied to an interpreter's `-c` /
+`-e` command or script file retain their conservative treatment.
+
+A plain `cat <<'PY' | python3 -` pipeline also preserves the consumer's language
+when the quoted body and both executables can be proven. The corresponding
+Python, JavaScript, Ruby, Perl and PHP source is not reparsed as a bare shell
+script. Shell consumers still receive shell analysis. Extra input files,
+transforming `cat` flags, and mutable producer lookup cannot establish a
+literal-source proof. Quoted shell arguments are similarly kept intact during
+dialect selection: the `|^` in `sed 's|^\./||'` does not start a cmd command.
+
+Embedded process calls retain every argument position when reconstructed. For
+example, `subprocess.run(["git", "-C", path, "diff", "HEAD"])` keeps the unknown
+`path` as the operand of `-C`; it cannot turn `diff` into that operand. Literal
+arguments retain quoting and unknown targets remain unknown. A spread or
+computed argument list with a known executable fails closed under a
+language-specific `argv_unverified` rule because its argument count cannot be
+proven. A wholly opaque process call retains the existing analysis posture.
+
+Ambiguous shell substitutions carry the stable rules
+`heredoc.posix:substitution-unverified` or
+`heredoc.powershell:substitution-unverified`; substitution size and nesting
+limits use `heredoc.shell:analysis-bounds`.
+
 **Implementation Details**
 
 The context classifier uses a multi-pass approach:
@@ -3081,6 +3115,19 @@ files are the point, so there is no "scratch" subset to carve out. Reads,
 for a project that legitimately manages one of these files, allowlist the rule
 id with a reason (that lifts only this rule — an existing file is still judged
 by `redirect-truncate-root-home`), or use `dcg allow-once` for a one-off.
+
+Archive extraction uses the same protected-destination checks. Explicit
+destinations under credential directories or `.git` are denied for `tar`,
+`bsdtar`, `unzip`, and `7z` / `7za` / `7zr`, including traditional tar flags,
+attached directory options, and repeated relative `-C` changes. Listing,
+testing, creating archives, and genuine stdout-only extraction do not acquire
+a destination-write denial. An archive filename, filter, or member named like
+an option cannot masquerade as a mode flag. For `tar`, dcg accounts for both
+GNU and BSD option semantics. This check protects explicit destinations; it
+does not inspect archive members or infer their paths from the archive's name.
+Credential-directory writes retain `core.filesystem:credential-file-write`,
+while `.git` writes retain `core.filesystem:git-internals-write`, so a grant for
+one does not exempt the other.
 
 **Glob semantics.**
 

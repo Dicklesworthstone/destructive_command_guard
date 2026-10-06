@@ -18,6 +18,7 @@
 //! spawn of the same shape that must stay allowed, because the argv join is a
 //! widening and its false-positive surface is the whole risk.
 
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -289,4 +290,215 @@ fn argv_split_non_rm_verbs_reach_their_pack_rules() {
     assert_blocked(&node(
         "cp.spawnSync('dd',['if=/dev/zero','of=/tmp/scratch'])",
     ));
+}
+
+/// #527 exercises the real hook envelope. The supplied command is JSON data;
+/// only dcg is executed, under an isolated home and configuration.
+fn hook_decision(command: &str) -> (String, String) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let config = temp.path().join("config.toml");
+    std::fs::write(&config, "[history]\nenabled = false\n").expect("config");
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+        "cwd": temp.path(),
+    });
+    let mut child = Command::new(dcg_binary())
+        .env_clear()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("APPDATA", home.join("appdata"))
+        .env("LOCALAPPDATA", home.join("localappdata"))
+        .env("TEMP", temp.path())
+        .env("TMP", temp.path())
+        .env("DCG_CONFIG", &config)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env(
+            "DCG_PENDING_EXCEPTIONS_PATH",
+            temp.path().join("pending_exceptions.jsonl"),
+        )
+        .env("DCG_SELF_HEAL_HOOK", "0")
+        .env("DCG_HOOK_TIMEOUT_MS", "5000")
+        .current_dir(temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dcg");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(payload.to_string().as_bytes())
+        .expect("write hook JSON");
+    let output = child.wait_with_output().expect("wait for dcg");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "hook failed for {command}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if output.stdout.is_empty() {
+        return ("allow".to_string(), String::new());
+    }
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("invalid hook JSON for {command}: {error}"));
+    let output = &document["hookSpecificOutput"];
+    (
+        output["permissionDecision"]
+            .as_str()
+            .expect("hook decision")
+            .to_string(),
+        output["ruleId"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+fn argv_git_scripts(tail: &str) -> [String; 3] {
+    [
+        format!(
+            "python3 -c {}",
+            shell_words::quote(&format!(
+                "import subprocess; subprocess.run([\"git\",\"-C\",p,{tail}])"
+            ))
+        ),
+        format!(
+            "node -e {}",
+            shell_words::quote(&format!(
+                "require(\"child_process\").spawnSync(\"git\",[\"-C\",p,{tail}])"
+            ))
+        ),
+        format!(
+            "ruby -e {}",
+            shell_words::quote(&format!("system(\"git\",\"-C\",p,{tail})"))
+        ),
+    ]
+}
+
+#[test]
+fn dynamic_git_directory_keeps_the_real_subcommand_issue_527() {
+    for tail in [
+        r#""diff","HEAD""#,
+        r#""show","HEAD""#,
+        r#""rev-parse","HEAD""#,
+        r#""apply","a.patch""#,
+        r#""diff""#,
+    ] {
+        for command in argv_git_scripts(tail) {
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(decision, "allow", "{command}: {rule}");
+        }
+    }
+}
+
+#[test]
+fn dynamic_git_directory_preserves_destructive_controls_issue_527() {
+    for (tail, expected_rule) in [
+        (r#""reset","--hard""#, Some("core.git:reset-hard")),
+        (r#""clean","-fdx""#, Some("core.git:clean-force")),
+        (r#""checkout","--",".""#, Some("core.git:checkout-discard")),
+        (r#""push","--force","origin","main""#, None),
+        (r#""branch","-D","topic""#, None),
+    ] {
+        for command in argv_git_scripts(tail) {
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(decision, "deny", "{command}: {rule}");
+            assert!(!rule.is_empty(), "denial needs a rule: {command}");
+            if let Some(expected) = expected_rule {
+                assert_eq!(rule, expected, "{command}");
+            }
+        }
+    }
+    for command in [
+        r#"python3 -c 'import subprocess; subprocess.run((["git","-C",p,"reset","--hard"]))'"#,
+        r#"node -e 'require("child_process").spawnSync("git",(["-C",p,"reset","--hard"]))'"#,
+    ] {
+        let (decision, rule) = hook_decision(command);
+        assert_eq!(decision, "deny", "parenthesized argv: {command}: {rule}");
+        assert_eq!(rule, "core.git:reset-hard", "{command}");
+    }
+}
+
+#[test]
+fn nested_expressions_and_quoted_arguments_keep_their_positions_issue_527() {
+    for command in [
+        r#"python3 -c 'import subprocess; subprocess.check_output(["git","-C",str(var),"diff","HEAD","--name-only"])'"#,
+        r#"python3 -c 'import subprocess; subprocess.run(["git","-C",choose("/tmp/a,b",nested(1,2)),"diff","HEAD"])'"#,
+        r#"node -e 'require("child_process").spawnSync("git",["-C",choose("a,b",{path: get(1,2)}),"diff","HEAD"])'"#,
+        r#"ruby -e 'system("git","-C",File.join(root,"a,b"),"diff","HEAD")'"#,
+        r#"python3 -c 'import subprocess; subprocess.run(["git","-C","/tmp/repo with spaces","diff","HEAD"])'"#,
+        r#"python3 -c 'import subprocess; subprocess.run(["git","-C","/tmp/quo\"te, path","diff","HEAD"])'"#,
+        r#"python3 -c 'import subprocess; subprocess.run(["git","-C","/tmp/repro","diff","HEAD"])'"#,
+        r#"python3 -c 'import subprocess; subprocess.run(["git","diff","HEAD"],cwd=p)'"#,
+    ] {
+        let (decision, rule) = hook_decision(command);
+        assert_eq!(decision, "allow", "{command}: {rule}");
+    }
+}
+
+#[test]
+fn unknown_rm_targets_do_not_disappear_behind_temp_targets_issue_527() {
+    for command in [
+        r#"python3 -c 'import subprocess; subprocess.run(["rm","-rf","/tmp/a",target])'"#,
+        r#"node -e 'require("child_process").spawnSync("rm",["-rf","/tmp/a",target])'"#,
+        r#"ruby -e 'system("rm","-rf","/tmp/a",target)'"#,
+        r#"python3 -c 'import subprocess; subprocess.run(["rm","-rf",choose("/tmp/a",target)])'"#,
+        r#"python3 -c 'import subprocess; subprocess.run(["r"+"m","-rf","/tmp/"+target])'"#,
+        r#"node -e 'require("child_process").spawnSync("r"+"m",["-rf","/etc"])'"#,
+        r#"python3 -c 'import subprocess; subprocess.run(["rm" if condition else "echo","-rf","/etc"])'"#,
+    ] {
+        let (decision, rule) = hook_decision(command);
+        assert_eq!(decision, "deny", "{command}: {rule}");
+        assert!(!rule.is_empty(), "denial needs a rule: {command}");
+    }
+    for command in [
+        r#"python3 -c 'import subprocess; subprocess.run(["r"+"m","-rf","/tmp/a"])'"#,
+        r#"node -e 'require("child_process").spawnSync("rm",["-rf","/tmp/a"])'"#,
+        r#"ruby -e 'system("rm","-rf","/tmp/a")'"#,
+    ] {
+        let (decision, rule) = hook_decision(command);
+        assert_eq!(decision, "allow", "literal temp control: {command}: {rule}");
+    }
+}
+
+#[test]
+fn spread_argv_requires_review_without_reclassifying_opaque_programs_issue_527() {
+    for command in [
+        r#"python3 -c 'import subprocess; subprocess.run(["git","-C",*paths,"diff","HEAD"])'"#,
+        r#"node -e 'require("child_process").spawnSync("git",["-C",...paths,"diff","HEAD"])'"#,
+        r#"ruby -e 'system("git","-C",*paths,"diff","HEAD")'"#,
+        r#"node -e 'require("child_process").spawnSync("git",args)'"#,
+        r#"python3 -c 'import subprocess; subprocess.run(["rm","-rf","/tmp/a",*targets])'"#,
+    ] {
+        let (decision, rule) = hook_decision(command);
+        assert_eq!(decision, "deny", "variable cardinality: {command}: {rule}");
+        assert!(rule.ends_with("argv_unverified"), "{command}: {rule}");
+    }
+    // A wholly opaque argv retains its existing posture. The string passed to
+    // program_for does not prove that argv[0] is git: preserving that unknown
+    // executable lets the launcher verifier review the following -C argument.
+    for (command, expected_decision, expected_rule) in [
+        (
+            "python3 -c 'import subprocess; subprocess.run(argv)'",
+            "allow",
+            "",
+        ),
+        (
+            r#"python3 -c 'import subprocess; subprocess.run([program_for("git"),"-C",p,"diff",revision])'"#,
+            "deny",
+            "heredoc.posix:inline-launcher-unverified",
+        ),
+    ] {
+        let (decision, rule) = hook_decision(command);
+        assert_eq!(
+            decision, expected_decision,
+            "unknown executable: {command}: {rule}"
+        );
+        assert_eq!(rule, expected_rule, "{command}");
+    }
 }

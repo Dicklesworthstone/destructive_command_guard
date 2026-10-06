@@ -4541,6 +4541,27 @@ mod hook_mode_tests {
         );
     }
 
+    fn assert_hook_denies_rule(command: &str, expected_rule: &str) {
+        let result = run_dcg_hook(command);
+        let stdout = result.stdout_str();
+        assert!(
+            result.output.status.success(),
+            "hook exit for {command:?}: {}",
+            result.stderr_str()
+        );
+        let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|error| {
+            panic!("invalid hook denial for {command:?}: {error}: {stdout}")
+        });
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{command:?}: {json}"
+        );
+        assert_eq!(
+            json["hookSpecificOutput"]["ruleId"], expected_rule,
+            "{command:?}: {json}"
+        );
+    }
+
     fn run_dcg_hook_in_dir_with_env(
         cwd: &std::path::Path,
         command: &str,
@@ -4883,6 +4904,124 @@ block = [
 
         for cmd in allow_cases {
             assert_hook_allows(cmd);
+        }
+    }
+
+    #[test]
+    fn hook_mode_quoted_interpreter_syntax_is_not_outer_shell_syntax() {
+        for command in [
+            r#"python3 - <<'PY'
+import re
+a = 'it\'s'
+b = '#'
+c = re.compile(r"^")
+PY"#,
+            r#"node <<'JS'
+const format = (value) => `# ${value} ^`;
+console.log(format("safe"));
+JS"#,
+        ] {
+            assert_hook_allows(command);
+        }
+    }
+
+    #[test]
+    fn hook_mode_quoted_sed_patterns_inside_loops_are_data() {
+        for command in [
+            "for x in a b; do\nls | sed 's|^\\./||'\ndone",
+            "for x in a b; do\nls | sed \"s|^\\./||\"\ndone",
+        ] {
+            assert_hook_allows(command);
+        }
+    }
+
+    #[test]
+    fn hook_mode_quoted_source_masking_preserves_outer_execution() {
+        for (command, rule) in [
+            ("g^it reset --hard", "core.git:reset-hard"),
+            (
+                r#"echo "$(Remove-Item -Recurse -Force C:\Users\Alice\project)""#,
+                "core.filesystem:powershell-remove-item-recursive",
+            ),
+            (
+                r"(Remove-Item -Recurse -Force C:\Users\Alice\project)",
+                "core.filesystem:powershell-remove-item-recursive",
+            ),
+            (
+                "python3 - <<'PY'\nprint(\"safe ^\")\nPY\ngit reset --hard",
+                "core.git:reset-hard",
+            ),
+        ] {
+            assert_hook_denies_rule(command, rule);
+        }
+        // An unquoted delimiter leaves expansions active in the parent shell.
+        assert_hook_denies("cat <<EOF\n$(rm -rf /etc)\nEOF");
+    }
+
+    #[test]
+    fn hook_mode_quoted_interpreter_source_keeps_destructive_sink_scans() {
+        for (command, rule) in [
+            (
+                "python3 - <<'PY'\nimport shutil\nshutil.rmtree(\"/home/alice/project\")\nPY",
+                "heredoc.python:shutil_rmtree",
+            ),
+            (
+                "python3 - <<'PY'\nfrom os import system as run\nrun(\"rm -rf /home/alice/project\")\nPY",
+                "heredoc.python:exec_sink.rm_rf_catastrophic",
+            ),
+            (
+                r#"python3 - <<'PY'
+import os
+os.system('ver & copy nul .git\\config')
+PY"#,
+                "core.filesystem:git-internals-write",
+            ),
+            (
+                r#"python3 - <<'PY'
+from os import system as run
+run('ver & copy nul .git\\config')
+PY"#,
+                "core.filesystem:git-internals-write",
+            ),
+            (
+                r#"python3 - <<'PY'
+import os
+run = os.system
+run('ver & copy nul .git\\config')
+PY"#,
+                "core.filesystem:git-internals-write",
+            ),
+            (
+                "python3 - <<'PY'\nimport os\nos.system('echo ok; Remove-Item -Recurse -Force C:/x')\nPY",
+                "core.filesystem:powershell-remove-item-recursive",
+            ),
+            (
+                "python3 - <<'PY'\nfrom os import system as run\nrun('echo ok; Remove-Item -Recurse -Force C:/x')\nPY",
+                "core.filesystem:powershell-remove-item-recursive",
+            ),
+            (
+                "python3 - <<'PY'\nimport os\nrun = os.system\nrun('echo ok; Remove-Item -Recurse -Force C:/x')\nPY",
+                "core.filesystem:powershell-remove-item-recursive",
+            ),
+        ] {
+            assert_hook_denies_rule(command, rule);
+        }
+    }
+
+    #[test]
+    fn hook_mode_interpreter_data_inputs_do_not_gain_source_masking() {
+        for command in [
+            r#"python3 -c 'import os,sys; os.system(sys.stdin.read())' <<'PY'
+copy nul .git\config
+PY"#,
+            r#"python3 script.py <<'PY'
+copy nul .git\config
+PY"#,
+            r#"node -e 'require("child_process").execSync(require("fs").readFileSync(0,"utf8"))' <<'JS'
+copy nul .git\config
+JS"#,
+        ] {
+            assert_hook_denies_rule(command, "core.filesystem:git-internals-write");
         }
     }
 

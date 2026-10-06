@@ -49,9 +49,6 @@ pub(crate) const GIT_INTERNALS_WRITE_NAME: &str = "git-internals-write";
 /// The single path component that anchors [`GIT_INTERNALS_WRITE_NAME`].
 const GIT_ANCHOR: &str = ".git";
 
-/// What [`may_name_protected_path`] looks for instead of the bare [`GIT_ANCHOR`].
-const GIT_ANCHOR_NEEDLE: &str = ".git/";
-
 /// Safer alternatives for a `.git` write, attached to the pack pattern.
 ///
 /// Deliberately not [`CREDENTIAL_FILE_WRITE_SUGGESTIONS`]: `chmod 600` and
@@ -268,23 +265,30 @@ fn may_name_protected_path_as_written(command: &str) -> bool {
             .chain(RELATIVE_ANCHORS.iter().filter(|anchor| **anchor != GIT_ANCHOR))
             .chain(RELATIVE_FILE_ANCHORS)
             .any(|needle| contains_ascii_case_insensitive(command, needle))
-        // `.git` is the one anchor whose bare name is too common to scan for.
-        // This gate is a substring test on the raw command, so listing it
-        // beside the others would wake the classifier for `.gitignore`,
-        // `.github/`, `.gitattributes` and `.gitmodules` — four of the most
-        // frequent tokens in a developer's shell — on every command, which is
-        // the same always-on cost `.config` was left out for.
-        //
-        // Requiring the separator costs exactly one spelling: a quote sitting
-        // between the anchor and the slash, `tee ".git"/config`. That is
-        // measured, not assumed — the equivalent `tee ".ssh"/id_rsa` IS caught
-        // today, which is why the other anchors keep their permissive needle
-        // and only this one is tightened. The redirect spellings of the same
-        // write are covered by the `redirect-*-git-internals-relative` rules
-        // regardless.
-        || contains_ascii_case_insensitive(command, GIT_ANCHOR_NEEDLE)
+        // The whole directory is also a destination: `tar -C .git` and
+        // `7z x -o.git` do not spell a following slash. Keep a component
+        // boundary so `.gitignore`, `.github/`, `.gitattributes` and
+        // `.gitmodules` still avoid the classifier's hot path.
+        || mentions_git_directory(command)
         || mentions_runtime_home(command)
         || rewrites_an_absolute_directory(command)
+}
+
+fn mentions_git_directory(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    bytes
+        .windows(GIT_ANCHOR.len())
+        .enumerate()
+        .any(|(start, candidate)| {
+            candidate.eq_ignore_ascii_case(GIT_ANCHOR.as_bytes())
+                && bytes.get(start + GIT_ANCHOR.len()).is_none_or(|byte| {
+                    byte.is_ascii_whitespace()
+                        || matches!(
+                            byte,
+                            b'/' | b'\'' | b'"' | b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>'
+                        )
+                })
+        })
 }
 
 /// Whether an absolute path in `command` has a glob or brace character in a
@@ -1413,8 +1417,8 @@ const RELATIVE_ANCHORS: &[&str] = &[
     // precedent: `.git/config` is repository state whether it is reached from
     // a checkout root or from three directories down. It denies under
     // `git-internals-write`, not `credential-file-write`, and unlike its
-    // neighbours it is gated on `.git/` rather than `.git` in
-    // `may_name_protected_path` — see the note there (#457).
+    // neighbours its cheap gate requires a component boundary after `.git`
+    // in `may_name_protected_path` — see the note there (#457).
     GIT_ANCHOR,
 ];
 
@@ -3597,56 +3601,389 @@ fn classify_rsync(args: &[&Word]) -> Option<CredentialFileWrite> {
 /// not this rule's business — and declining there is also what keeps this from
 /// colliding with `tar --remove-files`, which is about the source.
 fn classify_archive_extract(name: &str, args: &[&Word]) -> Option<CredentialFileWrite> {
-    let extracting = match name {
-        // `7z x` / `7z e` extract; `a` adds to an archive.
-        "7z" | "7za" | "7zr" => args
-            .iter()
-            .find(|word| !word.as_string().starts_with('-'))
-            .is_some_and(|word| matches!(word.as_string().as_str(), "x" | "e")),
-        // unzip extracts by default.
-        "unzip" => true,
-        // tar needs an explicit extract verb; `-czf` creates.
-        _ => args.iter().any(|word| {
-            let text = word.as_string();
-            text == "--extract"
-                || (text.starts_with('-') && !text.starts_with("--") && text.contains('x'))
-        }),
-    };
-    if !extracting {
-        return None;
+    match name {
+        // macOS calls bsdtar `tar`. Its option arities differ from GNU tar
+        // (`-s` takes a rewrite expression; `-H` does not take a value), so
+        // neither grammar alone can prove an invocation harmless everywhere.
+        "tar" => classify_tar_extract("tar", args).or_else(|| classify_tar_extract("bsdtar", args)),
+        "bsdtar" => classify_tar_extract(name, args),
+        "unzip" => classify_unzip_extract(args),
+        "7z" | "7za" | "7zr" => classify_7z_extract(args),
+        _ => None,
+    }
+}
+
+/// Consume an option's attached or following value without interpreting the
+/// value as another option. Traditional tar clusters always take the next
+/// word, unlike short clusters (`xfC archive dir` versus `-xfC`).
+fn archive_option_value(
+    word: &Word,
+    value_offset: usize,
+    args: &[&Word],
+    index: &mut usize,
+) -> Option<Word> {
+    if word.text.len() > value_offset {
+        Some(word.suffix(value_offset))
+    } else {
+        let value = (*args.get(*index)?).clone();
+        *index += 1;
+        Some(value)
+    }
+}
+
+#[derive(Default)]
+struct TarExtraction {
+    extracting: bool,
+    no_file_output: bool,
+    has_members: bool,
+    directory: Option<Word>,
+    member_hit: Option<CredentialFileWrite>,
+}
+
+impl TarExtraction {
+    fn flag(&mut self, flag: char, literal: bool) {
+        match flag {
+            'x' => self.extracting = true,
+            'c' | 'r' | 'u' | 'A' | 'd' | 't' | 'O' if literal => {
+                self.no_file_output = true;
+            }
+            _ => {}
+        }
     }
 
-    // An option that carries its value inside the same token is split, so the
-    // judges see the PATH rather than `-o/home/user/.ssh`. Judging the whole
-    // token instead silently declines, which an end-to-end test caught.
-    let mut destination: Option<Word> = None;
-    let mut index = 0;
-    while index < args.len() {
-        let text = args[index].as_string();
-        // `-o<dir>` (7z) carries its value with no space.
-        if matches!(name, "7z" | "7za" | "7zr") && text.starts_with("-o") && text.len() > 2 {
-            destination = args[index].value_suffix(2);
-            break;
+    fn long_option(
+        &mut self,
+        word: &Word,
+        prefix_len: usize,
+        args: &[&Word],
+        index: &mut usize,
+    ) -> Option<()> {
+        let long: String = word.text[prefix_len..].iter().collect();
+        let (option, attached) = long
+            .split_once('=')
+            .map_or((long.as_str(), false), |(key, _)| (key, true));
+        if !option.is_empty() && (option == "cd" || "directory".starts_with(option)) {
+            let value = if attached {
+                word.value_suffix(prefix_len + option.len() + 1)?
+            } else {
+                archive_option_value(word, word.text.len(), args, index)?
+            };
+            self.change_directory(value);
+        } else if !option.is_empty() && (option == "get" || "extract".starts_with(option)) {
+            self.extracting = true;
+        } else if (option.len() >= 5 && "files-from".starts_with(option))
+            || (option.len() >= 3 && "add-file".starts_with(option))
+        {
+            if !attached {
+                args.get(*index)?;
+                *index += 1;
+            }
+            self.possible_members();
+        } else if word.is_all_literal()
+            && matches!(
+                option,
+                "create"
+                    | "append"
+                    | "update"
+                    | "catenate"
+                    | "concatenate"
+                    | "delete"
+                    | "diff"
+                    | "compare"
+                    | "list"
+                    | "test-label"
+                    | "to-stdout"
+                    | "help"
+                    | "usage"
+                    | "version"
+            )
+        {
+            self.no_file_output = true;
+        } else if !attached
+            // These no-argument names are themselves prefixes of a value
+            // option. GNU's unique long abbreviations otherwise preserve
+            // arity, so --quote-char -O must consume -O as character data.
+            && !matches!(option, "checkpoint" | "sparse" | "xattrs")
+            && !option.is_empty()
+            && TAR_VALUE_LONGS.iter().any(|known| known.starts_with(option))
+        {
+            args.get(*index)?;
+            *index += 1;
         }
-        if text.starts_with("--directory=") {
-            destination = args[index].value_suffix("--directory=".chars().count());
-            break;
-        }
-        let takes_next = text == "-C"
-            || text == "--directory"
-            || (name == "unzip" && text == "-d")
-            // A tar short cluster ending in `C` takes the next word
-            // (`tar -xzfC` is not valid, but `tar -xC` is).
-            || (text.starts_with('-')
-                && !text.starts_with("--")
-                && text.ends_with('C'));
-        if takes_next {
-            destination = args.get(index + 1).map(|word| (*word).clone());
-            break;
-        }
-        index += 1;
+        Some(())
     }
-    let dest = &destination?;
+
+    fn change_directory(&mut self, mut directory: Word) {
+        // tar applies relative -C values from the preceding -C, not the
+        // caller's cwd. Keep their quoting/expansion provenance while joining
+        // them. An absolute path or a supported home expansion starts afresh.
+        let absolute = directory.text.first() == Some(&'/')
+            || (!directory.literal.first().copied().unwrap_or(true)
+                && (directory.text.first() == Some(&'~')
+                    || parse_variable(&directory).is_some_and(|(name, _)| {
+                        VARIABLE_ROOTS.iter().any(|(known, _, _)| *known == name)
+                    })));
+        if !absolute && let Some(mut previous) = self.directory.take() {
+            previous.text.push('/');
+            previous.literal.push(true);
+            previous.text.append(&mut directory.text);
+            previous.literal.append(&mut directory.literal);
+            previous.range = directory.range;
+            previous.glued_paren |= directory.glued_paren;
+            directory = previous;
+        }
+        self.directory = Some(directory);
+    }
+
+    fn member(&mut self) {
+        self.has_members = true;
+        self.possible_members();
+    }
+
+    fn possible_members(&mut self) {
+        // -T/--files-from (and BSD -I) select members at this -C position.
+        // The file contents are unknown, so keep this possible write without
+        // using the list to prove a later directory unused.
+        if self.member_hit.is_none()
+            && let Some(directory) = &self.directory
+        {
+            self.member_hit = judge_archive_directory(directory);
+        }
+    }
+
+    fn finish(self) -> Option<CredentialFileWrite> {
+        if !self.extracting || self.no_file_output {
+            return None;
+        }
+        self.member_hit.or_else(|| {
+            (!self.has_members)
+                .then_some(self.directory)
+                .flatten()
+                .and_then(|directory| judge_archive_directory(&directory))
+        })
+    }
+}
+
+/// Value-taking options must consume their arguments even when the value is
+/// spelled `-x`, `-O` or `-C`: those bytes are archive names, filters, dates or
+/// helper commands, not extraction modes or destinations.
+const TAR_VALUE_LONGS: &[&str] = &[
+    "add-file",
+    "after-date",
+    "block-size",
+    "blocking-factor",
+    "checkpoint-action",
+    "exclude",
+    "exclude-from",
+    "exclude-ignore",
+    "exclude-ignore-recursive",
+    "exclude-tag",
+    "exclude-tag-all",
+    "exclude-tag-under",
+    "file",
+    "files-from",
+    "format",
+    "gid",
+    "gname",
+    "group",
+    "group-map",
+    "hole-detection",
+    "include",
+    "index-file",
+    "info-script",
+    "label",
+    "level",
+    "listed-incremental",
+    "mode",
+    "mtime",
+    "new-volume-script",
+    "newer",
+    "newer-ctime",
+    "newer-ctime-than",
+    "newer-mtime",
+    "newer-mtime-than",
+    "newer-than",
+    "no-quote-chars",
+    "older",
+    "older-ctime",
+    "older-ctime-than",
+    "older-mtime",
+    "older-mtime-than",
+    "older-than",
+    "options",
+    "owner",
+    "owner-map",
+    "passphrase",
+    "pax-option",
+    "quote-chars",
+    "quoting-style",
+    "record-size",
+    "rmt-command",
+    "rsh-command",
+    "sort",
+    "sparse-version",
+    "starting-file",
+    "strip-components",
+    "suffix",
+    "tape-length",
+    "to-command",
+    "transform",
+    "uid",
+    "uname",
+    "use-compress-program",
+    "volno-file",
+    "warning",
+    "xattrs-exclude",
+    "xattrs-include",
+    "xform",
+];
+
+fn classify_tar_extract(name: &str, args: &[&Word]) -> Option<CredentialFileWrite> {
+    let mut extraction = TarExtraction::default();
+    let mut ended = false;
+    let mut index = 0;
+    while let Some(word) = args.get(index) {
+        let first = index == 0;
+        index += 1;
+        let text = word.as_string();
+        let literal = word.is_all_literal();
+        let traditional = first && !text.starts_with('-');
+        if ended || (!traditional && (!text.starts_with('-') || text == "-")) {
+            if literal && !text.is_empty() {
+                extraction.member();
+            } else {
+                // A dynamic expansion can disappear, leaving tar's default
+                // extract-all behavior in the final directory active.
+                extraction.possible_members();
+            }
+            // bsdtar stops parsing options at the first member. GNU tar
+            // continues, with each -C applying to the members that follow.
+            ended |= name == "bsdtar" && literal && !text.is_empty();
+            continue;
+        }
+        if text == "--" {
+            ended = true;
+            continue;
+        }
+        if text.starts_with("--") {
+            extraction.long_option(word, 2, args, &mut index)?;
+            continue;
+        }
+        let offset = usize::from(!traditional);
+        for position in offset..word.text.len() {
+            let flag = word.text[position];
+            let takes_value = if name == "bsdtar" {
+                "bCfIsTWX".contains(flag)
+            } else {
+                "bCfFgHIKLNTVX".contains(flag)
+            };
+            if takes_value {
+                let value_offset = if traditional {
+                    word.text.len()
+                } else {
+                    position + 1
+                };
+                let value = archive_option_value(word, value_offset, args, &mut index)?;
+                if flag == 'C' {
+                    extraction.change_directory(value);
+                } else if flag == 'T' || (name == "bsdtar" && flag == 'I') {
+                    extraction.possible_members();
+                } else if name == "bsdtar" && flag == 'W' {
+                    extraction.long_option(&value, 0, args, &mut index)?;
+                }
+                if !traditional {
+                    break;
+                }
+            } else {
+                extraction.flag(flag, literal);
+            }
+        }
+    }
+    extraction.finish()
+}
+
+fn classify_unzip_extract(args: &[&Word]) -> Option<CredentialFileWrite> {
+    let mut leading_options = true;
+    let mut no_file_output = false;
+    let mut negated_option = false;
+    let mut destination_hit = None;
+    let mut index = 0;
+    while let Some(word) = args.get(index) {
+        index += 1;
+        let text = word.as_string();
+        let literal = word.is_all_literal();
+        if !text.starts_with('-') || text == "-" {
+            leading_options = false;
+            continue;
+        }
+        // Info-ZIP accepts -d after the archive, but other option-looking
+        // words there are member names. In particular, a member named -l
+        // must not turn a real extraction into a safe listing proof.
+        if !leading_options {
+            if text.starts_with("-d") {
+                let directory = archive_option_value(word, 2, args, &mut index)?;
+                destination_hit = destination_hit.or_else(|| judge_archive_directory(&directory));
+            }
+            continue;
+        }
+        for position in 1..word.text.len() {
+            let flag = word.text[position];
+            if matches!(flag, 'd' | 'P' | 'I' | 'O') {
+                let value = archive_option_value(word, position + 1, args, &mut index)?;
+                if flag == 'd' {
+                    destination_hit = destination_hit.or_else(|| judge_archive_directory(&value));
+                }
+                break;
+            }
+            // Info-ZIP's --l / -l-l can undo a previous listing mode. Do not
+            // lift a protected-destination denial on an unmodeled negation.
+            negated_option |= flag == '-';
+            if literal && matches!(flag, 'l' | 'v' | 't' | 'T' | 'p' | 'c' | 'z' | 'Z' | 'h') {
+                no_file_output = true;
+            }
+        }
+    }
+    if no_file_output && !negated_option {
+        None
+    } else {
+        destination_hit
+    }
+}
+
+fn classify_7z_extract(args: &[&Word]) -> Option<CredentialFileWrite> {
+    let mut extracting = None;
+    let mut ended = false;
+    let mut no_file_output = false;
+    let mut destination_hit = None;
+    for word in args {
+        let text = word.as_string();
+        if ended || !text.starts_with('-') || text == "-" {
+            if extracting.is_none() {
+                extracting = Some(
+                    word.is_all_literal()
+                        && (text.eq_ignore_ascii_case("x") || text.eq_ignore_ascii_case("e")),
+                );
+            }
+        } else if text == "--" {
+            ended = true;
+        } else if word.is_all_literal() && text.eq_ignore_ascii_case("-so") {
+            no_file_output = true;
+        } else if text
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("-o"))
+            && let Some(directory) = word.value_suffix(2)
+        {
+            destination_hit = destination_hit.or_else(|| judge_archive_directory(&directory));
+        }
+    }
+    if extracting == Some(true) && !no_file_output {
+        destination_hit
+    } else {
+        None
+    }
+}
+
+fn judge_archive_directory(dest: &Word) -> Option<CredentialFileWrite> {
     let writer = Writer {
         kind: Some(WriterKind::ArchiveExtract),
         mode: WriteMode::Replace,
@@ -3656,12 +3993,18 @@ fn classify_archive_extract(name: &str, args: &[&Word]) -> Option<CredentialFile
 
 /// Judge a destination directory that will receive UNKNOWN archive members.
 ///
-/// This mirrors the `Exact::Parent` branch of [`judge_placement`], but without
-/// a source: an extraction can create ANY name in the directory, which is the
-/// same position a wildcard source puts `cp` in. Naming the first protected
-/// descendant is what makes the reason concrete rather than abstract.
+/// Only the named directory is judged. Archive member names are not evidence
+/// that an ordinary parent such as `/etc` or `~` contains a protected write.
 fn judge_extraction_destination(writer: Writer, dest: &Word) -> Option<CredentialFileWrite> {
-    resolve_all(dest)
+    // These options require a directory. Supplying that fact to the relative
+    // anchor resolver makes `.git` and `.ssh` identical to `.git/` and
+    // `.ssh/`, without treating a plain file operand with that name as a tree.
+    let mut directory = dest.clone();
+    if directory.text.last() != Some(&'/') {
+        directory.text.push('/');
+        directory.literal.push(true);
+    }
+    resolve_all(&directory)
         .iter()
         .find_map(|destination| judge_extraction_spelling(writer, dest, destination))
 }
@@ -3676,15 +4019,22 @@ fn judge_extraction_spelling(
     }
     let span = dest.range.clone();
     match exact(destination.root, &destination.comps) {
-        Exact::Protected { display, what, .. } => spelled_hit(
-            destination,
-            dest,
-            writer,
-            &display,
-            what,
-            rule_for(&destination.comps),
-            span,
-        ),
+        Exact::Protected { display, what, .. } => {
+            let display = if destination.rebased_at_anchor {
+                dest.as_string()
+            } else {
+                display
+            };
+            spelled_hit(
+                destination,
+                dest,
+                writer,
+                &display,
+                what,
+                rule_for(&destination.comps),
+                span,
+            )
+        }
         // A directory that merely CONTAINS protected files is not itself a
         // protected destination. `/etc` is the case that matters: dcg allows
         // `cp -r payload/ /etc/` and `rsync -a payload/ /etc/`, so extraction
@@ -4371,6 +4721,144 @@ mod tests {
         }
     }
 
+    #[test]
+    fn archive_extraction_reads_option_arity_and_traditional_tar_flags() {
+        for command in [
+            "tar xf payload.tar -C /home/user/.ssh",
+            "tar xfC payload.tar /home/user/.ssh",
+            "tar xCf /home/user/.ssh payload.tar",
+            "tar xvfC payload.tar /home/user/.ssh",
+            "bsdtar xfC payload.tar /home/user/.ssh",
+            "tar -x -s ',^,prefix/,' -f payload.tar -C /home/user/.ssh",
+            "tar --get -f payload.tar -C /home/user/.ssh",
+            "tar -xC/home/user/.ssh -fpayload.tar",
+            "tar --directory=/home/user/.ssh --extract --file=payload.tar",
+            "tar --extr --file=payload.tar --direc=/home/user/.ssh",
+            "bsdtar -W extract -f payload.tar -W directory=/home/user/.ssh",
+            "tar -W extract -f payload.tar -W directory=/home/user/.ssh",
+            "tar --exclude -C -xf payload.tar -C /home/user/.ssh",
+            "tar --exclude -O -xf payload.tar -C /home/user/.ssh",
+            "tar --quote-chars -O -xf payload.tar -C /home/user/.ssh",
+            "tar --quote-char -O -xf payload.tar -C /home/user/.ssh",
+            "bsdtar -x --passphrase -O -f payload.tar -C /home/user/.ssh",
+            "tar -xf -O -C /home/user/.ssh",
+            "tar -x --same-order --atime-preserve -f payload.tar -C /home/user/.ssh",
+            "tar -x --checkpoint --sparse --xattrs -f payload.tar -C /home/user/.ssh",
+            "unzip -d/home/user/.ssh payload.zip",
+            "unzip -od/home/user/.ssh payload.zip",
+            "unzip -d /home/user/.ssh -P ptvlcz payload.zip",
+            "unzip -Pptvlcz payload.zip -d /home/user/.ssh",
+            "unzip -I UTF-8 -O CP437 payload.zip -d /home/user/.ssh",
+            "7z -o/home/user/.ssh x payload.7z",
+            "7za e payload.7z -o/home/user/.ssh",
+            "7zr x -p-so payload.7z -o/home/user/.ssh",
+        ] {
+            let found = denied(command);
+            assert_eq!(found.rule, CREDENTIAL_FILE_WRITE_NAME, "{command}");
+        }
+    }
+
+    #[test]
+    fn archive_extraction_directory_options_prove_bare_relative_anchors() {
+        for (destination, expected) in [
+            (".git", GIT_INTERNALS_WRITE_NAME),
+            ("project/.git", GIT_INTERNALS_WRITE_NAME),
+            ("'project/.git'", GIT_INTERNALS_WRITE_NAME),
+            (".ssh", CREDENTIAL_FILE_WRITE_NAME),
+            ("./.gnupg", CREDENTIAL_FILE_WRITE_NAME),
+        ] {
+            for command in [
+                format!("tar -xf payload.tar -C {destination}"),
+                format!("bsdtar -xf payload.tar --directory={destination}"),
+                format!("unzip payload.zip -d {destination}"),
+                format!("7z x payload.7z -o{destination}"),
+            ] {
+                let found = denied(&command);
+                assert_eq!(found.rule, expected, "{command}");
+                assert!(found.reason.contains("extracting an archive"), "{command}");
+                assert!(command.get(found.span).is_some(), "{command}");
+            }
+        }
+    }
+
+    #[test]
+    fn archive_extraction_tracks_tar_directory_changes_at_member_positions() {
+        for command in [
+            "tar -xf payload.tar -C /tmp -C /home/user/.ssh",
+            "tar -xf payload.tar -C /home/user -C .ssh",
+            "tar -xf payload.tar -C /home/user/.config -C ../.ssh",
+            "tar -xf payload.tar -C /tmp -C '$HOME/.ssh'",
+            "tar -xf payload.tar -C /tmp -C \"$HOME/.ssh\"",
+            "tar -xf payload.tar -C /tmp first -C /home/user/.ssh second",
+            "tar -xf payload.tar -C /home/user/.ssh first -C /tmp second",
+            "tar -xf payload.tar -C /home/user/.ssh -T members.txt -C /tmp",
+            "tar -xf payload.tar -C /home/user/.ssh -Tmembers.txt -C /tmp",
+            "tar -xf payload.tar -C /home/user/.ssh --files-from members.txt -C /tmp",
+            "tar -xf payload.tar -C /home/user/.ssh --files=members.txt -C /tmp",
+            "tar -xf payload.tar -C /home/user/.ssh --add-file=member -C /tmp",
+            "tar -xf payload.tar -C /tmp -T members.txt -C /home/user/.ssh",
+            "tar -xf payload.tar -C /tmp $EMPTY -C /home/user/.ssh",
+            "bsdtar -xf payload.tar -C /tmp $EMPTY -C /home/user/.ssh",
+            "tar -xf payload.tar -C /tmp '' -C /home/user/.ssh",
+            "bsdtar -xf payload.tar -C /home/user/.ssh -I members.txt -C /tmp",
+            "tar -xf payload.tar -C project -C .git",
+            "bsdtar -xf payload.tar -C /home/user -C .ssh",
+            "unzip payload.zip -d /home/user/.ssh -l",
+            "unzip -l --l payload.zip -d /home/user/.ssh",
+            "unzip -- payload.zip -d /home/user/.ssh",
+        ] {
+            assert!(hit(command).is_some(), "{command}");
+        }
+        for command in [
+            "tar -xf payload.tar -C /home/user/.ssh -C /tmp",
+            "tar -xf payload.tar -C /home/user/.ssh -C ..",
+            "tar -xf payload.tar -C /tmp first -C /home/user/.ssh",
+            "tar -xf payload.tar -C /tmp -T members.txt -C ./build",
+            "tar -xf payload.tar -C /tmp $MEMBERS -C ./build",
+            "tar -tf payload.tar -C /home/user/.ssh -T members.txt -C /tmp",
+            "tar -xOf payload.tar -C /home/user/.ssh -T members.txt -C /tmp",
+            "tar -xf payload.tar -C /tmp -- -C /home/user/.ssh",
+            "bsdtar -xf payload.tar -C /tmp first -C /home/user/.ssh second",
+        ] {
+            allowed(command);
+        }
+    }
+
+    #[test]
+    fn archive_extraction_preserves_read_modes_and_option_looking_data() {
+        for command in [
+            "tar -xOf payload.tar -C /home/user/.ssh",
+            "tar xOfC payload.tar /home/user/.ssh",
+            "tar -xf payload.tar --to-stdout -C /home/user/.ssh",
+            "bsdtar -xOf payload.tar -C /home/user/.ssh",
+            "tar -tf payload.tar -C /home/user/.ssh",
+            "tar -cf -x -C /home/user/.ssh file",
+            "tar -cf payload.tar --exclude -x -C /home/user/.ssh file",
+            "tar -tf payload.tar -- -x -C /home/user/.ssh",
+            "tar -xf payload.tar -- -C /home/user/.ssh",
+            "tar -xfC /home/user/.ssh",
+            "unzip -l payload.zip -d /home/user/.ssh",
+            "unzip -v payload.zip -d /home/user/.ssh",
+            "unzip -t payload.zip -d /home/user/.ssh",
+            "unzip -p payload.zip -d /home/user/.ssh",
+            "unzip -c payload.zip -d /home/user/.ssh",
+            "unzip -z payload.zip -d /home/user/.ssh",
+            "unzip -Z payload.zip -d /home/user/.ssh",
+            "unzip -P-d payload.zip /home/user/.ssh",
+            "7z x -so payload.7z -o/home/user/.ssh",
+            "7z l payload.7z -o/home/user/.ssh",
+            "7z t payload.7z -o/home/user/.ssh",
+            "7z a payload.7z -o/home/user/.ssh",
+            "7z x -- -o/home/user/.ssh",
+            "tar -xf payload.tar -C",
+            "tar -xf payload.tar --directory=",
+            "unzip payload.zip -d",
+            "7z x payload.7z -o",
+        ] {
+            allowed(command);
+        }
+    }
+
     /// The carve-outs, which are what keep this from being a false-positive
     /// engine for the most ordinary build step there is.
     #[test]
@@ -4396,6 +4884,11 @@ mod tests {
             // `/etc` is deliberately out of scope: dcg does not judge
             // `cp -r payload/ /etc/` either.
             "tar -xf payload.tar -C /etc",
+            "tar -xf payload.tar -C ~",
+            "unzip payload.zip -d /etc",
+            "7z x payload.7z -o/etc",
+            "tar -xf payload.tar -C .github",
+            "unzip payload.zip -d ./git",
         ] {
             assert!(
                 hit(command).is_none(),
@@ -4577,7 +5070,7 @@ mod tests {
         }
     }
 
-    /// The gate needle is `.git/`, so the common neighbours never reach the
+    /// The gate requires a `.git` boundary, so common neighbours never reach the
     /// classifier at all — the hot-path half of the same decision.
     #[test]
     fn the_gate_ignores_git_adjacent_tokens() {
@@ -4593,6 +5086,8 @@ mod tests {
             );
         }
         assert!(may_name_protected_path("tee .git/config"));
+        assert!(may_name_protected_path("tar -xf payload.tar -C .git"));
+        assert!(may_name_protected_path("7z x payload.7z -o'.git'"));
     }
 
     fn denied(command: &str) -> CredentialFileWrite {

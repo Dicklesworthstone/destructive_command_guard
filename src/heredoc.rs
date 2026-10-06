@@ -44,6 +44,7 @@
 
 use memchr::memchr;
 use regex::RegexSet;
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -7801,25 +7802,139 @@ pub(crate) fn range_is_inert_interpreter_stdin(command: &str, range: &Range<usiz
         return false;
     };
     heredocs.iter().any(|heredoc| {
-        let ActiveHeredocBody::Heredoc {
-            body_start,
-            body_end,
-            delimiter_quoted,
-        } = heredoc.body
-        else {
-            return false;
-        };
-        if !delimiter_quoted || range.start < body_start || range.end > body_end {
-            return false;
-        }
-        let Some(target) = extract_heredoc_target_command(command, heredoc.operator_start) else {
-            return false;
-        };
-        if !is_non_shell_interpreter_stdin_command(&target) {
-            return false;
-        }
-        !stdin_data_sink_may_be_overridden(command, heredoc.operator_start, &target)
+        matches!(
+            heredoc.body,
+            ActiveHeredocBody::Heredoc { body_start, body_end, .. }
+                if range.start >= body_start && range.end <= body_end
+        ) && inert_interpreter_stdin_body(command, heredoc).is_some()
     })
+}
+
+fn inert_interpreter_stdin_body(command: &str, heredoc: &ActiveHeredoc) -> Option<Range<usize>> {
+    let ActiveHeredocBody::Heredoc {
+        body_start,
+        body_end,
+        delimiter_quoted: true,
+    } = heredoc.body
+    else {
+        return None;
+    };
+    let target = extract_heredoc_target_command(command, heredoc.operator_start)?;
+    (is_non_shell_interpreter_stdin_command(&target)
+        && !stdin_data_sink_may_be_overridden(command, heredoc.operator_start, &target))
+    .then_some(body_start..body_end)
+}
+
+/// A view for consumers asking only about OUTER shell syntax. A proven,
+/// quoted non-shell interpreter body cannot contribute a shell substitution
+/// or contradict the hook's shell label (#520, #523). Keep its byte offsets
+/// and newlines so findings outside the body still refer to the original.
+///
+/// This is deliberately separate from the pattern-matching view: interpreter
+/// source must still reach both the language-specific analysis and the raw
+/// destructive-pattern scan, including opaque or aliased execution sinks.
+#[must_use]
+pub(crate) fn mask_inert_interpreter_stdin(command: &str) -> Cow<'_, str> {
+    if !command.contains("<<") {
+        return Cow::Borrowed(command);
+    }
+    let Some(heredocs) = active_heredocs(command) else {
+        return Cow::Borrowed(command);
+    };
+    // Each proof inspects the owning command and visible executable lookup.
+    // Bound their count before those scans, just as extraction bounds bodies;
+    // exceeding the bound keeps all source visible to the conservative path.
+    if heredocs.len() > ExtractionLimits::default().max_heredocs {
+        return Cow::Borrowed(command);
+    }
+    let bodies: Vec<_> = heredocs
+        .iter()
+        .filter(|heredoc| {
+            let Some(owner) = plain_heredoc_command_at(command, heredoc.operator_start) else {
+                return false;
+            };
+            let Ok(words) = shell_words::split(&owner) else {
+                return false;
+            };
+            let Some((program, arguments)) = words.split_first() else {
+                return false;
+            };
+            let name = program.rsplit('/').next().unwrap_or(program);
+            matches!(
+                ScriptLanguage::from_command(name),
+                ScriptLanguage::Python
+                    | ScriptLanguage::JavaScript
+                    | ScriptLanguage::Ruby
+                    | ScriptLanguage::Perl
+                    | ScriptLanguage::Php
+            ) && (arguments.is_empty() || matches!(arguments, [arg] if arg == "-"))
+        })
+        .filter_map(|heredoc| inert_interpreter_stdin_body(command, heredoc))
+        .collect();
+    if bodies.is_empty() {
+        Cow::Borrowed(command)
+    } else {
+        Cow::Owned(blank_ranges(command, &bodies))
+    }
+}
+
+/// The plain command owning one heredoc, with no other redirection, pipeline
+/// or trailing argument hidden under the redirection node. Callers use this
+/// narrow shape to prove how stdin is consumed; an interpreter running `-c`
+/// or a script file can hand stdin to a shell and is not such a proof.
+pub(crate) fn plain_heredoc_command_at(command: &str, operator_start: usize) -> Option<String> {
+    if command.len() > MAX_SUBSTITUTION_SOURCE_BYTES
+        || longest_pipeline_stages(command) > MAX_PARSED_PIPELINE_STAGES
+    {
+        return None;
+    }
+    let ast = AstGrep::try_new(command, SupportLang::Bash).ok()?;
+    if ast.root().get_inner_node().has_error() {
+        return None;
+    }
+    let mut pending = vec![ast.root()];
+    while let Some(node) = pending.pop() {
+        if node.kind().as_ref() == "heredoc_redirect"
+            && node
+                .text()
+                .find("<<")
+                .map(|offset| node.range().start + offset)
+                == Some(operator_start)
+        {
+            if node
+                .children()
+                .filter(ast_grep_core::Node::is_named)
+                .any(|child| {
+                    !matches!(
+                        child.kind().as_ref(),
+                        "heredoc_start" | "heredoc_body" | "heredoc_end"
+                    )
+                })
+            {
+                return None;
+            }
+            let statement = node.parent()?;
+            if statement.kind().as_ref() != "redirected_statement"
+                || statement
+                    .children()
+                    .filter(ast_grep_core::Node::is_named)
+                    .any(|child| !matches!(child.kind().as_ref(), "command" | "heredoc_redirect"))
+                || statement
+                    .children()
+                    .filter(|child| child.kind().as_ref() == "heredoc_redirect")
+                    .count()
+                    != 1
+            {
+                return None;
+            }
+            return statement
+                .children()
+                .find(|child| child.kind().as_ref() == "command")
+                .map(|owner| owner.text().to_string());
+        }
+        pending.extend(node.children());
+    }
+    None
 }
 
 /// Whether the command owning the heredoc or here-string at `heredoc_start`
@@ -8563,6 +8678,22 @@ pub(crate) fn heredoc_bodies_with_operators(command: &str) -> Vec<(Range<usize>,
             Some((body, heredoc.operator_start))
         })
         .collect()
+}
+
+/// The quoted body belonging to this exact operator. This retains source
+/// identity when a pipeline consumer supplies the body's interpreter language;
+/// identical text in another heredoc cannot establish that relationship.
+pub(crate) fn quoted_heredoc_body_at(command: &str, operator_start: usize) -> Option<Range<usize>> {
+    active_heredocs(command)?
+        .into_iter()
+        .find_map(|heredoc| match heredoc.body {
+            ActiveHeredocBody::Heredoc {
+                body_start,
+                body_end,
+                delimiter_quoted: true,
+            } if heredoc.operator_start == operator_start => Some(body_start..body_end),
+            ActiveHeredocBody::HereString | ActiveHeredocBody::Heredoc { .. } => None,
+        })
 }
 
 /// `command` with every byte inside `ranges` (other than newlines) blanked.
@@ -15675,6 +15806,66 @@ EOF";
 
     mod inert_interpreter_stdin {
         use super::*;
+
+        #[test]
+        fn syntax_view_preserves_outer_source_and_raw_interpreter_analysis() {
+            let command = "echo before\npython3 - <<'PY'\na = 'it\\'s'\nb = '#'\nc = re.compile(r\"^\")\nlabel = 'café'\nrun('rm -rf ~')\nPY\ngit reset --hard";
+            let masked = mask_inert_interpreter_stdin(command);
+            assert!(!masked.contains("re.compile"));
+            assert!(!masked.contains("run("));
+            assert_eq!(masked.len(), command.len());
+            assert_eq!(masked.lines().count(), command.lines().count());
+            assert!(masked.starts_with("echo before\npython3 - <<'PY'\n"));
+            assert!(masked.ends_with("PY\ngit reset --hard"));
+            assert_eq!(
+                masked.find("git reset --hard"),
+                command.find("git reset --hard")
+            );
+            assert!(mask_non_expanding_data_heredocs(command).contains("run('rm -rf ~')"));
+        }
+
+        #[test]
+        fn syntax_view_requires_a_proven_program_from_stdin() {
+            for header in [
+                "python3 -",
+                "/usr/bin/python3 -",
+                "node -",
+                "ruby",
+                "perl -",
+                "php",
+            ] {
+                let command = format!("{header} <<'EOF'\ncopy nul .git\\config\nEOF");
+                assert!(
+                    !mask_inert_interpreter_stdin(&command).contains("copy nul"),
+                    "{command}"
+                );
+            }
+            for command in [
+                "python3 -c 'import os,sys; os.system(sys.stdin.read())' <<'PY'\ncopy nul .git\\config\nPY",
+                "python3 script.py <<'PY'\ncopy nul .git\\config\nPY",
+                "python3 <<'PY' script.py\ncopy nul .git\\config\nPY",
+                "node -e 'eval(require(\"fs\").readFileSync(0,\"utf8\"))' <<'JS'\ncopy nul .git\\config\nJS",
+                "python3 - <<PY\n$(git reset --hard)\nPY",
+                "bash <<'SH'\ncopy nul .git\\config\nSH",
+                "env python3 - <<'PY'\ncopy nul .git\\config\nPY",
+                "python3() { bash -s; }; python3 - <<'PY'\ncopy nul .git\\config\nPY",
+                "PATH=/tmp python3 - <<'PY'\ncopy nul .git\\config\nPY",
+                "/tmp/python3 - <<'PY'\ncopy nul .git\\config\nPY",
+            ] {
+                assert_eq!(mask_inert_interpreter_stdin(command), command, "{command}");
+            }
+        }
+
+        #[test]
+        fn quoted_body_lookup_keeps_operator_identity() {
+            let command = "cat <<'A'\nsame text\nA\ncat <<B\nsame text\nB";
+            let quoted = command.find("<<'A'").unwrap();
+            let expanding = command.find("<<B").unwrap();
+            let body = quoted_heredoc_body_at(command, quoted).expect("quoted body");
+            assert!(command[body].contains("same text"));
+            assert!(quoted_heredoc_body_at(command, expanding).is_none());
+            assert!(quoted_heredoc_body_at(command, quoted + 1).is_none());
+        }
 
         /// Ask the predicate about the span of `needle` inside `command`.
         fn needle_is_inert(command: &str, needle: &str) -> bool {
