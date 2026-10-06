@@ -306,6 +306,16 @@ it to `[packs] enabled` — see [Enable More Protection](#enable-more-protection
 - `system.permissions` - Protects against dangerous permission changes like chmod 777, recursive chmod/chown on system directories.
 - `system.services` - Protects against dangerous service operations like stopping critical services and modifying init configuration.
 
+When `system.permissions` is enabled, POSIX `chmod`, `chown`, and `chgrp`
+checks use the complete invocation: recursive options can occur after targets
+or in flag bundles, and option values such as `--reference="chmod 777 notes"`
+remain filename data. The ordinary relative-file `chmod` exemption requires
+every target to qualify and no recursive option. Thus `chmod 755 notes -vR /etc`
+and `chmod 777 notes /etc/shadow` require review. Independent rule matches stay
+separate: granting `chmod-777` does not also grant `chmod-recursive-root`, and
+granting `chmod-setuid` does not exempt a simultaneous `chmod-setgid` match.
+Unsupported or dynamic arguments retain conservative pattern checks.
+
 ### CI/CD Packs
 - `cicd.circleci` - Protects against destructive CircleCI operations like deleting contexts, removing secrets, deleting orbs/namespaces, or removing pipelines.
 - `cicd.github_actions` - Protects against destructive GitHub Actions operations like deleting secrets/variables or using gh api DELETE against /actions endpoints.

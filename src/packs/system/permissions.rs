@@ -6,9 +6,347 @@
 //! - chown -R on system directories
 //! - setfacl with dangerous patterns
 
+use crate::destructive_pattern;
 use crate::packs::regex_engine::LazyCompiledRegex;
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
-use crate::{destructive_pattern, safe_pattern};
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PosixPermissionDecision {
+    NoMatch,
+    NonDestructive,
+    Destructive(Vec<&'static str>),
+}
+
+struct PermissionWord {
+    text: String,
+    ordinary_relative: bool,
+    expands_home: bool,
+}
+
+/// Decode a literal word, retaining the home spellings already protected by
+/// this pack. Other expansions cannot prove a complete argv and must leave the
+/// conservative matcher in charge. Quoted option values remain single words.
+fn permission_word(raw: &str) -> Option<PermissionWord> {
+    let mut decoded = shell_words::split(raw).ok()?;
+    if decoded.len() != 1 {
+        return None;
+    }
+    let text = decoded.pop()?;
+    let mut single = false;
+    let mut double = false;
+    let mut expands_home = false;
+    let mut chars = raw.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '\\' if !single => {
+                let (_, next) = chars.peek().copied()?;
+                if !double || matches!(next, '$' | '`' | '"' | '\\' | '\n') {
+                    chars.next();
+                }
+            }
+            '$' if !single => {
+                // `$HOME_suffix` is another variable. Only a leading HOME
+                // expansion followed by a path boundary is modeled here.
+                if index != 0 && !(index == 1 && raw.starts_with('"')) {
+                    return None;
+                }
+                let tail = &raw[index..];
+                let variable = if tail.starts_with("${HOME}") {
+                    "${HOME}"
+                } else if tail.starts_with("$HOME") {
+                    "$HOME"
+                } else {
+                    return None;
+                };
+                if !tail[variable.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|next| next == '/' || double && next == '"')
+                {
+                    return None;
+                }
+                for _ in 1..variable.len() {
+                    chars.next();
+                }
+                expands_home = true;
+            }
+            '`' if !single => return None,
+            '~' if !single && !double && index == 0 => {
+                if !raw[1..].is_empty() && !raw[1..].starts_with('/') {
+                    return None;
+                }
+                expands_home = true;
+            }
+            '*' | '?' | '[' | ']' | '{' | '}' | '<' | '>' | '(' | ')' | ';' | '&' | '|'
+                if !single && !double =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    Some(PermissionWord {
+        ordinary_relative: !text.is_empty()
+            && !text.starts_with('/')
+            && !raw.starts_with(['/', '~', '$', '"', '\''])
+            && !expands_home,
+        text,
+        expands_home,
+    })
+}
+
+struct PermissionInvocation {
+    executable: String,
+    recursive: bool,
+    mode_or_owner: Option<PermissionWord>,
+    targets: Vec<PermissionWord>,
+}
+
+fn permission_invocation(command: &str) -> Option<PermissionInvocation> {
+    use crate::normalize::{
+        NormalizeTokenKind, strip_wrapper_prefixes, tokenize_for_normalization,
+    };
+
+    // Validate before stripping wrappers: unresolved shell code in a wrapper
+    // cannot establish that the remaining text is a complete invocation.
+    let tokens = tokenize_for_normalization(command);
+    for token in &tokens {
+        if token.kind != NormalizeTokenKind::Word {
+            return None;
+        }
+        permission_word(token.text(command)?)?;
+    }
+    let stripped = strip_wrapper_prefixes(command);
+    if stripped.wrapper_limit_reached {
+        return None;
+    }
+    let command = stripped.normalized.as_ref();
+    let words = tokenize_for_normalization(command)
+        .iter()
+        .map(|token| permission_word(token.text(command)?))
+        .collect::<Option<Vec<_>>>()?;
+    let mut words = words.into_iter();
+    let executable = words.next()?.text.rsplit('/').next()?.to_string();
+    if !matches!(executable.as_str(), "chmod" | "chown" | "chgrp") {
+        return None;
+    }
+    let mut recursive = false;
+    let mut reference = false;
+    let mut options = true;
+    let mut operands = Vec::new();
+    while let Some(word) = words.next() {
+        if options && word.text == "--" {
+            options = false;
+        } else if options && word.text.starts_with("--") {
+            let (name, value) = word.text[2..]
+                .split_once('=')
+                .map_or((&word.text[2..], None), |(name, value)| (name, Some(value)));
+            let mut candidates = [
+                "recursive",
+                "reference",
+                "changes",
+                "silent",
+                "quiet",
+                "verbose",
+                "preserve-root",
+                "no-preserve-root",
+                "dereference",
+                "no-dereference",
+                "from",
+            ]
+            .into_iter()
+            .filter(|candidate| {
+                *candidate == name || !name.is_empty() && candidate.starts_with(name)
+            })
+            .filter(|candidate| executable == "chown" || *candidate != "from");
+            let option = candidates.next()?;
+            if candidates.next().is_some() {
+                return None;
+            }
+            match option {
+                "reference" | "from" => {
+                    if value.is_none() {
+                        words.next()?;
+                    }
+                    reference |= option == "reference";
+                }
+                _ if value.is_some() => return None,
+                "recursive" => recursive = true,
+                _ => {}
+            }
+        } else if options
+            && word.text.starts_with('-')
+            && word.text.len() > 1
+            && word.text[1..]
+                .chars()
+                .all(|flag| matches!(flag, 'c' | 'f' | 'v' | 'R' | 'H' | 'L' | 'P' | 'h'))
+        {
+            recursive |= word.text.contains('R');
+        } else if options
+            && word.text.starts_with('-')
+            && !(executable == "chmod" && chmod_mode(&word.text).is_some())
+        {
+            return None;
+        } else {
+            operands.push(word);
+        }
+    }
+    let mut operands = operands.into_iter();
+    let mode_or_owner = if reference {
+        None
+    } else {
+        Some(operands.next()?)
+    };
+    if executable == "chmod"
+        && mode_or_owner
+            .as_ref()
+            .is_some_and(|mode| chmod_mode(&mode.text).is_none())
+    {
+        return None;
+    }
+    let targets: Vec<_> = operands.collect();
+    if targets.is_empty() {
+        return None;
+    }
+    Some(PermissionInvocation {
+        executable,
+        recursive,
+        mode_or_owner,
+        targets,
+    })
+}
+
+/// Return the existing chmod predicates for a supported literal mode. Complex
+/// symbolic expressions retain the regex fallback instead of being mistaken
+/// for harmless modes or targets containing flag-like data.
+fn chmod_mode(mode: &str) -> Option<(bool, bool, bool)> {
+    if (3..=4).contains(&mode.len()) && mode.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
+        let bits = u16::from_str_radix(mode, 8).ok()?;
+        return Some((bits == 0o777, bits & 0o4000 != 0, bits & 0o2000 != 0));
+    }
+    let permissions = mode
+        .strip_prefix(['u', 'g', 'o', 'a'])
+        .unwrap_or(mode)
+        .strip_prefix(['+', '-'])?;
+    if permissions.is_empty()
+        || !permissions
+            .chars()
+            .all(|ch| matches!(ch, 'r' | 'w' | 'x' | 'X' | 's' | 't'))
+    {
+        return None;
+    }
+    // Preserve the currently authored symbolic predicates; changing which
+    // permission modes this opt-in pack claims is a separate posture decision.
+    Some((false, mode.starts_with("u+s"), mode.starts_with("g+s")))
+}
+
+fn routine_chmod(invocation: &PermissionInvocation) -> bool {
+    invocation.executable == "chmod"
+        && !invocation.recursive
+        && invocation
+            .mode_or_owner
+            .as_ref()
+            .is_some_and(|mode| mode.ordinary_relative)
+        && invocation
+            .targets
+            .iter()
+            .all(|target| target.ordinary_relative)
+}
+
+fn protected_permission_target(target: &PermissionWord) -> bool {
+    if target.expands_home {
+        return matches!(target.text.trim_end_matches('/'), "~" | "$HOME" | "${HOME}");
+    }
+    let Some(path) = target.text.strip_prefix('/') else {
+        return false;
+    };
+    let mut components = path.trim_end_matches('/').split('/');
+    let root = components.next().unwrap_or_default();
+    if root.is_empty() {
+        return true;
+    }
+    if matches!(root, "home" | "Users") {
+        return components.count() <= 1;
+    }
+    // Retain the authored rules' named-tree word boundary as well as their
+    // home-depth carve-out; this argv repair does not narrow target coverage.
+    [
+        "bin", "boot", "dev", "etc", "lib64", "lib", "opt", "proc", "root", "run", "sbin", "srv",
+        "sys", "usr", "var",
+    ]
+    .iter()
+    .any(|name| {
+        root.strip_prefix(*name).is_some_and(|suffix| {
+            suffix
+                .chars()
+                .next()
+                .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+        })
+    })
+}
+
+pub(crate) fn posix_chmod_is_safe(command: &str) -> bool {
+    permission_invocation(command)
+        .as_ref()
+        .is_some_and(routine_chmod)
+}
+
+/// Classify a fully understood POSIX invocation, returning every matching rule
+/// in authored order. An exception for chmod-777 must not silently exempt a
+/// recursive system-tree mutation. Unsupported syntax retains the old matcher.
+pub(crate) fn posix_permission_decision(
+    command: &str,
+    dialect: crate::normalize::ShellDialect,
+) -> PosixPermissionDecision {
+    if !matches!(
+        dialect,
+        crate::normalize::ShellDialect::Posix | crate::normalize::ShellDialect::Unknown
+    ) {
+        return PosixPermissionDecision::NoMatch;
+    }
+    let Some(invocation) = permission_invocation(command) else {
+        return PosixPermissionDecision::NoMatch;
+    };
+    if routine_chmod(&invocation) {
+        return PosixPermissionDecision::NonDestructive;
+    }
+    let mut rules = Vec::new();
+    let mode = invocation
+        .mode_or_owner
+        .as_ref()
+        .map(|word| word.text.as_str());
+    let chmod_bits = (invocation.executable == "chmod")
+        .then(|| mode.and_then(chmod_mode))
+        .flatten();
+    if chmod_bits.is_some_and(|bits| bits.0) {
+        rules.push("chmod-777");
+    }
+    if invocation.recursive && invocation.targets.iter().any(protected_permission_target) {
+        rules.push(match invocation.executable.as_str() {
+            "chmod" => "chmod-recursive-root",
+            "chown" => "chown-recursive-root",
+            _ => "chgrp-recursive-root",
+        });
+    }
+    if chmod_bits.is_some_and(|bits| bits.1) {
+        rules.push("chmod-setuid");
+    }
+    if chmod_bits.is_some_and(|bits| bits.2) {
+        rules.push("chmod-setgid");
+    }
+    if invocation.executable == "chown"
+        && mode.is_some_and(|owner| owner == "root" || owner.starts_with("root:"))
+    {
+        rules.push("chown-to-root");
+    }
+    if rules.is_empty() {
+        PosixPermissionDecision::NonDestructive
+    } else {
+        PosixPermissionDecision::Destructive(rules)
+    }
+}
 
 /// Anchor a read-only exemption to the command the segment actually runs.
 ///
@@ -81,32 +419,9 @@ pub fn create_pack() -> Pack {
 
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
-        // A non-recursive chmod on an ordinary file is routine, so it is
-        // exempted. The exemption keyed only on "the target does not begin with
-        // `/`", and a safe match short-circuits the whole pack, so every other
-        // way of naming an absolute or home path walked straight through it:
-        //
-        //   chmod 777 /etc/shadow        denied
-        //   chmod 777 "/etc/shadow"      ALLOWED   <- same file, one quote
-        //   chmod 777 ~/.ssh/id_rsa      ALLOWED
-        //   chmod 777 $HOME/.ssh/id_rsa  ALLOWED
-        //   chmod 4755 ~/bin/tool        ALLOWED   <- setuid, same cause
-        //
-        // The quoted spelling is the sharpest: the shell unquotes it to the
-        // identical path, so the deny and the allow name the same file. This is
-        // the `~`/`$HOME` family that #489 fixed for the RECURSIVE rules, in
-        // the one place that is a safe pattern rather than a destructive one —
-        // and `quote_bypass_does_not_evade_system_dir_block` pinned only the
-        // recursive half.
-        //
-        // Excluding `~`, `$`, `"` and `'` alongside `/` costs nothing real:
-        // those four never begin an ordinary relative filename, and a target
-        // that is genuinely plain (`notes.txt`, `./build`) still matches. The
-        // exemption is narrowed, never a destructive pattern widened.
-        safe_pattern!(
-            "chmod-non-recursive",
-            r#"chmod\s+(?!-[rR])(?:\d{3,4}|[ugoa][+-][rwxXst]+)\s+[^/~$"']"#
-        ),
+        // The chmod exemption is now proven by routine_chmod: every target
+        // must be ordinary and no later argument may turn on recursion.
+        // Prefix matches also let a reference filename forge a safe command.
         // stat is safe (read-only), but only when stat is what runs. As a bare
         // word it matched anywhere in the segment, and a safe match
         // short-circuits the pack, so `chmod -R 777 /etc --reference=/tmp/stat`
@@ -174,7 +489,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // quotes but not single ones, so it takes an optional `"` only.
         destructive_pattern!(
             "chmod-recursive-root",
-            r#"chmod\s+(?:.*(?:-[rR]|--recursive)).*\s+(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))"#,
+            r#"chmod\s+(?:.*(?:-[a-zA-Z]*[rR]|--recursive)).*\s+(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))"#,
             "chmod -R on system directories can break system permissions.",
             Critical,
             "Recursively changing permissions on system directories can render the system \
@@ -188,7 +503,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chown -R on root or system directories
         destructive_pattern!(
             "chown-recursive-root",
-            r#"chown\s+(?:.*(?:-[rR]|--recursive)).*\s+(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))"#,
+            r#"chown\s+(?:.*(?:-[a-zA-Z]*[rR]|--recursive)).*\s+(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))"#,
             "chown -R on system directories can break system ownership.",
             High,
             "Recursive ownership changes on system directories can disrupt services, \
@@ -209,7 +524,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // the effect is the same kind of change to the same metadata.
         destructive_pattern!(
             "chgrp-recursive-root",
-            r#"chgrp\s+(?:.*(?:-[rR]|--recursive)).*\s+(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))"#,
+            r#"chgrp\s+(?:.*(?:-[a-zA-Z]*[rR]|--recursive)).*\s+(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))"#,
             "chgrp -R on system directories can break system group ownership.",
             High,
             "Recursive group changes on system directories can disrupt services that \
@@ -358,8 +673,120 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::normalize::ShellDialect;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    #[test]
+    fn chmod_exemption_requires_the_complete_invocation() {
+        let pack = create_pack();
+        for command in [
+            "chmod 755 file -R /etc",
+            "chmod 755 --recursive /etc",
+            "chmod 777 notes /etc/shadow",
+            "chmod 777 notes $HOME/.ssh/id_rsa",
+            "chmod 4755 notes ~/bin/tool",
+            "chmod -R --reference=\"chmod 777 notes\" /etc",
+            "chown -R --reference=\"chmod 777 notes\" /etc",
+            "chgrp -R --reference=\"chmod 777 notes\" /etc",
+            "chmod 777 notes $other_targets",
+            "chmod 777 notes --unknown-option",
+        ] {
+            assert!(!pack.matches_safe(command), "{command:?}");
+            assert!(
+                !pack.matches_safe_with_deadline(command, None),
+                "{command:?}"
+            );
+        }
+        for command in [
+            "chmod 777 notes",
+            "chmod 4755 ./tool",
+            "chmod u+x ./script.sh",
+        ] {
+            assert!(pack.matches_safe(command), "{command:?}");
+            assert!(
+                pack.matches_safe_with_deadline(command, None),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_permission_roles_distinguish_options_values_and_operands() {
+        for command in [
+            "chmod -R --reference=/etc/passwd ./project",
+            "chmod --reference '-vR' /etc",
+            "chmod 644 notes -- -R /etc",
+            "chmod -- -r /etc",
+            "chown --from=root nobody /tmp/file",
+            "chown --from -vR nobody /etc",
+            "chown -vR --reference /etc/passwd ./project",
+            "chgrp -vR --reference /etc/passwd ./project",
+            "chgrp staff -- -R /etc",
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NonDestructive,
+                "{command:?}"
+            );
+        }
+        for (command, rule) in [
+            ("chmod -vR 755 /etc", "chmod-recursive-root"),
+            ("chmod 755 /etc -fvR", "chmod-recursive-root"),
+            ("chmod --rec --ref=/tmp/mode /etc", "chmod-recursive-root"),
+            ("chown nobody /etc -vR", "chown-recursive-root"),
+            ("chgrp -vR staff /Users/user", "chgrp-recursive-root"),
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::Destructive(vec![rule]),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_permissions_keep_every_independent_rule_identity() {
+        for (command, rules) in [
+            (
+                "chmod -vR 777 /etc",
+                vec!["chmod-777", "chmod-recursive-root"],
+            ),
+            ("chmod 6755 /etc/file", vec!["chmod-setuid", "chmod-setgid"]),
+            (
+                "chown -vR root /etc",
+                vec!["chown-recursive-root", "chown-to-root"],
+            ),
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::Destructive(rules),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_permission_argv_never_proves_safety() {
+        for command in [
+            "chmod -vR $(cat mode) /etc",
+            "chmod 777 file $targets",
+            "chmod 777 file*",
+            "chmod 777 'unterminated",
+            "chmod --reference",
+            "chmod --unknown=755 /etc",
+            "chmod --re 755 /etc",
+            "chmod 755 notes; chmod 777 /etc",
+            "echo 'chmod 777 notes'",
+        ] {
+            assert!(!posix_chmod_is_safe(command), "{command:?}");
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NoMatch,
+                "{command:?}"
+            );
+        }
+    }
 
     #[test]
     fn read_only_tool_names_in_argument_data_do_not_disarm_the_pack_issue_448() {

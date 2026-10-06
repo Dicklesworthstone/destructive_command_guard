@@ -21763,6 +21763,94 @@ fn evaluate_packs_with_allowlists_at_depth(
                 return result;
             }
             continue;
+        } else if pack_id == "system.permissions"
+            && matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        {
+            // Preserve quoted option values for argv roles. A string such as
+            // --reference="chmod 777 notes" is one data argument, never a
+            // second invocation capable of exempting this entire pack.
+            let permissions_command = scp_semantic_masked.as_ref();
+            let permissions_ranges =
+                command_segment_ranges_in_dialect(permissions_command, shell_dialect);
+            for &(start, end) in &permissions_ranges {
+                if deadline_exceeded(deadline)
+                    || remaining_below(deadline, &crate::perf::PATTERN_MATCH)
+                {
+                    return EvaluationResult::indeterminate_due_to_budget();
+                }
+                let segment = &permissions_command[start..end];
+                match crate::packs::system::permissions::posix_permission_decision(
+                    segment,
+                    shell_dialect,
+                ) {
+                    crate::packs::system::permissions::PosixPermissionDecision::NonDestructive => {
+                        continue;
+                    }
+                    crate::packs::system::permissions::PosixPermissionDecision::Destructive(
+                        names,
+                    ) => {
+                        // All independent hits remain reviewable. Granting
+                        // chmod-777 does not also grant recursive-root.
+                        for name in names {
+                            if let Some(result) = evaluate_named_pack_rule(
+                                pack_id,
+                                pack,
+                                name,
+                                allowlists,
+                                project_path,
+                                &mut first_allowlist_hit,
+                            ) {
+                                return result;
+                            }
+                        }
+                        continue;
+                    }
+                    crate::packs::system::permissions::PosixPermissionDecision::NoMatch => {}
+                }
+                // Never prove a complete chmod argv from a view that may have
+                // masked an unresolved later target or shell expansion.
+                if pack.matches_safe_with_deadline(segment, deadline) {
+                    continue;
+                }
+                let nested_ranges: Vec<_> = permissions_ranges
+                    .iter()
+                    .copied()
+                    .filter(|&(nested_start, nested_end)| {
+                        nested_start >= start
+                            && nested_end <= end
+                            && (nested_start != start || nested_end != end)
+                    })
+                    .collect();
+                let sanitized = sanitize_for_pattern_matching(segment);
+                let masked = mask_nested_segment_ranges(sanitized.as_ref(), start, &nested_ranges);
+                // Unsupported argv still needs the established executable
+                // decoding, such as ch$'mod' or a quoted chmod followed by a
+                // dynamic target. Decode only the destructive fallback: its
+                // masked arguments cannot establish a safe invocation. Mask
+                // child domains first, while their source offsets are valid.
+                let fallback =
+                    crate::normalize::normalize_command_in_dialect(masked.as_ref(), shell_dialect);
+                let fallback_offset = (fallback.as_ref() == masked.as_ref()).then_some(0);
+                if let Some(result) = evaluate_pack_destructive_patterns(
+                    pack_id,
+                    pack,
+                    fallback.as_ref(),
+                    shell_dialect,
+                    start,
+                    original_command,
+                    fallback_offset,
+                    original_len,
+                    allowlists,
+                    project_path,
+                    &mut first_allowlist_hit,
+                    deadline,
+                    &[],
+                    None,
+                ) {
+                    return result;
+                }
+            }
+            continue;
         } else if pack_id == "core.git" {
             // In PowerShell, a leading `&` is an executable call operator, not
             // a background separator. The generic segment tokenizer keeps it

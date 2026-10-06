@@ -706,6 +706,11 @@ impl Pack {
         if self.destructive_match_vetoes_safe(cmd) {
             return false;
         }
+        if self.id == "system.permissions"
+            && crate::packs::system::permissions::posix_chmod_is_safe(cmd)
+        {
+            return true;
+        }
         if self.id == "kubernetes.kubectl"
             && crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd)
         {
@@ -763,6 +768,11 @@ impl Pack {
         if self.destructive_match_vetoes_safe_with_deadline(cmd, deadline) {
             return false;
         }
+        if self.id == "system.permissions"
+            && crate::packs::system::permissions::posix_chmod_is_safe(cmd)
+        {
+            return true;
+        }
         if self.id == "kubernetes.kubectl"
             && crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd)
         {
@@ -804,6 +814,22 @@ impl Pack {
     /// Returns the matched pattern's reason, name, severity, and explanation if found.
     #[must_use]
     pub fn matches_destructive(&self, cmd: &str) -> Option<DestructiveMatch> {
+        if self.id == "system.permissions" {
+            match crate::packs::system::permissions::posix_permission_decision(
+                cmd,
+                crate::normalize::ShellDialect::Unknown,
+            ) {
+                crate::packs::system::permissions::PosixPermissionDecision::NonDestructive => {
+                    return None;
+                }
+                crate::packs::system::permissions::PosixPermissionDecision::Destructive(names) => {
+                    return names
+                        .iter()
+                        .find_map(|name| self.destructive_match_by_name(name, cmd));
+                }
+                crate::packs::system::permissions::PosixPermissionDecision::NoMatch => {}
+            }
+        }
         if self.id == "careful_company_running_windows.transfer" {
             match crate::packs::careful_company_running_windows::transfer::direct_scp_decision(cmd) {
                 crate::packs::careful_company_running_windows::transfer::DirectScpDecision::Safe
@@ -995,7 +1021,10 @@ impl Pack {
                     return Some(m);
                 }
             }
-            if matches!(self.id.as_str(), "core.git" | "remote.scp") {
+            if matches!(
+                self.id.as_str(),
+                "core.git" | "remote.scp" | "system.permissions"
+            ) {
                 return None;
             }
             // Also check the whole command so patterns that legitimately
