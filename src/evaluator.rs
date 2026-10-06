@@ -509,7 +509,7 @@ pub struct EvaluationResult {
     pub session_occurrence: Option<crate::session::OccurrenceSnapshot>,
     /// Graduated response level (present when graduation system is enabled).
     pub graduated_response: Option<GraduatedResponse>,
-    /// How a soft block was bypassed (present when bypass occurred).
+    /// How explicit authorization allowed a blocked command.
     pub bypass_method: Option<BypassMethod>,
 }
 
@@ -529,6 +529,14 @@ impl EvaluationResult {
             session_occurrence: None,
             graduated_response: None,
             bypass_method: None,
+        }
+    }
+
+    /// Preserve a consumed exact-command grant across dialect views.
+    fn allowed_by_allow_once() -> Self {
+        Self {
+            bypass_method: Some(BypassMethod::AllowOnce),
+            ..Self::allowed()
         }
     }
 
@@ -1149,7 +1157,7 @@ impl GraduatedResponse {
     }
 }
 
-/// How a soft block was bypassed.
+/// How explicit authorization allowed a blocked command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BypassMethod {
     /// The `--force` flag was used.
@@ -12970,6 +12978,13 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         inherited_automated_stdin,
     );
 
+    // An exact-command grant authorizes the complete raw request in every
+    // dialect. It has already been consumed, so replay must not look it up
+    // again and turn an approved request into a denial (GH#537).
+    if primary.bypass_method == Some(BypassMethod::AllowOnce) {
+        return primary;
+    }
+
     if shell_dialect != ShellDialect::Unknown
         || nested_command_depth != 0
         || primary.decision != EvaluationDecision::Allow
@@ -13001,6 +13016,9 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             nested_command_depth,
             inherited_automated_stdin,
         );
+        if alternate.bypass_method == Some(BypassMethod::AllowOnce) {
+            return alternate;
+        }
         // Deny-wins union. An incomplete alternate view is fail-closed for the
         // same reason an incomplete primary view is. A warn is adopted only
         // when the primary view found nothing at all, so an alternate view can
@@ -13050,12 +13068,19 @@ fn evaluate_command_in_single_dialect_view(
         return EvaluationResult::allowed();
     }
 
+    // Grants bind to the original bytes, before diagnostic or modeled-command
+    // masking. Nested payloads must never borrow or consume an outer request's
+    // exact-command grant (GH#537).
+    let allow_once_command = command;
+
     // Step 1: Check precompiled block overrides first. Deny wins when
     // allow/block override patterns overlap; only a force allow-once exception
     // may intentionally bypass an explicit config block.
     if let Some(reason) = compiled_overrides.check_block(command) {
-        if allow_once_match_force_config(command, allow_once_audit).is_some() {
-            return EvaluationResult::allowed();
+        if nested_command_depth == 0
+            && allow_once_match_force_config(allow_once_command, allow_once_audit).is_some()
+        {
+            return EvaluationResult::allowed_by_allow_once();
         }
         return EvaluationResult::denied_by_config(reason.to_string());
     }
@@ -13150,15 +13175,15 @@ fn evaluate_command_in_single_dialect_view(
     // cannot accidentally authorize arbitrary nested commands.
     let checked_allow_once_before_nested = may_evaluate_nested_payload_before_allowlists(command)
         || !posix_executable_model.invocations.is_empty();
-    if checked_allow_once_before_nested
-        && (allow_once_match(command, allow_once_audit).is_some()
-            || outer_command_allowlisted_before_nested_evaluation(
-                command,
-                allowlists,
-                project_path,
-            ))
-    {
-        return EvaluationResult::allowed();
+    if checked_allow_once_before_nested {
+        if nested_command_depth == 0
+            && allow_once_match(allow_once_command, allow_once_audit).is_some()
+        {
+            return EvaluationResult::allowed_by_allow_once();
+        }
+        if outer_command_allowlisted_before_nested_evaluation(command, allowlists, project_path) {
+            return EvaluationResult::allowed();
+        }
     }
 
     // A straight-line `d=docker; $d system prune -af` carries enough static
@@ -13707,8 +13732,11 @@ fn evaluate_command_in_single_dialect_view(
     // Nested envelopes were checked before recursion above; ordinary commands
     // stay here, past quick rejection, to avoid ~65µs of filesystem I/O on
     // every unrelated hook invocation.
-    if !checked_allow_once_before_nested && allow_once_match(command, allow_once_audit).is_some() {
-        return EvaluationResult::allowed();
+    if nested_command_depth == 0
+        && !checked_allow_once_before_nested
+        && allow_once_match(allow_once_command, allow_once_audit).is_some()
+    {
+        return EvaluationResult::allowed_by_allow_once();
     }
 
     // The careful-company Windows preset treats `hfdt` as a trusted first-party

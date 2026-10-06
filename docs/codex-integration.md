@@ -4,8 +4,8 @@ Last updated: 2026-10-06
 
 This document is the maintainer reference for dcg's Codex CLI hook path. It
 explains how dcg distinguishes Codex from Claude-compatible hook payloads, why
-Codex denials use a minimal stdout JSON contract, and how to debug a hook run
-that Codex reports as failed instead of blocked.
+Codex denials use a minimal stdout JSON contract, how a user reviews a blocked
+command for a single retry, and how to diagnose the active hook.
 
 ## Protocol Detection
 
@@ -64,6 +64,21 @@ important on Codex 0.144.x for Windows: a verified report showed the legacy
 exit-2 path being classified as `PreToolUse Failed` and then failing open,
 whereas the minimal JSON denial blocks correctly (#183).
 
+When dcg successfully records a pending exception, `permissionDecisionReason`
+also includes the existing review instruction:
+
+```text
+To permit this single command once, the user can approve it with: dcg allow-once 137527
+```
+
+`137527` is illustrative; use the code from the actual denial. This instruction
+is text inside the supported reason field, so `hookSpecificOutput` still has
+exactly three fields. Codex receives no sibling `allowOnceCode`,
+`allowOnceFullHash`, `ruleId`, `packId`, `severity`, `confidence`, or `remediation`
+fields. The reason carries the command explanation and matching rule when
+available. Codex stderr retains its warning and instruction against self-bypass;
+integrations must read the reason on stdout to obtain the review code (#537).
+
 The implementation points are:
 
 - `src/hook.rs:output_denial_for_protocol` selects the minimal Codex JSON shape.
@@ -84,48 +99,118 @@ The exit-code split is intentional:
 For Codex hook integrations, parse the minimal stdout JSON. Empty stdout with
 exit 0 still means allow.
 
-## Exact-Command Human Review
+## Review An Exact Command Once
 
-After #537, a denial with a successfully persisted pending exception includes
-`dcg allow-once <code>` in `permissionDecisionReason`. The JSON still has only
-the three documented fields above and the decision remains `deny`. No
-`allowOnceCode`, hash, rule metadata, or remediation fields are added to the
-Codex payload. stderr retains the rule diagnostic and instruction against
-self-bypass; the review identifier is surfaced through the supported JSON
-reason instead.
+A denial and its pending code do **not** grant permission. The supported flow
+keeps the command blocked until the user reviews it and redeems the code. It
+uses the existing allow-once store and does not change command classification
+or add an allowlist rule. The agent must not redeem the code or change policy
+on its own. Approval of an exact command does not certify the contents of any
+referenced script as safe.
 
-The human must inspect the actual blocked command and approve it explicitly
-using `dcg allow-once <code> --single-use` in the same home/project context as
-the hook. The CLI displays the pending command and asks for confirmation.
-After approval, retry that exact command through Codex: one matching hook
-invocation is permitted, a different command remains denied, and another retry
-is denied after the grant is consumed. The agent must not redeem the code or
-change policy on its own. Approval does not certify script contents as safe.
+1. Keep the original denied tool request and its `permissionDecisionReason`.
+   Review the complete command, intended effect, working directory, and matching
+   rule. Correlate the response with that request's `turn_id` and `tool_use_id`
+   in the Codex record when available; these request identifiers are not
+   allow-once codes. A sanitized command from a diagnostic report is not the
+   exact target for an exception; review the original request locally.
+2. Use the **same dcg executable and user/state context as the active hook**.
+   In a terminal at the original working directory, inspect the proposed grant
+   without creating it:
 
-Code issuance is best effort. If the pending store cannot be written, including
-a lock timeout, dcg still emits the minimal JSON denial without a code. There
-is no redeemable identifier to infer or invent. Resolve the store problem and
-obtain a fresh denial through the normal guarded path before requesting review;
-do not disable dcg, broaden an allowlist, or rewrite the rejected command to
-evade classification. Older builds that omit the code from the reason do not
-provide this surfaced review path; this change does not establish that either
-PowerShell classification reported in #537 is fixed.
+   ```bash
+   dcg allow-once CODE --dry-run --single-use
+   ```
 
-For diagnostics, first identify the executable actually configured in the Codex
-hook, then run that executable's `--version` and `doctor`. A `dcg` found on PATH
-alone does not establish the active hook build. The manual protocol probe below
-checks that executable's output without executing the command in the payload.
-The reason identifies the blocked command and rule when available; the code
-correlates a persisted pending denial for review. Share only version/protocol
-and necessary sanitized diagnostics: command text and diagnostic output may
-contain private paths or configuration. A sanitized command is not an exact
-target for an exception.
+   Replace `CODE` with the denial's code. The preview shows the command, original
+   CWD, scope, expiry, and single-use mode. Commands are redacted by default; if
+   that hides information needed for review, use `--show-raw` only in a private
+   local terminal. A preview does not authorize the command.
+3. If the user approves the displayed operation and scope, have them redeem it
+   in their terminal and answer the confirmation prompt:
+
+   ```bash
+   dcg allow-once CODE --single-use
+   ```
+
+   Confirm that the command succeeds and prints `Allow-once entry created`.
+   This invocation requires an interactive terminal; otherwise the confirmation
+   cannot be answered and no grant is written. The code and prompt are part of
+   the review workflow, not a separate authentication boundary.
+4. Retry the original command through the guarded Codex tool. Preserve the
+   complete command text, including whitespace, quoting, arguments, and shell
+   wrappers. The grant matches the raw command exactly; a different command is
+   evaluated normally and receives no permission from this grant.
+
+In a repository, the existing CLI scopes the grant to that repository root and
+its subdirectories; outside a repository, it scopes it to the original CWD.
+The preview displays which scope was selected. An identical command outside
+that scope receives no permission from the grant. `--single-use` is explicit
+above and is also the current default: the grant is consumed when a matching
+evaluation allows the command, even if later execution fails. Run `dcg test`
+and `dcg explain` before redemption: they share the evaluator and can consume
+an existing grant without executing the command. Another retry requires a new
+review. An unused grant expires after 24 hours; pending codes also expire after
+24 hours. Explicit config block overrides retain their separate approval
+requirements and are not implicitly lifted by this flow.
+
+On Windows, invoke the binary configured in Codex's hook by its full path, for
+example after setting `$Dcg` as described under troubleshooting:
+
+```powershell
+& $Dcg allow-once CODE --dry-run --single-use
+# After the user reviews and approves the preview:
+& $Dcg allow-once CODE --single-use
+```
+
+### Missing, Expired, Or Ambiguous Codes
+
+Code issuance is best-effort. A bounded pending-store lock timeout, an exhausted
+hook deadline, or a storage error can leave a denial without a code. Storage
+errors can also produce a stderr warning saying that the block still stands;
+lock contention need not produce that warning. None of these conditions turns
+the denial into an allow or makes a guessed code valid.
+
+To inspect existing pending records through the supported CLI, use the hook's
+binary and state context:
+
+```bash
+dcg allow-once list --json
+```
+
+This lists pending records and active grants without creating a grant; routine
+expired/consumed-entry maintenance can occur. Pending records include the
+short code, full hash, creation/expiry times, CWD, reason, and redacted command.
+Correlate all of those with the original denial before selecting an entry. If
+multiple distinct records share a short code, dcg requires disambiguation;
+review the matching record and use its full hash with `--hash HASH` on both the
+preview and redemption commands. Never choose the first entry merely because
+the short code matches.
+
+Older builds affected by #537 could persist the pending record while omitting
+its identifier from the Codex reason. The listing can recover an unexpired
+record in that case. It cannot recover a record that was never written, has
+expired, or belongs to a different state store. If no matching record exists,
+resolve the state/store problem and submit the unchanged request through the
+guarded hook again to obtain a fresh denial and review code. Keep the block in
+place until the supported review succeeds. Do not disable dcg, broaden an
+allowlist, or rewrite the rejected command to evade classification.
+
+`dcg test` and `dcg explain` diagnose command evaluation; they do not recreate
+the missing pending review identifier. Whether this fix is available depends
+on the binary the hook actually invokes, not merely on a checkout containing
+this documentation. The protocol probe below verifies its behavior without
+assuming a particular release contains the change. The #537 review-code
+visibility fix does not establish that either PowerShell classification
+reported in that issue is fixed.
 
 ## Manual Protocol Probe
 
 Use a throwaway repository when testing real destructive commands through an
 agent. For a cheap protocol-shape probe, you can pipe a Codex-shaped hook
-payload directly into a dcg binary without asking Codex to run anything:
+payload directly into the active dcg binary without asking Codex to run
+anything. The command in the JSON is data for evaluation and is never executed
+by dcg. Substitute the active hook's binary path for `./target/release/dcg`:
 
 ```bash
 printf '%s\n' \
@@ -139,12 +224,55 @@ Expected result:
 
 - exit code is 0;
 - stdout contains a three-field `hookSpecificOutput` denial;
-- stderr is non-empty and mentions the blocked command plus the matching rule.
+- stderr is non-empty and mentions the blocked command plus the matching rule;
+- if pending-code persistence succeeded, `permissionDecisionReason` includes
+  `dcg allow-once CODE`; no additional JSON field carries it.
+
+This probe can create a pending record but grants no permission. It verifies
+the binary's protocol output, not whether a live Codex client dispatches or
+displays a particular hook event. The live-Codex harness covers that layer.
 
 For a Claude-compatible negative control, remove `turn_id` from the same payload.
 The denial should return exit code 0 with a JSON object on stdout.
 
 ## Troubleshooting
+
+### Identify The Active Binary And Denial
+
+Inspect the dcg command entry in `~/.codex/hooks.json` (on Windows,
+`%USERPROFILE%\.codex\hooks.json`) and Codex's hook view. Record its executable
+path and any wrapper arguments. A `dcg` found on your terminal's `PATH` can be
+different from the absolute executable configured in the hook. If the entry
+uses a bare command, check resolution in Codex's launch environment as well.
+
+For Windows PowerShell, replace the example path with the executable from that
+entry:
+
+```powershell
+Get-Command dcg -All | Select-Object CommandType, Source
+$Dcg = 'C:\path\from\the\hook\dcg.exe'
+& $Dcg --version
+codex --version
+$Report = & $Dcg doctor --format json | ConvertFrom-Json
+$Report.checks |
+    Where-Object { $_.id -in @('binary_path', 'codex_hook', 'build_provenance') } |
+    Select-Object id, status, message
+```
+
+`dcg --version` writes the semver to stdout and available build provenance,
+including `Commit:` and `Git SHA:`, to stderr. Preserve both when comparing
+builds. In Windows PowerShell 5.1, stderr may be displayed as
+`NativeCommandError`; inspect the native exit code instead of treating the
+presence of stderr as failure. `dcg doctor` checks hook registration and
+enablement when it detects Codex, but does not prove which binary handled an
+earlier request. Match the path/build with the original denial and probe it.
+
+When reporting a problem, include the binary path/build, Codex version,
+relevant doctor checks, request identifiers, minimal denial JSON, and relevant
+stderr. Review and redact these locally before sharing. Full environment,
+configuration, and pending-store dumps are unnecessary and can expose command
+arguments or credentials. Use `dcg config --format json` locally if the effective
+configuration needs inspection, sharing only the relevant source/setting.
 
 ### Codex Reports `PreToolUse Failed`
 
@@ -158,7 +286,8 @@ block. Check these in order:
 3. Confirm `codex --version` reports 0.125.0 or newer.
 4. Run the manual protocol probe above. The Codex payload must contain only
    `hookEventName`, `permissionDecision`, and `permissionDecisionReason` inside
-   `hookSpecificOutput`; dcg-only metadata belongs only on tolerant protocols.
+   `hookSpecificOutput`; the review instruction belongs inside the reason,
+   while extra metadata fields belong only on tolerant protocols.
 5. If stderr is empty on a destructive command, inspect `src/hook.rs` output
    dispatch and `src/main.rs` deny handling before looking at installer code.
 
@@ -192,6 +321,12 @@ Claude-compatible path. Only the final hook output contract changes. Check:
 - the project/user/system allowlist file being edited is the one dcg loads;
 - the pending exception store is under the same home/project context that the
   hook process sees;
+- the pending and active store path overrides, if configured, resolve the same
+  way for review and retry (`DCG_PENDING_EXCEPTIONS_PATH` and
+  `DCG_ALLOW_ONCE_PATH`); use `dcg allow-once list --json` rather than guessing a
+  Unix-style path on Windows;
+- the grant was successfully written, has not expired or already been consumed,
+  and matches the exact raw command and the scope shown during review;
 - `tests/codex_hook_protocol.rs` still passes the allowlist and allow-once
   round-trip tests.
 
@@ -360,6 +495,13 @@ Before closing Codex hook work, collect evidence for the relevant layer:
 - `cargo clippy --all-targets -- -D warnings` passes.
 - The manual protocol probe returns exit code 0, minimal denial JSON on stdout,
   and non-empty stderr for a destructive Codex-shaped payload.
+- The Codex allow-once regression captures the code from
+  `permissionDecisionReason`, redeems it as single-use, rejects changed targets,
+  wrappers, substitutions, and whitespace, allows the exact command once, and
+  denies it again after consumption. This includes raw diagnostic text,
+  PowerShell wrappers, and unknown-dialect commands. Pending-store lock
+  contention and storage errors retain a code-less denial with the three-field
+  shape and blocking decision.
 - `scripts/e2e_codex.sh --verbose --json --artifacts <dir> --dcg-binary <path>`
   either passes against an authenticated Codex CLI or exits successfully with an
   explicit skip reason.

@@ -3273,8 +3273,10 @@ pub fn write_denial_to(
         HookProtocol::Codex => {
             // Codex 0.144.x: emit only the documented PreToolUse fields.
             // Extra dcg metadata is intentionally omitted because Codex's
-            // parser is stricter than Claude's.  Exit remains 0; some current
-            // Codex builds classify exit 2 as hook failure and then fail open.
+            // parser is stricter than Claude's. An allow-once review code can
+            // appear in the supported reason string without adding fields.
+            // Exit remains 0; some current Codex builds classify exit 2 as
+            // hook failure and then fail open.
             let output = HookOutput {
                 hook_specific_output: HookSpecificOutput {
                     hook_event_name: "PreToolUse",
@@ -7403,15 +7405,20 @@ mod tests {
                 .as_str()
                 .is_some_and(|reason| reason.contains("git reset --hard HEAD~1"))
         );
+        let reason = specific["permissionDecisionReason"].as_str().unwrap();
+        assert!(
+            reason.contains("the user can approve it with: dcg allow-once abc123"),
+            "Codex must expose the persisted review code in its supported reason: {reason}"
+        );
+        assert!(
+            !reason.contains("--yes") && !reason.contains("dcg allowlist add"),
+            "the review hint must retain explicit user approval and exact-command scope: {reason}"
+        );
+        assert_eq!(json.as_object().map(serde_json::Map::len), Some(1));
         assert_eq!(
             specific.as_object().map(serde_json::Map::len),
             Some(3),
             "Codex payload must omit dcg-only fields: {json}"
-        );
-        assert!(
-            specific["permissionDecisionReason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("dcg allow-once abc123"))
         );
         assert!(
             !stderr.is_empty(),
@@ -7442,6 +7449,79 @@ mod tests {
             stderr_str.contains("Do not retry it, create a bypass, or change dcg policy yourself"),
             "Codex stderr should give an explicit no-bypass instruction; got: {stderr_str}"
         );
+    }
+
+    /// GH#537: store contention or failed persistence must not fabricate a
+    /// review identifier or change Codex's parser-compatible denial.
+    #[test]
+    fn test_write_denial_codex_without_code_still_denies() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Codex,
+            "git reset --hard HEAD~1",
+            "destroys uncommitted changes",
+            Some("core.git"),
+            Some("reset-hard"),
+            None,
+            None,
+            None,
+            Some(crate::packs::Severity::Critical),
+            None,
+            &[],
+            None,
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        let specific = &json["hookSpecificOutput"];
+        assert_eq!(json.as_object().map(serde_json::Map::len), Some(1));
+        assert_eq!(specific.as_object().map(serde_json::Map::len), Some(3));
+        assert_eq!(specific["hookEventName"], "PreToolUse");
+        assert_eq!(specific["permissionDecision"], "deny");
+        let reason = specific["permissionDecisionReason"].as_str().unwrap();
+        assert!(reason.starts_with("BLOCKED by dcg"), "{reason}");
+        assert!(reason.contains("Rule: core.git:reset-hard"), "{reason}");
+        assert!(
+            !reason.contains("allow-once"),
+            "a code-less denial must not advertise an unredeemable code: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_write_denial_codex_review_code_without_rule_metadata() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let allow = test_allow_once();
+
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Codex,
+            "unverified-command",
+            "cannot statically verify the command",
+            None,
+            None,
+            None,
+            Some(&allow),
+            None,
+            None,
+            None,
+            &[],
+            None,
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        let specific = &json["hookSpecificOutput"];
+        assert_eq!(json.as_object().map(serde_json::Map::len), Some(1));
+        assert_eq!(specific.as_object().map(serde_json::Map::len), Some(3));
+        assert_eq!(specific["hookEventName"], "PreToolUse");
+        assert_eq!(specific["permissionDecision"], "deny");
+        let reason = specific["permissionDecisionReason"].as_str().unwrap();
+        assert!(reason.contains("dcg allow-once abc123"), "{reason}");
+        assert!(!reason.contains("Rule:"), "{reason}");
     }
 
     #[test]
@@ -7814,6 +7894,19 @@ mod tests {
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
             assert_ne!(decision, Some("allow"), "payload: {json}");
+            if protocol == HookProtocol::Codex {
+                assert_eq!(json.as_object().map(serde_json::Map::len), Some(1));
+                assert_eq!(
+                    json["hookSpecificOutput"]
+                        .as_object()
+                        .map(serde_json::Map::len),
+                    Some(3)
+                );
+                assert!(
+                    reason.is_some_and(|text| text.contains("dcg allow-once abc123")),
+                    "Codex review must remain a denial with a user-review code: {json}"
+                );
+            }
             if matches!(
                 protocol,
                 HookProtocol::ClaudeCompatible | HookProtocol::Copilot
