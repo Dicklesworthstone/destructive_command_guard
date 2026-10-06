@@ -104,6 +104,80 @@ fn all_eight_reported_temporary_redirects_are_allowed() {
 }
 
 #[test]
+fn literal_prefixes_and_loop_variables_resolve_temporary_targets_issue_526() {
+    for command in [
+        r#"i=1; echo hi > "/tmp/repro/run-$i.log""#,
+        r#"true && i=1 && echo hi > "/tmp/repro/run-${i}.log""#,
+        r#"for i in 1 2 3; do echo hi > "/tmp/repro/run-$i.log"; done"#,
+        r#"for i in 1 2 3; do echo hi > "/tmp/repro/run-${i}.log"; done"#,
+        r#"for i in 1 2 3; do echo hi > "/tmp/repro/$i"; done"#,
+        r#"for i in 1 2 3; do log="/tmp/repro/run-$i.log"; echo hi > "$log"; done"#,
+        r#"i=1; log="/tmp/repro/run-$i.log"; echo hi > "$log""#,
+        r#"bash -c 'for i in 1 2 3; do echo hi > "/tmp/repro/run-$i.log"; done'"#,
+        r#"bash -c 'i=1; echo hi > "/tmp/repro/run-$i.log"'"#,
+        r#"bash -c 'D=/tmp/repro; echo hi > "$D/x"'"#,
+        "bash <<'SH'\nfor i in 1 2 3; do echo hi > \"/tmp/repro/run-$i.log\"; done\nSH",
+        "cat > /tmp/repro/run.sh <<'SH'\nfor i in 1 2 3; do echo hi > \"/tmp/repro/run-$i.log\"; done\nSH\nbash /tmp/repro/run.sh",
+        "mkdir -p /tmp/repro && cat > /tmp/repro/run.sh <<'SH'\nfor i in 1 2 3; do log=\"/tmp/repro/run-$i.log\"; echo hi > \"$log\"; done\nSH\nbash /tmp/repro/run.sh",
+    ] {
+        let (decision, rule) = hook(command);
+        assert_eq!(decision, "allow", "must allow {command:?}: {rule}");
+    }
+}
+
+#[test]
+fn literal_prefixes_do_not_hide_sensitive_or_unknown_loop_targets_issue_526() {
+    for command in [
+        r#"for i in /etc/passwd /etc/hosts; do echo hi > "$i"; done"#,
+        r#"for i in ../../etc/passwd; do echo hi > "/tmp/repro/$i"; done"#,
+        r#"for i in /etc/passwd; do echo hi > "/tmp/repro/..$i"; done"#,
+        r#"for i in .git/config .ssh/id_rsa; do echo hi > "/tmp/repro/$i"; done"#,
+        r#"for i in $(cat /tmp/repro/names.txt); do echo hi > "/tmp/repro/$i"; done"#,
+        r#"for i in 1 2; do echo hi > "/tmp/repro/$i-$(date +%s)"; done"#,
+        r#"i=1; echo hi > "/etc/run-$i.log""#,
+        r#"i=1; echo hi > "/tmp/repro/$i-$OTHER""#,
+        r#"false && i=1; echo hi > "/tmp/repro/$i""#,
+        "if false; then\ni=1\nfi\necho hi > \"/tmp/repro/$i\"",
+        r#"for i in 1 2; do log="/tmp/repro/$i"; read log; echo hi > "$log"; done"#,
+        r#"for i in 1 2; do false && log="/tmp/repro/$i"; echo hi > "$log"; done"#,
+        r#"for i in 1 2; do _="/tmp/repro/$i"; echo hi > "$_"; done"#,
+        r#"base=/tmp/repro; for i in 1 2; do log="$base/out"; echo hi > "$log"; base=/etc; done"#,
+        r#"for i in 1 2; do log="/tmp/repro/$i"; trap 'i=../../etc/passwd' DEBUG > "$log"; done"#,
+    ] {
+        assert_denied(command);
+    }
+}
+
+#[test]
+fn literal_bash_context_preserves_expansion_and_later_denials_issue_526() {
+    for command in [
+        // The outer shell expands these variables before the body binds them.
+        r#"bash -c "i=1; echo hi > /tmp/repro/$i""#,
+        r#"bash -c "for i in 1 2; do echo hi > /tmp/repro/$i; done""#,
+        "bash <<SH\ni=1; echo hi > /tmp/repro/$i\nSH",
+        "bash <<SH\nD=/tmp/repro; echo hi > \"$D/x\"\nSH",
+        "cat > /tmp/repro/run.sh <<SH\ni=1; echo hi > /tmp/repro/$i\nSH\nbash /tmp/repro/run.sh",
+        "cat > /tmp/repro/run.sh <<SH\nD=/tmp/repro; echo hi > \"$D/x\"\nSH\nbash /tmp/repro/run.sh",
+        // Script assignments cannot establish a later parent-shell binding.
+        "cat > /tmp/repro/run.sh <<SH\ni=1\nSH\nbash /tmp/repro/run.sh\necho hi > /tmp/repro/$i",
+        "cat > /tmp/repro/run.sh <<'SH'\ni=1\nSH\nbash /tmp/repro/run.sh\necho hi > /tmp/repro/$i",
+        // Literal source preserves the complete path and binding checks.
+        r#"bash -c 'for i in ../../etc/passwd; do echo hi > "/tmp/repro/$i"; done'"#,
+        r#"bash -c 'false && i=1; echo hi > "/tmp/repro/$i"'"#,
+        r#"i=1; bash -c 'echo hi > "/tmp/repro/$i"'"#,
+        r#"bash -c 'for i in $(cat names); do echo hi > "/tmp/repro/$i"; done'"#,
+        "cat > /tmp/repro/run.sh <<'SH'\nfor i in ../../etc/passwd; do echo hi > \"/tmp/repro/$i\"; done\nSH\nbash /tmp/repro/run.sh",
+        // Only the exact proven operator can stand down the dynamic rule.
+        r#"bash -c 'i=1; echo hi > "/tmp/repro/$i"; echo hi > "$OTHER"'"#,
+        r#"bash -c 'i=1; echo hi > "/tmp/repro/$i"' > "$OTHER""#,
+        r#"bash -c 'i=1; echo hi > "/tmp/repro/$i"; git reset --hard'"#,
+        "cat > /tmp/repro/run.sh <<'SH'\ni=1; echo hi > \"/tmp/repro/$i\"; echo hi > \"$OTHER\"\nSH\nbash /tmp/repro/run.sh",
+    ] {
+        assert_denied(command);
+    }
+}
+
+#[test]
 fn existing_literal_and_bare_mktemp_controls_stay_allowed() {
     for command in [
         "echo hi > /tmp/d/x",

@@ -2210,6 +2210,22 @@ transforming `cat` flags, and mutable producer lookup cannot establish a
 literal-source proof. Quoted shell arguments are similarly kept intact during
 dialect selection: the `|^` in `sed 's|^\./||'` does not start a cmd command.
 
+A quoted heredoc written by a plain `cat > file` and immediately consumed by
+`node file`, `python3 file`, `ruby file`, `perl file`, or `php file` also reaches
+the corresponding language checks. This bounded proof requires the same literal
+file path and an unmodified overwrite; an optional literal `mkdir` setup is
+supported. A script file handed to a supported POSIX shell such as `bash` or
+`sh` receives shell analysis. Append writes, transformations, wrappers, extra
+consumers and ambiguous control flow keep their conservative treatment. For a proven
+JavaScript file, an AST-confirmed `=>` arrow is not a shell redirect. Shell
+command strings elsewhere in the source still receive the raw safety checks.
+
+Recognized literal `sed`, `awk 1` and `tac` reads before a quoted heredoc write
+do not make the newly written body executable. This ordering proof applies only
+to bounded synchronous readers in a straight-line command sequence. Later
+execution, including `sed e`, `awk` with `system()`, shell wrappers and remote
+consumers, still keeps the body visible to safety analysis.
+
 Embedded process calls retain every argument position when reconstructed. For
 example, `subprocess.run(["git", "-C", path, "diff", "HEAD"])` keeps the unknown
 `path` as the operand of `-C`; it cannot turn `diff` into that operand. Literal
@@ -3069,6 +3085,7 @@ without executing shell code ([#536](https://github.com/Dicklesworthstone/destru
 |-------------|---------|
 | A literal assignment on the redirect's `&&` success path | `true && S=/tmp/d && echo hi > "$S/x"` |
 | A known variable with a literal suffix | `S=/tmp/d; T="$S/sub"; echo hi > "$T/x"` |
+| A literal prefix and suffix around one proven scalar or loop variable | `for i in 1 2 3; do echo hi > "/tmp/run-$i.log"; done` |
 | PID digits inside a literal `/tmp/` path | `echo hi > "/tmp/d-$$.log"` |
 | A supported `mktemp` substitution with an explicit temporary root | `D=$(mktemp -d /tmp/v-XXXXXX); echo hi > "$D/p"` or `D=$(mktemp -d -p /tmp); echo hi > "$D/p"` |
 
@@ -3084,6 +3101,13 @@ syntax, templates for hidden directories, `/etc` roots, dynamic `$TMPDIR`
 roots, and `-u`/`--dry-run` keep their denials. This built-in proof does not add
 a configurable dynamic-path exemption, and every other redirect and command
 is still checked.
+
+The loop proof also supports a single path assignment from the iteration
+variable immediately before the redirect, such as
+`for i in 1 2; do log="/tmp/run-$i.log"; echo hi > "$log"; done`.
+Every literal list value must yield a benign final path. Computed lists,
+conditional bindings, shell-maintained variables, later mutation within the
+loop, and additional expansions do not qualify.
 
 **Filesystem evidence belongs to the environment running the script.** The
 new-home-file allowance uses local filesystem checks and therefore applies

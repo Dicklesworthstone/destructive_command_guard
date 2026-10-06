@@ -6606,6 +6606,7 @@ fn extract_heredocs(
 
     let mut hit_limit = false;
     let mut foreign_body_ranges = None;
+    let written_source = written_heredoc_interpreter(command);
     for cap in HEREDOC_EXTRACTOR.captures_iter(command) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
@@ -6698,9 +6699,21 @@ fn extract_heredocs(
             timeout,
         ) {
             Ok((content, end_pos, body_start_abs, body_end_abs)) => {
-                let (language, _confidence) = ScriptLanguage::detect(command, &content);
-                // Extract the command that receives the heredoc
-                let target_cmd = extract_heredoc_target_command(command, full_match.start());
+                let (mut language, _confidence) = ScriptLanguage::detect(command, &content);
+                // A literal cat write immediately consumed as a script is
+                // executable source, not a data-only cat body (#519). Bind
+                // the language to this exact operator and body, so the AST
+                // and synchronous sink backstops inspect the written bytes.
+                let target_cmd = if let Some(source) = written_source.as_ref().filter(|source| {
+                    quoted
+                        && source.operator_start == full_match.start()
+                        && source.body == (body_start_abs..body_end_abs)
+                }) {
+                    language = source.language;
+                    Some(source.interpreter.clone())
+                } else {
+                    extract_heredoc_target_command(command, full_match.start())
+                };
                 extracted.push(ExtractedContent {
                     content,
                     language,
@@ -7890,6 +7903,310 @@ pub(crate) fn mask_inert_interpreter_stdin(command: &str) -> Cow<'_, str> {
     }
 }
 
+/// A quoted cat body written verbatim and immediately read by a concrete
+/// interpreter. This proof supplies a language, never an allow:
+/// both the language-aware checks and conservative raw-pattern scan remain.
+struct WrittenHeredocInterpreter {
+    operator_start: usize,
+    body: Range<usize>,
+    interpreter: String,
+    language: ScriptLanguage,
+}
+
+/// Whether these exact bytes are written verbatim and handed to a supported
+/// POSIX shell. Reuse the file and interpreter proof when evaluating redirects
+/// with the complete shell body as their assignment and loop scope.
+pub(crate) fn range_is_written_bash_source(command: &str, range: &Range<usize>) -> bool {
+    written_heredoc_interpreter(command)
+        .is_some_and(|source| source.language == ScriptLanguage::Bash && source.body == *range)
+}
+
+/// The `>` bytes that JavaScript itself parses as arrow operators in a
+/// proven written script (#519). Do not exempt the whole body from redirect
+/// or launcher rules: strings passed through opaque sinks can still hold
+/// shell syntax, and their conservative raw-pattern evidence must survive.
+pub(crate) fn written_javascript_arrow_offsets(command: &str) -> Vec<usize> {
+    if !command.contains("=>") {
+        return Vec::new();
+    }
+    let Some(source) = written_heredoc_interpreter(command) else {
+        return Vec::new();
+    };
+    if source.language != ScriptLanguage::JavaScript {
+        return Vec::new();
+    }
+    let Some(body) = command.get(source.body.clone()) else {
+        return Vec::new();
+    };
+    let Ok(ast) = AstGrep::try_new(body, SupportLang::JavaScript) else {
+        return Vec::new();
+    };
+    if ast.root().get_inner_node().has_error() {
+        return Vec::new();
+    }
+    ast.root()
+        .dfs()
+        .filter(|node| node.kind().as_ref() == "=>")
+        .map(|node| source.body.start + node.range().start + 1)
+        .collect()
+}
+
+/// Keep the file provenance deliberately small: one plain overwrite followed
+/// by one direct interpreter invocation, optionally preceded by a literal
+/// mkdir. No append, transformations, extra consumers, mutable bindings,
+/// wrappers, branches, pipelines or deferred execution can establish this
+/// proof. In particular a later `bash file` must not borrow an earlier
+/// `node file` classification merely because the filename matches.
+fn written_heredoc_interpreter(command: &str) -> Option<WrittenHeredocInterpreter> {
+    if !command.contains("<<") || command.len() > MAX_SUBSTITUTION_SOURCE_BYTES {
+        return None;
+    }
+    let ast = AstGrep::try_new(command, SupportLang::Bash).ok()?;
+    if ast.root().get_inner_node().has_error() {
+        return None;
+    }
+    let mut statements = Vec::new();
+    let mut pending = vec![ast.root()];
+    while let Some(node) = pending.pop() {
+        match node.kind().as_ref() {
+            "program" | "list" => {
+                if node
+                    .children()
+                    .any(|child| matches!(child.kind().as_ref(), "&" | "||"))
+                {
+                    return None;
+                }
+                let start = pending.len();
+                pending.extend(node.children().filter(ast_grep_core::Node::is_named));
+                pending[start..].reverse();
+            }
+            "comment" => {}
+            "command" | "redirected_statement" => {
+                statements.push(node);
+                if statements.len() > 3 {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    let (writer, consumer) = match statements.as_slice() {
+        [writer, consumer] => (writer, consumer),
+        [setup, writer, consumer] if literal_mkdir_setup(setup) => (writer, consumer),
+        _ => return None,
+    };
+    let (operator_start, body, destination) = literal_cat_file_write(writer)?;
+    if consumer.kind().as_ref() != "command"
+        || consumer
+            .children()
+            .filter(ast_grep_core::Node::is_named)
+            .any(|child| {
+                !matches!(
+                    child.kind().as_ref(),
+                    "command_name" | "word" | "raw_string" | "string"
+                )
+            })
+    {
+        return None;
+    }
+    let words = literal_script_words(consumer)?;
+    let [program, path] = words.as_slice() else {
+        return None;
+    };
+    let interpreter = program.rsplit('/').next()?;
+    let language = ScriptLanguage::from_command(interpreter);
+    let supported_shell = matches!(interpreter, "bash" | "sh" | "dash" | "ksh" | "zsh");
+    if destination != *path
+        || !(supported_shell
+            || matches!(
+                language,
+                ScriptLanguage::Python
+                    | ScriptLanguage::JavaScript
+                    | ScriptLanguage::Ruby
+                    | ScriptLanguage::Perl
+                    | ScriptLanguage::Php
+            ))
+        || !trusted_literal_script_program(program)
+    {
+        return None;
+    }
+    Some(WrittenHeredocInterpreter {
+        operator_start,
+        body,
+        interpreter: interpreter.to_string(),
+        language,
+    })
+}
+
+fn literal_cat_file_write<D: ast_grep_core::Doc>(
+    writer: &ast_grep_core::Node<'_, D>,
+) -> Option<(usize, Range<usize>, String)> {
+    if writer.kind().as_ref() != "redirected_statement" {
+        return None;
+    }
+    let owner = literal_cat_write_owner(writer)?;
+    let words = literal_script_words(&owner)?;
+    let [program] = words.as_slice() else {
+        return None;
+    };
+    if owner.kind().as_ref() != "command"
+        || owner
+            .children()
+            .filter(ast_grep_core::Node::is_named)
+            .any(|child| child.kind().as_ref() != "command_name")
+        || !matches!(program.as_str(), "cat" | "/bin/cat" | "/usr/bin/cat")
+        || !trusted_literal_script_program(program)
+    {
+        return None;
+    }
+    let mut redirects = Vec::new();
+    let mut heredoc = None;
+    for child in writer.children().filter(ast_grep_core::Node::is_named) {
+        match child.kind().as_ref() {
+            "command" | "list" => {}
+            "file_redirect" => redirects.push(child),
+            "heredoc_redirect" if heredoc.is_none() => heredoc = Some(child),
+            _ => return None,
+        }
+    }
+    let heredoc = heredoc?;
+    let text = heredoc.text();
+    let operator_offset = text.find("<<")?;
+    let mut body = None;
+    let mut quoted = false;
+    for child in heredoc.children().filter(ast_grep_core::Node::is_named) {
+        match child.kind().as_ref() {
+            "heredoc_start" => {
+                quoted = heredoc_delimiter_is_quoted(
+                    text.as_ref(),
+                    operator_offset,
+                    child.range().end.checked_sub(heredoc.range().start)?,
+                    child.text().as_ref(),
+                );
+            }
+            "heredoc_body" => {
+                // Extraction excludes the newline immediately before the
+                // terminator. Use the same source boundary for exact identity.
+                let mut range = child.range();
+                let text = child.text();
+                if text.ends_with('\n') {
+                    range.end -= 1;
+                    if text.ends_with("\r\n") {
+                        range.end -= 1;
+                    }
+                }
+                body = Some(range);
+            }
+            "heredoc_end" => {}
+            "file_descriptor" if child.text().as_ref() == "0" => {}
+            "file_redirect" => redirects.push(child),
+            _ => return None,
+        }
+    }
+    if !quoted || redirects.len() != 1 {
+        return None;
+    }
+    Some((
+        heredoc.range().start + operator_offset,
+        body?,
+        literal_overwrite_destination(&redirects[0])?,
+    ))
+}
+
+fn literal_cat_write_owner<'a, D: ast_grep_core::Doc>(
+    writer: &ast_grep_core::Node<'a, D>,
+) -> Option<ast_grep_core::Node<'a, D>> {
+    let body = writer.field("body")?;
+    if body.kind().as_ref() == "command" {
+        return Some(body);
+    }
+    // Bash's grammar attaches `mkdir ... && cat >file <<EOF` redirects
+    // to the list. Only its final cat consumes the heredoc. Admit this exact
+    // setup shape; a grouped, branching or longer command is not a proof.
+    if body.kind().as_ref() != "list" {
+        return None;
+    }
+    let children: Vec<_> = body.children().collect();
+    let [setup, operator, owner] = children.as_slice() else {
+        return None;
+    };
+    (literal_mkdir_setup(setup)
+        && operator.kind().as_ref() == "&&"
+        && owner.kind().as_ref() == "command")
+        .then(|| owner.clone())
+}
+
+fn literal_overwrite_destination<D: ast_grep_core::Doc>(
+    redirect: &ast_grep_core::Node<'_, D>,
+) -> Option<String> {
+    let mut destination = None;
+    let mut overwrite = false;
+    for child in redirect.children() {
+        match child.kind().as_ref() {
+            ">" | ">|" => overwrite = true,
+            "file_descriptor" if child.text().as_ref() == "1" => {}
+            "word" | "raw_string" | "string" if destination.is_none() => {
+                let words = literal_script_words(&child)?;
+                let [path] = words.as_slice() else {
+                    return None;
+                };
+                if !is_plain_file_path(path) || path == "/dev/null" {
+                    return None;
+                }
+                destination = Some(path.clone());
+            }
+            _ => return None,
+        }
+    }
+    overwrite.then_some(destination).flatten()
+}
+
+fn literal_script_words<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+) -> Option<Vec<String>> {
+    let text = node.text();
+    if text.contains(['$', '`', '\\', '*', '?', '[', '{', '~']) {
+        return None;
+    }
+    shell_words::split(text.as_ref()).ok()
+}
+
+fn trusted_literal_script_program(program: &str) -> bool {
+    let basename = program.rsplit('/').next().unwrap_or(program);
+    if program.contains('/') {
+        is_trusted_os_data_sink_path(program, basename)
+    } else {
+        std::env::var_os(format!("BASH_FUNC_{basename}%%")).is_none()
+    }
+}
+
+fn literal_mkdir_setup<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> bool {
+    if node.kind().as_ref() != "command" {
+        return false;
+    }
+    let Some(words) = literal_script_words(node) else {
+        return false;
+    };
+    let Some((program, arguments)) = words.split_first() else {
+        return false;
+    };
+    matches!(program.as_str(), "mkdir" | "/bin/mkdir" | "/usr/bin/mkdir")
+        && trusted_literal_script_program(program)
+        && !arguments.is_empty()
+        && arguments
+            .iter()
+            .all(|arg| arg == "-p" || arg == "--" || is_plain_file_path(arg))
+        && node
+            .children()
+            .filter(ast_grep_core::Node::is_named)
+            .all(|child| {
+                matches!(
+                    child.kind().as_ref(),
+                    "command_name" | "word" | "raw_string" | "string"
+                )
+            })
+}
+
 /// The plain command owning one heredoc, with no other redirection, pipeline
 /// or trailing argument hidden under the redirection node. Callers use this
 /// narrow shape to prove how stdin is consumed; an interpreter running `-c`
@@ -8751,8 +9068,10 @@ fn runs_its_input_as_code(program: &str) -> bool {
 /// `sh -c "$(cat x.sh)"`, `cat x.sh | sh`, `bash < x.sh`. A mention by a
 /// program that only reads or files the text away (`git add notes.md`,
 /// `cat notes.md`) is not one, unless that segment pipes into another. Names
-/// are compared by basename at word boundaries. Coarse on purpose — it only
-/// ever keeps a body visible. Linear in the command times the (few) files.
+/// are compared by basename at word boundaries. A proven synchronous reader
+/// before a file's first write cannot consume the newly written body (#525).
+/// All other mentions retain the conservative treatment, including readers
+/// inside loops and commands whose execution may be deferred.
 fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
     use crate::normalize::NormalizeTokenKind;
     /// Programs whose mention of a file neither runs it nor hands it on.
@@ -8775,6 +9094,7 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
     let Ok(outside) = String::from_utf8(outside) else {
         return true;
     };
+    let ordered_readers = ordered_file_reader_ranges(command, &outside);
     let tokens = crate::normalize::tokenize_for_normalization(&outside);
     let name_of = |word: &str| -> String {
         let word = dequoted_executable_word(word);
@@ -8784,8 +9104,9 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
     // Per token: the written file it names as a write target, and the
     // command word of its segment plus whether that segment pipes into a
     // shell or interpreter (`cat x.sh | bash`, not `… | wc -c`).
-    let mut written: Vec<String> = Vec::new();
+    let mut written: Vec<(String, usize)> = Vec::new();
     let mut write_targets = vec![false; tokens.len()];
+    let mut process_substitution_words = vec![false; tokens.len()];
     let mut segment_command: Vec<Option<String>> = vec![None; tokens.len()];
     let mut piped = vec![false; tokens.len()];
     // (first token, end token, program, pipes on) of each segment.
@@ -8807,8 +9128,16 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
             segment_start = index + 1;
             continue;
         }
+        if !process_substitution_bodies(text).is_empty() {
+            // A process substitution names a generated descriptor, not a
+            // literal written file, including after `>` or as a tee operand.
+            // Its nested command is checked independently as a consumer below.
+            process_substitution_words[index] = true;
+            pending_target = false;
+            continue;
+        }
         if std::mem::take(&mut pending_target) {
-            written.push(name_of(text));
+            written.push((name_of(text), segment_start));
             write_targets[index] = true;
             continue;
         }
@@ -8817,7 +9146,7 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
             if target.is_empty() {
                 pending_target = true;
             } else {
-                written.push(name_of(target));
+                written.push((name_of(target), segment_start));
                 write_targets[index] = true;
             }
             continue;
@@ -8825,7 +9154,7 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
         if command_word.as_deref() == Some("dd")
             && let Some(target) = text.strip_prefix("of=")
         {
-            written.push(name_of(target));
+            written.push((name_of(target), segment_start));
             write_targets[index] = true;
             continue;
         }
@@ -8841,7 +9170,7 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
                 }
             }
             Some("tee") if !text.starts_with('-') => {
-                written.push(name_of(text));
+                written.push((name_of(text), segment_start));
                 write_targets[index] = true;
             }
             Some(_) => {}
@@ -8859,9 +9188,10 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
             piped[index] = feeds_interpreter;
         }
     }
-    written.retain(|name| !name.is_empty() && name != "-");
+    written.retain(|(name, _)| !name.is_empty() && name != "-");
     written.sort_unstable();
-    written.dedup();
+    // Sorting also orders each file's writes, so retain its earliest command.
+    written.dedup_by(|later, earlier| later.0 == earlier.0);
     if written.is_empty() {
         return false;
     }
@@ -8876,12 +9206,19 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
         })
     };
     tokens.iter().enumerate().any(|(index, token)| {
-        if write_targets[index] || token.kind != NormalizeTokenKind::Word {
+        if token.kind != NormalizeTokenKind::Word {
             return false;
         }
         let Some(text) = token.text(&outside) else {
             return false;
         };
+        // The tokenizer keeps a process substitution inside its outer word.
+        // Its commands do not inherit cat/tee's data-only argv contract.
+        // The quote-aware scan above keeps literal `<(...)` prose inert.
+        let has_process_substitution = process_substitution_words[index];
+        if write_targets[index] && !has_process_substitution {
+            return false;
+        }
         // A name the shell computes may be the file: any such word run by a
         // shell or interpreter (`sh $(ls *.sh)`, `bash ./*.sh`), and a
         // command word computed the same way (`$f`, `./*.sh`).
@@ -8889,10 +9226,19 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
         let program = segment_command[index].as_deref();
         let command_word = program.is_some_and(|word| word == name_of(text));
         let interpreted = program.is_some_and(runs_its_input_as_code);
-        if computed && !is_shell_env_assignment(text) && (command_word || interpreted) {
+        if computed
+            && (has_process_substitution
+                || (!is_shell_env_assignment(text) && (command_word || interpreted)))
+        {
             return true;
         }
-        let mentions = written.iter().any(|name| {
+        let synchronous_reader = ordered_readers.iter().any(|range| {
+            range.start <= token.byte_range.start && token.byte_range.end <= range.end
+        });
+        let mentions = written.iter().any(|(name, first_write)| {
+            if synchronous_reader && index < *first_write {
+                return false;
+            }
             text.match_indices(name.as_str()).any(|(at, _)| {
                 boundary(
                     at.checked_sub(1)
@@ -8901,10 +9247,216 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
             })
         });
         mentions
-            && (piped[index]
+            && (has_process_substitution
+                || piped[index]
                 || !segment_command[index]
                     .as_deref()
                     .is_some_and(|word| READERS.contains(&word)))
+    })
+}
+
+/// Readers whose file access follows lexical command order. This proof is
+/// deliberately narrower than the legacy READERS list: it only withdraws a
+/// prior sed/awk/tac mention when the entire shell has ordinary sequential
+/// statements and the reader has a literal, non-executing program. A prior
+/// arbitrary executable can arrange a future read, and a loop can read the
+/// newly written bytes on its next iteration. Neither supplies this proof.
+fn ordered_file_reader_ranges(command: &str, outside: &str) -> Vec<Range<usize>> {
+    if !outside.contains("sed") && !outside.contains("awk") && !outside.contains("tac") {
+        return Vec::new();
+    }
+    let Ok(ast) = AstGrep::try_new(outside, SupportLang::Bash) else {
+        return Vec::new();
+    };
+    if ast.root().get_inner_node().has_error() {
+        return Vec::new();
+    }
+    let mut pending = vec![ast.root()];
+    let mut readers = Vec::new();
+    while let Some(node) = pending.pop() {
+        match node.kind().as_ref() {
+            "program" | "list" => {
+                for child in node.children() {
+                    if child.is_named() {
+                        pending.push(child);
+                    } else if !matches!(child.text().as_ref(), ";" | "&&" | "||") {
+                        // A background operator, pipeline, or unknown shell
+                        // construct does not establish completion order.
+                        return Vec::new();
+                    }
+                }
+            }
+            "redirected_statement" => {
+                // Bash's heredoc grammar wraps `reader && cat > file` around
+                // a list; recurse through that list's ordering checks too.
+                for child in node.children().filter(ast_grep_core::Node::is_named) {
+                    if !matches!(
+                        child.kind().as_ref(),
+                        "command" | "list" | "file_redirect" | "heredoc_redirect"
+                    ) {
+                        return Vec::new();
+                    }
+                    pending.push(child);
+                }
+            }
+            "heredoc_redirect" => {
+                let text = node.text();
+                let Some(operator) = text.find("<<") else {
+                    return Vec::new();
+                };
+                let Some(delimiter) = node
+                    .children()
+                    .find(|child| child.kind().as_ref() == "heredoc_start")
+                else {
+                    return Vec::new();
+                };
+                if !heredoc_delimiter_is_quoted(
+                    text.as_ref(),
+                    operator,
+                    delimiter.range().end.saturating_sub(node.range().start),
+                    delimiter.text().as_ref(),
+                ) {
+                    // The blanked view omitted expansions from an unquoted
+                    // body; they could start deferred work before the write.
+                    return Vec::new();
+                }
+                for child in node.children().filter(ast_grep_core::Node::is_named) {
+                    match child.kind().as_ref() {
+                        "heredoc_start" | "heredoc_body" | "heredoc_end" => {}
+                        "file_redirect" => pending.push(child),
+                        _ => return Vec::new(),
+                    }
+                }
+            }
+            "command" => {
+                let Some(name) = node
+                    .children()
+                    .find(|child| child.kind().as_ref() == "command_name")
+                else {
+                    return Vec::new();
+                };
+                let name_text = name.text();
+                let Some(name) = literal_program_name(name_text.as_ref()) else {
+                    return Vec::new();
+                };
+                if is_code_runner_name(name)
+                    || matches!(name, "trap" | "coproc" | "exec" | "disown" | "wait")
+                {
+                    return Vec::new();
+                }
+                // Shell expansions may execute or arrange future work, even
+                // when the containing command itself is a simple statement.
+                let mut parts: Vec<_> = node.children().collect();
+                while let Some(part) = parts.pop() {
+                    if matches!(
+                        part.kind().as_ref(),
+                        "command_substitution" | "process_substitution" | "variable_assignment"
+                    ) {
+                        return Vec::new();
+                    }
+                    parts.extend(part.children());
+                }
+                if synchronous_file_reader(node.text().as_ref())
+                    && !stdin_data_sink_may_be_overridden(command, node.range().end, name)
+                {
+                    readers.push(node.range());
+                    if readers.len() > 32 {
+                        return Vec::new();
+                    }
+                }
+            }
+            "file_redirect" => {
+                let mut parts: Vec<_> = node.children().collect();
+                while let Some(part) = parts.pop() {
+                    if matches!(
+                        part.kind().as_ref(),
+                        "command_substitution" | "process_substitution"
+                    ) {
+                        return Vec::new();
+                    }
+                    parts.extend(part.children());
+                }
+            }
+            "comment" => {}
+            // Functions, loops, conditionals, groups, subshells and pipelines
+            // all keep the old conservative scan, regardless of byte order.
+            _ => return Vec::new(),
+        }
+    }
+    readers
+}
+
+/// A small set of synchronous reads, with no program files, executable
+/// options, mutable arguments, or wrappers. These are not new data-sink
+/// exemptions: they apply only to a mention before the file is written.
+fn synchronous_file_reader(command: &str) -> bool {
+    if command.contains(['$', '`', '*', '?', '[', '{', '~', '\n', '\r']) {
+        return false;
+    }
+    let Ok(words) = shell_words::split(command) else {
+        return false;
+    };
+    let Some((program, mut arguments)) = words.split_first() else {
+        return false;
+    };
+    let name = program.rsplit('/').next().unwrap_or(program);
+    match name {
+        "tac" => true,
+        "awk" | "gawk" | "mawk" | "nawk" => {
+            matches!(arguments.split_first(), Some((program, files))
+                if program == "1" && files.iter().all(|file| !file.starts_with('-')))
+        }
+        "sed" | "gsed" => {
+            while arguments
+                .first()
+                .is_some_and(|arg| matches!(arg.as_str(), "-n" | "-E" | "-r"))
+            {
+                arguments = &arguments[1..];
+            }
+            let Some((script, files)) = arguments.split_first() else {
+                return false;
+            };
+            files.iter().all(|file| !file.starts_with('-')) && sed_program_is_plain_read(script)
+        }
+        _ => false,
+    }
+}
+
+/// A single print command or substitution without an execution/write flag.
+/// Escaped delimiters stay inside the pattern or replacement; no surrounding
+/// sed commands are accepted, so `e`, `s///e`, and appended programs stay code.
+fn sed_program_is_plain_read(script: &str) -> bool {
+    if let Some(address) = script.strip_suffix('p') {
+        if address
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b',')
+        {
+            return true;
+        }
+    }
+    let bytes = script.as_bytes();
+    let Some(&delimiter) = bytes.get(1) else {
+        return false;
+    };
+    if bytes.first() != Some(&b's') || !delimiter.is_ascii_punctuation() || delimiter == b'\\' {
+        return false;
+    }
+    let mut index = 2;
+    for _ in 0..2 {
+        loop {
+            let Some(&byte) = bytes.get(index) else {
+                return false;
+            };
+            index += 1;
+            if byte == b'\\' {
+                index += 1;
+            } else if byte == delimiter {
+                break;
+            }
+        }
+    }
+    bytes[index..].iter().all(|byte| {
+        byte.is_ascii_digit() || matches!(byte, b'g' | b'p' | b'i' | b'I' | b'm' | b'M')
     })
 }
 
@@ -11632,6 +12184,108 @@ mod tests {
                     "{command:?} -> {bodies:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn synchronous_reads_before_quoted_writes_do_not_execute_the_new_body_525() {
+        for command in [
+            "sed -n 1p notes.txt && cat >> notes.txt <<'EOF'\n$(ls)\nEOF",
+            "sed 's/a\\.b/c/' notes.txt && cat >> notes.txt <<'EOF'\n`ls`\nEOF",
+            "sed 's/a\\.b/c/' notes.txt && cat > notes.txt <<'EOF'\n`ls`\nEOF",
+            "sed 's/a\\.b/c/' notes.txt && cat >> notes.txt <<'EOF'\nrm -rf ~/project\nEOF",
+            "awk 1 notes.txt && cat >> notes.txt <<'EOF'\nrm -rf ~/project\nEOF",
+            "tac notes.txt && cat >> notes.txt <<'EOF'\nrm -rf ~/project\nEOF",
+            "sed -n 1p notes.txt\ncat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF",
+        ] {
+            for view in [
+                mask_non_executing_heredocs(command),
+                mask_non_expanding_data_heredocs(command),
+            ] {
+                assert!(
+                    !view.contains("$(ls)")
+                        && !view.contains("`ls`")
+                        && !view.contains("rm -rf ~/project"),
+                    "the earlier reader cannot consume newly written text: {command:?} -> {view:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn file_read_order_preserves_repeated_deferred_and_later_consumers_525() {
+        for command in [
+            "for round in 1 2; do sed -n 1p notes.txt; cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF\ndone",
+            "while sed -n 1p notes.txt; do cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF\ndone",
+            "read_notes() { sed -n 1p notes.txt; }; cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF\nread_notes",
+            "sed -n 1p notes.txt & cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF",
+            "cat <(sed -n 1p notes.txt); cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF",
+            "cat <(bash notes.txt); cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF",
+            "consumer=<(bash \"$script\"); cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF",
+            "cat > >(bash notes.txt); cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF",
+            "cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF\ncat <(bash notes.txt)",
+            "cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF\ncat >(bash notes.txt)",
+            "cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF\ncat > >(bash notes.txt)",
+            "cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF\ntee >(bash notes.txt)",
+            "trap 'bash notes.txt' EXIT; sed -n 1p notes.txt && /bin/cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF",
+            "\"$reader\" notes.txt; cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF",
+            "sed -n 1p notes.txt; cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF\nsed e notes.txt",
+            "sed -n 1p notes.txt; cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF\nsed 's/^/ /e' notes.txt",
+            "sed -n 1p notes.txt; cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF\nawk '{system($0)}' notes.txt",
+            "cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF\nsed -n 1p notes.txt; cat > notes.txt <<'OTHER'\nnew text\nOTHER",
+        ] {
+            assert!(
+                mask_non_executing_heredocs(command).contains("rm -rf ~/project"),
+                "source order does not prove this body inert: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_process_substitution_prose_is_not_a_file_consumer_525() {
+        for command in [
+            "cat '<(bash notes.txt)'; cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF",
+            "cat \"<(bash notes.txt)\"; cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF",
+            "cat --note='>(bash notes.txt)'; cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF",
+            "cat \\<\\(bash\\ notes.txt\\); cat > notes.txt <<'EOF'\nrm -rf ~/project\nEOF",
+        ] {
+            for view in [
+                mask_non_executing_heredocs(command),
+                mask_non_expanding_data_heredocs(command),
+            ] {
+                assert!(
+                    !view.contains("rm -rf ~/project"),
+                    "quoted prose cannot consume the written file: {command:?} -> {view:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prior_sed_read_proof_rejects_execution_and_extra_programs_525() {
+        for script in ["p", "1p", "1,20p", "s/a\\.b/c/", "s|a\\|b|c|g"] {
+            assert!(sed_program_is_plain_read(script), "{script:?}");
+        }
+        for script in [
+            "e",
+            "1e",
+            "s/x/y/e",
+            "s/x/y/w file",
+            "s/x/y/; e",
+            "s/x/y/\ne",
+            "s/x/y",
+        ] {
+            assert!(!sed_program_is_plain_read(script), "{script:?}");
+        }
+        for command in [
+            "sed -f program.sed notes.txt",
+            "sed 1p notes.txt -e e",
+            "sed -n 1p \"$notes\"",
+            "awk -l extension 1 notes.txt",
+            "awk '{system($0)}' notes.txt",
+            "tac $(choose_file)",
+        ] {
+            assert!(!synchronous_file_reader(command), "{command:?}");
         }
     }
 
@@ -15144,6 +15798,123 @@ fi"#;
                 "{cmd} must NOT be masked as interpreter source (#136 reverted — masking executes is unsound)"
             );
         }
+    }
+
+    #[test]
+    fn written_heredoc_uses_its_exact_file_interpreter_519() {
+        for (header, runner, language, body) in [
+            (
+                "cat > /tmp/a.js <<'EOF'",
+                "node /tmp/a.js",
+                ScriptLanguage::JavaScript,
+                "f(u => !x);\n",
+            ),
+            (
+                "cat <<'EOF' > /tmp/a.js",
+                "node /tmp/a.js",
+                ScriptLanguage::JavaScript,
+                "f(u => !x);\n",
+            ),
+            (
+                "/bin/cat 1> '/tmp/a b.py' 0<<'EOF'",
+                "/usr/bin/python3 '/tmp/a b.py'",
+                ScriptLanguage::Python,
+                "import shutil\nshutil.rmtree('/home/user')\n",
+            ),
+            (
+                "cat >| /tmp/a.rb <<'EOF'",
+                "ruby /tmp/a.rb",
+                ScriptLanguage::Ruby,
+                "system('git reset --hard')\n",
+            ),
+            (
+                "cat > /tmp/a.pl <<'EOF'",
+                "perl /tmp/a.pl",
+                ScriptLanguage::Perl,
+                "system('git reset --hard');\n",
+            ),
+            (
+                "cat > /tmp/a.php <<'EOF'",
+                "php /tmp/a.php",
+                ScriptLanguage::Php,
+                "<?php system('git reset --hard'); ?>\n",
+            ),
+            (
+                "cat > /tmp/a.sh <<'EOF'",
+                "bash /tmp/a.sh",
+                ScriptLanguage::Bash,
+                "git reset --hard\n",
+            ),
+        ] {
+            let command = format!("{header}\n{body}EOF\n{runner}");
+            let proof = written_heredoc_interpreter(&command).expect("literal script handoff");
+            assert_eq!(proof.language, language, "{command}");
+            let ExtractionResult::Extracted(contents) =
+                extract_content(&command, &ExtractionLimits::structural_scan())
+            else {
+                panic!("complete extraction required: {command}");
+            };
+            let content = contents
+                .iter()
+                .find(|source| source.byte_range.start == proof.operator_start)
+                .expect("the exact written body must reach typed analysis");
+            assert_eq!(content.language, language, "{command}");
+            assert_eq!(
+                content.target_command.as_deref(),
+                Some(proof.interpreter.as_str())
+            );
+            assert_eq!(
+                content.content,
+                body.strip_suffix('\n').expect("body newline"),
+                "the complete source must be analyzed"
+            );
+            assert!(
+                mask_non_executing_heredocs(&command).contains(body),
+                "raw safety evidence remains visible"
+            );
+        }
+    }
+
+    #[test]
+    fn written_script_proof_rejects_ambiguous_file_flows_519() {
+        for command in [
+            "cat >> /tmp/a.js <<'EOF'\nf(u => !x);\nEOF\nnode /tmp/a.js",
+            "cat extra > /tmp/a.js <<'EOF'\nf(u => !x);\nEOF\nnode /tmp/a.js",
+            "cat -n > /tmp/a.js <<'EOF'\nf(u => !x);\nEOF\nnode /tmp/a.js",
+            "cat 2> /tmp/a.js <<'EOF'\nf(u => !x);\nEOF\nnode /tmp/a.js",
+            "cat > /tmp/a.js 3<<'EOF'\nf(u => !x);\nEOF\nnode /tmp/a.js",
+            "cat > /tmp/a.js < other <<'EOF'\nf(u => !x);\nEOF\nnode /tmp/a.js",
+            "cat > /tmp/a.js > /tmp/b.js <<'EOF'\nf(u => !x);\nEOF\nnode /tmp/a.js",
+            "cat > /tmp/a.js <<EOF\nf(u => !x);\nEOF\nnode /tmp/a.js",
+            "cat > /tmp/a.js <<'EOF'\nf(u => !x);\nEOF\nnode /tmp/b.js",
+            "cat > /tmp/a.js <<'EOF'\nf(u => !x);\nEOF\nenv node /tmp/a.js",
+            "cat > /tmp/a.js <<'EOF'\nf(u => !x);\nEOF\n/tmp/node /tmp/a.js",
+            "cat > /tmp/a.js <<'EOF'\nf(u => !x);\nEOF\nnode /tmp/a.js\nbash /tmp/a.js",
+            "alias node=bash\ncat > /tmp/a.js <<'EOF'\nf(u => !x);\nEOF\nnode /tmp/a.js",
+            "for n in 1 2; do cat > /tmp/a.js <<'EOF'\nf(u => !x);\nEOF\nnode /tmp/a.js; done",
+            "cat > /proc/self/fd/1 <<'EOF'\nf(u => !x);\nEOF\nnode /proc/self/fd/1",
+        ] {
+            assert!(
+                written_heredoc_interpreter(command).is_none(),
+                "must retain conservative analysis: {command}"
+            );
+            assert!(
+                written_javascript_arrow_offsets(command).is_empty(),
+                "unproven source cannot exempt an arrow: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn written_javascript_arrow_proof_excludes_strings_and_comments_519() {
+        let command = "mkdir -p /tmp/x && cat >/tmp/x/a.js <<'EOF'\n// => !comment\nconst text = 'π => !string';\nf(u => !x);\nEOF\nnode /tmp/x/a.js";
+        let arrow = command.find("u =>").expect("arrow") + 3;
+        assert_eq!(written_javascript_arrow_offsets(command), vec![arrow]);
+        assert_eq!(command.as_bytes()[arrow], b'>');
+        assert!(mask_non_executing_heredocs(command).contains("=> !string"));
+        // A body that cannot be parsed is never syntax evidence.
+        let malformed = "cat >/tmp/a.js <<'EOF'\nf(u => !x;\nEOF\nnode /tmp/a.js";
+        assert!(written_javascript_arrow_offsets(malformed).is_empty());
     }
 
     /// #136 REVERTED: a python (or any interpreter) heredoc body is NOT masked —
