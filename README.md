@@ -3103,6 +3103,23 @@ too; `-X` / `--no-psqlrc` disables those startup files so a literal SQL command
 can be evaluated directly. dcg does not connect to the other environment to
 inspect its files.
 
+Literal script text piped into `ssh host`, an explicit remote stdin-reading
+shell, or an interactive `docker` / `podman` / `nerdctl` / `kubectl` / `oc`
+`exec` shell receives the same filesystem boundary. This includes supported
+process-substitution inputs. For example, `printf '%s\n' 'echo x > ~/notes.txt'
+| ssh host` cannot borrow local evidence that the file is new. Unknown script
+producers, compound remote dispatch, and unsupported carrier options require
+review through the existing unverified-source denial. Grouped and transformed
+producers retain the same conservative source checks as local shell pipelines.
+
+Ordinary data consumers such as `ssh host cat` and `docker exec -i container
+cat` do not execute their input as program text. Disabled stdin and detached
+container exec also remain data paths. SSH's local command-execution options
+need separate review even with `-n`, because they can use the caller's stdin.
+Local output redirects on the carrier still use local creation checks. An
+exact-command `dcg allow-once` review remains available for a required operation;
+these checks do not add allowlist entries or inspect remote files.
+
 **Credential and login files are never exempted by path.**
 `core.filesystem:credential-file-write` (writes to `~/.ssh/*`,
 `~/.aws/credentials`, `~/.netrc`, `~/.npmrc`, the shell rc files,

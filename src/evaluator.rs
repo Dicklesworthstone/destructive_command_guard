@@ -7876,7 +7876,15 @@ fn direct_stdin_code_input_mode(command: &[String]) -> PipelineShellInputMode {
     if command.is_empty() {
         return PipelineShellInputMode::Unverified;
     }
-    pipeline_shell_input_mode(&posix_command_from_argv(command))
+    let source = posix_command_from_argv(command);
+    // xargs/parallel return only an input mode, without carrying a child's
+    // filesystem or recursion scope. Until they retain that provenance, a
+    // remote/isolated child must not borrow the outer local consumer's proof
+    // or restart carrier recursion as though it were a top-level command.
+    if script_segment_is_nonlocal(&source) {
+        return PipelineShellInputMode::Unverified;
+    }
+    pipeline_shell_input_mode(&source)
 }
 
 fn parse_pipeline_record_delimiter(value: &str) -> Option<PipelineRecordDelimiter> {
@@ -8347,6 +8355,317 @@ fn powershell_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
     PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PowerShell)
 }
 
+#[derive(Clone, Copy)]
+enum ContainerPipelineOption {
+    Value,
+    Flag,
+    Interactive,
+    Detached,
+    Help,
+}
+
+#[derive(Default)]
+struct ContainerPipelineFlags {
+    interactive: bool,
+    detached: bool,
+    help: bool,
+}
+
+fn container_pipeline_long_option(
+    executable: &str,
+    name: &str,
+    exec_options: bool,
+) -> Option<ContainerPipelineOption> {
+    use ContainerPipelineOption::{Detached, Flag, Help, Interactive, Value};
+
+    let kubernetes = matches!(executable, "kubectl" | "oc");
+    if name == "help" {
+        return Some(Help);
+    }
+    if exec_options {
+        match name {
+            "interactive" if !kubernetes => return Some(Interactive),
+            "stdin" if kubernetes => return Some(Interactive),
+            "detach" if !kubernetes => return Some(Detached),
+            "tty" => return Some(Flag),
+            "quiet" if kubernetes => return Some(Flag),
+            "container" | "pod-running-timeout" if kubernetes => return Some(Value),
+            "env" | "env-file" | "user" | "workdir" if !kubernetes => return Some(Value),
+            "privileged" if !kubernetes => return Some(Flag),
+            "detach-keys" if matches!(executable, "docker" | "podman") => return Some(Value),
+            "preserve-fd" | "preserve-fds" | "wait" if executable == "podman" => {
+                return Some(Value);
+            }
+            "no-session" if executable == "podman" => return Some(Flag),
+            _ => {}
+        }
+    }
+    // Persistent options may occur before the subcommand or among exec's
+    // options. A value named "exec", "sh", or "--interactive" stays a value.
+    match executable {
+        "docker" => match name {
+            "config" | "context" | "host" | "log-level" | "tlscacert" | "tlscert" | "tlskey" => {
+                Some(Value)
+            }
+            "debug" | "tls" | "tlsverify" | "version" => Some(Flag),
+            _ => None,
+        },
+        "podman" => match name {
+            "connection" | "url" | "identity" | "root" | "runroot" | "runtime" | "log-level"
+            | "storage-driver" | "storage-opt" | "tmpdir" | "events-backend" | "cgroup-manager"
+            | "namespace" | "module" => Some(Value),
+            "remote" | "syslog" | "version" => Some(Flag),
+            _ => None,
+        },
+        "nerdctl" => match name {
+            "address" | "namespace" | "snapshotter" | "data-root" | "cgroup-manager" => Some(Value),
+            "debug" | "insecure-registry" | "experimental" | "version" => Some(Flag),
+            _ => None,
+        },
+        "kubectl" | "oc" => match name {
+            "as"
+            | "as-group"
+            | "as-uid"
+            | "cache-dir"
+            | "certificate-authority"
+            | "client-certificate"
+            | "client-key"
+            | "cluster"
+            | "context"
+            | "kubeconfig"
+            | "kuberc"
+            | "namespace"
+            | "password"
+            | "profile"
+            | "profile-output"
+            | "request-timeout"
+            | "server"
+            | "tls-server-name"
+            | "token"
+            | "user"
+            | "username"
+            | "v"
+            | "vmodule" => Some(Value),
+            "disable-compression"
+            | "insecure-skip-tls-verify"
+            | "match-server-version"
+            | "warnings-as-errors" => Some(Flag),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn container_pipeline_short_option(
+    executable: &str,
+    flag: u8,
+    exec_options: bool,
+) -> Option<&'static str> {
+    let kubernetes = matches!(executable, "kubectl" | "oc");
+    match flag {
+        b'h' => Some("help"),
+        b'i' if exec_options => Some(if kubernetes { "stdin" } else { "interactive" }),
+        b't' if exec_options => Some("tty"),
+        b'd' if exec_options && !kubernetes => Some("detach"),
+        b'e' if exec_options && !kubernetes => Some("env"),
+        b'u' if exec_options && !kubernetes => Some("user"),
+        b'w' if exec_options && !kubernetes => Some("workdir"),
+        b'c' if exec_options && kubernetes => Some("container"),
+        b'q' if exec_options && kubernetes => Some("quiet"),
+        b'c' if executable == "docker" => Some("context"),
+        b'c' if executable == "podman" => Some("connection"),
+        b'H' if executable == "docker" => Some("host"),
+        b'l' if executable == "docker" => Some("log-level"),
+        b'D' if executable == "docker" => Some("debug"),
+        b'r' if executable == "podman" => Some("remote"),
+        b'a' if executable == "nerdctl" => Some("address"),
+        b'n' if kubernetes || executable == "nerdctl" => Some("namespace"),
+        b's' if kubernetes => Some("server"),
+        b'v' if kubernetes => Some("v"),
+        b'v' => Some("version"),
+        _ => None,
+    }
+}
+
+fn container_pipeline_bool(value: &str) -> Option<bool> {
+    // These are the spellings accepted by Go's strconv.ParseBool, which
+    // backs the Cobra/pflag bool flags used by these command-line clients.
+    match value {
+        "1" | "t" | "T" | "true" | "TRUE" | "True" => Some(true),
+        "0" | "f" | "F" | "false" | "FALSE" | "False" => Some(false),
+        _ => None,
+    }
+}
+
+fn set_container_pipeline_flag(
+    option: ContainerPipelineOption,
+    value: bool,
+    flags: &mut ContainerPipelineFlags,
+) {
+    match option {
+        ContainerPipelineOption::Interactive => flags.interactive = value,
+        ContainerPipelineOption::Detached => flags.detached = value,
+        ContainerPipelineOption::Help => flags.help = value,
+        ContainerPipelineOption::Value | ContainerPipelineOption::Flag => {}
+    }
+}
+
+fn consume_container_pipeline_option(
+    executable: &str,
+    args: &[String],
+    index: usize,
+    exec_options: bool,
+    flags: &mut ContainerPipelineFlags,
+) -> Option<usize> {
+    let argument = args.get(index)?;
+    if let Some(long) = argument.strip_prefix("--") {
+        let (name, attached) = long
+            .split_once('=')
+            .map_or((long, None), |(name, value)| (name, Some(value)));
+        let option = container_pipeline_long_option(executable, name, exec_options)?;
+        if matches!(option, ContainerPipelineOption::Value) {
+            return if attached.is_some() {
+                Some(index + 1)
+            } else {
+                args.get(index + 1).map(|_| index + 2)
+            };
+        }
+        let value = attached.map_or(Some(true), container_pipeline_bool)?;
+        set_container_pipeline_flag(option, value, flags);
+        return Some(index + 1);
+    }
+    let short = argument.strip_prefix('-')?;
+    if short.is_empty() {
+        return None;
+    }
+    for (position, flag) in short.bytes().enumerate() {
+        let name = container_pipeline_short_option(executable, flag, exec_options)?;
+        let option = container_pipeline_long_option(executable, name, exec_options)?;
+        let remaining = short.get(position + 1..)?;
+        if matches!(option, ContainerPipelineOption::Value) {
+            return if remaining.is_empty() {
+                args.get(index + 1).map(|_| index + 2)
+            } else {
+                Some(index + 1)
+            };
+        }
+        if let Some(value) = remaining.strip_prefix('=') {
+            set_container_pipeline_flag(option, container_pipeline_bool(value)?, flags);
+            return Some(index + 1);
+        }
+        set_container_pipeline_flag(option, true, flags);
+    }
+    Some(index + 1)
+}
+
+fn container_pipeline_command_start(
+    executable: &str,
+    args: &[String],
+    start: usize,
+    flags: &mut ContainerPipelineFlags,
+) -> Option<usize> {
+    let mut index = start;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            index += 1;
+            break;
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            break;
+        }
+        index = consume_container_pipeline_option(executable, args, index, false, flags)?;
+    }
+    Some(index)
+}
+
+/// Recover an exec consumer without treating the container, resource name,
+/// or an option value as its executable. Exec preserves argv, unlike SSH's
+/// remote command string: quote the recovered words before recursive parsing.
+fn container_exec_pipeline_input_mode(
+    executable: &str,
+    args: &[String],
+    depth: usize,
+) -> PipelineShellInputMode {
+    if depth >= MAX_EMBEDDED_SHELL_DEPTH {
+        return PipelineShellInputMode::Unverified;
+    }
+    let kubernetes = matches!(executable, "kubectl" | "oc");
+    let mut flags = ContainerPipelineFlags::default();
+    let Some(mut index) = container_pipeline_command_start(executable, args, 0, &mut flags) else {
+        return PipelineShellInputMode::Unverified;
+    };
+    if !kubernetes
+        && args
+            .get(index)
+            .is_some_and(|argument| argument == "container")
+    {
+        // Persistent flags can also occur between the management group and
+        // its exec subcommand: docker container --context prod exec ...
+        let Some(next) = container_pipeline_command_start(executable, args, index + 1, &mut flags)
+        else {
+            return PipelineShellInputMode::Unverified;
+        };
+        index = next;
+    }
+    if args.get(index).is_none_or(|argument| argument != "exec") {
+        return PipelineShellInputMode::NotShell;
+    }
+    index += 1;
+
+    let mut resources = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            index += 1;
+            break;
+        }
+        if argument.starts_with('-') && argument != "-" {
+            let Some(next) =
+                consume_container_pipeline_option(executable, args, index, true, &mut flags)
+            else {
+                // In particular, Podman's --latest/--cidfile change the
+                // positional grammar. Never guess a container slot for them.
+                return PipelineShellInputMode::Unverified;
+            };
+            index = next;
+        } else if kubernetes {
+            resources += 1;
+            index += 1;
+        } else {
+            // Docker, Podman, and nerdctl disable interspersed exec options:
+            // the first positional is the container, everything after is argv.
+            break;
+        }
+    }
+    if flags.help {
+        return PipelineShellInputMode::DoesNotReadStdin;
+    }
+    if kubernetes {
+        // Kubectl requires -- before the command; exactly one preceding
+        // positional identifies the pod or resource. Filename-selected targets
+        // use another grammar and remain unverified in this bounded parser.
+        if resources != 1 || index == 0 || args.get(index - 1).is_none_or(|arg| arg != "--") {
+            return PipelineShellInputMode::Unverified;
+        }
+    } else {
+        if args.get(index).is_none_or(String::is_empty) {
+            return PipelineShellInputMode::Unverified;
+        }
+        index += 1;
+        // nerdctl explicitly accepts a separator after the container too.
+        if executable == "nerdctl" && args.get(index).is_some_and(|arg| arg == "--") {
+            index += 1;
+        }
+    }
+    let command_args = &args[index..];
+    if command_args.is_empty() {
+        return PipelineShellInputMode::Unverified;
+    }
+    if !flags.interactive || flags.detached {
+        return PipelineShellInputMode::DoesNotReadStdin;
+    }
+    pipeline_shell_input_mode_at_depth(&posix_command_from_argv(command_args), depth + 1)
+}
+
 fn cmd_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
     if args.is_empty() {
         return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Cmd);
@@ -8367,21 +8686,207 @@ fn cmd_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
     PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Cmd)
 }
 
+/// Keep only the argv of one statically known POSIX command. Redirects belong
+/// to the caller's shell, and quoted redirect-looking arguments remain words.
+/// A compound or dynamic command has no single verified argv boundary.
+fn static_posix_command_without_redirects(command: &str) -> Option<String> {
+    let ast = AstGrep::new(command, SupportLang::Bash);
+    if ast.root().get_inner_node().has_error() {
+        return None;
+    }
+    let statements: Vec<_> = ast
+        .root()
+        .children()
+        .filter(|node| node.is_named() && node.kind().as_ref() != "comment")
+        .collect();
+    let [statement] = statements.as_slice() else {
+        return None;
+    };
+    let node = if statement.kind().as_ref() == "redirected_statement" {
+        statement
+            .children()
+            .find(|node| node.kind().as_ref() == "command")?
+    } else {
+        statement.clone()
+    };
+    if node.kind().as_ref() != "command" {
+        return None;
+    }
+    // Tree-sitter may attach ordinary words after an interspersed redirect
+    // to that redirect node. Share SSH extraction's raw-token filter so those
+    // words survive, and quoted `>` operands cannot become local redirects.
+    // Use the verified statement's range: a preceding comment or blank line
+    // must not stop the token walk before the executable.
+    let statement_source = statement.text();
+    let command = statement_source.as_ref();
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Posix);
+    let words = crate::heredoc::local_command_argv(command, &tokens, 0)?;
+    let source = words
+        .iter()
+        .map(|token| token.text(command))
+        .collect::<Option<Vec<_>>>()?
+        .join(" ");
+    (!source.is_empty() && !contains_dynamic_shell_output(&source)).then_some(source)
+}
+
+/// SSH reparses its space-joined remote argv as shell source. Compound or
+/// dynamic source cannot be treated as a data consumer just because its first
+/// word is `cat`; a later stage may execute the received bytes.
+fn remote_shell_payload_input_mode(source: &str, depth: usize) -> PipelineShellInputMode {
+    let Some(command) = static_posix_command_without_redirects(source) else {
+        return PipelineShellInputMode::Unverified;
+    };
+    if input_redirect(source).is_some() {
+        return PipelineShellInputMode::Unverified;
+    }
+    pipeline_shell_input_mode_at_depth(&command, depth + 1)
+}
+
+fn ssh_pipeline_input_mode(args: &[String], depth: usize) -> PipelineShellInputMode {
+    use crate::heredoc::{SSH_VALUE_OPTIONS, SshOptionShape, classify_ssh_option};
+
+    let mut index = 0usize;
+    let mut destination_seen = false;
+    let mut options_ended = false;
+    let mut stdin_disabled = false;
+    let mut unverified_session = false;
+    let mut local_command = false;
+    while let Some(argument) = args.get(index) {
+        if !options_ended && argument == "--" {
+            options_ended = true;
+            index += 1;
+            continue;
+        }
+        if !options_ended && argument.starts_with('-') && argument != "-" {
+            let consumes_next = match classify_ssh_option(argument) {
+                SshOptionShape::FlagsOnly | SshOptionShape::ValueAttached => false,
+                SshOptionShape::TakesSeparateValue => true,
+                SshOptionShape::Unknown => return PipelineShellInputMode::Unverified,
+            };
+            if consumes_next && args.get(index + 1).is_none() {
+                return PipelineShellInputMode::Unverified;
+            }
+            for (offset, option) in argument.as_bytes().iter().copied().enumerate().skip(1) {
+                if SSH_VALUE_OPTIONS.contains(&option) {
+                    let value = if consumes_next {
+                        args[index + 1].as_str()
+                    } else {
+                        &argument[offset + 1..]
+                    };
+                    if matches!(option, b'O' | b'Q' | b'W') {
+                        stdin_disabled = true;
+                    }
+                    if option == b'o' {
+                        let key = value
+                            .trim_start()
+                            .split(['=', ' ', '\t'])
+                            .next()
+                            .unwrap_or_default();
+                        let key = key.to_ascii_lowercase();
+                        local_command |=
+                            matches!(key.as_str(), "localcommand" | "permitlocalcommand");
+                        // These options change which command receives stdin.
+                        // Never inspect a caller's ssh_config to resolve them.
+                        unverified_session |= matches!(
+                            key.as_str(),
+                            "remotecommand"
+                                | "sessiontype"
+                                | "stdinnull"
+                                | "forkafterauthentication"
+                        );
+                    }
+                    break;
+                }
+                stdin_disabled |= matches!(option, b'n' | b'f' | b'N' | b'G' | b'V');
+                unverified_session |= option == b's';
+            }
+            index += if consumes_next { 2 } else { 1 };
+            continue;
+        }
+        if destination_seen {
+            break;
+        }
+        destination_seen = true;
+        index += 1;
+    }
+    if !destination_seen {
+        return PipelineShellInputMode::Unverified;
+    }
+    // LocalCommand inherits the caller's stdin even when -n disconnects the
+    // remote session. A visible local execution option cannot prove the
+    // incoming bytes inert; it needs a separate, verified source relationship.
+    if local_command {
+        return PipelineShellInputMode::Unverified;
+    }
+    if stdin_disabled {
+        return PipelineShellInputMode::DoesNotReadStdin;
+    }
+    if unverified_session {
+        return PipelineShellInputMode::Unverified;
+    }
+    if index == args.len() {
+        return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell);
+    }
+    // OpenSSH joins argv without quoting. Exec-style container carriers below
+    // preserve each argument and use posix_command_from_argv instead.
+    remote_shell_payload_input_mode(&args[index..].join(" "), depth)
+}
+
 /// Classify whether a POSIX shell invocation consumes its standard input as
 /// shell source. A bare `sh`/`bash`/etc. does; `-c CODE` and a positional
 /// script path do not. `-s` explicitly restores stdin-source mode even when
 /// positional arguments follow it.
 fn pipeline_shell_input_mode(command: &str) -> PipelineShellInputMode {
-    if pipeline_wrapper_limit_reached(command) {
+    pipeline_shell_input_mode_at_depth(command, 0)
+}
+
+fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineShellInputMode {
+    if depth >= MAX_EMBEDDED_SHELL_DEPTH || pipeline_wrapper_limit_reached(command) {
         return PipelineShellInputMode::Unverified;
     }
     let Some((executable, args)) = command_tokens(command) else {
         return PipelineShellInputMode::NotShell;
     };
+    const REMOTE_STDIN_CARRIERS: &[&str] = &["ssh", "docker", "podman", "nerdctl", "kubectl", "oc"];
+    let names_carrier = REMOTE_STDIN_CARRIERS.contains(&executable.as_str());
+    // A leading local redirect can occupy command_tokens' apparent argv0.
+    // Recover the actual executable before deciding that a carrier is absent.
+    if names_carrier || command.contains(['<', '>']) {
+        if let Some(source) = static_posix_command_without_redirects(command)
+            && let Some((carrier, args)) = command_tokens(&source)
+            && REMOTE_STDIN_CARRIERS.contains(&carrier.as_str())
+        {
+            return if carrier == "ssh" {
+                ssh_pipeline_input_mode(&args, depth)
+            } else {
+                container_exec_pipeline_input_mode(&carrier, &args, depth)
+            };
+        }
+        if names_carrier {
+            return PipelineShellInputMode::Unverified;
+        }
+    }
+    if depth > 0
+        && matches!(executable.as_str(), "." | "source")
+        && args.first().is_some_and(|argument| {
+            matches!(
+                argument.as_str(),
+                "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0"
+            )
+        })
+    {
+        return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell);
+    }
     if executable == "xargs" {
+        if depth > 0 {
+            return PipelineShellInputMode::Unverified;
+        }
         return xargs_pipeline_input_mode(&args);
     }
     if executable == "parallel" {
+        if depth > 0 {
+            return PipelineShellInputMode::Unverified;
+        }
         return parallel_pipeline_input_mode(&args);
     }
     if matches!(executable.as_str(), "powershell" | "pwsh") {
@@ -8457,6 +8962,19 @@ fn pipeline_shell_input_mode(command: &str) -> PipelineShellInputMode {
         if matches!(argument.as_str(), "--command" | "--command=")
             || argument.starts_with("--command=")
         {
+            if depth > 0 {
+                let source = argument
+                    .strip_prefix("--command=")
+                    .or_else(|| args.get(index + 1).map(String::as_str));
+                return source.map_or(PipelineShellInputMode::Unverified, |source| {
+                    match remote_shell_payload_input_mode(source, depth) {
+                        PipelineShellInputMode::NotShell => {
+                            PipelineShellInputMode::DoesNotReadStdin
+                        }
+                        mode => mode,
+                    }
+                });
+            }
             return PipelineShellInputMode::DoesNotReadStdin;
         }
         if let Some(flags) = argument
@@ -8464,14 +8982,24 @@ fn pipeline_shell_input_mode(command: &str) -> PipelineShellInputMode {
             .filter(|flags| !flags.is_empty() && !flags.starts_with('-'))
         {
             if flags.contains('c') {
-                return if args
-                    .get(index + 1)
-                    .is_some_and(|source| static_posix_shell_code_reads_stdin(source))
-                {
-                    PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell)
-                } else {
-                    PipelineShellInputMode::DoesNotReadStdin
-                };
+                if let Some(source) = args.get(index + 1) {
+                    // A remote fixed script may hand stdin to another shell
+                    // with flags (e.g. `bash -s`) or to an interpreter. Follow
+                    // that command with the same recursion bound; compound
+                    // or dynamic dispatch stays unverified.
+                    if depth > 0 {
+                        return match remote_shell_payload_input_mode(source, depth) {
+                            PipelineShellInputMode::NotShell => {
+                                PipelineShellInputMode::DoesNotReadStdin
+                            }
+                            mode => mode,
+                        };
+                    }
+                    if static_posix_shell_code_reads_stdin(source) {
+                        return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell);
+                    }
+                }
+                return PipelineShellInputMode::DoesNotReadStdin;
             }
             force_stdin |= flags.contains('s');
             index += 1;
@@ -14385,6 +14913,7 @@ fn collect_indirect_input_flows_at_depth(
         .collect();
     collect_indirect_input_flows_from_node(
         ast.root(),
+        command,
         &mut flows,
         segment_ranges,
         false,
@@ -15124,6 +15653,7 @@ fn indirect_flow_for_consumer(
 
 fn collect_indirect_input_flows_from_node<D: Doc>(
     node: ast_grep_core::Node<'_, D>,
+    command: &str,
     flows: &mut Vec<IndirectInputFlow>,
     segment_ranges: &[(usize, usize)],
     inside_redirected_statement: bool,
@@ -15201,7 +15731,7 @@ fn collect_indirect_input_flows_from_node<D: Doc>(
                     push_indirect_flow(flows, indirect_flow_for_consumer(pack_id, source, &text));
                 }
             } else if matches!(input_redirect(&text), Some(RedirectInput::HandledByHeredoc)) {
-                collect_heredoc_pipeline_flows(&text, flows);
+                collect_heredoc_pipeline_flows(command, &node, flows);
             }
         }
         "redirected_statement" => {}
@@ -15251,6 +15781,7 @@ fn collect_indirect_input_flows_from_node<D: Doc>(
     for child in node.children() {
         collect_indirect_input_flows_from_node(
             child,
+            command,
             flows,
             segment_ranges,
             descendants_are_redirected,
@@ -15291,8 +15822,15 @@ fn has_indirect_input_cli_hint(command: &str) -> bool {
     has_database_cli_hint(command) || command.to_ascii_lowercase().contains("nsupdate")
 }
 
-fn collect_heredoc_pipeline_flows(command: &str, flows: &mut Vec<IndirectInputFlow>) {
-    let header = command.split_once('\n').map_or(command, |(line, _)| line);
+fn collect_heredoc_pipeline_flows<D: Doc>(
+    command: &str,
+    statement: &ast_grep_core::Node<'_, D>,
+    flows: &mut Vec<IndirectInputFlow>,
+) {
+    let text = statement.text();
+    let header = text
+        .split_once('\n')
+        .map_or_else(|| text.as_ref(), |(line, _)| line);
     let ranges = top_level_segment_ranges(header);
     let Some(heredoc_index) = ranges
         .iter()
@@ -15300,11 +15838,42 @@ fn collect_heredoc_pipeline_flows(command: &str, flows: &mut Vec<IndirectInputFl
     else {
         return;
     };
-    let mut source = literal_heredoc_producer_source(command).unwrap_or_else(|| {
-        IndirectInputSource::Unverified(
-            "heredoc pipeline producer could not be reconstructed".to_string(),
-        )
-    });
+    // The parser attaches the pipeline to the heredoc redirect. Remove only
+    // that attached pipeline before applying the whole-producer proof; passing
+    // the full statement would reject even a plain `cat <<'SQL' | psql`.
+    // Keep the original source and byte ranges for both reconstruction and
+    // executable lookup so earlier functions/aliases cannot forge a literal
+    // producer, and preceding commands cannot shift the ownership boundary.
+    let producer = (|| {
+        let mut producer = None;
+        for redirect in statement
+            .children()
+            .filter(|child| child.kind().as_ref() == "heredoc_redirect")
+        {
+            for pipeline in redirect
+                .children()
+                .filter(|child| child.kind().as_ref() == "pipeline")
+            {
+                if producer.is_some() {
+                    return None;
+                }
+                let operator = redirect.range().start + redirect.text().find("<<")?;
+                if crate::heredoc::stdin_data_sink_may_be_overridden(command, operator, "cat") {
+                    return None;
+                }
+                producer = Some(heredoc_pipeline_producer(command, &pipeline)?);
+            }
+        }
+        producer
+    })();
+    let mut source = producer
+        .as_deref()
+        .and_then(literal_heredoc_producer_source)
+        .unwrap_or_else(|| {
+            IndirectInputSource::Unverified(
+                "heredoc pipeline producer could not be reconstructed".to_string(),
+            )
+        });
 
     for index in heredoc_index + 1..ranges.len() {
         let previous = ranges[index - 1];
@@ -25115,6 +25684,13 @@ fn script_segment_is_nonlocal(segment: &str) -> bool {
         || command_tokens(segment).is_some_and(|(executable, args)| {
             executable == "parallel" && parallel_uses_remote_hosts(&args)
         })
+        // A local redirect can precede the carrier's executable. Use the
+        // same verified argv recovery as stdin classification, only for the
+        // emitted script's scope; the outer redirect still runs locally.
+        || (segment.contains(['<', '>'])
+            && static_posix_command_without_redirects(segment).is_some_and(|source| {
+                source != segment && script_segment_is_nonlocal(&source)
+            }))
 }
 
 fn script_site_is_nonlocal(command: &str, position: usize) -> bool {

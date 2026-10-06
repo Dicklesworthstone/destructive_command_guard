@@ -3162,11 +3162,11 @@ fn push_joined_payload(
 
 /// ssh short options that consume a value (OpenSSH `getopt` string; the value
 /// may be attached, `-p22`, or the following argv word, `-p 22`).
-const SSH_VALUE_OPTIONS: &[u8] = b"BbcDEeFIiJLlmOoPpQRSWw";
+pub(crate) const SSH_VALUE_OPTIONS: &[u8] = b"BbcDEeFIiJLlmOoPpQRSWw";
 /// ssh short options that take no value and may be bundled (`-fnT`).
 const SSH_FLAG_OPTIONS: &[u8] = b"1246AaCfGgKkMNnqsTtVvXxYy";
 
-enum SshOptionShape {
+pub(crate) enum SshOptionShape {
     /// Every letter is a no-value flag; the token is complete.
     FlagsOnly,
     /// The token ends in a value-taking letter; the NEXT token is its value.
@@ -3181,7 +3181,7 @@ enum SshOptionShape {
 /// grammar. Bundled flags are walked letter by letter: the first value-taking
 /// letter either consumes the token's remainder (attached value) or the next
 /// argv word (separate value), matching `getopt` semantics.
-fn classify_ssh_option(word: &str) -> SshOptionShape {
+pub(crate) fn classify_ssh_option(word: &str) -> SshOptionShape {
     let Some(letters) = word.strip_prefix('-') else {
         return SshOptionShape::Unknown;
     };
@@ -6384,17 +6384,16 @@ const PARALLEL_FLAG_OPTIONS: &[&str] = &[
     "--xargs",
 ];
 
-/// Locate the remote-command payload of the `ssh` invocation whose executable
-/// token is at `start`. See [`extract_ssh_inline_scripts`] for the grammar and
-/// the deliberate bail on unmodeled options.
-fn ssh_remote_payload(
+/// Words passed to a command, excluding redirects performed by the local
+/// shell. Raw quoting distinguishes a literal `>` argument from a redirect;
+/// redirects may appear before, between, or after ordinary argv words.
+pub(crate) fn local_command_argv<'a>(
     command: &str,
-    tokens: &[crate::normalize::NormalizeToken],
+    tokens: &'a [crate::normalize::NormalizeToken],
     start: usize,
-) -> Option<SshRemotePayload> {
+) -> Option<Vec<&'a crate::normalize::NormalizeToken>> {
     use crate::normalize::NormalizeTokenKind;
 
-    let full_start = tokens.get(start)?.byte_range.start;
     // ssh's argv: the words up to the next shell separator (which belongs to
     // the LOCAL shell), without local redirects and a bare operator's target,
     // which the local shell also removes wherever they stand — a redirect
@@ -6407,7 +6406,7 @@ fn ssh_remote_payload(
     // deny for an unchanged, harmless inner redirect (issue #404).
     let mut argv: Vec<&crate::normalize::NormalizeToken> = Vec::new();
     let mut redirect_target = false;
-    for (index, token) in tokens.iter().enumerate().skip(start + 1) {
+    for (index, token) in tokens.iter().enumerate().skip(start) {
         if token.kind != NormalizeTokenKind::Word {
             if splits_fd_duplication(command, tokens, index) {
                 redirect_target = true;
@@ -6425,6 +6424,19 @@ fn ssh_remote_payload(
         }
         argv.push(token);
     }
+    Some(argv)
+}
+
+/// Locate the remote-command payload of the `ssh` invocation whose executable
+/// token is at `start`. See [`extract_ssh_inline_scripts`] for the grammar and
+/// the deliberate bail on unmodeled options.
+fn ssh_remote_payload(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    start: usize,
+) -> Option<SshRemotePayload> {
+    let full_start = tokens.get(start)?.byte_range.start;
+    let argv = local_command_argv(command, tokens, start + 1)?;
     let word_at = |index: usize| -> Option<&str> {
         let token = argv.get(index)?;
         let (word, _, _) = dequoted_flag_word(

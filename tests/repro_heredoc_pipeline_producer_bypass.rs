@@ -22,6 +22,7 @@ fn dcg_binary() -> PathBuf {
 
 struct Lab {
     root: PathBuf,
+    packs: &'static str,
 }
 
 impl Lab {
@@ -38,7 +39,15 @@ impl Lab {
         std::fs::create_dir_all(root.join("home")).unwrap();
         std::fs::create_dir_all(root.join("xdg")).unwrap();
         std::fs::create_dir_all(root.join("work")).unwrap();
-        Self { root }
+        Self {
+            root,
+            packs: "core.git,core.filesystem",
+        }
+    }
+
+    fn with_database_packs(mut self) -> Self {
+        self.packs = "core.git,core.filesystem,database.postgresql,database.redis";
+        self
     }
 
     /// Bare `dcg` hook mode. Returns (stdout, stderr).
@@ -54,7 +63,7 @@ impl Lab {
             .env("XDG_CONFIG_HOME", self.root.join("xdg"))
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
             .env("DCG_HOOK_TIMEOUT_MS", "5000")
-            .env("DCG_PACKS", "core.git,core.filesystem")
+            .env("DCG_PACKS", self.packs)
             .current_dir(self.root.join("work"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -318,6 +327,75 @@ fn heredoc_piped_into_a_data_consumer_stays_data() {
     ] {
         lab.assert_allowed(command);
     }
+}
+
+#[test]
+fn heredoc_database_pipelines_attribute_plain_cat_source() {
+    let lab = Lab::new("database-heredoc-source").with_database_packs();
+    for command in [
+        "cat <<'SQL' | psql app\nSELECT 1;\nSQL",
+        "cat - <<'SQL' | psql -X app\nSELECT 1;\nSQL",
+        "cat <<'SQL' | cat | psql -X app\nSELECT 1;\nSQL",
+        "cat <<'REDIS' | redis-cli\nPING\nREDIS",
+        "cat <<'REDIS' | cat | redis-cli\nGET example\nREDIS",
+        // The producer's AST ranges are relative to the original command,
+        // including harmless earlier statements, not to a sliced header.
+        "true; cat <<'SQL' | psql -X app\nSELECT 1;\nSQL",
+        "printf ready >/dev/null; cat <<'REDIS' | cat | redis-cli\nPING\nREDIS",
+    ] {
+        lab.assert_allowed(command);
+    }
+}
+
+#[test]
+fn heredoc_database_pipelines_still_deny_destructive_source() {
+    let lab = Lab::new("database-heredoc-destructive").with_database_packs();
+    for (command, rule) in [
+        (
+            "cat <<'SQL' | psql -X app\nDROP TABLE users;\nSQL",
+            "database.postgresql:drop-table",
+        ),
+        (
+            "true; cat <<'SQL' | cat | psql -X app\nDROP TABLE users;\nSQL",
+            "database.postgresql:drop-table",
+        ),
+        (
+            "cat <<'REDIS' | redis-cli\nFLUSHALL\nREDIS",
+            "database.redis:flushall",
+        ),
+        (
+            "printf ready >/dev/null; cat <<'REDIS' | cat | redis-cli\nFLUSHALL\nREDIS",
+            "database.redis:flushall",
+        ),
+    ] {
+        lab.assert_denial(command, Some(rule));
+    }
+}
+
+#[test]
+fn heredoc_database_producers_require_one_unmodified_stdin_source() {
+    let lab = Lab::new("database-heredoc-provenance").with_database_packs();
+    for command in [
+        // Extra cat operands remain inputs on either side of the heredoc
+        // operator. A benign body must not hide the file's unknown bytes.
+        "cat extra.sql - <<'SQL' | psql -X app\nSELECT 1;\nSQL",
+        "cat <<'SQL' extra.sql - | psql -X app\nSELECT 1;\nSQL",
+        // Neither a different producer nor a pipeline transform has the
+        // byte-for-byte proof that a plain cat stdin copy provides.
+        "sed 's/SELECT/DROP/' <<'SQL' | psql -X app\nSELECT 1;\nSQL",
+        "cat <<'SQL' | sed 's/SELECT/DROP/' | psql -X app\nSELECT 1;\nSQL",
+        "(cat <<'SQL'\nSELECT 1;\nSQL\nprintf '%s\\n' 'DROP TABLE users;'\n) | psql -X app",
+        "cat <<'FIRST' <<'SECOND' | psql -X app\nSELECT 1;\nFIRST\nSELECT 2;\nSECOND",
+        // Inspect the original command when checking producer lookup; a
+        // sliced producer would lose this earlier function definition.
+        "cat() { printf '%s\\n' 'DROP TABLE users;'; }; cat <<'SQL' | psql -X app\nSELECT 1;\nSQL",
+    ] {
+        lab.assert_denial(command, Some("database.postgresql:stdin-unverified"));
+    }
+    lab.assert_denial(
+        "cat extra.redis - <<'REDIS' | redis-cli\nPING\nREDIS",
+        Some("database.redis:stdin-unverified"),
+    );
 }
 
 #[test]

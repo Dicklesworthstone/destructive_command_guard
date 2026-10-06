@@ -23,7 +23,9 @@ impl Fixture {
     fn judge(&self, command: &str) -> (String, String, String) {
         let home = self.dir.path().join("home");
         let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
             "tool_name": "Bash", "tool_input": { "command": command },
+            "cwd": self.dir.path(),
         })
         .to_string();
         let mut child = Command::new(env!("CARGO_BIN_EXE_dcg"))
@@ -33,11 +35,18 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", home.join("config"))
             .env("XDG_DATA_HOME", home.join("data"))
             .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("TMPDIR", self.dir.path())
+            .env("TEMP", self.dir.path())
+            .env("TMP", self.dir.path())
             .env("DCG_CONFIG", self.dir.path().join("config.toml"))
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
             .env(
                 "DCG_PENDING_EXCEPTIONS_PATH",
                 self.dir.path().join("pending.jsonl"),
+            )
+            .env(
+                "DCG_ALLOW_ONCE_PATH",
+                self.dir.path().join("allow_once.jsonl"),
             )
             .env("DCG_SELF_HEAL_HOOK", "0")
             .env("DCG_HOOK_TIMEOUT_MS", "5000")
@@ -112,7 +121,6 @@ fn remote_home_redirects_ignore_local_existence() {
             "docker exec -i c sh <<'EOF'\necho x > ~/note\nEOF",
             "kubectl exec -i pod -- sh <<'EOF'\necho x > ~/note\nEOF",
             "cat <<'EOF' | ssh host\necho x > ~/note\nEOF",
-            "cat <<'EOF' | tee log | ssh host\necho x > ~/note\nEOF",
             "ssh host 'echo x >| ~/note'",
             "ssh host 'set -C; echo x > ~/note'",
         ] {
@@ -122,7 +130,403 @@ fn remote_home_redirects_ignore_local_existence() {
                 "{command:?}: {reason}"
             );
         }
+        // The executable-input pass now reaches SSH through this pipeline.
+        // As for a local shell, tee is not a modeled literal producer, so its
+        // source guard denies before applying the remote redirect rule.
+        fixture.denied(
+            "cat <<'EOF' | tee log | ssh host\necho x > ~/note\nEOF",
+            "heredoc.posix:pipeline-consumer",
+        );
     }
+}
+
+const REMOTE_STDIN_SHELLS: &[&str] = &[
+    "ssh host",
+    "/usr/bin/ssh -p 22 host",
+    "sudo ssh -i key host",
+    "ssh host bash -s",
+    "ssh host fish --command=sh",
+    "docker exec -i c sh",
+    "docker exec -i c fish --command sh",
+    "podman exec -i c bash",
+    "kubectl exec -i pod -- sh",
+];
+
+#[test]
+fn remote_stdin_shells_evaluate_literal_producer_bytes() {
+    let fixture = Fixture::new();
+    for consumer in REMOTE_STDIN_SHELLS {
+        // These bytes are executable source on the consumer, even though
+        // they are quoted data in the local producer's argument list.
+        fixture.denied(
+            &format!("printf '%s\\n' 'rm -rf /' | {consumer}"),
+            "core.filesystem:rm-rf-root-home",
+        );
+    }
+}
+
+#[test]
+fn remote_stdin_ssh_options_are_separate_from_remote_shell_arguments() {
+    let fixture = Fixture::new();
+    for consumer in [
+        // Option values resembling flags must not disable the real stdin.
+        "ssh -p 22 -o 'HostKeyAlias=-n' host sh -s",
+        "ssh -p2222 -oHostKeyAlias=sh host sh -s",
+        "ssh -o 'SetEnv=MODE=-n' -p 22 host sh -s",
+        // SSH joins decoded remote argv with spaces before the remote shell
+        // parses it, including a command supplied in one quoted argument.
+        "ssh host 'sh -s'",
+        "ssh host 'sh ' '-s'",
+        "ssh host -p 22 'sh -s'",
+    ] {
+        fixture.denied(
+            &format!("printf '%s\\n' 'rm -rf /' | {consumer}"),
+            "core.filesystem:rm-rf-root-home",
+        );
+    }
+    for consumer in [
+        // A shell-like option value is not the remote command to execute.
+        "ssh -p 22 -o 'HostKeyAlias=sh' host cat",
+        "ssh -o 'User sh' host cat",
+        "ssh -p 22 -o 'HostKeyAlias=-n' host cat",
+        "ssh -n -p 22 -o 'HostKeyAlias=sh' host 'sh -s'",
+    ] {
+        fixture.allowed(&format!("printf '%s\\n' 'rm -rf /' | {consumer}"));
+    }
+}
+
+#[test]
+fn remote_stdin_ssh_simple_script_boundaries_remain_executable() {
+    let fixture = Fixture::new();
+    for consumer in [
+        "ssh host '. /dev/stdin'",
+        "ssh host 'source /dev/fd/0'",
+        "ssh host '# leading comment\nsh -s'",
+        "ssh host \"sh -c 'bash -s'\"",
+    ] {
+        fixture.denied(
+            &format!("printf '%s\\n' 'rm -rf /' | {consumer}"),
+            "core.filesystem:rm-rf-root-home",
+        );
+    }
+    // A source-like pair of arguments is not a source command, and a
+    // leading comment must not change an actual data consumer's mode.
+    fixture.allowed("printf '%s\\n' 'rm -rf /' | ssh host '# leading comment\ncat'");
+    fixture.allowed("printf '%s\\n' 'rm -rf /' | ssh host \"printf '%s %s' source /dev/stdin\"");
+}
+
+#[test]
+fn remote_stdin_ssh_output_redirects_preserve_remote_arguments() {
+    let fixture = Fixture::new();
+    for consumer in [
+        ">/tmp/ssh-output ssh host sh -s",
+        "ssh host >/tmp/ssh-output sh -s",
+        "ssh host sh >/tmp/ssh-output -s",
+        "ssh host sh -s >/tmp/ssh-output",
+        "ssh host 'sh -s' 1>&2",
+        // This redirect is parsed remotely after SSH joins its argv. The
+        // later -s is still a shell argument after redirect removal.
+        "ssh host sh '> /tmp/ssh-output' -s",
+    ] {
+        fixture.denied(
+            &format!("printf '%s\\n' 'rm -rf /' | {consumer}"),
+            "core.filesystem:rm-rf-root-home",
+        );
+    }
+    // The pipeline AST can end this consumer at `ssh` and attach the later
+    // destination/arguments to its outer redirect. An incomplete destination
+    // is unverified, never evidence that the received bytes are data.
+    fixture.denied(
+        "printf '%s\\n' 'rm -rf /' | ssh >/tmp/ssh-output host sh -s",
+        "heredoc.posix:pipeline-consumer",
+    );
+    fixture.denied(
+        "printf '%s\\n' 'echo x > ~/note' | ssh 2>/dev/null host",
+        "heredoc.posix:pipeline-consumer",
+    );
+    for consumer in [
+        "ssh host cat >/tmp/ssh-output",
+        "ssh host 'cat > /tmp/ssh-output'",
+    ] {
+        fixture.allowed(&format!("printf '%s\\n' 'rm -rf /' | {consumer}"));
+    }
+}
+
+#[test]
+fn remote_stdin_ssh_local_command_is_unverified_even_with_stdin_disabled() {
+    let fixture = Fixture::new();
+    for flags in ["", "-n "] {
+        // -n affects the remote session input. LocalCommand can still
+        // inherit the caller's stdin, so it cannot establish a data-only
+        // consumer even when the remote command itself is harmless.
+        fixture.denied(
+            &format!(
+                "printf '%s\\n' 'rm -rf /' | ssh {flags}-o PermitLocalCommand=yes \
+                 -o 'LocalCommand=sh -s' host true"
+            ),
+            "heredoc.posix:pipeline-consumer",
+        );
+    }
+}
+
+#[test]
+fn remote_stdin_container_exec_keeps_argv_boundaries() {
+    let fixture = Fixture::new();
+    for consumer in [
+        // The shell is the executable after the container/pod operand, not
+        // an earlier container name or value-taking carrier option.
+        "docker exec -i sh sh -s",
+        "docker exec -i --user sh c sh -s",
+        "docker container --context prod exec -i c sh",
+        "podman exec -i --user sh c sh -s",
+        "nerdctl exec -i --user sh c sh -s",
+        "nerdctl exec -i c -- sh",
+        "kubectl exec sh -i -c sh -- sh -s",
+        "oc exec sh -i -c sh -- sh -s",
+    ] {
+        fixture.denied(
+            &format!("printf '%s\\n' 'rm -rf /' | {consumer}"),
+            "core.filesystem:rm-rf-root-home",
+        );
+    }
+    for consumer in [
+        "docker exec -i sh cat",
+        "docker exec -i --user sh c cat",
+        "docker exec -i -u sh c cat",
+        "podman exec -i --user sh c cat",
+        "nerdctl exec -i --user sh c cat",
+        "kubectl exec sh -i -c sh -- cat",
+        "oc exec sh -i -c sh -- cat",
+        // These carriers preserve the remote argv. Unlike SSH, a single
+        // command argument containing spaces is not split into `sh`, `-s`.
+        "docker exec -i c 'sh -s'",
+        "podman exec -i c 'sh -s'",
+        "kubectl exec pod -i -- 'sh -s'",
+        "docker exec -i c cat sh -s",
+    ] {
+        fixture.allowed(&format!("printf '%s\\n' 'rm -rf /' | {consumer}"));
+    }
+}
+
+#[test]
+fn remote_stdin_docker_delivery_obeys_boolean_and_detach_flags() {
+    let fixture = Fixture::new();
+    for consumer in [
+        "docker exec --interactive=true c sh",
+        "docker exec -i=true -d=false c sh",
+        "docker exec --interactive=false --interactive=true c sh",
+        "docker exec -i --detach=true --detach=false c sh",
+    ] {
+        fixture.denied(
+            &format!("printf '%s\\n' 'rm -rf /' | {consumer}"),
+            "core.filesystem:rm-rf-root-home",
+        );
+    }
+    for consumer in [
+        "docker exec --interactive=false c sh",
+        "docker exec -i=false c sh",
+        "docker exec -i --interactive=false c sh",
+        "docker exec -i -d c sh",
+        "docker exec -i --detach c sh",
+        "docker exec --interactive=true --detach=true c sh",
+        // After the container operand, -i belongs to sh, not to Docker.
+        "docker exec c sh -i",
+    ] {
+        fixture.allowed(&format!("printf '%s\\n' 'rm -rf /' | {consumer}"));
+    }
+}
+
+#[test]
+fn remote_stdin_kubectl_flags_after_pod_remain_carrier_options() {
+    let fixture = Fixture::new();
+    for consumer in [
+        "kubectl exec pod -i -- sh",
+        "kubectl exec pod --stdin=true -- sh",
+        "kubectl exec pod -c sh --stdin=true -- sh -s",
+        "oc exec pod -i -- sh",
+    ] {
+        fixture.denied(
+            &format!("printf '%s\\n' 'rm -rf /' | {consumer}"),
+            "core.filesystem:rm-rf-root-home",
+        );
+    }
+    for consumer in [
+        "kubectl exec pod --stdin=false -- sh",
+        "kubectl exec pod -i --stdin=false -- sh",
+        "kubectl exec pod -i -c sh -- cat",
+        // The double dash ends carrier options; the shell's -i does not
+        // enable forwarding when kubectl itself did not receive -i.
+        "kubectl exec pod -- sh -i",
+    ] {
+        fixture.allowed(&format!("printf '%s\\n' 'rm -rf /' | {consumer}"));
+    }
+}
+
+#[test]
+fn remote_stdin_redirects_ignore_local_existence() {
+    let fixture = Fixture::new();
+    let local_note = fixture.dir.path().join("home/note");
+    for existing in [false, true] {
+        if existing {
+            std::fs::write(&local_note, "keep").expect("existing local note");
+        }
+        for consumer in REMOTE_STDIN_SHELLS {
+            let command = format!("printf '%s\\n' 'echo x > ~/note' | {consumer}");
+            let reason = fixture.denied(&command, "core.filesystem:redirect-truncate-root-home");
+            assert!(
+                reason.contains("another machine or filesystem"),
+                "{command:?}: {reason}"
+            );
+        }
+        for command in [
+            "echo 'echo x > ~/note' | ssh host",
+            "printf '%s\\n' 'echo x > ~/note' | 2>/dev/null ssh host",
+            "ssh host < <(printf '%s\\n' 'echo x > ~/note')",
+            "printf '%s\\n' 'echo x > ~/note' > >(ssh host)",
+            "printf '%s\\n' 'echo x > ~/note' | tee >(ssh host)",
+        ] {
+            let reason = fixture.denied(command, "core.filesystem:redirect-truncate-root-home");
+            assert!(
+                reason.contains("another machine or filesystem"),
+                "{command:?}: {reason}"
+            );
+        }
+        if existing {
+            assert_eq!(
+                std::fs::read_to_string(&local_note).expect("local note survives"),
+                "keep"
+            );
+        } else {
+            assert!(
+                !local_note.exists(),
+                "hook analysis must not execute its input"
+            );
+        }
+    }
+}
+
+#[test]
+fn remote_stdin_composite_producers_preserve_fail_closed_analysis() {
+    let fixture = Fixture::new();
+    for command in [
+        "(cat <<'EOF'\necho x > ~/note\nEOF\n) | ssh host",
+        "(cat <<'EOF'\necho x > ~/note\nEOF\n) | docker exec -i c sh",
+        "(cat <<'EOF'\necho x > ~/note\nEOF\n) | tee log | kubectl exec -i pod -- sh",
+        "printf '%s\\n' 'echo x > ~/note' | tee log | ssh host",
+    ] {
+        fixture.denied(command, "heredoc.posix:pipeline-consumer");
+    }
+    // These producer shapes were already unverified when feeding a local
+    // shell. Recognizing remote consumers must preserve that fail-closed
+    // policy rather than inventing a new proof of their emitted bytes.
+    for command in [
+        "ssh host true; (cat <<'EOF'\necho x > ~/new-note\nEOF\n) | sh",
+        "printf '%s\\n' 'echo x > ~/new-note' | tee log | sh",
+    ] {
+        let reason = fixture.denied(command, "heredoc.posix:pipeline-consumer");
+        assert!(
+            !reason.contains("another machine or filesystem"),
+            "{reason}"
+        );
+    }
+}
+
+#[test]
+fn remote_stdin_shells_fail_closed_for_unknown_producers() {
+    let fixture = Fixture::new();
+    for consumer in [
+        "ssh host",
+        "ssh host sh -s",
+        "docker exec -i c bash",
+        "kubectl exec -i pod -- sh",
+    ] {
+        fixture.denied(
+            &format!("generate-script | {consumer}"),
+            "heredoc.posix:pipeline-consumer",
+        );
+    }
+}
+
+#[test]
+fn remote_stdin_data_consumers_and_safe_scripts_remain_allowed() {
+    let fixture = Fixture::new();
+    for consumer in [
+        "ssh host cat",
+        "ssh host sh -c 'cat'",
+        "docker exec -i c cat",
+        "docker exec -i c sh -c 'cat'",
+        "kubectl exec -i pod -- cat",
+        // These invocations do not send pipeline input to a remote shell.
+        "ssh -n host",
+        "docker exec c sh",
+        "kubectl exec pod -- sh",
+    ] {
+        fixture.allowed(&format!("printf '%s\\n' 'rm -rf /' | {consumer}"));
+        fixture.allowed(&format!("generate-data | {consumer}"));
+    }
+    for source in ["echo remote", "echo x >> ~/note", "echo x > /tmp/sub/out"] {
+        for consumer in [
+            "ssh host",
+            "docker exec -i c sh",
+            "kubectl exec -i pod -- sh",
+        ] {
+            fixture.allowed(&format!("printf '%s\\n' '{source}' | {consumer}"));
+        }
+    }
+    fixture.allowed("printf '%s\\n' 'echo x > ~/new-note' | sh");
+    fixture.allowed("printf '%s\\n' 'echo remote' | ssh host > ~/new-note");
+}
+
+#[test]
+fn remote_stdin_scripts_do_not_read_local_database_files() {
+    let fixture = Fixture::new();
+    let sql = fixture.dir.path().join("local-benign.sql");
+    std::fs::write(&sql, "SELECT 1;\n").expect("local SQL");
+    let script = format!(
+        "psql -X -f {}",
+        shell_words::quote(sql.to_str().expect("UTF-8 path"))
+    );
+    let producer = format!("printf '%s\\n' {}", shell_words::quote(&script));
+    fixture.allowed(&format!("{producer} | sh"));
+    for consumer in [
+        "ssh host",
+        "docker exec -i c sh",
+        "kubectl exec -i pod -- sh",
+    ] {
+        let command = format!("{producer} | {consumer}");
+        let reason = fixture.denied(&command, "database.postgresql:stdin-unverified");
+        assert!(
+            reason.contains("another machine or filesystem"),
+            "{command:?}: {reason}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(sql).expect("local SQL survives"),
+        "SELECT 1;\n"
+    );
+}
+
+#[test]
+fn remote_stdin_nested_dispatch_cannot_borrow_outer_local_proof() {
+    let fixture = Fixture::new();
+    for consumer in [
+        "parallel --pipe ssh host",
+        "parallel --pipe docker exec -i c sh",
+        "xargs -a /dev/null ssh host",
+        "parallel --pipe xargs -a /dev/null ssh host",
+        "ssh host \"parallel --pipe sh -c 'sh -s'\"",
+        "ssh host \"xargs -a /dev/null sh -c 'sh -s'\"",
+    ] {
+        fixture.denied(
+            &format!("printf '%s\\n' 'echo x > ~/note' | {consumer}"),
+            "heredoc.posix:pipeline-consumer",
+        );
+    }
+    let nested = "ssh host ".repeat(32);
+    fixture.denied(
+        &format!("printf '%s\\n' 'rm -rf /' | {nested}sh -s"),
+        "heredoc.posix:pipeline-consumer",
+    );
 }
 
 #[test]
