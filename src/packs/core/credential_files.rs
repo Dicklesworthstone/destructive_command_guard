@@ -8,15 +8,15 @@ mod embedded;
 mod shell;
 
 pub(crate) use embedded::{scan_extracted, source_scan_required};
-// The two rule NAMES are deliberately not re-exported: every hit carries the
+// Rule NAMES are deliberately not re-exported: every hit carries the
 // rule it denies under, so the evaluator reads `hit.rule` instead of choosing
 // one. That is what keeps `.git/` writes allowlistable separately from
 // credential writes (#457); a caller reaching for a name here would be
 // guessing at something the classifier already decided.
 pub(crate) use shell::{
     CREDENTIAL_FILE_WRITE_SUGGESTIONS, CredentialFileWrite, GIT_INTERNALS_WRITE_SUGGESTIONS,
-    classify_credential_file_write, may_name_protected_path, names_protected_file,
-    names_windows_shell_writer,
+    classify_credential_file_write, classify_git_redirect_writes, may_name_protected_path,
+    names_protected_file, names_windows_shell_writer,
 };
 
 use crate::normalize::ShellDialect;

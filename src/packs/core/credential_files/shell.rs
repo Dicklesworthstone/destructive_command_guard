@@ -46,6 +46,9 @@ pub(crate) const CREDENTIAL_FILE_WRITE_NAME: &str = "credential-file-write";
 /// not the same grant and must not share a name.
 pub(crate) const GIT_INTERNALS_WRITE_NAME: &str = "git-internals-write";
 
+const GIT_REDIRECT_TRUNCATE_NAME: &str = "redirect-truncate-git-internals-relative";
+const GIT_REDIRECT_APPEND_NAME: &str = "redirect-append-git-internals-relative";
+
 /// The single path component that anchors [`GIT_INTERNALS_WRITE_NAME`].
 const GIT_ANCHOR: &str = ".git";
 
@@ -102,10 +105,9 @@ pub(crate) struct CredentialFileWrite {
     pub(crate) span: Range<usize>,
     /// Reason naming the writer, the file, and why it matters.
     pub(crate) reason: String,
-    /// Which rule denies this write — [`CREDENTIAL_FILE_WRITE_NAME`] for
-    /// everything that is a secret or a login file, and
-    /// [`GIT_INTERNALS_WRITE_NAME`] for `.git/`. Carried on the hit rather
-    /// than assumed by the caller so allowlists stay separable (#457).
+    /// Which rule denies this write: credentials, non-redirect Git writes,
+    /// or the existing Git truncate/append redirect rules. Carried on the hit
+    /// rather than assumed by the caller so allowlists stay separable.
     pub(crate) rule: &'static str,
 }
 
@@ -159,6 +161,52 @@ pub(crate) fn classify_credential_file_write(
             .or_else(|| windows_shells::classify(segment, ShellDialect::PowerShell))
             .or_else(|| windows_shells::classify(segment, ShellDialect::Cmd)),
     }
+}
+
+/// All Git redirect writes, retaining the existing truncate and append rule
+/// identities. The declared shell decides whether a backslash separates path
+/// components or escapes the following character; an unknown shell retains
+/// every concrete reading. Ordinary argument data is never a redirect target.
+///
+/// Keep this separate from the first credential hit: granting one Git rule
+/// must not hide a later credential write or the other Git redirect rule.
+pub(crate) fn classify_git_redirect_writes(
+    segment: &str,
+    dialect: ShellDialect,
+) -> Vec<CredentialFileWrite> {
+    if !may_name_protected_path(segment) {
+        return Vec::new();
+    }
+    let mut hits: Vec<_> = if matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        tokenize(segment)
+            .iter()
+            .filter_map(|token| match token {
+                Token::Write { mode, target } => git_redirect_write(target, *mode),
+                Token::Word(_) | Token::Separator => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for view in [ShellDialect::PowerShell, ShellDialect::Cmd] {
+        if dialect == view || dialect == ShellDialect::Unknown {
+            hits.extend(windows_shells::classify_git_redirect_writes(segment, view));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    hits.retain(|hit| seen.insert((hit.rule, hit.span.start, hit.span.end)));
+    hits
+}
+
+fn is_git_redirect_rule(rule: &str) -> bool {
+    matches!(rule, GIT_REDIRECT_TRUNCATE_NAME | GIT_REDIRECT_APPEND_NAME)
+}
+
+fn git_redirect_write(target: &Word, mode: WriteMode) -> Option<CredentialFileWrite> {
+    resolve_all(target)
+        .iter()
+        .filter_map(|spelling| judge_file_spelling(target, spelling, Writer::redirect(mode)))
+        .find(|hit| is_git_redirect_rule(hit.rule))
 }
 
 /// Whether `command` names a PowerShell or Cmd writer this classifier reads.
@@ -2827,34 +2875,38 @@ impl Writer {
 
 const REMEDY: &str = "Reads and chmod/chown are unaffected; show the user the exact change and let them apply it, or grant this one command with `dcg allow-once`.";
 
-/// Build the hit for a resolved protected path, unless an existing rule owns
-/// this spelling already.
+/// Build the hit for a resolved protected path, retaining the rule that owns
+/// this write mode.
 ///
-/// Returns `None` for a *redirect* into `.git/`. Those spellings are decided by
+/// A *redirect* into `.git/` keeps
 /// `redirect-truncate-git-internals-relative` and
 /// `redirect-append-git-internals-relative`, which predate this entry, carry
 /// their own git-specific guidance, and are what existing allowlists name. The
-/// classifier is evaluated ahead of every redirect rule, so without this it
-/// would silently take those two rules' hits over and rename them — a
-/// user-visible id change and a broken allowlist, for no added coverage. What
-/// `.git/` gains here is the writers a redirect rule cannot see: `tee`,
-/// `sponge`, `cp`, `mv`, `install`, `sed -i`, `perl -i`, dd of=`, and the
-/// embedded-code sinks.
+/// classifier must not rename these hits to `git-internals-write`. They are
+/// collected separately by [`classify_git_redirect_writes`], so a first Git
+/// redirect cannot hide a later credential write from the credential scan.
+/// The semantic path decoder also reaches Windows separators and escaped
+/// spellings that the legacy redirect regexes cannot read (#492).
 fn protected_hit(
     writer: Writer,
     display: &str,
     what: &str,
     rule: &'static str,
     span: Range<usize>,
-) -> Option<CredentialFileWrite> {
-    if rule == GIT_INTERNALS_WRITE_NAME && writer.kind.is_none() {
-        return None;
-    }
-    Some(CredentialFileWrite {
+) -> CredentialFileWrite {
+    let rule = if rule == GIT_INTERNALS_WRITE_NAME && writer.kind.is_none() {
+        match writer.mode {
+            WriteMode::Replace => GIT_REDIRECT_TRUNCATE_NAME,
+            WriteMode::Append => GIT_REDIRECT_APPEND_NAME,
+        }
+    } else {
+        rule
+    };
+    CredentialFileWrite {
         span,
         reason: format!("{} {display}, which {what}. {REMEDY}", writer.verb()),
         rule,
-    })
+    }
 }
 
 fn unprovable_hit(
@@ -2914,9 +2966,9 @@ fn spelled_hit(
     what: &str,
     rule: &'static str,
     span: Range<usize>,
-) -> Option<CredentialFileWrite> {
+) -> CredentialFileWrite {
     if spelling.speculative {
-        return Some(unprovable_hit(writer, word, display, what, span));
+        return unprovable_hit(writer, word, display, what, span);
     }
     protected_hit(writer, display, what, rule, span)
 }
@@ -2953,7 +3005,7 @@ fn judge_file_spelling(
                 } else {
                     display
                 };
-                spelled_hit(
+                Some(spelled_hit(
                     spelling,
                     word,
                     writer,
@@ -2961,7 +3013,7 @@ fn judge_file_spelling(
                     what,
                     rule_for(&spelling.comps),
                     span,
-                )
+                ))
             }
         }
         Exact::Parent | Exact::Clear => None,
@@ -3063,7 +3115,7 @@ fn judge_placement(
             .map(|(example, what)| unprovable_hit(writer, directory_word, &example, what, span));
     }
     match exact(directory.root, &directory.comps) {
-        Exact::Protected { display, what, .. } => spelled_hit(
+        Exact::Protected { display, what, .. } => Some(spelled_hit(
             directory,
             directory_word,
             writer,
@@ -3071,7 +3123,7 @@ fn judge_placement(
             what,
             rule_for(&directory.comps),
             span,
-        ),
+        )),
         Exact::Clear => None,
         Exact::Parent => {
             let pattern = source_basename_pattern(source);
@@ -3090,13 +3142,13 @@ fn judge_placement(
                 comps.push(basename);
                 return match exact(directory.root, &comps) {
                     Exact::Protected { display, what, .. } => {
-                        protected_hit(
+                        Some(protected_hit(
                             writer,
                             &display,
                             what,
                             rule_for(&comps),
                             source.range.clone(),
-                        )
+                        ))
                     }
                     // Copying a whole `.aws`/`.config` tree into place installs
                     // whatever credential files it carries.
@@ -3267,7 +3319,15 @@ fn classify_simple_command(tokens: &[Token]) -> Option<CredentialFileWrite> {
         match token {
             Token::Word(word) => words.push(word),
             Token::Write { mode, target } => {
-                if let Some(hit) = judge_file_target(target, Writer::redirect(*mode)) {
+                // A brace list may contain both Git and credential targets.
+                // Skip Git readings, not the rest of this target's readings.
+                if let Some(hit) = resolve_all(target)
+                    .iter()
+                    .filter_map(|spelling| {
+                        judge_file_spelling(target, spelling, Writer::redirect(*mode))
+                    })
+                    .find(|hit| !is_git_redirect_rule(hit.rule))
+                {
                     return Some(hit);
                 }
             }
@@ -3441,7 +3501,7 @@ fn judge_transfer_destination(
             return judge_file_spelling(dest, destination, writer);
         }
         match exact(destination.root, &destination.comps) {
-            Exact::Protected { display, what, .. } => spelled_hit(
+            Exact::Protected { display, what, .. } => Some(spelled_hit(
                 destination,
                 dest,
                 writer,
@@ -3449,7 +3509,7 @@ fn judge_transfer_destination(
                 what,
                 rule_for(&destination.comps),
                 dest.range.clone(),
-            ),
+            )),
             Exact::Parent => sources
                 .iter()
                 .find_map(|source| judge_placement(destination, dest, source, writer)),
@@ -4025,7 +4085,7 @@ fn judge_extraction_spelling(
             } else {
                 display
             };
-            spelled_hit(
+            Some(spelled_hit(
                 destination,
                 dest,
                 writer,
@@ -4033,7 +4093,7 @@ fn judge_extraction_spelling(
                 what,
                 rule_for(&destination.comps),
                 span,
-            )
+            ))
         }
         // A directory that merely CONTAINS protected files is not itself a
         // protected destination. `/etc` is the case that matters: dcg allows
@@ -4983,7 +5043,7 @@ mod tests {
         );
     }
 
-    /// The two rule names this module reports must exist as pack entries.
+    /// Every rule name this module reports must exist as a pack entry.
     ///
     /// `destructive_pattern!` takes a string literal, so the id in
     /// `filesystem.rs` and the const here are two spellings of one name with
@@ -4994,7 +5054,12 @@ mod tests {
     fn both_rule_names_are_registered_pack_rules() {
         let pack = crate::packs::core::filesystem::create_pack();
         let names: Vec<&str> = pack.guidance_rule_names().collect();
-        for rule in [CREDENTIAL_FILE_WRITE_NAME, GIT_INTERNALS_WRITE_NAME] {
+        for rule in [
+            CREDENTIAL_FILE_WRITE_NAME,
+            GIT_INTERNALS_WRITE_NAME,
+            GIT_REDIRECT_TRUNCATE_NAME,
+            GIT_REDIRECT_APPEND_NAME,
+        ] {
             assert!(
                 names.contains(&rule),
                 "{rule} is reported by the classifier but is not a rule in core.filesystem, \
@@ -5053,6 +5118,125 @@ mod tests {
                 .rule,
             CREDENTIAL_FILE_WRITE_NAME
         );
+    }
+
+    #[test]
+    fn git_redirect_writes_use_declared_shell_decoding_and_original_spans() {
+        with_runtime_home(None, || {
+            for dialect in [
+                ShellDialect::PowerShell,
+                ShellDialect::Cmd,
+                ShellDialect::Unknown,
+            ] {
+                for target in [
+                    r".git\config",
+                    ".git/config",
+                    r"sub\.git\hooks\pre-commit",
+                    r#""C:\my repo\.git\HEAD""#,
+                ] {
+                    for (operator, rule) in [
+                        (">", GIT_REDIRECT_TRUNCATE_NAME),
+                        (">>", GIT_REDIRECT_APPEND_NAME),
+                    ] {
+                        let command = format!("echo x {operator} {target}");
+                        let hits = classify_git_redirect_writes(&command, dialect);
+                        assert_eq!(hits.len(), 1, "{dialect:?}: {command}: {hits:?}");
+                        assert_eq!(hits[0].rule, rule, "{dialect:?}: {command}");
+                        assert_eq!(&command[hits[0].span.clone()], target);
+                    }
+                }
+            }
+            for command in [r"echo x > .git\config", r"echo x >> '.git\config'"] {
+                assert!(
+                    classify_git_redirect_writes(command, ShellDialect::Posix).is_empty(),
+                    "{command}"
+                );
+            }
+            let escaped =
+                classify_git_redirect_writes(r"echo x > .g\it/config", ShellDialect::Posix);
+            assert_eq!(escaped.len(), 1);
+            assert_eq!(escaped[0].rule, GIT_REDIRECT_TRUNCATE_NAME);
+        });
+    }
+
+    #[test]
+    fn git_redirect_writes_retain_all_targets_without_hiding_credentials() {
+        with_runtime_home(None, || {
+            let command = "echo x > .git/config >> .git/HEAD > .git/index >> .ssh/authorized_keys";
+            for dialect in [
+                ShellDialect::Posix,
+                ShellDialect::PowerShell,
+                ShellDialect::Cmd,
+                ShellDialect::Unknown,
+            ] {
+                let hits = classify_git_redirect_writes(command, dialect);
+                assert_eq!(
+                    hits.iter().map(|hit| hit.rule).collect::<Vec<_>>(),
+                    [
+                        GIT_REDIRECT_TRUNCATE_NAME,
+                        GIT_REDIRECT_APPEND_NAME,
+                        GIT_REDIRECT_TRUNCATE_NAME
+                    ],
+                    "{dialect:?}"
+                );
+                assert_eq!(
+                    classify_credential_file_write(command, dialect)
+                        .expect("later credential write")
+                        .rule,
+                    CREDENTIAL_FILE_WRITE_NAME,
+                    "{dialect:?}"
+                );
+            }
+            for command in [
+                "echo x > {.git/config,.ssh/authorized_keys}",
+                "echo x > {.ssh/authorized_keys,.git/config}",
+            ] {
+                assert_eq!(
+                    classify_git_redirect_writes(command, ShellDialect::Posix).len(),
+                    1,
+                    "{command}"
+                );
+                assert_eq!(
+                    hit(command).expect("credential alternative").rule,
+                    CREDENTIAL_FILE_WRITE_NAME,
+                    "{command}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn git_redirect_writes_leave_data_reads_and_neighbor_paths_untouched() {
+        with_runtime_home(None, || {
+            for dialect in [
+                ShellDialect::Posix,
+                ShellDialect::PowerShell,
+                ShellDialect::Cmd,
+                ShellDialect::Unknown,
+            ] {
+                for command in [
+                    r#"echo "> .git\config""#,
+                    "cat .git/config",
+                    "tee .git/config",
+                    "echo x > .gitignore",
+                    "echo x > .github/config",
+                    "echo x > my.git/config",
+                    "echo x > notes.txt",
+                    "echo x 2>&1",
+                ] {
+                    assert!(
+                        classify_git_redirect_writes(command, dialect).is_empty(),
+                        "{dialect:?}: {command}"
+                    );
+                }
+            }
+            assert_eq!(
+                hit("tee .git/config")
+                    .expect("non-redirect writer retains its rule")
+                    .rule,
+                GIT_INTERNALS_WRITE_NAME
+            );
+        });
     }
 
     /// The neighbours that are not inside `.git/` and must stay ordinary.

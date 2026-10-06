@@ -26291,7 +26291,7 @@ fn evaluate_core_filesystem_pack(
     // Set once the whole-command embedded-credential scan below has run, so a
     // multi-segment command pays for it at most once.
     let mut embedded_credential_scanned = false;
-    // Likewise for the whole-command PowerShell credential read below.
+    // Likewise for the whole-command PowerShell protected-write read below.
     let mut powershell_credential_scanned = false;
     // What normalization stripped ahead of the command, e.g. `env -C ~/.ssh `
     // (#480): it still decides the directory the first segment runs in.
@@ -26370,48 +26370,70 @@ fn evaluate_core_filesystem_pack(
         // segment holds both the writer and its path (#477). The PowerShell
         // lexer splits commands and reads such groups itself, and its spans
         // already refer to the original command.
-        let credential_hit = if shell_dialect == ShellDialect::PowerShell {
+        let protected_hits: Vec<_> = if shell_dialect == ShellDialect::PowerShell {
             if powershell_credential_scanned {
-                None
+                Vec::new()
             } else {
                 powershell_credential_scanned = true;
                 crate::packs::core::credential_files::classify_credential_file_write(
                     original_command,
                     shell_dialect,
                 )
+                .into_iter()
+                .chain(
+                    crate::packs::core::credential_files::classify_git_redirect_writes(
+                        original_command,
+                        shell_dialect,
+                    ),
+                )
                 .map(|hit| (hit, 0, Some(0)))
+                .collect()
             }
         } else {
             let masked =
                 mask_nested_segment_ranges(dialect_segment, segment_start, &nested_segment_ranges);
-            crate::packs::core::credential_files::classify_credential_file_write(
-                masked.as_ref(),
-                shell_dialect,
-            )
-            .or_else(|| {
-                // `cd ~/.ssh && echo k > authorized_keys`: the relative target
-                // names the key file once the literal `cd` is applied (#480).
-                let anchored = cwd_anchored_segment(
-                    dialect_source,
-                    segment_ranges,
-                    segment_start,
-                    masked.as_ref(),
-                    stripped_prefix,
-                    shell_dialect,
-                )?;
+            let credential_hit =
                 crate::packs::core::credential_files::classify_credential_file_write(
-                    &anchored,
+                    masked.as_ref(),
                     shell_dialect,
                 )
-                .map(|hit| {
-                    crate::packs::core::credential_files::CredentialFileWrite {
-                        // The span indexes the anchored text; point at the segment.
-                        span: 0..masked.len(),
-                        ..hit
-                    }
-                })
-            })
-            .map(|hit| (hit, segment_start, normalized_offset))
+                .or_else(|| {
+                    // `cd ~/.ssh && echo k > authorized_keys`: the relative target
+                    // names the key file once the literal `cd` is applied (#480).
+                    let anchored = cwd_anchored_segment(
+                        dialect_source,
+                        segment_ranges,
+                        segment_start,
+                        masked.as_ref(),
+                        stripped_prefix,
+                        shell_dialect,
+                    )?;
+                    crate::packs::core::credential_files::classify_credential_file_write(
+                        &anchored,
+                        shell_dialect,
+                    )
+                    .map(|hit| {
+                        crate::packs::core::credential_files::CredentialFileWrite {
+                            // The span indexes the anchored text; point at the segment.
+                            span: 0..masked.len(),
+                            ..hit
+                        }
+                    })
+                });
+            // Decode Git redirect targets with the declared dialect as well.
+            // A Windows backslash is a path separator here, not an unknown
+            // POSIX escape. Collect every redirect rule: granting truncation
+            // must not hide an append or a credential write in the same command.
+            credential_hit
+                .into_iter()
+                .chain(
+                    crate::packs::core::credential_files::classify_git_redirect_writes(
+                        masked.as_ref(),
+                        shell_dialect,
+                    ),
+                )
+                .map(|hit| (hit, segment_start, normalized_offset))
+                .collect()
         };
         // Embedded interpreter code is delivered out-of-band, so no single
         // segment holds both the interpreter and its code: a heredoc body is
@@ -26440,13 +26462,12 @@ fn evaluate_core_filesystem_pack(
         };
         // Segment attribution keeps precedence. Embedded spans already refer
         // to the original command, not its normalized or sanitized view.
-        for (hit, credential_span_base, span_offset) in credential_hit
+        for (hit, credential_span_base, span_offset) in protected_hits
             .into_iter()
             .chain(embedded_hits.into_iter().map(|hit| (hit, 0, Some(0))))
         {
-            // The hit names its own rule: `.git/` writes deny under
-            // `git-internals-write` so allowing one does not also allow a
-            // write to `~/.ssh/authorized_keys` (#457).
+            // The hit names its own rule: Git writers, Git truncation, Git
+            // append, and credentials keep independent grants (#457, #492).
             let rule = hit.rule;
             let severity = crate::packs::Severity::Critical;
             let (explanation, suggestions) = pack.rule_guidance(rule);

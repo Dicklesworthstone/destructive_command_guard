@@ -3170,6 +3170,18 @@ Credential-directory writes retain `core.filesystem:credential-file-write`,
 while `.git` writes retain `core.filesystem:git-internals-write`, so a grant for
 one does not exempt the other.
 
+Shell redirects into `.git` retain the separate Critical rules
+`core.filesystem:redirect-truncate-git-internals-relative` and
+`core.filesystem:redirect-append-git-internals-relative`. Targets are decoded
+using the payload's shell dialect, so `echo x >> .git\config` is protected in
+PowerShell and Cmd on any host. When the shell is unknown, dcg checks each
+supported interpretation. An explicitly POSIX payload retains POSIX escape
+semantics. A grant for the generic dynamic-path rule cannot exempt a known
+Git target, and a grant for Git truncation does not exempt append or credential
+writes elsewhere in the same command. Other dynamic redirect targets still
+require their own review. For a required one-off write, use the exact-command
+`dcg allow-once` review path.
+
 **Glob semantics.**
 
 - `~` and `~/` expand to the user's home directory; `~user` is not supported.

@@ -71,6 +71,20 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
         .find_map(|command| classify_command(command, dialect))
 }
 
+pub(super) fn classify_git_redirect_writes(
+    segment: &str,
+    dialect: ShellDialect,
+) -> Vec<CredentialFileWrite> {
+    lex(segment, dialect)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| match item {
+            Lexed::Write { mode, target } => super::git_redirect_write(&target, mode),
+            Lexed::Arg(_) => None,
+        })
+        .collect()
+}
+
 fn classify_command(command: Vec<Lexed>, dialect: ShellDialect) -> Option<CredentialFileWrite> {
     let mut args: Vec<Arg> = Vec::new();
     let mut tokens: Vec<Token> = Vec::new();
