@@ -11018,7 +11018,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             "  Hook registered with wrong matcher: {:?}",
             hook_diag.wrong_matcher_hooks
         );
-        println!("  → dcg must match both Claude shell tools ({CLAUDE_SHELL_MATCHER})");
+        println!("  → dcg must match all Claude shell tools ({CLAUDE_SHELL_MATCHER})");
         if fix {
             println!("  Attempting to migrate the hook...");
             if install_hook(true, false).is_ok() {
@@ -13024,8 +13024,8 @@ fn collect_doctor_report(
     }
 }
 
-const CLAUDE_SHELL_MATCHER: &str = "Bash|PowerShell";
-const LEGACY_CLAUDE_SHELL_MATCHER: &str = "Bash";
+const CLAUDE_SHELL_MATCHER: &str = "Bash|PowerShell|Monitor";
+const LEGACY_CLAUDE_SHELL_MATCHERS: &[&str] = &["Bash", "Bash|PowerShell"];
 const ANTIGRAVITY_SHELL_MATCHER: &str = "Bash";
 
 fn current_dcg_executable() -> std::io::Result<std::path::PathBuf> {
@@ -13595,7 +13595,7 @@ fn install_dcg_hook_into_settings(
         settings,
         force,
         CLAUDE_SHELL_MATCHER,
-        &[LEGACY_CLAUDE_SHELL_MATCHER],
+        LEGACY_CLAUDE_SHELL_MATCHERS,
         desired_hook,
     )
 }
@@ -22567,38 +22567,51 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     }
 
     #[test]
-    fn install_into_settings_migrates_legacy_bash_hook_without_widening_siblings() {
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": LEGACY_CLAUDE_SHELL_MATCHER,
-                    "hooks": [
-                        { "type": "command", "command": "dcg" },
-                        { "type": "command", "command": "bash-only-hook" }
-                    ],
-                    "customField": "preserve"
-                }]
-            }
-        });
+    fn install_into_settings_migrates_legacy_matchers_without_widening_siblings() {
+        for legacy_matcher in LEGACY_CLAUDE_SHELL_MATCHERS {
+            let mut settings = serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": legacy_matcher,
+                        "hooks": [
+                            { "type": "command", "command": "dcg" },
+                            { "type": "command", "command": "original-tool-hook" }
+                        ],
+                        "customField": "preserve"
+                    }]
+                }
+            });
 
-        let changed = install_dcg_hook_into_settings(&mut settings, false).expect("migration ok");
-        assert!(changed, "legacy matcher should be migrated without --force");
+            let changed =
+                install_dcg_hook_into_settings(&mut settings, false).expect("migration ok");
+            assert!(
+                changed,
+                "{legacy_matcher} should be migrated without --force"
+            );
 
-        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(
-            pre.iter().filter(|entry| is_dcg_hook_entry(entry)).count(),
-            1
-        );
-        assert_eq!(pre[0]["matcher"], CLAUDE_SHELL_MATCHER);
-        assert_eq!(pre[0]["hooks"][0], claude_dcg_hook().expect("desired hook"));
+            let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(
+                pre.iter().filter(|entry| is_dcg_hook_entry(entry)).count(),
+                1
+            );
+            assert_eq!(pre[0]["matcher"], CLAUDE_SHELL_MATCHER);
+            assert_eq!(pre[0]["hooks"][0], claude_dcg_hook().expect("desired hook"));
 
-        let legacy = pre
-            .iter()
-            .find(|entry| entry["matcher"] == LEGACY_CLAUDE_SHELL_MATCHER)
-            .expect("Bash-only sibling entry must remain");
-        assert!(entry_has_hook_command(legacy, "bash-only-hook"));
-        assert_eq!(legacy["customField"], "preserve");
-        assert!(!entry_has_hook_command(legacy, "dcg"));
+            let legacy = pre
+                .iter()
+                .find(|entry| entry["matcher"] == *legacy_matcher)
+                .expect("sibling entry must retain its original matcher");
+            assert!(entry_has_hook_command(legacy, "original-tool-hook"));
+            assert_eq!(legacy["customField"], "preserve");
+            assert!(!entry_has_hook_command(legacy, "dcg"));
+
+            let installed = settings.clone();
+            assert!(!install_dcg_hook_into_settings(&mut settings, false).unwrap());
+            assert_eq!(
+                settings, installed,
+                "{legacy_matcher} migration is idempotent"
+            );
+        }
     }
 
     #[test]
@@ -22736,23 +22749,28 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
 
     #[test]
     fn install_into_settings_refuses_malformed_legacy_matcher_hooks() {
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": LEGACY_CLAUDE_SHELL_MATCHER,
-                    "hooks": { "not": "an array" }
-                }]
-            }
-        });
-        let original = settings.clone();
+        for legacy_matcher in LEGACY_CLAUDE_SHELL_MATCHERS {
+            let mut settings = serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": legacy_matcher,
+                        "hooks": { "not": "an array" }
+                    }]
+                }
+            });
+            let original = settings.clone();
 
-        let err = install_dcg_hook_into_settings(&mut settings, false)
-            .expect_err("malformed legacy entry must fail closed");
-        assert!(err.to_string().contains("legacy Bash matcher hooks"));
-        assert_eq!(
-            settings, original,
-            "in-memory settings must remain unchanged on validation failure"
-        );
+            let err = install_dcg_hook_into_settings(&mut settings, false)
+                .expect_err("malformed legacy entry must fail closed");
+            assert!(
+                err.to_string()
+                    .contains(&format!("legacy {legacy_matcher} matcher hooks"))
+            );
+            assert_eq!(
+                settings, original,
+                "in-memory settings must remain unchanged on validation failure"
+            );
+        }
     }
 
     #[test]
@@ -30817,26 +30835,42 @@ exclude = ["target/**"]
     fn self_heal_repair_carries_timeout_from_legacy_matcher() {
         // A hook migrating off the legacy matcher keeps its host-owned fields.
         let desired = claude_dcg_hook().unwrap();
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": LEGACY_CLAUDE_SHELL_MATCHER,
-                    "hooks": [dcg_hook_with_timeout("/stale/path/to/dcg", 7)]
-                }]
-            }
-        });
+        for legacy_matcher in LEGACY_CLAUDE_SHELL_MATCHERS {
+            let dir = tempfile::tempdir().unwrap();
+            let settings_path = dir.path().join("settings.json");
+            let lock_path = dir.path().join("selfheal.lock");
+            let settings = serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": legacy_matcher,
+                        "hooks": [dcg_hook_with_timeout(desired["command"].as_str().unwrap(), 7)]
+                    }]
+                }
+            });
+            assert!(!settings_has_exact_dcg_hook(&settings, &desired));
+            std::fs::write(
+                &settings_path,
+                serde_json::to_vec_pretty(&settings).unwrap(),
+            )
+            .unwrap();
 
-        let changed = install_dcg_hook_into_settings(&mut settings, false).unwrap();
-        assert!(changed);
-        let hook = canonical_dcg_hook(&settings);
-        assert_eq!(hook["command"], desired["command"]);
-        assert_eq!(hook["timeout"], 7);
-        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert!(
-            pre.iter()
-                .all(|entry| entry["matcher"] != LEGACY_CLAUDE_SHELL_MATCHER),
-            "emptied legacy entry is dropped"
-        );
+            ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+            let content = std::fs::read(&settings_path).unwrap();
+            let healed: serde_json::Value = serde_json::from_slice(&content).unwrap();
+            let hook = canonical_dcg_hook(&healed);
+            assert_eq!(hook["command"], desired["command"]);
+            assert_eq!(hook["timeout"], 7);
+            assert!(settings_has_exact_dcg_hook(&healed, &desired));
+            let pre = healed["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(pre.len(), 1, "emptied {legacy_matcher} entry is dropped");
+
+            ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+            assert_eq!(
+                std::fs::read(&settings_path).unwrap(),
+                content,
+                "self-heal is idempotent"
+            );
+        }
     }
 
     #[cfg(not(windows))]

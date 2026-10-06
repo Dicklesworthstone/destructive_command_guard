@@ -1292,7 +1292,7 @@ Add to `~/.claude/settings.json`:
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|PowerShell",
+        "matcher": "Bash|PowerShell|Monitor",
         "hooks": [
           {
             "type": "command",
@@ -1311,20 +1311,21 @@ non-interactive shell whose `PATH` may omit `~/.local/bin`, causing the hook to
 fail open. On native Windows, let `install.ps1` write the PowerShell-safe
 absolute invocation (`& 'C:\...\dcg.exe'` plus `"shell": "powershell"`).
 
-Claude Code exposes separate `Bash` and `PowerShell` shell tools on Windows, so
-the combined matcher is required for complete shell coverage. The native
+Claude Code exposes `Bash`, `PowerShell`, and `Monitor` tools that can execute
+shell commands. `Monitor` runs its `command` as a POSIX shell script; its
+commandless WebSocket (`ws`) mode needs no command evaluation. The native
 PowerShell installer also runs dcg through an explicitly selected PowerShell
 hook shell; this prevents Git Bash from stripping backslashes out of an
 absolute `C:\...\dcg.exe` path. Re-running the installer migrates a legacy
-dcg-only `Bash` entry while preserving unrelated Bash-only hooks.
+dcg hook while preserving unrelated hooks under their original matchers.
 
 **Important:** Restart Claude Code after adding the hook configuration.
 
-The matcher is a regex over the tool name and must cover **both** shells: on
-native Windows, Claude Code runs shell commands through a `PowerShell` tool, so
-a `Bash`-only matcher leaves every PowerShell command unguarded. `dcg install`,
-the installers, and `dcg doctor --fix` all write `Bash|PowerShell` and migrate a
-pre-existing `Bash`-only dcg entry in place (no duplicate hook is added).
+The matcher is a regex over the tool name and must cover **all three** tools:
+omitting `PowerShell` or `Monitor` leaves their commands unguarded. `dcg install`,
+the installers, `dcg doctor --fix`, and hook self-healing all write
+`Bash|PowerShell|Monitor` and migrate pre-existing `Bash` or `Bash|PowerShell`
+dcg entries without adding duplicate hooks or widening unrelated matchers.
 
 ## Codex CLI Configuration
 
@@ -3049,6 +3050,24 @@ syntax, templates for hidden directories, `/etc` roots, dynamic `$TMPDIR`
 roots, and `-u`/`--dry-run` keep their denials. This built-in proof does not add
 a configurable dynamic-path exemption, and every other redirect and command
 is still checked.
+
+**Filesystem evidence belongs to the environment running the script.** The
+new-home-file allowance uses local filesystem checks and therefore applies
+only to local scripts. An extracted SSH, container, namespace, or other-user
+script cannot use a same-named local file to establish that its redirect is
+safe ([#534](https://github.com/Dicklesworthstone/destructive_command_guard/issues/534)).
+For example, `ssh host 'echo x > ~/notes.txt'` stays denied even if the local
+`~/notes.txt` is absent. A local redirect such as
+`ssh host 'echo x' > ~/new-notes.txt` keeps the local creation checks. Append
+and proven temporary paths in the remote script remain available, subject to
+the existing credential and Git protections.
+
+The same boundary applies to files consumed by nested database or shell
+commands: remote files are unverified rather than read from the local disk.
+With the PostgreSQL pack enabled, remote `psql` startup files are unverified
+too; `-X` / `--no-psqlrc` disables those startup files so a literal SQL command
+can be evaluated directly. dcg does not connect to the other environment to
+inspect its files.
 
 **Credential and login files are never exempted by path.**
 `core.filesystem:credential-file-write` (writes to `~/.ssh/*`,

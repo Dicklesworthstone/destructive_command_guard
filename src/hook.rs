@@ -1619,7 +1619,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // Claude-shaped answer (#518).
     let is_claude_compatible_shell_tool = matches!(
         tool_name.as_str(),
-        "bash" | "launch-process" | "powershell" | "pwsh" | "cmd" | "cmd.exe" | "shell"
+        "bash" | "monitor" | "launch-process" | "powershell" | "pwsh" | "cmd" | "cmd.exe" | "shell"
     ) || is_vscode_terminal_tool(&tool_name);
     let has_codex_turn_id = input
         .turn_id
@@ -1679,7 +1679,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         "powershell" | "pwsh" | "cmd" | "cmd.exe"
     );
     // Claude Code on Windows DOES send `PowerShell` (dcg's own installer
-    // registers its Claude hook for `Bash|PowerShell`), and classifying those
+    // registers its Claude hook for `Bash|PowerShell|Monitor`), and classifying those
     // payloads as Codex answered every deny in the minimal shape — no ruleId,
     // packId, severity, allow-once code or remediation. An Anthropic tool-use
     // id (`toolu_…`) is the precise wire marker: Codex never emits one. The
@@ -1696,7 +1696,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     }
 
     // --- Claude-compatible indicators ---
-    // Claude Code uses tool_name="Bash" or "launch-process"; Codex-style
+    // Claude Code uses tool_name="Bash", "Monitor" or "launch-process"; Codex-style
     // shell payloads can also use PowerShell names. These tool names are not
     // Gemini's shell tool names, so check them before Gemini envelope fields.
     // Claude Code payloads also include session_id/cwd/transcript_path, which
@@ -1778,6 +1778,9 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
         || matches!(
             normalized.as_str(),
             "bash"
+            // Claude Code's Monitor command is a POSIX shell script. Its
+            // commandless WebSocket form is ignored during extraction (#529).
+            | "monitor"
             | "launch-process"
             | "powershell"
             | "pwsh"
@@ -1851,7 +1854,7 @@ pub(crate) fn shell_dialect_for_tool_name(tool_name: Option<&str>) -> ShellDiale
     };
 
     match tool_name.to_ascii_lowercase().as_str() {
-        "bash" => ShellDialect::Posix,
+        "bash" | "monitor" => ShellDialect::Posix,
         "powershell" | "pwsh" => ShellDialect::PowerShell,
         "cmd" | "cmd.exe" => ShellDialect::Cmd,
         _ => ShellDialect::Unknown,
@@ -4241,8 +4244,51 @@ mod tests {
     }
 
     #[test]
+    fn test_monitor_command_uses_claude_protocol_and_posix_dialect() {
+        for tool_name in ["Monitor", "monitor", "MONITOR"] {
+            let input: HookInput = serde_json::from_value(serde_json::json!({
+                "tool_name": tool_name,
+                "tool_input": { "command": "until git reset --hard HEAD; do sleep 1; done" },
+                "hook_event_name": "PreToolUse",
+                "session_id": "monitor-529",
+                "tool_use_id": "toolu_monitor_529",
+                "cwd": "/tmp",
+            }))
+            .unwrap();
+
+            assert!(is_supported_shell_tool(input.tool_name.as_deref()));
+            let extracted = extract_command_with_context(&input).expect("Monitor shell script");
+            assert_eq!(
+                extracted.command,
+                "until git reset --hard HEAD; do sleep 1; done"
+            );
+            assert_eq!(extracted.protocol, HookProtocol::ClaudeCompatible);
+            assert_eq!(extracted.dialect, ShellDialect::Posix);
+        }
+    }
+
+    #[test]
+    fn test_monitor_websocket_without_command_is_not_evaluated() {
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "tool_name": "Monitor",
+            "tool_input": { "ws": { "url": "wss://example.com/stream" } },
+            "hook_event_name": "PreToolUse",
+            "session_id": "monitor-529",
+            "tool_use_id": "toolu_monitor_529",
+            "cwd": "/tmp",
+        }))
+        .unwrap();
+
+        assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+        assert!(extract_command_with_context(&input).is_none());
+        for tool_name in ["MonitorStatus", "MCP:monitor"] {
+            assert!(!is_supported_shell_tool(Some(tool_name)));
+        }
+    }
+
+    #[test]
     fn test_shell_dialect_inference_requires_explicit_shell_tool_name() {
-        for tool_name in ["bash", "Bash", "BASH"] {
+        for tool_name in ["bash", "Bash", "BASH", "monitor", "Monitor", "MONITOR"] {
             assert_eq!(
                 shell_dialect_for_tool_name(Some(tool_name)),
                 ShellDialect::Posix

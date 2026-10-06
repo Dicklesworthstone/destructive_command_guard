@@ -8540,6 +8540,31 @@ pub(crate) fn data_heredoc_bodies_whose_output_may_run(command: &str) -> Vec<Ran
     found
 }
 
+/// Preserve the association between a body and its input operator. The
+/// evaluator needs the operator's owning command to distinguish a remote
+/// script from a local command that happens to follow an ssh invocation.
+pub(crate) fn heredoc_bodies_with_operators(command: &str) -> Vec<(Range<usize>, usize)> {
+    active_heredocs(command)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|heredoc| {
+            let body = match heredoc.body {
+                ActiveHeredocBody::Heredoc {
+                    body_start,
+                    body_end,
+                    ..
+                } => body_start..body_end,
+                ActiveHeredocBody::HereString => {
+                    let (start, end) =
+                        find_herestring_content_bounds(command, heredoc.operator_start + 3)?;
+                    start..end
+                }
+            };
+            Some((body, heredoc.operator_start))
+        })
+        .collect()
+}
+
 /// `command` with every byte inside `ranges` (other than newlines) blanked.
 fn blank_ranges(command: &str, ranges: &[Range<usize>]) -> String {
     let mut outside = command.as_bytes().to_vec();

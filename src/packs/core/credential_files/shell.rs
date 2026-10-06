@@ -3150,7 +3150,9 @@ fn executable_name(word: &Word) -> Option<String> {
 }
 
 /// Skip the options of a wrapper command; returns the index of the wrapped
-/// command word, or `None` when the wrapper makes it unknowable.
+/// command word, or `None` when the wrapper makes it unknowable or an option
+/// is missing its required operand. A wrapper with no command returns
+/// `args.len()`, so the caller can safely consume the remaining arguments.
 fn skip_wrapper(name: &str, args: &[&Word]) -> Option<usize> {
     let (short_value, long_value): (&[char], &[&str]) = match name {
         "sudo" => (
@@ -3197,6 +3199,7 @@ fn skip_wrapper(name: &str, args: &[&Word]) -> Option<usize> {
         if let Some(long) = text.strip_prefix("--") {
             let option = long.split_once('=').map_or(long, |(option, _)| option);
             if long_value.contains(&option) && !long.contains('=') {
+                args.get(index + 1)?;
                 index += 2;
             } else {
                 index += 1;
@@ -3211,6 +3214,9 @@ fn skip_wrapper(name: &str, args: &[&Word]) -> Option<usize> {
                     consumed_next = position + 1 == cluster.len();
                     break;
                 }
+            }
+            if consumed_next {
+                args.get(index + 1)?;
             }
             index += if consumed_next { 2 } else { 1 };
             continue;
@@ -3244,8 +3250,9 @@ fn strip_prefixes<'a>(mut words: &'a [&'a Word]) -> Option<&'a [&'a Word]> {
         if writer_kind(&name).is_some() {
             return Some(words);
         }
-        let skip = skip_wrapper(&name, &words[1..])?;
-        words = &words[1 + skip..];
+        let args = &words[1..];
+        let skip = skip_wrapper(&name, args)?;
+        words = args.get(skip..)?;
     }
     None
 }
@@ -4911,6 +4918,10 @@ mod tests {
             "command tee ~/.zshrc",
             "nohup tee ~/.zshrc",
             "nice -n 10 tee ~/.zshrc",
+            "nice -n 5 tee ~/.ssh/authorized_keys",
+            "nice --adjustment 5 tee ~/.ssh/authorized_keys",
+            "env -u UNUSED tee ~/.ssh/authorized_keys",
+            "sudo -u root nice -n 5 tee ~/.ssh/authorized_keys",
             "timeout 10 tee ~/.zshrc",
             "timeout -s KILL 10 tee ~/.zshrc",
             "stdbuf -oL tee ~/.zshrc",
@@ -4928,6 +4939,116 @@ mod tests {
         }
         allowed("env -S 'tee ~/.zshrc'");
         allowed("command -v tee ~/.zshrc");
+    }
+
+    #[test]
+    fn wrapper_value_options_require_operands_issue_521() {
+        let wrappers: &[(&str, &[&str])] = &[
+            (
+                "sudo",
+                &[
+                    "-u",
+                    "-g",
+                    "-p",
+                    "-C",
+                    "-D",
+                    "-h",
+                    "-r",
+                    "-t",
+                    "-T",
+                    "-U",
+                    "--user",
+                    "--group",
+                    "--prompt",
+                    "--close-from",
+                    "--chdir",
+                    "--host",
+                    "--role",
+                    "--type",
+                    "--command-timeout",
+                    "--other-user",
+                ],
+            ),
+            ("doas", &["-u", "-C"]),
+            ("env", &["-u", "-C", "--unset", "--chdir"]),
+            ("nice", &["-n", "--adjustment"]),
+            (
+                "ionice",
+                &["-c", "-n", "-p", "--class", "--classdata", "--pid"],
+            ),
+            ("timeout", &["-s", "-k", "--signal", "--kill-after"]),
+            (
+                "stdbuf",
+                &["-i", "-o", "-e", "--input", "--output", "--error"],
+            ),
+            ("exec", &["-a"]),
+            ("caffeinate", &["-t", "-w"]),
+        ];
+        assert!(strip_prefixes(&[]).is_none());
+        for &(wrapper, options) in wrappers {
+            let (wrapper_word, _) = read_word(wrapper, 0);
+            assert_eq!(skip_wrapper(wrapper, &[]), Some(0), "{wrapper}");
+            assert!(strip_prefixes(&[&wrapper_word]).is_none(), "{wrapper}");
+            for option in options {
+                let (option_word, _) = read_word(option, 0);
+                assert_eq!(
+                    skip_wrapper(wrapper, &[&option_word]),
+                    None,
+                    "{wrapper} {option} needs an operand"
+                );
+                assert!(
+                    strip_prefixes(&[&wrapper_word, &option_word]).is_none(),
+                    "{wrapper} {option} must not produce an invalid slice"
+                );
+                // An explicit empty word is still an operand; consuming it
+                // leaves no command and must also stop without a panic.
+                let (empty_operand, _) = read_word("''", 0);
+                assert_eq!(
+                    skip_wrapper(wrapper, &[&option_word, &empty_operand]),
+                    Some(2),
+                    "{wrapper} {option} ''"
+                );
+                assert!(
+                    strip_prefixes(&[&wrapper_word, &option_word, &empty_operand]).is_none(),
+                    "{wrapper} {option} '' has no wrapped command"
+                );
+                // Redirections are removed from argv and cannot supply an
+                // option's missing value, but they still open their target
+                // before the malformed wrapper command fails.
+                for redirect in [">", "2>"] {
+                    allowed(&format!("{wrapper} {option} {redirect}~/notes.txt"));
+                    denied(&format!(
+                        "{wrapper} {option} {redirect}~/.ssh/authorized_keys"
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrapper_prefixes_end_safely_without_a_command_issue_521() {
+        for command in [
+            "command",
+            "nohup",
+            "builtin",
+            "time",
+            "chronic",
+            "setsid",
+            "unbuffer",
+            "sudo --",
+            "env --",
+            "env UNUSED=1",
+            "nice -n5",
+            "nice --adjustment=5",
+            "nice -n 5",
+            "timeout -s TERM 5",
+            "sudo nice -n",
+            "sudo -Eu",
+            "sudo -E --user",
+        ] {
+            allowed(&format!("{command} >~/notes.txt"));
+            denied(&format!("{command} 2>~/.ssh/authorized_keys"));
+        }
     }
 
     #[test]

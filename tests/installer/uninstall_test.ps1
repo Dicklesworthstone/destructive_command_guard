@@ -42,12 +42,12 @@ try {
 
     . (Join-Path $repoRoot 'uninstall.ps1') -LoadFunctionsOnly
 
-Write-Host "Test 0: Claude (Bash|PowerShell wrapper) - remove dcg, keep Bash-only hook"
+Write-Host "Test 0: Claude (Bash|PowerShell|Monitor wrapper) - remove dcg, keep Bash-only hook"
 $h0 = New-Tmp; New-Item -ItemType Directory -Path $h0 -Force | Out-Null
 try {
     $f = Join-Path $h0 'settings.json'
     @{ hooks = @{ PreToolUse = @(
-        @{ matcher = 'Bash|PowerShell'; hooks = @(
+        @{ matcher = 'Bash|PowerShell|Monitor'; hooks = @(
             @{ type = 'command'; command = "& '$escapedDcg'"; shell = 'powershell' }) },
         @{ matcher = 'Bash'; hooks = @(
             @{ type = 'command'; command = 'keep-bash-only' }) })

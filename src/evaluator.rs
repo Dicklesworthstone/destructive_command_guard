@@ -6664,6 +6664,7 @@ enum ExecutableTextSink {
         source: String,
         dialect: ShellDialect,
         context: &'static str,
+        nonlocal_filesystem: bool,
     },
     /// A sink whose executable source cannot be statically verified. Each
     /// site carries a stable dotted rule id (`heredoc.<family>.<name>`) so
@@ -7018,6 +7019,7 @@ fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) 
                 source,
                 dialect: ShellDialect::Posix,
                 context: "POSIX eval executes an embedded shell command",
+                nonlocal_filesystem: false,
             }),
             Err(()) => {
                 // The warn downgrade is sound only when this eval idiom is the
@@ -8033,6 +8035,38 @@ fn xargs_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
     }
 }
 
+fn parallel_option_takes_value(argument: &str) -> bool {
+    matches!(
+        argument,
+        "-a" | "--arg-file"
+            | "-j"
+            | "--jobs"
+            | "-S"
+            | "--sshlogin"
+            | "--sshloginfile"
+            | "--joblog"
+            | "--results"
+            | "--workdir"
+            | "--tmpdir"
+            | "--timeout"
+            | "--delay"
+            | "--retries"
+            | "--tagstring"
+            | "--colsep"
+            | "--env"
+            | "--halt"
+            | "--header"
+            | "--load"
+            | "--memfree"
+            | "--nice"
+            | "--block"
+            | "--recend"
+            | "--recstart"
+            | "-d"
+            | "--delimiter"
+    )
+}
+
 fn parallel_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
     if args.is_empty() {
         return PipelineShellInputMode::ReadsStdin(
@@ -8076,35 +8110,7 @@ fn parallel_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
             index += 1;
             continue;
         }
-        if matches!(
-            argument.as_str(),
-            "-a" | "--arg-file"
-                | "-j"
-                | "--jobs"
-                | "-S"
-                | "--sshlogin"
-                | "--sshloginfile"
-                | "--joblog"
-                | "--results"
-                | "--workdir"
-                | "--tmpdir"
-                | "--timeout"
-                | "--delay"
-                | "--retries"
-                | "--tagstring"
-                | "--colsep"
-                | "--env"
-                | "--halt"
-                | "--header"
-                | "--load"
-                | "--memfree"
-                | "--nice"
-                | "--block"
-                | "--recend"
-                | "--recstart"
-                | "-d"
-                | "--delimiter"
-        ) {
+        if parallel_option_takes_value(argument) {
             let Some(value) = args.get(index + 1) else {
                 return PipelineShellInputMode::Unverified;
             };
@@ -8660,15 +8666,17 @@ fn split_pipeline_records(
 fn push_executable_input_source(
     source: IndirectInputSource,
     kind: PipelineSourceKind,
+    nonlocal_filesystem: bool,
     sinks: &mut Vec<ExecutableTextSink>,
 ) {
-    push_executable_input_source_at(source, kind, None, sinks);
+    push_executable_input_source_at(source, kind, None, nonlocal_filesystem, sinks);
 }
 
 fn push_executable_input_source_at(
     source: IndirectInputSource,
     kind: PipelineSourceKind,
     matched_span: Option<MatchSpan>,
+    nonlocal_filesystem: bool,
     sinks: &mut Vec<ExecutableTextSink>,
 ) {
     if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
@@ -8693,6 +8701,7 @@ fn push_executable_input_source_at(
                         IndirectInputSource::StaticProducer(record),
                         PipelineSourceKind::PosixShell,
                         matched_span,
+                        nonlocal_filesystem,
                         sinks,
                     );
                 }
@@ -8711,6 +8720,7 @@ fn push_executable_input_source_at(
                         IndirectInputSource::StaticProducer(record),
                         PipelineSourceKind::Interpreter(language),
                         matched_span,
+                        nonlocal_filesystem,
                         sinks,
                     );
                 }
@@ -8729,6 +8739,7 @@ fn push_executable_input_source_at(
                         IndirectInputSource::StaticProducer(record),
                         PipelineSourceKind::PowerShell,
                         matched_span,
+                        nonlocal_filesystem,
                         sinks,
                     );
                 }
@@ -8747,6 +8758,7 @@ fn push_executable_input_source_at(
                         IndirectInputSource::StaticProducer(record),
                         PipelineSourceKind::Cmd,
                         matched_span,
+                        nonlocal_filesystem,
                         sinks,
                     );
                 }
@@ -8764,6 +8776,7 @@ fn push_executable_input_source_at(
                     IndirectInputSource::StaticProducer(records.join(" ")),
                     PipelineSourceKind::PowerShell,
                     matched_span,
+                    nonlocal_filesystem,
                     sinks,
                 );
                 return;
@@ -8780,6 +8793,7 @@ fn push_executable_input_source_at(
                     IndirectInputSource::StaticProducer(records.join(" ")),
                     PipelineSourceKind::Cmd,
                     matched_span,
+                    nonlocal_filesystem,
                     sinks,
                 );
                 return;
@@ -8788,6 +8802,7 @@ fn push_executable_input_source_at(
                 source,
                 dialect: ShellDialect::Posix,
                 context: "POSIX shell executes source received from a pipeline",
+                nonlocal_filesystem,
             },
             PipelineSourceKind::Interpreter(language) => {
                 let Some(source) = interpreter_pipeline_heredoc(&source, language) else {
@@ -8801,17 +8816,20 @@ fn push_executable_input_source_at(
                     source,
                     dialect: ShellDialect::Posix,
                     context: "interpreter executes source received from a pipeline",
+                    nonlocal_filesystem,
                 }
             }
             PipelineSourceKind::PowerShell => ExecutableTextSink::Payload {
                 source,
                 dialect: ShellDialect::PowerShell,
                 context: "PowerShell executes source received from a pipeline",
+                nonlocal_filesystem,
             },
             PipelineSourceKind::Cmd => ExecutableTextSink::Payload {
                 source,
                 dialect: ShellDialect::Cmd,
                 context: "cmd.exe executes source received from a pipeline",
+                nonlocal_filesystem,
             },
         },
         IndirectInputSource::File(_) | IndirectInputSource::PsqlStartupFile { .. } => {
@@ -8865,9 +8883,18 @@ fn push_posix_pipeline_source(
     producer: &str,
     kind: PipelineSourceKind,
     matched_span: Option<MatchSpan>,
+    nonlocal_filesystem: bool,
     sinks: &mut Vec<ExecutableTextSink>,
 ) {
-    push_executable_input_source_at(static_producer_source(producer), kind, matched_span, sinks);
+    // Resolve the producer locally, then label its emitted executable bytes
+    // with the consumer's filesystem before deduplicating any payloads.
+    push_executable_input_source_at(
+        static_producer_source(producer),
+        kind,
+        matched_span,
+        nonlocal_filesystem,
+        sinks,
+    );
 }
 
 fn process_substitution_redirect_target(prefix: &str, operator: u8) -> Option<&str> {
@@ -9406,25 +9433,33 @@ fn collect_posix_process_substitution_sinks(command: &str, sinks: &mut Vec<Execu
                     continue;
                 }
             }
-            let mode = if let Some(consumer) = process_substitution_redirect_target(before, b'<') {
-                pipeline_shell_input_mode(consumer)
-            } else {
-                let mut marker = "__DCG_PROCESS_SUBSTITUTION__".to_string();
-                while segment.contains(&marker) {
-                    marker.push('_');
-                }
-                let reconstructed = format!("{before}{marker}{after}");
-                process_substitution_file_input_mode(&reconstructed, &marker)
-            };
+            let (mode, nonlocal_filesystem) =
+                if let Some(consumer) = process_substitution_redirect_target(before, b'<') {
+                    (
+                        pipeline_shell_input_mode(consumer),
+                        script_segment_is_nonlocal(consumer),
+                    )
+                } else {
+                    let mut marker = "__DCG_PROCESS_SUBSTITUTION__".to_string();
+                    while segment.contains(&marker) {
+                        marker.push('_');
+                    }
+                    let reconstructed = format!("{before}{marker}{after}");
+                    (
+                        process_substitution_file_input_mode(&reconstructed, &marker),
+                        script_segment_is_nonlocal(&reconstructed),
+                    )
+                };
             match mode {
                 PipelineShellInputMode::ReadsStdin(kind) => {
-                    push_executable_input_source(source, kind, sinks);
+                    push_executable_input_source(source, kind, nonlocal_filesystem, sinks);
                 }
                 PipelineShellInputMode::FixedTemplate(template) => {
                     sinks.push(ExecutableTextSink::Payload {
                         source: template,
                         dialect: ShellDialect::Posix,
                         context: "POSIX shell executes a fixed template with spliced input records",
+                        nonlocal_filesystem,
                     });
                 }
                 PipelineShellInputMode::Unverified => {
@@ -9448,15 +9483,17 @@ fn collect_posix_process_substitution_sinks(command: &str, sinks: &mut Vec<Execu
             let Some(producer) = producer else {
                 continue;
             };
+            let nonlocal_filesystem = script_segment_is_nonlocal(&substitution.source);
             match pipeline_shell_input_mode(&substitution.source) {
                 PipelineShellInputMode::ReadsStdin(kind) => {
-                    push_executable_input_source(producer, kind, sinks);
+                    push_executable_input_source(producer, kind, nonlocal_filesystem, sinks);
                 }
                 PipelineShellInputMode::FixedTemplate(source) => {
                     sinks.push(ExecutableTextSink::Payload {
                         source,
                         dialect: ShellDialect::Posix,
                         context: "POSIX shell executes a fixed template with spliced input records",
+                        nonlocal_filesystem,
                     });
                 }
                 PipelineShellInputMode::Unverified => {
@@ -9542,6 +9579,7 @@ fn collect_posix_pipeline_executable_sinks(command: &str, sinks: &mut Vec<Execut
                 if input_redirect(consumer).is_some() {
                     continue;
                 }
+                let nonlocal_filesystem = script_segment_is_nonlocal(consumer);
                 match pipeline_shell_input_mode(consumer) {
                     PipelineShellInputMode::ReadsStdin(kind) => {
                         let mut producer_index = consumer_index - 1;
@@ -9554,6 +9592,7 @@ fn collect_posix_pipeline_executable_sinks(command: &str, sinks: &mut Vec<Execut
                             &stages[producer_index].0,
                             kind,
                             *consumer_span,
+                            nonlocal_filesystem,
                             sinks,
                         );
                     }
@@ -9563,6 +9602,7 @@ fn collect_posix_pipeline_executable_sinks(command: &str, sinks: &mut Vec<Execut
                             dialect: ShellDialect::Posix,
                             context:
                                 "POSIX shell executes a fixed template with spliced input records",
+                            nonlocal_filesystem,
                         });
                     }
                     PipelineShellInputMode::Unverified => {
@@ -9842,6 +9882,7 @@ fn collect_dialect_pipeline_stdin_sinks(
                     static_producer_source(producer),
                     kind,
                     consumer_span,
+                    false,
                     sinks,
                 );
             }
@@ -9930,6 +9971,7 @@ fn collect_powershell_iex_sinks(command: &str, sinks: &mut Vec<ExecutableTextSin
                         source,
                         dialect: ShellDialect::PowerShell,
                         context: "Invoke-Expression executes PowerShell source received from the pipeline",
+                        nonlocal_filesystem: false,
                     }),
                     Err(()) => sinks.push(ExecutableTextSink::Unverified {
                         rule: POWERSHELL_IEX_RULE,
@@ -9956,6 +9998,7 @@ fn collect_powershell_iex_sinks(command: &str, sinks: &mut Vec<ExecutableTextSin
                 source,
                 dialect: ShellDialect::PowerShell,
                 context: "Invoke-Expression executes an embedded PowerShell command",
+                nonlocal_filesystem: false,
             }),
             Err(()) => sinks.push(ExecutableTextSink::Unverified {
                 rule: POWERSHELL_IEX_RULE,
@@ -10383,6 +10426,7 @@ fn collect_powershell_scriptblock_sinks(command: &str, sinks: &mut Vec<Executabl
                     source,
                     dialect: ShellDialect::PowerShell,
                     context: "an invoked ScriptBlock executes embedded PowerShell source",
+                    nonlocal_filesystem: false,
                 }),
                 Err(()) => sinks.push(ExecutableTextSink::Unverified {
                     rule: POWERSHELL_SCRIPTBLOCK_RULE,
@@ -11415,6 +11459,7 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
 /// already resolves are judged twice, to the same answer.
 fn collect_data_heredoc_output_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
     for body in crate::heredoc::data_heredoc_bodies_whose_output_may_run(command) {
+        let nonlocal_filesystem = heredoc_output_is_nonlocal(command, body.start);
         let Some(source) = command.get(body) else {
             continue;
         };
@@ -11422,6 +11467,7 @@ fn collect_data_heredoc_output_sinks(command: &str, sinks: &mut Vec<ExecutableTe
             source: source.to_string(),
             dialect: ShellDialect::Posix,
             context: "a heredoc's output reaches a program that runs it",
+            nonlocal_filesystem,
         };
         if !sinks.contains(&sink) {
             sinks.push(sink);
@@ -11467,7 +11513,7 @@ fn evaluate_executable_text_sinks(
     // knows where a data sink's output goes — not a mask swap here.
     let sinks = collect_executable_text_sinks(command, shell_dialect);
     for sink in sinks {
-        let (source, dialect, context) = match sink {
+        let (source, dialect, context, nonlocal_filesystem) = match sink {
             ExecutableTextSink::Unverified { rule, reason } => {
                 let (pack_id, pattern_name) = split_ast_rule_id(rule);
                 if let Some(hit) =
@@ -11583,7 +11629,8 @@ fn evaluate_executable_text_sinks(
                 source,
                 dialect,
                 context,
-            } => (source, dialect, context),
+                nonlocal_filesystem,
+            } => (source, dialect, context, nonlocal_filesystem),
         };
         if nested_command_depth >= MAX_EMBEDDED_SHELL_DEPTH
             || source.len() > heredoc_settings.limits.max_body_bytes
@@ -11592,6 +11639,7 @@ fn evaluate_executable_text_sinks(
                 "executable text source exceeds dcg's bounded static-analysis limit",
             ));
         }
+        let _filesystem_scope = NonlocalFilesystemScope::enter(nonlocal_filesystem);
         let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
             &source,
             enabled_keywords,
@@ -18089,6 +18137,23 @@ fn command_argument_payloads(
     if psql_analysis
         .as_ref()
         .is_some_and(|analysis| !analysis.no_psqlrc && !analysis.skips_startup_files)
+        && NonlocalFilesystemScope::active()
+    {
+        flows.push(IndirectInputFlow {
+            pack_id: "database.postgresql",
+            source: IndirectInputSource::Unverified(
+                "psql startup files belong to another execution environment and cannot be \
+                 inspected on this machine; use -X/--no-psqlrc to disable startup files"
+                    .to_string(),
+            ),
+            psql_interpolates_variables: true,
+            snowflake_templating: crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
+            snowflake_retain_comments: false,
+            snowflake_local_only: false,
+        });
+    } else if psql_analysis
+        .as_ref()
+        .is_some_and(|analysis| !analysis.no_psqlrc && !analysis.skips_startup_files)
     {
         let inline_value = env_split_string_assignment(&masked.command, "PSQLRC", "psql")
             .or_else(|| shell_assignment_value_before_executable(&masked.command, "PSQLRC", "psql"))
@@ -18775,6 +18840,14 @@ fn resolve_indirect_inputs(
         return resolve_indirect_input(source, project_path).map(|resolved| vec![resolved]);
     };
 
+    if NonlocalFilesystemScope::active() {
+        return Err(
+            "psql startup files belong to another execution environment and cannot be \
+                    inspected on this machine; use -X/--no-psqlrc to disable startup files"
+                .to_string(),
+        );
+    }
+
     let base = resolve_indirect_input_path(path, project_path);
     let parent = base.parent().unwrap_or_else(|| Path::new("."));
     let base_name = base
@@ -18839,6 +18912,13 @@ fn read_indirect_input_file_with_origin(
     path: &Path,
     base_path: Option<&Path>,
 ) -> Result<ResolvedIndirectInput, String> {
+    if NonlocalFilesystemScope::active() {
+        return Err(format!(
+            "input file {} belongs to another machine or filesystem; local file contents \
+             cannot verify the script's input",
+            path.display()
+        ));
+    }
     let resolved = resolve_indirect_input_path(path, base_path);
     let path_metadata = fs::symlink_metadata(&resolved)
         .map_err(|error| format!("cannot stat stdin source {}: {error}", resolved.display()))?;
@@ -21242,6 +21322,14 @@ fn evaluate_packs_with_allowlists_at_depth(
                 continue;
             };
 
+            let _filesystem_scope = NonlocalFilesystemScope::enter(
+                pack_id == "core.filesystem"
+                    && pattern.name == Some("redirect-truncate-root-home")
+                    && map_span_with_offset(span, normalized_offset, original_len).is_some_and(
+                        |mapped| heredoc_redirect_is_nonlocal(original_command, mapped),
+                    ),
+            );
+
             // Executable scoping (issue #289). Same rule as the per-segment
             // pass: a rule declaring `executables` fires only when its complete
             // match span stays inside a segment whose resolved argv0 is one of
@@ -21397,7 +21485,8 @@ fn evaluate_packs_with_allowlists_at_depth(
             } else {
                 pattern
             };
-            let reason = pattern.reason;
+            let (reason, explanation, suggestions) =
+                filesystem_pattern_denial_text(pack_id, pattern, command_for_packs, shell_dialect);
             let mapped_span = map_span_with_offset(span, normalized_offset, original_len);
             let preview = mapped_span
                 .as_ref()
@@ -21419,8 +21508,8 @@ fn evaluate_packs_with_allowlists_at_depth(
                                 source: MatchSource::Pack,
                                 matched_span: mapped_span,
                                 matched_text_preview: preview,
-                                explanation: pattern.explanation.map(str::to_string),
-                                suggestions: pattern.suggestions,
+                                explanation: explanation.map(str::to_string),
+                                suggestions,
                             },
                             hit.layer,
                             hit.entry.reason.clone(),
@@ -21436,9 +21525,9 @@ fn evaluate_packs_with_allowlists_at_depth(
                         pack_id,
                         pattern_name,
                         reason,
-                        pattern.explanation,
+                        explanation,
                         pattern.severity,
-                        pattern.suggestions,
+                        suggestions,
                         original_command,
                         mapped_span,
                     );
@@ -21448,9 +21537,9 @@ fn evaluate_packs_with_allowlists_at_depth(
                     pack_id,
                     pattern_name,
                     reason,
-                    pattern.explanation,
+                    explanation,
                     pattern.severity,
-                    pattern.suggestions,
+                    suggestions,
                 );
             }
 
@@ -21458,13 +21547,13 @@ fn evaluate_packs_with_allowlists_at_depth(
                 return EvaluationResult::denied_by_pack_with_span(
                     pack_id,
                     reason,
-                    pattern.explanation,
+                    explanation,
                     original_command,
                     mapped_span,
                 );
             }
 
-            return EvaluationResult::denied_by_pack(pack_id, reason, pattern.explanation);
+            return EvaluationResult::denied_by_pack(pack_id, reason, explanation);
         }
 
         if let Some(result) = evaluate_original_control_plane_payloads(
@@ -22415,8 +22504,11 @@ fn conditional_binding_dominates_redirect(source: &str, end: usize, use_start: u
 
 #[derive(Clone, Copy)]
 enum VariableResolution {
-    /// Preserve the established binding rules for argv, rm, and mv proofs.
+    /// Literal bindings shared by argv, rm, mv, and redirect proofs.
     Literal,
+    /// Keep established literal candidates when propagation can only add a
+    /// denial. A possibly stale candidate must never authorize an exemption.
+    DenyOnlyLiteral,
     /// Redirect-only extension; a copied value consumes one level of depth.
     Redirect { remaining_depth: usize },
 }
@@ -22584,35 +22676,35 @@ fn resolve_variable_bindings(
     name: &str,
     mode: VariableResolution,
 ) -> Option<Vec<String>> {
-    if let VariableResolution::Redirect { remaining_depth } = mode {
-        // These names are maintained by the shell, so ordinary commands can
-        // change them without an assignment word (cd updates PWD, for example).
-        // The new proof needs ordinary scalar bindings, not shell state.
-        if remaining_depth == 0
-            || name.starts_with("BASH")
-            || matches!(
-                name,
-                "_" | "PWD"
-                    | "OLDPWD"
-                    | "DIRSTACK"
-                    | "PIPESTATUS"
-                    | "FUNCNAME"
-                    | "LINENO"
-                    | "RANDOM"
-                    | "SRANDOM"
-                    | "SECONDS"
-                    | "EPOCHSECONDS"
-                    | "EPOCHREALTIME"
-                    | "UID"
-                    | "EUID"
-                    | "GROUPS"
-                    | "PPID"
-                    | "SHELLOPTS"
-                    | "IFS"
-            )
-        {
-            return None;
-        }
+    // These names are maintained by the shell, so ordinary commands can
+    // change them without an assignment word (cd updates PWD, for example).
+    // Every proof needs ordinary scalar bindings, including the literal proof
+    // that can exempt rm or run before the extended redirect proof.
+    let shell_maintained = name.starts_with("BASH")
+        || matches!(
+            name,
+            "_" | "PWD"
+                | "OLDPWD"
+                | "DIRSTACK"
+                | "PIPESTATUS"
+                | "FUNCNAME"
+                | "LINENO"
+                | "RANDOM"
+                | "SRANDOM"
+                | "SECONDS"
+                | "EPOCHSECONDS"
+                | "EPOCHREALTIME"
+                | "UID"
+                | "EUID"
+                | "GROUPS"
+                | "PPID"
+                | "SHELLOPTS"
+                | "IFS"
+        );
+    if (!matches!(mode, VariableResolution::DenyOnlyLiteral) && shell_maintained)
+        || matches!(mode, VariableResolution::Redirect { remaining_depth: 0 })
+    {
+        return None;
     }
     let mut values: Option<Vec<String>> = None;
     for &(start, end) in segment_ranges {
@@ -22654,7 +22746,7 @@ fn resolve_variable_bindings(
                     return None;
                 }
                 values = Some(match mode {
-                    VariableResolution::Literal => vec![
+                    VariableResolution::Literal | VariableResolution::DenyOnlyLiteral => vec![
                         literal_assignment_value(raw)
                             .or_else(|| mktemp_scratch_assignment_value(raw))?,
                     ],
@@ -22684,8 +22776,7 @@ fn resolve_variable_bindings(
                 continue;
             }
         }
-        if matches!(mode, VariableResolution::Redirect { .. })
-            && let Some((other, raw)) = posix_scalar_assignment(segment)
+        if let Some((other, raw)) = posix_scalar_assignment(segment)
             && other != name
             && other != "IFS"
             && raw.len() <= MAX_REDIRECT_VALUE_BYTES
@@ -22698,14 +22789,14 @@ fn resolve_variable_bindings(
             continue;
         }
         let first = hazard_first_word(segment);
-        if matches!(mode, VariableResolution::Redirect { .. })
+        if !matches!(mode, VariableResolution::DenyOnlyLiteral)
             && (first.contains(['$', '`'])
                 || first.starts_with('-')
                 || matches!(first.as_ref(), "command" | "builtin" | "time"))
         {
             // An expanded command word may invoke a mutating builtin, and an
             // option-bearing wrapper is outside the simple first-word parser.
-            // Neither can establish that the copied binding remains intact.
+            // Neither can establish that a prior binding remains intact.
             return None;
         }
         // `Owned` means the command word carried shell quoting that had to be
@@ -22721,6 +22812,10 @@ fn resolve_variable_bindings(
             // Checked against `source`, not `segment`: printf's arguments are
             // stripped as data before this scan, so the segment is bare.
             "printf" => command_word_was_quoted || printf_can_bind_variable(source),
+            // These invalidate permission-lifting proofs. The deny-only
+            // pass retains the earlier literal as a conservative candidate,
+            // so adding this guard cannot hide an existing sensitive target.
+            "trap" | "alias" => !matches!(mode, VariableResolution::DenyOnlyLiteral),
             other => matches!(
                 other,
                 "read"
@@ -23376,11 +23471,15 @@ enum ResolutionDirection {
     /// is left exactly as written and the walk continues, because substituting
     /// what IS known can only reveal a rule the literal text hid — and the words
     /// left unresolved still face the dynamic-path rules they always did.
+    /// Earlier literal candidates remain available when the stricter mutation
+    /// guards invalidate a permission-lifting proof; they can only add a deny.
     DenyOnly,
 }
 
-/// Rewrite `$NAME` / `${NAME}` in `segment` to the single literal value each one
-/// is provably bound to earlier in this same command.
+/// Rewrite `$NAME` / `${NAME}` in `segment` to an earlier single literal binding.
+/// Permission-lifting rewrites require proof that the value is still current;
+/// deny-only rewrites may retain a conservative candidate after an unmodeled
+/// mutation, since the caller promotes only a denial from that rendered text.
 ///
 /// Returns None when nothing was substituted, and — under
 /// [`ResolutionDirection::MayAllow`] — when any reference is unprovable,
@@ -23447,15 +23546,24 @@ fn resolve_proven_variables_in_segment(
                     out.push_str(&tail[..consumed]);
                     &tail[consumed..]
                 };
-                let values =
-                    match resolved_variable_values(source, segment_ranges, segment_start, name) {
-                        Some(values) => values,
-                        None if direction == ResolutionDirection::DenyOnly => {
-                            rest = keep(&mut out);
-                            continue;
-                        }
-                        None => return None,
-                    };
+                let mode = match direction {
+                    ResolutionDirection::MayAllow => VariableResolution::Literal,
+                    ResolutionDirection::DenyOnly => VariableResolution::DenyOnlyLiteral,
+                };
+                let values = match resolve_variable_bindings(
+                    source,
+                    segment_ranges,
+                    segment_start,
+                    name,
+                    mode,
+                ) {
+                    Some(values) => values,
+                    None if direction == ResolutionDirection::DenyOnly => {
+                        rest = keep(&mut out);
+                        continue;
+                    }
+                    None => return None,
+                };
                 let [value] = values.as_slice() else {
                     if direction == ResolutionDirection::DenyOnly {
                         rest = keep(&mut out);
@@ -24636,6 +24744,9 @@ fn literal_home_redirect_path(raw: &str, home: &Path) -> Option<PathBuf> {
 /// the target path is "something exists there" and stays denied, because the
 /// shell's `O_TRUNC` open would follow it.
 fn path_is_new_file_under_home(target: &Path, home: &Path) -> bool {
+    if NonlocalFilesystemScope::active() {
+        return false;
+    }
     match fs::symlink_metadata(target) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         _ => return false,
@@ -24704,8 +24815,255 @@ fn redirect_targets_are_new_home_files_with_home(
 /// it is exactly what `dcg create-new` exists for when exclusive creation must
 /// be guaranteed.
 fn redirect_targets_are_new_home_files(command: &str, dialect: ShellDialect) -> bool {
+    if NonlocalFilesystemScope::active() {
+        return false;
+    }
     crate::config::home_dir()
         .is_some_and(|home| redirect_targets_are_new_home_files_with_home(command, dialect, &home))
+}
+
+thread_local! {
+    /// Nested evaluation is synchronous. A scoped value carries filesystem
+    /// provenance through all recursive shell and indirect-input paths without
+    /// accidentally restoring local access in a remote script's child shell.
+    static NONLOCAL_FILESYSTEM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct NonlocalFilesystemScope {
+    previous: bool,
+}
+
+impl NonlocalFilesystemScope {
+    fn enter(nonlocal: bool) -> Self {
+        let previous = NONLOCAL_FILESYSTEM.with(|scope| {
+            let previous = scope.get();
+            scope.set(previous || nonlocal);
+            previous
+        });
+        Self { previous }
+    }
+
+    fn active() -> bool {
+        NONLOCAL_FILESYSTEM.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for NonlocalFilesystemScope {
+    fn drop(&mut self) {
+        NONLOCAL_FILESYSTEM.with(|scope| scope.set(self.previous));
+    }
+}
+
+/// These carriers run extracted scripts against another machine, namespace,
+/// or user's home. Merely mentioning their names in an argument is not enough:
+/// only the executable of the script's own segment establishes the scope.
+const NONLOCAL_SCRIPT_CARRIERS: &[&str] = &[
+    "ssh",
+    "mosh",
+    "sshpass",
+    "autossh",
+    "gcloud",
+    "fly",
+    "vagrant",
+    "ansible",
+    "pdsh",
+    "clush",
+    "pssh",
+    "parallel-ssh",
+    "docker",
+    "podman",
+    "nerdctl",
+    "kubectl",
+    "oc",
+    "lxc",
+    "incus",
+    "machinectl",
+    "nsenter",
+    "chroot",
+    "wsl",
+    "su",
+    "runuser",
+    "sudo",
+    "doas",
+];
+
+fn parallel_uses_remote_hosts(args: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" || !argument.starts_with('-') || argument == "-" {
+            break;
+        }
+        if matches!(argument.as_str(), "-S" | "--sshlogin" | "--sshloginfile")
+            || argument.starts_with("--sshlogin=")
+            || argument.starts_with("--sshloginfile=")
+            || argument
+                .strip_prefix("-S")
+                .is_some_and(|value| !value.is_empty())
+        {
+            return true;
+        }
+        // Share option arity with the existing parallel source parser: a
+        // value spelling --sshlogin is data, not another remote-host flag.
+        index += if parallel_option_takes_value(argument) {
+            2
+        } else {
+            1
+        };
+    }
+    false
+}
+
+fn script_segment_is_nonlocal(segment: &str) -> bool {
+    // Executable normalization removes sudo. Its identity still matters for
+    // an extracted script: that shell may have another user's HOME. This is
+    // never applied to an outer redirect, which the caller's shell performs.
+    let stripped = strip_wrapper_prefixes(segment);
+    stripped
+        .stripped_wrappers
+        .iter()
+        .any(|wrapper| wrapper.wrapper_type == "sudo")
+        || segment_invokes_executable_in_dialect(
+            segment,
+            NONLOCAL_SCRIPT_CARRIERS,
+            ShellDialect::Posix,
+        )
+        || command_tokens(segment).is_some_and(|(executable, args)| {
+            executable == "parallel" && parallel_uses_remote_hosts(&args)
+        })
+}
+
+fn script_site_is_nonlocal(command: &str, position: usize) -> bool {
+    command_segment_ranges_in_dialect(command, ShellDialect::Posix)
+        .into_iter()
+        .any(|(start, end)| {
+            start <= position && position < end && script_segment_is_nonlocal(&command[start..end])
+        })
+}
+
+fn extracted_script_is_nonlocal(command: &str, content: &crate::heredoc::ExtractedContent) -> bool {
+    content
+        .target_command
+        .as_deref()
+        .is_some_and(|target| NONLOCAL_SCRIPT_CARRIERS.contains(&target))
+        || script_site_is_nonlocal(command, content.byte_range.start)
+        // A heredoc's target name has already lost wrappers such as sudo,
+        // and its body is in a separate segment from the receiving command.
+        // Recover that command from the body/operator association as well.
+        || (content.heredoc_type.is_some()
+            && heredoc_redirect_is_nonlocal(command, MatchSpan {
+                start: content.byte_range.start,
+                end: content.byte_range.end,
+            }))
+}
+
+fn heredoc_redirect_is_nonlocal(command: &str, span: MatchSpan) -> bool {
+    command.contains("<<")
+        && crate::heredoc::heredoc_bodies_with_operators(command)
+            .into_iter()
+            .any(|(body, operator)| {
+                body.start < span.end
+                    && span.start < body.end
+                    && script_site_is_nonlocal(command, operator)
+            })
+}
+
+/// A data heredoc may be copied into a remote shell by a pipeline. Follow
+/// only its own header's pipeline, stopping at a list boundary; an unrelated
+/// `docker ps;` or `ssh host true &&` cannot change a local script's scope.
+fn heredoc_output_is_nonlocal(command: &str, body_start: usize) -> bool {
+    let Some((_, operator)) = crate::heredoc::heredoc_bodies_with_operators(command)
+        .into_iter()
+        .find(|(body, _)| body.start == body_start)
+    else {
+        return false;
+    };
+    let line_end = command[operator..]
+        .find('\n')
+        .map_or(command.len(), |end| operator + end);
+    let header = &command[..line_end];
+    let mut ranges = command_segment_ranges_in_dialect(header, ShellDialect::Posix);
+    ranges.sort_unstable();
+    let Some((_, mut end)) = ranges
+        .iter()
+        .copied()
+        .filter(|&(start, end)| start <= operator && operator < end)
+        .min_by_key(|&(start, end)| end - start)
+    else {
+        return false;
+    };
+    if script_site_is_nonlocal(header, operator) {
+        return true;
+    }
+    for (next_start, next_end) in ranges {
+        if next_start < end {
+            continue;
+        }
+        let separator = header[end..next_start]
+            .trim_matches(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '(' | ')'));
+        if !matches!(separator, "|" | "|&") {
+            break;
+        }
+        if script_segment_is_nonlocal(&header[next_start..next_end]) {
+            return true;
+        }
+        end = next_end;
+    }
+    false
+}
+
+const NONLOCAL_REDIRECT_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "producer >> ~/file",
+        "Append in the other environment when appending is the intended operation.",
+    ),
+    PatternSuggestion::new(
+        "producer > /tmp/<subdir>/new-file",
+        "Write to a scratch path in the environment where the script runs.",
+    ),
+    PatternSuggestion::gated(
+        "set -C; producer > ~/file",
+        "Enable noclobber in the executing POSIX shell; dcg still requires approval because \
+         it cannot prove that the option remains enabled at the write.",
+    ),
+];
+
+fn filesystem_pattern_denial_text(
+    pack_id: &str,
+    pattern: &crate::packs::DestructivePattern,
+    command: &str,
+    dialect: ShellDialect,
+) -> (
+    &'static str,
+    Option<&'static str>,
+    &'static [PatternSuggestion],
+) {
+    let remote_home = pack_id == "core.filesystem"
+        && pattern.name == Some("redirect-truncate-root-home")
+        && NonlocalFilesystemScope::active()
+        && unquoted_output_redirect_targets(command, dialect).is_some_and(|targets| {
+            targets.iter().any(|target| {
+                let target = target.trim_start_matches(['\'', '"']);
+                target.starts_with("~/")
+                    || target.starts_with("/home/")
+                    || target.starts_with("/Users/")
+                    || target.starts_with("/root/")
+            })
+        });
+    if remote_home {
+        (
+            "shell truncating redirect to a home path in a script that runs on another machine \
+             or filesystem: dcg cannot verify whether the target already exists there",
+            Some(
+                "The local filesystem cannot establish that this remote or isolated home file \
+                  is new. The shell opens the target with truncation before the command runs, \
+                  so existing contents could be lost. Use an appropriate append or scratch \
+                  path in that environment, or obtain approval for the write.",
+            ),
+            NONLOCAL_REDIRECT_SUGGESTIONS,
+        )
+    } else {
+        (pattern.reason, pattern.explanation, pattern.suggestions)
+    }
 }
 
 /// Whether a matched `core.filesystem` redirect rule is suppressed by a
@@ -26396,6 +26754,15 @@ fn evaluate_pack_destructive_patterns(
             continue;
         }
 
+        let _filesystem_scope = NonlocalFilesystemScope::enter(
+            pack_id == "core.filesystem"
+                && pattern.name == Some("redirect-truncate-root-home")
+                && matched_span
+                    .as_ref()
+                    .and_then(|span| map_span_with_offset(*span, normalized_offset, original_len))
+                    .is_some_and(|mapped| heredoc_redirect_is_nonlocal(original_command, mapped)),
+        );
+
         // Executable scoping (issue #289). Exact rule: a rule declaring
         // `executables` fires only when the complete match span stays inside a
         // segment of this slice whose resolved argv0 is one of those
@@ -26563,7 +26930,12 @@ fn evaluate_pack_destructive_patterns(
         } else {
             pattern
         };
-        let reason = pattern.reason;
+        let (reason, explanation, suggestions) = filesystem_pattern_denial_text(
+            pack_id,
+            pattern,
+            redirect_syntax_command,
+            shell_dialect,
+        );
         let mapped_span = matched_span
             .as_ref()
             .and_then(|span| map_span_with_offset(*span, normalized_offset, original_len));
@@ -26592,8 +26964,8 @@ fn evaluate_pack_destructive_patterns(
                             source: MatchSource::Pack,
                             matched_span: mapped_span,
                             matched_text_preview: preview,
-                            explanation: pattern.explanation.map(str::to_string),
-                            suggestions: pattern.suggestions,
+                            explanation: explanation.map(str::to_string),
+                            suggestions,
                         },
                         hit.layer,
                         hit.entry.reason.clone(),
@@ -26607,9 +26979,9 @@ fn evaluate_pack_destructive_patterns(
                     pack_id,
                     pattern_name,
                     reason,
-                    pattern.explanation,
+                    explanation,
                     pattern.severity,
-                    pattern.suggestions,
+                    suggestions,
                     original_command,
                     mapped_span,
                 ));
@@ -26619,9 +26991,9 @@ fn evaluate_pack_destructive_patterns(
                 pack_id,
                 pattern_name,
                 reason,
-                pattern.explanation,
+                explanation,
                 pattern.severity,
-                pattern.suggestions,
+                suggestions,
             ));
         }
 
@@ -26629,7 +27001,7 @@ fn evaluate_pack_destructive_patterns(
             return Some(EvaluationResult::denied_by_pack_with_span(
                 pack_id,
                 reason,
-                pattern.explanation,
+                explanation,
                 original_command,
                 mapped_span,
             ));
@@ -26638,7 +27010,7 @@ fn evaluate_pack_destructive_patterns(
         return Some(EvaluationResult::denied_by_pack(
             pack_id,
             reason,
-            pattern.explanation,
+            explanation,
         ));
     }
 
@@ -27198,6 +27570,9 @@ fn evaluate_heredoc(
         if heredoc_content_is_exempt(command, &content, context) {
             continue;
         }
+
+        let _filesystem_scope =
+            NonlocalFilesystemScope::enter(extracted_script_is_nonlocal(command, &content));
 
         // Cheap, high-signal fallback before the expensive AST pass. If the
         // hook is already close to its evaluation deadline, this keeps obvious
@@ -29320,6 +29695,115 @@ mod tests {
             literal_cd_target("\"${HOME}/.ssh\"").as_deref(),
             Some("${HOME}/.ssh")
         );
+    }
+
+    #[test]
+    fn literal_variable_proofs_reject_parent_shell_mutation() {
+        for prefix in [
+            "D=/tmp/a; command -p printf -v D /etc; ",
+            "D=/tmp/a; builtin -- printf -v D /etc; ",
+            "D=/tmp/a; 'command' printf -v D /etc; ",
+            "D=/tmp/a; bu''iltin printf -v D /etc; ",
+            "D=/tmp/a; time -p printf -v D /etc; ",
+            // An ambient command variable can name a parent-shell builtin.
+            "D=/tmp/a; $P -v D /etc; ",
+            "D=/tmp/a; \"$P\" -v D /etc; ",
+            "D=/tmp/a; trap 'D=/etc' DEBUG; ",
+            "D=/tmp/a; tr'ap' 'D=/etc' DEBUG; ",
+            // Alias expansion takes effect when a subsequent line is parsed.
+            "shopt -s expand_aliases\nalias next='printf -v D /etc'\nD=/tmp/a\nnext\n",
+        ] {
+            for operation in [
+                r#"echo hi > "$D/passwd""#,
+                r#"rm -rf "$D""#,
+                r#"mv "$D" archive/"#,
+            ] {
+                let command = format!("{prefix}{operation}");
+                for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                    let result =
+                        evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
+                    assert!(
+                        result.is_denied(),
+                        "a stale literal must not exempt {command:?} ({dialect:?}): {:?}",
+                        result.pattern_info
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn literal_variable_proofs_do_not_treat_shell_state_as_scalars() {
+        for command in [
+            r#"PWD=/tmp/a; cd /etc; echo hi > "$PWD/passwd""#,
+            r#"PWD=/tmp/a; cd /etc; rm -rf "$PWD""#,
+            r#"PWD=/tmp/a; cd /etc; mv "$PWD" archive/"#,
+            r#"OLDPWD=/tmp/a; cd /etc; cd /tmp; rm -rf "$OLDPWD""#,
+            r#"_=/tmp/a; true /etc; echo hi > "$_/passwd""#,
+            r#"_=/tmp/a; true /etc; rm -rf "$_""#,
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_denied(),
+                    "shell state must not prove {command:?} ({dialect:?}): {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn literal_variable_proofs_retain_sensitive_denial_candidates() {
+        // Conservative candidates can add a denial even when they cannot
+        // prove the current value well enough to authorize an exemption.
+        // Tightening the allow direction must not conceal a sensitive target.
+        for command in [
+            r#"PWD=/etc; rm "$PWD/shadow""#,
+            r#"D=/etc; command -p echo ready; rm "$D/shadow""#,
+            r#"D=/etc; trap ':' DEBUG; rm "$D/shadow""#,
+            r#"D=/etc; alias next=true; rm "$D/shadow""#,
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_denied(),
+                    "sensitive candidate must stay visible in {command:?} ({dialect:?}): {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn literal_variable_proofs_preserve_inert_commands_and_temporary_paths() {
+        for command in [
+            r#"D=/tmp/a; echo ready; rm -rf "$D""#,
+            r#"D=/tmp/a; command echo ready; rm -rf "$D""#,
+            r#"D=/tmp/a; builtin echo ready; echo hi > "$D/x""#,
+            r#"D=$(mktemp -d); rm -rf "$D""#,
+            // mktemp's options belong to its child substitution, not a
+            // parent-shell wrapper that can mutate the unrelated T scalar.
+            r#"D=$(mktemp -d); T=/tmp/a; rm -rf "$T""#,
+            r#"D=$(mktemp -d -p /tmp); T=/tmp/a; echo hi > "$T/x""#,
+            r#"f=a; echo ready; mv "$f" archive/"#,
+            r#"for f in a b; do mv "$f" archive/; done"#,
+            // Unlike mv's candidate-by-candidate proof, rm's established
+            // substitution proof accepts only a single literal loop value.
+            r#"for f in /tmp/a; do rm -rf "$f"; done"#,
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_allowed(),
+                    "sound literal proof must survive {command:?} ({dialect:?}): {:?}",
+                    result.pattern_info
+                );
+            }
+        }
     }
 
     /// The hazard scan dispatches on this exact word, so a printf segment has
@@ -37198,6 +37682,69 @@ mod tests {
     /// already exists. A literal absent file with an existing parent under
     /// the home directory is creation, not truncation, whether or not a VCS
     /// worktree is anywhere in sight.
+    #[test]
+    fn nonlocal_filesystem_scope_restores_local_evidence_issue_534() {
+        let home = tempfile::tempdir().expect("home");
+        let target = home.path().join("new-note");
+        assert!(path_is_new_file_under_home(&target, home.path()));
+        {
+            let _remote = NonlocalFilesystemScope::enter(true);
+            assert!(!path_is_new_file_under_home(&target, home.path()));
+            {
+                let _child = NonlocalFilesystemScope::enter(false);
+                assert!(NonlocalFilesystemScope::active());
+                assert!(read_indirect_input_file_with_origin(&target, None).is_err());
+            }
+            assert!(NonlocalFilesystemScope::active());
+        }
+        assert!(!NonlocalFilesystemScope::active());
+        assert!(path_is_new_file_under_home(&target, home.path()));
+    }
+
+    #[test]
+    fn heredoc_filesystem_scope_belongs_to_its_carrier_issue_534() {
+        for (command, remote) in [
+            ("ssh host <<'EOF'\necho x > ~/note\nEOF", true),
+            ("sudo ssh host <<'EOF'\necho x > ~/note\nEOF", true),
+            ("docker exec -i c sh <<'EOF'\necho x > ~/note\nEOF", true),
+            ("ssh host true && bash <<'EOF'\necho x > ~/note\nEOF", false),
+            ("ssh host true | bash <<'EOF'\necho x > ~/note\nEOF", false),
+            ("bash <<'EOF'\necho x > ~/note\nEOF\nssh host true", false),
+        ] {
+            let start = command.find("> ~/note").expect("redirect");
+            assert_eq!(
+                heredoc_redirect_is_nonlocal(
+                    command,
+                    MatchSpan {
+                        start,
+                        end: start + "> ~/note".len(),
+                    }
+                ),
+                remote,
+                "{command:?}"
+            );
+        }
+        for (command, remote) in [
+            ("cat <<'EOF' | ssh host\necho x > ~/note\nEOF", true),
+            (
+                "cat <<'EOF' | tee log | ssh host\necho x > ~/note\nEOF",
+                true,
+            ),
+            ("docker ps; cat <<'EOF' | sh\necho x > ~/note\nEOF", false),
+            (
+                "ssh host true && cat <<'EOF' | sh\necho x > ~/note\nEOF",
+                false,
+            ),
+        ] {
+            let body_start = command.find("echo x").expect("body");
+            assert_eq!(
+                heredoc_output_is_nonlocal(command, body_start),
+                remote,
+                "{command:?}"
+            );
+        }
+    }
+
     #[test]
     fn new_literal_home_redirects_are_allowed_with_or_without_a_worktree() {
         let home = tempfile::tempdir().expect("temp home");

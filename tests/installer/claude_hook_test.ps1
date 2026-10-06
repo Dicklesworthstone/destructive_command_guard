@@ -38,12 +38,14 @@ try {
     Check (Test-Path $settings) "settings.json created"
     Check (Test-NoBom $settings) "file has no UTF-8 BOM"
     $p = Get-Content -Raw $settings | ConvertFrom-Json
-    Check ($p.hooks.PreToolUse[0].matcher -eq 'Bash|PowerShell') "matcher covers Bash and PowerShell"
+    Check ($p.hooks.PreToolUse[0].matcher -eq 'Bash|PowerShell|Monitor') "matcher covers Bash, PowerShell, and Monitor scripts"
     Check ($p.hooks.PreToolUse[0].hooks[0].command -eq "& '$dcgPath'") "dcg command uses a PowerShell-safe absolute path"
     Check ($p.hooks.PreToolUse[0].hooks[0].shell -eq 'powershell') "hook shell is explicitly PowerShell"
     Check (Test-DcgHookCommand $p.hooks.PreToolUse[0].hooks[0]) "wrapped command is recognized as dcg"
+    $before = Get-Content -Raw $settings
     $status2 = Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $h1
     Check ($status2 -eq 'already') "second run returns 'already' (got '$status2')"
+    Check ((Get-Content -Raw $settings) -eq $before) "current settings stay byte-for-byte unchanged"
 } finally { Remove-Item -Recurse -Force $h1 -ErrorAction SilentlyContinue }
 
 # --- Test 2: preserve a coexisting Bash-only hook without widening it ---
@@ -62,44 +64,52 @@ try {
     $status = Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $h2
     Check ($status -eq 'merged') "returns 'merged' (got '$status')"
     $p = Get-Content -Raw (Join-Path $cdir 'settings.json') | ConvertFrom-Json
-    $shells = @($p.hooks.PreToolUse | Where-Object { $_.matcher -eq 'Bash|PowerShell' })[0]
+    $shells = @($p.hooks.PreToolUse | Where-Object { $_.matcher -eq 'Bash|PowerShell|Monitor' })[0]
     $bash = @($p.hooks.PreToolUse | Where-Object { $_.matcher -eq 'Bash' })[0]
     Check ($shells.hooks[0].command -eq "& '$dcgPath'") "dcg hoisted first in combined shell matcher"
     Check ((@($bash.hooks | ForEach-Object { $_.command })) -contains 'other-tool') "coexisting Bash hook preserved under Bash only"
-    Check (-not ((@($shells.hooks | ForEach-Object { $_.command })) -contains 'other-tool')) "Bash-only hook was not widened to PowerShell"
+    Check (-not ((@($shells.hooks | ForEach-Object { $_.command })) -contains 'other-tool')) "Bash-only hook was not widened to PowerShell or Monitor"
     Check ($p.hooks.PostToolUse[0].hooks[0].command -eq 'formatter') "PostToolUse preserved"
     Check ($p.otherSetting -eq 'keep-me') "unrelated root setting preserved"
     Check (Test-NoBom (Join-Path $cdir 'settings.json')) "merged file has no BOM"
 } finally { Remove-Item -Recurse -Force $h2 -ErrorAction SilentlyContinue }
 
 # --- Test 3: migrate legacy dcg entry without duplicating or losing siblings ---
-Write-Host "Test 3: migrate legacy Bash dcg hook"
-$h3 = New-TempHome
-try {
-    $cdir = Join-Path $h3 '.claude'; New-Item -ItemType Directory -Path $cdir | Out-Null
-    $existing = [ordered]@{
-        hooks = [ordered]@{
-            PreToolUse = @([ordered]@{
-                matcher = 'Bash'
-                hooks = @(
-                    [ordered]@{ type = 'command'; command = $dcgPath },
-                    [ordered]@{ type = 'command'; command = 'keep-bash-only' }
-                )
-                customField = 'keep-metadata'
-            })
+Write-Host "Test 3: migrate both legacy shell matchers (#226, #529)"
+foreach ($legacyMatcher in @('Bash', 'Bash|PowerShell')) {
+    $h3 = New-TempHome
+    try {
+        $cdir = Join-Path $h3 '.claude'; New-Item -ItemType Directory -Path $cdir | Out-Null
+        $settings = Join-Path $cdir 'settings.json'
+        $existing = [ordered]@{
+            hooks = [ordered]@{
+                PreToolUse = @([ordered]@{
+                    matcher = $legacyMatcher
+                    hooks = @(
+                        [ordered]@{ type = 'command'; command = $dcgPath },
+                        [ordered]@{ type = 'command'; command = 'keep-original-scope'; timeout = 7 }
+                    )
+                    customField = 'keep-metadata'
+                })
+            }
         }
-    }
-    $existing | ConvertTo-Json -Depth 20 | Set-Content -Path (Join-Path $cdir 'settings.json')
-    $status = Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $h3
-    Check ($status -eq 'merged') "legacy install returns 'merged' (got '$status')"
-    $p = Get-Content -Raw (Join-Path $cdir 'settings.json') | ConvertFrom-Json
-    $allDcg = @($p.hooks.PreToolUse | ForEach-Object { $_.hooks } | Where-Object { Test-DcgHookCommand $_ })
-    $legacy = @($p.hooks.PreToolUse | Where-Object { $_.matcher -eq 'Bash' })[0]
-    Check ($allDcg.Count -eq 1) "exactly one dcg hook remains after migration"
-    Check ($p.hooks.PreToolUse[0].matcher -eq 'Bash|PowerShell') "migrated matcher is canonical"
-    Check ($legacy.hooks[0].command -eq 'keep-bash-only') "legacy sibling remains Bash-only"
-    Check ($legacy.customField -eq 'keep-metadata') "legacy entry metadata preserved"
-} finally { Remove-Item -Recurse -Force $h3 -ErrorAction SilentlyContinue }
+        $existing | ConvertTo-Json -Depth 20 | Set-Content -Path $settings
+        $status = Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $h3
+        Check ($status -eq 'merged') "$legacyMatcher install returns 'merged' (got '$status')"
+        $p = Get-Content -Raw $settings | ConvertFrom-Json
+        $allDcg = @($p.hooks.PreToolUse | ForEach-Object { $_.hooks } | Where-Object { Test-DcgHookCommand $_ })
+        $legacy = @($p.hooks.PreToolUse | Where-Object { $_.matcher -eq $legacyMatcher })[0]
+        Check ($allDcg.Count -eq 1) "exactly one dcg hook remains after $legacyMatcher migration"
+        Check ($p.hooks.PreToolUse[0].matcher -eq 'Bash|PowerShell|Monitor') "migrated matcher includes Monitor"
+        Check ($legacy.hooks[0].command -eq 'keep-original-scope') "legacy sibling stays under $legacyMatcher"
+        Check ($legacy.hooks[0].timeout -eq 7) "legacy sibling hook metadata preserved"
+        Check ($legacy.customField -eq 'keep-metadata') "legacy entry metadata preserved"
+        $before = Get-Content -Raw $settings
+        $status2 = Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $h3
+        Check ($status2 -eq 'already') "migrated $legacyMatcher registration is idempotent"
+        Check ((Get-Content -Raw $settings) -eq $before) "migrated settings stay byte-for-byte unchanged"
+    } finally { Remove-Item -Recurse -Force $h3 -ErrorAction SilentlyContinue }
+}
 
 # --- Test 4: refuse invalid JSON (leave untouched) ---
 Write-Host "Test 4: refuse invalid JSON"
@@ -135,7 +145,7 @@ try {
     $existing = [ordered]@{
         hooks = [ordered]@{
             PreToolUse = @([ordered]@{
-                matcher = 'Bash|PowerShell'
+                matcher = 'Bash|PowerShell|Monitor'
                 hooks = @([ordered]@{
                     type = 'command'
                     command = "& '$escapedPath'"
@@ -197,11 +207,64 @@ try {
     $allDcg = @($p.hooks.PreToolUse | ForEach-Object { $_.hooks } | Where-Object { Test-DcgHookCommand $_ })
     $write = @($p.hooks.PreToolUse | Where-Object { $_.matcher -eq 'Write' })[0]
     Check ($allDcg.Count -eq 1) "exactly one dcg hook remains after wrong-matcher repair"
-    Check ($p.hooks.PreToolUse[0].matcher -eq 'Bash|PowerShell') "repaired hook uses canonical matcher"
+    Check ($p.hooks.PreToolUse[0].matcher -eq 'Bash|PowerShell|Monitor') "repaired hook uses canonical matcher"
     Check ($write.hooks[0].command -eq 'keep-write-hook') "coexisting wrong-matcher hook preserved"
     $status2 = Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $h8
     Check ($status2 -eq 'already') "wrong-matcher repair is idempotent"
 } finally { Remove-Item -Recurse -Force $h8 -ErrorAction SilentlyContinue }
+
+# --- Test 9: one current hook replaces duplicates under both legacy matchers ---
+Write-Host "Test 9: collapse mixed current and legacy dcg registrations (#529)"
+$h9 = New-TempHome
+try {
+    $cdir = Join-Path $h9 '.claude'; New-Item -ItemType Directory -Path $cdir | Out-Null
+    $settings = Join-Path $cdir 'settings.json'
+    $existing = [ordered]@{
+        hooks = [ordered]@{
+            PreToolUse = @(
+                [ordered]@{
+                    matcher = 'Bash|PowerShell|Monitor'
+                    hooks = @([ordered]@{ type = 'command'; command = "& '$dcgPath'"; shell = 'powershell' })
+                },
+                [ordered]@{
+                    matcher = 'Bash|PowerShell'
+                    customField = 'keep-shells-metadata'
+                    hooks = @(
+                        [ordered]@{ type = 'command'; command = 'C:\old\dcg.exe' },
+                        [ordered]@{ type = 'command'; command = 'keep-shells' }
+                    )
+                },
+                [ordered]@{
+                    matcher = 'Bash'
+                    hooks = @([ordered]@{ type = 'command'; command = $dcgPath })
+                },
+                [ordered]@{
+                    matcher = 'Monitor'
+                    customField = 'keep-monitor-metadata'
+                    hooks = @([ordered]@{ type = 'command'; command = 'monitor-audit' })
+                }
+            )
+        }
+    }
+    $existing | ConvertTo-Json -Depth 20 | Set-Content -Path $settings
+    $status = Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $h9
+    Check ($status -eq 'merged') "duplicates prevent a false 'already' result"
+    $p = Get-Content -Raw $settings | ConvertFrom-Json
+    $entries = @($p.hooks.PreToolUse)
+    $allDcg = @($entries | ForEach-Object { $_.hooks } | Where-Object { Test-DcgHookCommand $_ })
+    Check ($allDcg.Count -eq 1) "exactly one dcg hook remains across all matcher generations"
+    Check ($entries.Count -eq 3) "emptied legacy matcher is removed"
+    Check ($entries[0].matcher -eq 'Bash|PowerShell|Monitor') "canonical entry stays first"
+    Check ($entries[0].hooks[0].command -eq "& '$dcgPath'") "canonical hook uses the current path"
+    Check ($entries[1].matcher -eq 'Bash|PowerShell') "legacy sibling scope is preserved"
+    Check ($entries[1].hooks[0].command -eq 'keep-shells') "legacy sibling command is preserved"
+    Check ($entries[1].customField -eq 'keep-shells-metadata') "legacy sibling entry metadata is preserved"
+    Check ($entries[2].matcher -eq 'Monitor') "unrelated Monitor-only hook is not widened"
+    Check ($entries[2].hooks[0].command -eq 'monitor-audit') "unrelated Monitor-only hook is preserved"
+    Check ($entries[2].customField -eq 'keep-monitor-metadata') "Monitor-only entry metadata is preserved"
+    $status2 = Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $h9
+    Check ($status2 -eq 'already') "mixed matcher migration is idempotent"
+} finally { Remove-Item -Recurse -Force $h9 -ErrorAction SilentlyContinue }
 
 if ($script:failures -gt 0) {
     Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red

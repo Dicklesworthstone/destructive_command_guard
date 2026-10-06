@@ -569,7 +569,7 @@ function Configure-CodexHook {
   Merge-AgentHookFile -HooksFile $hooksFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "Bash" -Label "Codex hooks.json"
 }
 
-# Configure Claude Code's PreToolUse hook for both native shell tools in
+# Configure Claude Code's PreToolUse hook for Bash, PowerShell, and Monitor in
 # ~/.claude/settings.json. The hook itself runs in PowerShell so an absolute
 # Windows path is not reinterpreted by Git Bash (#232).
 # Configures when ~/.claude exists or `claude` is on PATH (or always under -Force,
@@ -594,7 +594,7 @@ function Configure-ClaudeHook {
     command = "& '$escapedDcgPath'"
     shell = "powershell"
   }
-  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "Bash|PowerShell" -Label "Claude settings.json" -OwnedMatchers @("Bash", "Bash|PowerShell")
+  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "Bash|PowerShell|Monitor" -Label "Claude settings.json" -OwnedMatchers @("Bash", "Bash|PowerShell", "Bash|PowerShell|Monitor")
 }
 
 # Configure Gemini CLI's BeforeTool / run_shell_command hook in
@@ -1399,7 +1399,7 @@ function Configure-HermesHook {
 #
 #   1. The matcher is lowercase "bash|powershell". A simple matcher string is
 #      an EXACT match (with "|"/"," separating alternatives) against the tool
-#      name, so Claude's "Bash|PowerShell" would match neither shell tool.
+#      name, so Claude's "Bash|PowerShell|Monitor" would match neither shell tool.
 #   2. Only documented handler fields are emitted: type, command, timeout. In
 #      particular there is NO `shell` field (which the Claude entry uses); the
 #      command path is quoted instead — shell-form hooks run through cmd.exe on

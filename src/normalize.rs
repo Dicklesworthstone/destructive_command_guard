@@ -230,10 +230,7 @@ fn strip_sudo(command: &str) -> Option<(String, StrippedWrapper)> {
 
         // Parse one option word (e.g., -E, -EH, -uuser)
         let word_start = idx;
-        let mut word_end = idx + 1;
-        while word_end < bytes.len() && !bytes[word_end].is_ascii_whitespace() {
-            word_end += 1;
-        }
+        let word_end = consume_word_token(bytes, idx, bytes.len());
 
         if word_end <= word_start + 1 {
             break;
@@ -283,7 +280,7 @@ fn strip_sudo(command: &str) -> Option<(String, StrippedWrapper)> {
         idx = word_end;
 
         if saw_arg_inline {
-            if token_has_inline_code(word.as_bytes()) {
+            if token_has_shell_effect(word.as_bytes()) {
                 return None;
             }
             continue;
@@ -301,7 +298,7 @@ fn strip_sudo(command: &str) -> Option<(String, StrippedWrapper)> {
             // Skip argument token
             let arg_start = idx;
             idx = consume_word_token(bytes, idx, bytes.len());
-            if token_has_inline_code(&bytes[arg_start..idx]) {
+            if token_has_shell_effect(&bytes[arg_start..idx]) {
                 return None;
             }
         }
@@ -428,7 +425,7 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
         }
         let arg_start = idx;
         let end = consume_word_token(bytes, idx, bytes.len());
-        if token_has_inline_code(&bytes[arg_start..end]) {
+        if token_has_shell_effect(&bytes[arg_start..end]) {
             return None;
         }
         Some(end)
@@ -449,10 +446,7 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
         }
 
         let word_start = idx;
-        let mut word_end = idx + 1;
-        while word_end < bytes.len() && !bytes[word_end].is_ascii_whitespace() {
-            word_end += 1;
-        }
+        let word_end = consume_word_token(bytes, idx, bytes.len());
         if word_end <= word_start + 1 {
             break;
         }
@@ -487,7 +481,7 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
                 }
                 "--unset" | "--chdir" | "--file" | "--argv0" | "--ignore-signal" => {
                     if let Some(value) = value_opt {
-                        if token_has_inline_code(value.as_bytes()) {
+                        if token_has_shell_effect(value.as_bytes()) {
                             return EnvParseResult::Abort;
                         }
                         idx = word_end;
@@ -579,7 +573,7 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
                 }
                 'u' | 'P' | 'C' | 'f' | 'a' => {
                     if pos + 1 < word_bytes.len() {
-                        if token_has_inline_code(&word_bytes[pos + 1..]) {
+                        if token_has_shell_effect(&word_bytes[pos + 1..]) {
                             return EnvParseResult::Abort;
                         }
                         idx = word_end;
@@ -621,7 +615,7 @@ fn parse_env_assignments(bytes: &[u8], mut idx: usize) -> usize {
         let has_equals = word_bytes.iter().position(|b| *b == b'=');
 
         if has_equals.is_some_and(|pos| pos > 0) {
-            if token_has_inline_code(word_bytes) {
+            if token_has_shell_effect(word_bytes) {
                 return start;
             }
             idx = end;
@@ -634,7 +628,14 @@ fn parse_env_assignments(bytes: &[u8], mut idx: usize) -> usize {
     idx
 }
 
-fn token_has_inline_code(token: &[u8]) -> bool {
+/// A removable wrapper word must not contain shell actions of its own.
+///
+/// The lightweight normalizer keeps redirects inside `Word` tokens, including
+/// a bare `>` and attached forms such as `5>file` or `--unset=NAME>file`.
+/// Consuming one as an option value would erase a redirect the shell performs
+/// before it even runs the wrapper (#531). Refuse that normalization while
+/// preserving quoted and escaped operators as ordinary argument data.
+fn token_has_shell_effect(token: &[u8]) -> bool {
     let mut i = 0;
     let mut in_single = false;
     let mut in_double = false;
@@ -663,11 +664,7 @@ fn token_has_inline_code(token: &[u8]) -> bool {
             }
             b'`' if !in_single => return true,
             b'$' if !in_single && i + 1 < token.len() && token[i + 1] == b'(' => return true,
-            b'<' | b'>'
-                if !in_single && !in_double && i + 1 < token.len() && token[i + 1] == b'(' =>
-            {
-                return true;
-            }
+            b'<' | b'>' if !in_single && !in_double => return true,
             _ => {}
         }
 
@@ -847,7 +844,7 @@ fn strip_posix_assignment_prefix(command: &str) -> Option<(String, StrippedWrapp
     let raw = token.text(trimmed)?;
     let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
     let decoded = decoder.decode(raw, ShellTokenRole::Syntax)?;
-    if !is_env_assignment(decoded.as_ref()) || token_has_inline_code(raw.as_bytes()) {
+    if !is_env_assignment(decoded.as_ref()) || token_has_shell_effect(raw.as_bytes()) {
         return None;
     }
     let tail = trimmed.get(token.byte_range.end..)?;
@@ -890,7 +887,7 @@ fn wrapper_word(command: &str, tokens: &[NormalizeToken], index: usize) -> Optio
         return None;
     }
     let raw = token.text(command)?;
-    if token_has_inline_code(raw.as_bytes()) {
+    if token_has_shell_effect(raw.as_bytes()) {
         return None;
     }
     ShellTokenDecoder::new(ShellDialect::Posix)
@@ -4882,6 +4879,148 @@ mod tests {
             assert!(
                 !strip_wrapper_prefixes(command).was_normalized(),
                 "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapper_option_values_never_consume_redirections_issue_531() {
+        let wrappers: &[(&str, &[&str])] = &[
+            (
+                "sudo",
+                &[
+                    "-u", "-g", "-h", "-p", "-C", "-r", "-U", "-D", "-t", "-a", "-T",
+                ],
+            ),
+            (
+                "env",
+                &[
+                    "-u",
+                    "-P",
+                    "-C",
+                    "-f",
+                    "-a",
+                    "-S",
+                    "--unset",
+                    "--chdir",
+                    "--file",
+                    "--argv0",
+                    "--ignore-signal",
+                    "--split-string",
+                ],
+            ),
+            ("exec", &["-a"]),
+            ("time", &["-f", "--format", "-o", "--output"]),
+            ("nice", &["-n", "--adjustment"]),
+            ("ionice", &["-c", "--class", "-n", "--classdata"]),
+            ("timeout", &["-k", "--kill-after", "-s", "--signal"]),
+            (
+                "stdbuf",
+                &["-i", "--input", "-o", "--output", "-e", "--error"],
+            ),
+            (
+                "chrt",
+                &[
+                    "-T",
+                    "--sched-runtime",
+                    "-P",
+                    "--sched-period",
+                    "-D",
+                    "--sched-deadline",
+                ],
+            ),
+            (
+                "mise exec",
+                &[
+                    "-C",
+                    "--cd",
+                    "-E",
+                    "--env",
+                    "-j",
+                    "--jobs",
+                    "-P",
+                    "--profile",
+                    "--allow-net",
+                ],
+            ),
+        ];
+        for (wrapper, options) in wrappers {
+            for option in *options {
+                for redirect in [">", ">>", "2>", "&>", ">|", "<>"] {
+                    let command =
+                        format!("{wrapper} {option} {redirect} ~/.bashrc value 5 echo hi");
+                    let normalized = strip_wrapper_prefixes(&command);
+                    assert_eq!(normalized.normalized, command, "{command}");
+                    assert!(
+                        !normalized.was_normalized(),
+                        "a shell redirect is never a wrapper's option value: {command}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attached_redirections_stay_in_wrapper_source_issue_531() {
+        for command in [
+            "nice -n 5>~/.bashrc echo hi",
+            "nice -n5>~/.bashrc echo hi",
+            "nice --adjustment=5>~/.bashrc echo hi",
+            "sudo -u root>~/.bashrc echo hi",
+            "sudo -uroot>~/.bashrc echo hi",
+            "sudo -p'password '>~/.bashrc echo hi",
+            "env -u FOO>~/.bashrc echo hi",
+            "env -uFOO>~/.bashrc echo hi",
+            "env --unset=FOO>~/.bashrc echo hi",
+            "env --unset='FOO '>~/.bashrc echo hi",
+            "exec -a name>>~/.bashrc echo hi",
+            "time --format=%e>~/.bashrc echo hi",
+            "timeout 5>~/.bashrc echo hi",
+            "stdbuf -oL&>~/.bashrc echo hi",
+            "chrt -r 5>~/.bashrc echo hi",
+            "mise exec --cd=/tmp>~/.bashrc -- echo hi",
+            "FOO=value>~/.bashrc echo hi",
+        ] {
+            let normalized = strip_wrapper_prefixes(command);
+            assert_eq!(normalized.normalized, command, "{command}");
+            assert!(!normalized.was_normalized(), "{command}");
+        }
+
+        // An outer wrapper may still be removed, but no layer may discard
+        // the shell action from the remaining command.
+        for command in [
+            "sudo nice -n > ~/.bashrc 5 echo hi",
+            "env nice -n > ~/.bashrc 5 echo hi",
+            "X=1 nice -n > ~/.bashrc 5 echo hi",
+            "env FOO=value>~/.bashrc echo hi",
+        ] {
+            assert!(
+                strip_wrapper_prefixes(command).normalized.contains('>'),
+                "nested normalization erased the redirect: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_redirect_operators_in_wrapper_values_remain_literal_issue_531() {
+        for (command, expected) in [
+            ("nice -n 5 git reset --hard", "git reset --hard"),
+            ("nice -n 5 echo hi", "echo hi"),
+            ("sudo -p 'password > ' git status", "git status"),
+            ("sudo -p'password > ' git status", "git status"),
+            (r"sudo -p password\> git status", "git status"),
+            ("env -C '/tmp/a>b' git status", "git status"),
+            ("env --chdir='/tmp/a > b' git status", "git status"),
+            ("exec -a '>' git status", "git status"),
+            ("exec -a \"2>\" git status", "git status"),
+            ("time -f '>%e' git status", "git status"),
+            ("FOO='>' git status", "git status"),
+            ("nice -n 5 echo hi > /tmp/out", "echo hi > /tmp/out"),
+        ] {
+            assert_eq!(
+                strip_wrapper_prefixes(command).normalized,
+                expected,
+                "quoted/escaped operators are argument data: {command}"
             );
         }
     }

@@ -64,7 +64,7 @@ teardown() {
 
     # Check for required structure
     grep -q "PreToolUse" "$CLAUDE_SETTINGS"
-    grep -q "Bash" "$CLAUDE_SETTINGS"
+    grep -qF '"matcher": "Bash|PowerShell|Monitor"' "$CLAUDE_SETTINGS"
     grep -q "dcg" "$CLAUDE_SETTINGS"
 }
 
@@ -112,7 +112,7 @@ EOF
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|PowerShell",
+        "matcher": "Bash|PowerShell|Monitor",
         "hooks": [
           {"type": "command", "command": "$DEST/dcg"}
         ]
@@ -134,26 +134,30 @@ EOF
 
     # CLAUDE_STATUS should be "already"
     [ "$CLAUDE_STATUS" = "already" ]
+    [ "$after" = "$before" ]
 }
 
-@test "configure_claude_code: migrates a legacy Bash-only dcg hook (#226)" {
-    log_test "Testing Claude Code legacy Bash matcher migration..."
+@test "configure_claude_code: migrates both legacy shell matchers (#226, #529)" {
+    log_test "Testing Claude Code legacy matcher migration..."
     command -v python3 &>/dev/null || skip "python3 not available"
 
     CLAUDE_SETTINGS="$HOME/.claude/settings.json"
     mkdir -p "$HOME/.claude"
 
-    # Pre-#226 registration: the matcher covers only Bash, so Claude Code's
-    # native-Windows PowerShell tool ran completely unguarded.
-    cat > "$CLAUDE_SETTINGS" << EOF
+    # Both historical registrations must migrate, even when their dcg path
+    # is current and first. Sibling hooks retain their original scope.
+    local legacy_matcher
+    for legacy_matcher in 'Bash' 'Bash|PowerShell'; do
+        cat > "$CLAUDE_SETTINGS" << EOF
 {
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "$legacy_matcher",
+        "customField": "keep-metadata",
         "hooks": [
           {"type": "command", "command": "$DEST/dcg"},
-          {"type": "command", "command": "atuin history start"}
+          {"type": "command", "command": "atuin history start", "timeout": 7}
         ]
       }
     ]
@@ -161,19 +165,19 @@ EOF
 }
 EOF
 
-    configure_claude_code "$CLAUDE_SETTINGS" "0"
+        configure_claude_code "$CLAUDE_SETTINGS" "0"
 
-    log_test "CLAUDE_STATUS: $CLAUDE_STATUS"
-    log_test "After: $(cat "$CLAUDE_SETTINGS")"
+        log_test "Matcher: $legacy_matcher CLAUDE_STATUS: $CLAUDE_STATUS"
+        log_test "After: $(cat "$CLAUDE_SETTINGS")"
 
-    # A legacy entry must be migrated, never reported as already current.
-    [ "$CLAUDE_STATUS" = "merged" ]
+        # A legacy entry must be migrated, never reported as already current.
+        [ "$CLAUDE_STATUS" = "merged" ]
 
-    python3 - "$CLAUDE_SETTINGS" "$DEST/dcg" <<'PY'
+        python3 - "$CLAUDE_SETTINGS" "$DEST/dcg" "$legacy_matcher" <<'PY'
 import json
 import sys
 
-settings_file, dcg_path = sys.argv[1:3]
+settings_file, dcg_path, legacy_matcher = sys.argv[1:4]
 with open(settings_file, "r") as f:
     settings = json.load(f)
 
@@ -185,17 +189,70 @@ commands = [
     if isinstance(hook, dict)
 ]
 
-# Exactly one dcg hook, hoisted first, under a matcher that covers PowerShell.
+# Exactly one dcg hook, hoisted first, including Monitor script coverage.
 assert commands.count(dcg_path) == 1, commands
-assert entries[0]["matcher"] == "Bash|PowerShell", entries
+assert entries[0]["matcher"] == "Bash|PowerShell|Monitor", entries
 assert entries[0]["hooks"][0]["command"] == dcg_path, entries
-# The user's own hook keeps its original, unwidened Bash matcher.
-bash_entries = [e for e in entries if e.get("matcher") == "Bash"]
-assert len(bash_entries) == 1, entries
-assert [h["command"] for h in bash_entries[0]["hooks"]] == ["atuin history start"], entries
+# The user's own hook keeps its matcher, entry metadata, and hook metadata.
+legacy_entries = [e for e in entries if e.get("matcher") == legacy_matcher]
+assert len(legacy_entries) == 1, entries
+assert legacy_entries[0]["customField"] == "keep-metadata", entries
+assert legacy_entries[0]["hooks"] == [
+    {"type": "command", "command": "atuin history start", "timeout": 7}
+], entries
 PY
 
-    # Re-running settles: the migrated shape is now current.
+        # Re-running settles: the migrated shape is now current.
+        local before
+        before=$(cat "$CLAUDE_SETTINGS")
+        configure_claude_code "$CLAUDE_SETTINGS" "0"
+        [ "$CLAUDE_STATUS" = "already" ]
+        [ "$(cat "$CLAUDE_SETTINGS")" = "$before" ]
+    done
+}
+
+@test "configure_claude_code: collapses mixed current and legacy dcg registrations (#529)" {
+    log_test "Testing Claude Code duplicate matcher migration..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+    cat > "$CLAUDE_SETTINGS" << EOF
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Bash|PowerShell|Monitor", "hooks": [{"type": "command", "command": "$DEST/dcg"}]},
+      {"matcher": "Bash|PowerShell", "hooks": [{"type": "command", "command": "/opt/old/dcg"}]},
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "dcg"}]},
+      {"matcher": "Monitor", "customField": "keep-monitor", "hooks": [{"type": "command", "command": "monitor-audit"}]},
+      {"matcher": "Write", "hooks": [{"type": "command", "command": "write-audit"}]}
+    ],
+    "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "post-audit"}]}]
+  },
+  "theme": "dark"
+}
+EOF
+
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+    [ "$CLAUDE_STATUS" = "merged" ]
+    python3 - "$CLAUDE_SETTINGS" "$DEST/dcg" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r") as f:
+    settings = json.load(f)
+entries = settings["hooks"]["PreToolUse"]
+assert entries == [
+    {"matcher": "Bash|PowerShell|Monitor", "hooks": [{"type": "command", "command": sys.argv[2]}]},
+    {"matcher": "Monitor", "customField": "keep-monitor", "hooks": [{"type": "command", "command": "monitor-audit"}]},
+    {"matcher": "Write", "hooks": [{"type": "command", "command": "write-audit"}]},
+], entries
+assert settings["hooks"]["PostToolUse"] == [
+    {"matcher": "Bash", "hooks": [{"type": "command", "command": "post-audit"}]}
+], settings
+assert settings["theme"] == "dark", settings
+PY
+
     configure_claude_code "$CLAUDE_SETTINGS" "0"
     [ "$CLAUDE_STATUS" = "already" ]
 }
@@ -234,7 +291,7 @@ PY
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell|Monitor",
         "hooks": [
           {"type": "command", "command": "atuin history start"},
           {"type": "command", "command": "$DEST/dcg"}
@@ -376,7 +433,7 @@ EOF
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|PowerShell",
+        "matcher": "Bash|PowerShell|Monitor",
         "hooks": [
           {"type": "command", "command": "$DEST/dcg"}
         ]
@@ -410,7 +467,7 @@ EOF
 
     CLAUDE_SETTINGS="$HOME/.claude/settings.json"
     mkdir -p "$HOME/.claude"
-    printf '{"hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell","hooks":[{"type":"command","command":"%s"}]}]}}\n' "$DEST/dcg" > "$CLAUDE_SETTINGS"
+    printf '{"hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell|Monitor","hooks":[{"type":"command","command":"%s"}]}]}}\n' "$DEST/dcg" > "$CLAUDE_SETTINGS"
 
     local no_python_path="$TEST_TMPDIR/no-python-bin"
     mkdir -p "$no_python_path"
@@ -442,7 +499,7 @@ EOF
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell|Monitor",
         "hooks": [
           {"type": "command", "command": "atuin history start"},
           {"type": "command", "command": "$DEST/dcg"}
@@ -473,6 +530,38 @@ EOF
     [ "$CLAUDE_STATUS" = "failed" ]
     grep -qF 'atuin history start' "$CLAUDE_SETTINGS"
     grep -qF "$DEST/dcg" "$CLAUDE_SETTINGS"
+}
+
+@test "configure_claude_code: no-python fallback requires migration for both legacy matchers (#529)" {
+    log_test "Testing Claude Code no-python legacy matcher detection..."
+
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+    local no_python_path="$TEST_TMPDIR/no-python-bin"
+    mkdir -p "$no_python_path"
+    local tool
+    for tool in dirname mkdir cp date grep sed tr rm mv cat; do
+        ln -s "$(command -v "$tool")" "$no_python_path/$tool"
+    done
+
+    local legacy_matcher before rc old_path
+    old_path="$PATH"
+    for legacy_matcher in 'Bash' 'Bash|PowerShell'; do
+        printf '{"hooks":{"PreToolUse":[{"matcher":"%s","hooks":[{"type":"command","command":"%s"}]}]}}\n' \
+            "$legacy_matcher" "$DEST/dcg" > "$CLAUDE_SETTINGS"
+        before=$(cat "$CLAUDE_SETTINGS")
+
+        PATH="$no_python_path"
+        rc=0
+        configure_claude_code "$CLAUDE_SETTINGS" "0" || rc=$?
+        PATH="$old_path"
+
+        log_test "Matcher: $legacy_matcher CLAUDE_STATUS: $CLAUDE_STATUS rc=$rc"
+        [ "$rc" -eq 1 ]
+        [ "$CLAUDE_STATUS" = "failed" ]
+        [[ "$CLAUDE_FAILURE_REASON" == *"python3"* ]]
+        [ "$(cat "$CLAUDE_SETTINGS")" = "$before" ]
+    done
 }
 
 # ============================================================================

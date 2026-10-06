@@ -3279,6 +3279,59 @@ mod config_tests {
     }
 
     #[test]
+    fn doctor_reports_legacy_claude_matchers_missing_monitor() {
+        for matcher in ["Bash", "Bash|PowerShell"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (home_dir, xdg_config_dir, bin_dir) = setup_doctor_env(&temp);
+            let claude_dir = home_dir.join(".claude");
+            std::fs::create_dir_all(&claude_dir).expect("claude dir");
+            let settings_path = claude_dir.join("settings.json");
+            let original = serde_json::to_vec_pretty(&serde_json::json!({
+                "hooks": { "PreToolUse": [{
+                    "matcher": matcher,
+                    "hooks": [{ "type": "command", "command": dcg_binary() }],
+                }] },
+            }))
+            .expect("settings JSON");
+            std::fs::write(&settings_path, &original).expect("settings");
+
+            let output = Command::new(dcg_binary())
+                .env_clear()
+                .env("HOME", &home_dir)
+                .env("USERPROFILE", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                .env("PATH", &bin_dir)
+                .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                .current_dir(temp.path())
+                .args(["doctor", "--format", "json"])
+                .output()
+                .expect("doctor JSON");
+            assert!(output.status.success());
+            let report: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("doctor report");
+            let check = report["checks"]
+                .as_array()
+                .expect("checks")
+                .iter()
+                .find(|check| check["id"] == "hook_wiring")
+                .expect("hook wiring check");
+            assert_eq!(check["status"], "error", "{matcher}: {check}");
+            assert!(
+                check["message"].as_str().unwrap().contains("wrong matcher"),
+                "{matcher}: {check}"
+            );
+            assert!(
+                check["remediation"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Bash|PowerShell|Monitor"),
+                "{matcher}: {check}"
+            );
+            assert_eq!(std::fs::read(&settings_path).unwrap(), original);
+        }
+    }
+
+    #[test]
     fn doctor_fix_installs_hook_and_config() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (home_dir, xdg_config_dir, bin_dir) = setup_doctor_env(&temp);
@@ -3330,7 +3383,7 @@ mod config_tests {
             .expect("PreToolUse array");
         let expected_dcg = dcg_binary().to_string_lossy().into_owned();
         let has_dcg = hooks.iter().any(|entry| {
-            entry.get("matcher").and_then(|m| m.as_str()) == Some("Bash|PowerShell")
+            entry.get("matcher").and_then(|m| m.as_str()) == Some("Bash|PowerShell|Monitor")
                 && entry
                     .get("hooks")
                     .and_then(|h| h.as_array())

@@ -227,3 +227,46 @@ fn a_proven_temporary_target_does_not_mask_other_dangerous_operations() {
         );
     }
 }
+
+#[test]
+fn literal_proofs_cannot_bypass_shared_shell_mutation_guards() {
+    for command in [
+        r#"D=/tmp/a; command -p printf -v D /etc; echo hi > "$D/passwd""#,
+        r#"D=/tmp/a; command -p printf -v D /etc; rm -rf "$D""#,
+        r#"D=/tmp/a; builtin -- printf -v D /etc; echo hi > "$D/passwd""#,
+        r#"D=/tmp/a; 'command' printf -v D /etc; rm -rf "$D""#,
+        r#"D=/tmp/a; bu''iltin printf -v D /etc; mv "$D" archive/"#,
+        r#"D=/tmp/a; $P -v D /etc; echo hi > "$D/passwd""#,
+        r#"D=/tmp/a; trap 'D=/etc' DEBUG; rm -rf "$D""#,
+        r#"D=/tmp/a; tr'ap' 'D=/etc' DEBUG; mv "$D" archive/"#,
+        "shopt -s expand_aliases\nalias next='printf -v D /etc'\nD=/tmp/a\nnext\necho hi > \"$D/passwd\"",
+        r#"PWD=/tmp/a; cd /etc; echo hi > "$PWD/passwd""#,
+        r#"PWD=/tmp/a; cd /etc; rm -rf "$PWD""#,
+        r#"OLDPWD=/tmp/a; cd /etc; cd /tmp; rm -rf "$OLDPWD""#,
+        r#"_=/tmp/a; true /etc; rm -rf "$_""#,
+        // The strict allow proof must not remove conservative denial evidence.
+        r#"PWD=/etc; rm "$PWD/shadow""#,
+        r#"D=/etc; command -p echo ready; rm "$D/shadow""#,
+        r#"D=/etc; trap ':' DEBUG; rm "$D/shadow""#,
+    ] {
+        assert_denied(command);
+    }
+}
+
+#[test]
+fn shared_mutation_guards_preserve_literal_and_mktemp_proofs() {
+    for command in [
+        r#"D=/tmp/a; command echo ready; rm -rf "$D""#,
+        r#"D=/tmp/a; builtin echo ready; echo hi > "$D/x""#,
+        r#"D=$(mktemp -d); rm -rf "$D""#,
+        r#"D=$(mktemp -d); T=/tmp/a; rm -rf "$T""#,
+        r#"f=a; echo ready; mv "$f" archive/"#,
+        r#"for f in a b; do mv "$f" archive/; done"#,
+    ] {
+        let (decision, rule) = hook(command);
+        assert_eq!(
+            decision, "allow",
+            "sound proof must survive {command:?}: {rule}"
+        );
+    }
+}

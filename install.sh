@@ -2034,12 +2034,11 @@ if not isinstance(pre_tool_use, list):
     print("invalid")
     raise SystemExit(0)
 
-# Claude Code matchers are regexes over the tool name. `Bash` alone leaves the
-# native-Windows `PowerShell` tool completely unguarded (issue #226), so the
-# canonical dcg registration covers both. A dcg hook still sitting under the
-# legacy `Bash`-only matcher must be migrated, not left beside the new entry.
-CANONICAL_MATCHER = "Bash|PowerShell"
-LEGACY_MATCHERS = ("Bash",)
+# Claude Code matchers are regexes over the tool name. Guard shell commands
+# from Bash, native-Windows PowerShell (#226), and Monitor scripts (#529).
+# Migrate both older matchers instead of leaving duplicate dcg registrations.
+CANONICAL_MATCHER = "Bash|PowerShell|Monitor"
+LEGACY_MATCHERS = ("Bash", "Bash|PowerShell")
 
 dcg_commands = []
 predecessor_present = False
@@ -2093,9 +2092,9 @@ PYEOF
     else
       # Fallback for systems without python3; the merge path below is also
       # python-backed. Only trust the exact hook path when it is already the
-      # first command hook under the canonical `Bash|PowerShell` matcher — a
-      # legacy `Bash`-only registration must fall through to the merge so the
-      # native-Windows PowerShell tool stops being unguarded (issue #226).
+      # first command hook under the canonical `Bash|PowerShell|Monitor`
+      # matcher. Both legacy matchers must fall through to the merge so
+      # PowerShell and Monitor scripts receive the same protection.
       local dcg_hook_regex
       local compact_settings
       local dcg_command_marker
@@ -2111,7 +2110,7 @@ PYEOF
       if [ "$after_first_dcg" != "$compact_settings" ] &&
          [ "${after_first_dcg#*"$dcg_command_marker"}" = "$after_first_dcg" ] &&
          printf '%s\n' "$compact_settings" |
-           grep -Eq "\"matcher\":\"Bash\\|PowerShell\",\"hooks\":\\[\\{[^}]*\"command\":\"$dcg_hook_regex\""; then
+           grep -Eq "\"matcher\":\"Bash\\|PowerShell\\|Monitor\",\"hooks\":\\[\\{[^}]*\"command\":\"$dcg_hook_regex\""; then
         CLAUDE_STATUS="already"
         AUTO_CONFIGURED=1
         return 0
@@ -2189,11 +2188,11 @@ elif not isinstance(settings['hooks']['PreToolUse'], list):
     print(f"Claude Code settings.json PreToolUse must contain a list: {settings_file}", file=sys.stderr)
     raise SystemExit(1)
 
-# Claude Code matchers are regexes over the tool name. Registering only `Bash`
-# leaves the native-Windows `PowerShell` tool unguarded (issue #226), so dcg
-# owns a single `Bash|PowerShell` entry hoisted to the front of PreToolUse.
-CANONICAL_MATCHER = "Bash|PowerShell"
-LEGACY_MATCHERS = ("Bash",)
+# Claude Code matchers are regexes over the tool name. Guard Bash, PowerShell
+# (#226), and Monitor scripts (#529) through one dcg entry hoisted to the
+# front of PreToolUse.
+CANONICAL_MATCHER = "Bash|PowerShell|Monitor"
+LEGACY_MATCHERS = ("Bash", "Bash|PowerShell")
 
 # First pass: strip dcg (and, when asked, its predecessor) out of every entry
 # dcg may previously have owned. Other hooks keep their own matcher so their
@@ -2233,8 +2232,8 @@ for entry in settings['hooks']['PreToolUse']:
         new_pre_tool_use.append(entry)
 
 # Add exactly one current dcg hook, first, so it runs before any other hook.
-# Existing dcg hooks, including stale paths, duplicates, and legacy `Bash`-only
-# registrations, were collapsed above.
+# Existing dcg hooks, including stale paths, duplicates, and both legacy
+# matcher registrations, were collapsed above.
 new_pre_tool_use.insert(0, {
     "matcher": CANONICAL_MATCHER,
     "hooks": [{"type": "command", "command": dcg_path}]
@@ -2272,7 +2271,7 @@ PYEOF
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|PowerShell",
+        "matcher": "Bash|PowerShell|Monitor",
         "hooks": [
           {
             "type": "command",
