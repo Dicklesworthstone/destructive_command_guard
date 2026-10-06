@@ -3020,21 +3020,35 @@ a home directory (`~/proj/dist`) or outside the system directories
 (`/data/proj/dist`) is `rm-rf-general`. Check `dcg explain "<command>"` for the
 rule id you actually need.
 
-**Unresolved dynamic paths are never exempted by configuration.**
+**Unresolved dynamic paths are never exempted.**
 `core.filesystem:redirect-truncate-dynamic-path` deliberately supports no
-exemptions. When the runtime target cannot be proven, a glob over it would be a
-bypass, not a carve-out. An ambient `echo x > $DIR/log`
-stays denied no matter what is configured. Independently of exemption globs,
-dcg can prove a bounded set of POSIX redirect targets benign: preceding literal
-assignments, up to eight assignments derived from proven variables with literal
-suffixes, decimal `$$` text, and `mktemp` with an explicit literal `/tmp` template
-or `-p /tmp` / `--tmpdir=/tmp`. An assignment after `&&` qualifies only when an
-uninterrupted `&&` chain guarantees it ran before the use. The complete resolved
-path must still pass the benign-target check; sensitive roots, `..` traversal,
-unknown expansions, ambiguous bindings, and unsupported `mktemp` options remain
-denied. No command is executed to resolve a target. The same rule applies inside
-the supported rules: a target containing a variable, command substitution, backtick, glob, or
-`%VAR%` is not a literal, and is never matched against an exemption glob.
+target-glob setting. `echo x > $DIR/log` stays denied when `DIR` is unknown,
+regardless of the configured globs. A variable, command substitution, backtick,
+glob, or `%VAR%` is never matched against an exemption glob as if its source
+text were the resolved path.
+
+Separately, dcg's bounded POSIX analysis can prove some redirect targets benign
+without executing shell code ([#536](https://github.com/Dicklesworthstone/destructive_command_guard/issues/536)):
+
+| Proven form | Example |
+|-------------|---------|
+| A literal assignment on the redirect's `&&` success path | `true && S=/tmp/d && echo hi > "$S/x"` |
+| A known variable with a literal suffix | `S=/tmp/d; T="$S/sub"; echo hi > "$T/x"` |
+| PID digits inside a literal `/tmp/` path | `echo hi > "/tmp/d-$$.log"` |
+| A supported `mktemp` substitution with an explicit temporary root | `D=$(mktemp -d /tmp/v-XXXXXX); echo hi > "$D/p"` or `D=$(mktemp -d -p /tmp); echo hi > "$D/p"` |
+
+Existing literal assignments and bare `$(mktemp)` / `$(mktemp -d)` scratch
+idioms remain supported. The final target must pass the benign-path checks,
+including rejection of every `..` component and protected credential or `.git`
+files, even beneath `/tmp`. The additional symbolic proof requires a temporary
+root and is limited to eight binding levels, 4,096 expanded bytes, and 256
+command segments. A binding that might be skipped before a running redirect,
+a binding in a pipeline or subshell, an unknown dependency, reassignment, or a
+variable-mutating command cannot establish this proof. Unrecognized `mktemp`
+syntax, templates for hidden directories, `/etc` roots, dynamic `$TMPDIR`
+roots, and `-u`/`--dry-run` keep their denials. This built-in proof does not add
+a configurable dynamic-path exemption, and every other redirect and command
+is still checked.
 
 **Credential and login files are never exempted by path.**
 `core.filesystem:credential-file-write` (writes to `~/.ssh/*`,

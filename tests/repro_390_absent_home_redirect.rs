@@ -121,8 +121,9 @@ fn absent_literal_home_targets_are_creation_regardless_of_vcs() {
     );
 
     // A top-level file takes the same path as a dotdir. (`$HOME/...` is not
-    // in this table: `redirect-truncate-dynamic-path` fails closed on every
-    // `$`-bearing target by design, #249, independent of this carve-out.)
+    // in this table: `redirect-truncate-dynamic-path` fails closed on an
+    // unproven ambient `$HOME`, independent of this carve-out. Bounded proofs
+    // of temporary redirect targets are a separate exemption (#249, #536).)
     assert_eq!(verdict("echo hi > ~/absent-note.md", home), Verdict::Allow);
 
     // Credential files are not "creation like any other": the carve-out
