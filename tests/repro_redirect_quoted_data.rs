@@ -83,3 +83,77 @@ fn anti_bypass_operator_outside_quotes_still_blocks() {
     denied("\"git\">/dev/null reset --hard");
     denied("git>/dev/null reset --hard");
 }
+
+#[test]
+fn proven_tmp_dynamic_redirects_in_hook_mode_issue_536() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let home = tempfile::tempdir().expect("isolated home");
+    let config = home.path().join("config.toml");
+    std::fs::write(&config, "").expect("empty config");
+    for (command, allow) in [
+        ("mkdir -p /tmp/d && S=/tmp/d && echo hi > \"$S/x\"", true),
+        ("true && S=/tmp/d && echo hi > \"$S/x\"", true),
+        ("S=/tmp/d; T=\"$S/sub\"; echo hi > \"$T/x\"", true),
+        ("S=/tmp/d && T=\"$S/sub\" && echo hi > \"$T/x\"", true),
+        ("echo hi > /tmp/d-$$/x", true),
+        ("echo hi > \"/tmp/d-$$.log\"", true),
+        ("D=$(mktemp -d /tmp/v-XXXXXX); echo a > \"$D/p\"", true),
+        ("D=$(mktemp -d -p /tmp); echo a > \"$D/p\"", true),
+        ("true && S=/etc && echo x > \"$S/passwd\"", false),
+        (
+            "S=/tmp/d; T=\"$S/../../etc\"; echo x > \"$T/passwd\"",
+            false,
+        ),
+        ("echo x > /etc/d-$$/passwd", false),
+        ("D=$(mktemp -d /etc/v-XXXXXX); echo a > \"$D/p\"", false),
+        ("D=$(mktemp -d -p /etc); echo a > \"$D/p\"", false),
+        ("false && S=/tmp/d; echo x > \"$S/passwd\"", false),
+    ] {
+        let payload = serde_json::json!({
+            "tool_name": "Bash", "tool_input": {"command": command},
+            "hook_event_name": "PreToolUse", "cwd": home.path(),
+        });
+        let mut child = Command::new(env!("CARGO_BIN_EXE_dcg"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .current_dir(home.path())
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("TEMP", home.path())
+            .env("TMP", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("DCG_CONFIG", &config)
+            .env("DCG_NO_SELF_HEAL", "1")
+            .env("DCG_SELF_HEAL_HOOK", "0")
+            .env("DCG_HOOK_TIMEOUT_MS", "5000")
+            .env_remove("DCG_BYPASS")
+            .env_remove("DCG_FAIL_CLOSED")
+            .spawn()
+            .expect("spawn hook");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(payload.to_string().as_bytes())
+            .expect("hook JSON");
+        let output = child.wait_with_output().expect("hook output");
+        assert!(output.status.success(), "{command}: {:?}", output);
+        if allow {
+            assert!(
+                output.stdout.is_empty(),
+                "{command}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        } else {
+            let value: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("denial JSON");
+            assert_eq!(
+                value["hookSpecificOutput"]["permissionDecision"], "deny",
+                "{command}: {value}"
+            );
+        }
+    }
+}

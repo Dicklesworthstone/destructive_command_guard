@@ -22205,13 +22205,18 @@ fn filesystem_pre_rm_pattern_excluding_dynamic(name: Option<&str>) -> bool {
     filesystem_pre_rm_pattern(name) && name != Some("redirect-truncate-dynamic-path")
 }
 
-/// Statically prove that a `$VAR`-target redirect resolves to a benign literal
+/// Maximum derived-assignment edges followed by a redirect-target proof.
+const MAX_REDIRECT_DEPENDENCIES: usize = 8;
+
+/// Statically prove that a symbolic redirect resolves to a benign literal
 /// path, so `redirect-truncate-dynamic-path` need not fail closed on it.
 ///
-/// The proof is deliberately narrow (#249): the target must be exactly
-/// `$NAME`/`${NAME}` (optionally double-quoted, optionally followed by a
-/// literal path suffix); exactly one preceding top-level segment must assign
-/// `NAME=` a literal value; no preceding segment may reassign the name or
+/// The proof is deliberately narrow (#249, #536): targets use
+/// `$NAME`/`${NAME}` plus literal suffixes, or literal text plus decimal `$$`.
+/// Exactly one preceding top-level segment must bind each referenced name
+/// to a literal, bounded derived value, or recognized scratch path. Conditional
+/// bindings qualify only in an uninterrupted AND-list leading to the use.
+/// No preceding segment may reassign the name or
 /// start with a builtin that can mutate parent-shell variables; every trailing
 /// redirect in the segment must be a static fd duplication (`2>&1`); and the
 /// resolved path must be a tmp-family or relative path with no `..` traversal
@@ -22272,11 +22277,26 @@ fn statically_safe_variable_redirect(
     if !trailing_redirects_are_fd_duplications(trailing) {
         return false;
     }
+    // A PID contributes digits only, so a stand-in preserves path boundaries.
+    // Reject every other expansion and still check the complete resulting path.
+    if token.contains("$$") {
+        let resolved = token.replace("$$", "1");
+        return resolved
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
+            && resolved_redirect_target_is_benign(&format!("{resolved}{outer_suffix}"));
+    }
     let Some((name, inner_suffix)) = parse_posix_variable_with_literal_suffix(token) else {
         return false;
     };
     let suffix = format!("{inner_suffix}{outer_suffix}");
-    let Some(values) = resolved_variable_values(source, segment_ranges, segment_start, name) else {
+    let Some(values) = resolved_variable_values_inner(
+        source,
+        segment_ranges,
+        segment_start,
+        name,
+        Some(MAX_REDIRECT_DEPENDENCIES),
+    ) else {
         return false;
     };
     // An unquoted target lets a glob-bearing value expand further at run
@@ -22396,6 +22416,18 @@ fn resolved_variable_values(
     segment_start: usize,
     name: &str,
 ) -> Option<Vec<String>> {
+    resolved_variable_values_inner(source, segment_ranges, segment_start, name, None)
+}
+
+/// Redirect-only extensions have a fixed dependency depth. Other consumers
+/// retain their existing, unconditional literal-binding proof.
+fn resolved_variable_values_inner(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    name: &str,
+    redirect_depth: Option<usize>,
+) -> Option<Vec<String>> {
     let mut values: Option<Vec<String>> = None;
     for &(start, end) in segment_ranges {
         if end > segment_start {
@@ -22420,19 +22452,51 @@ fn resolved_variable_values(
         // below, where `segment_text_may_assign` refuses the proof outright —
         // which is the right answer, because an unprovable binding is exactly
         // the case the exemption must not cover.
-        let binds_in_parent = !nested && segment_binding_reaches_parent_shell(source, start, end);
+        let raw_assignment = strip_assignment_declaration(segment)
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('='));
+        let binds_in_parent = !nested
+            && (segment_binding_reaches_parent_shell(source, start, end)
+                || (redirect_depth.is_some()
+                    && raw_assignment.is_some()
+                    && conditional_assignment_reaches_redirect(source, start, end, segment_start)));
         if binds_in_parent {
-            if let Some(raw) = strip_assignment_declaration(segment)
-                .strip_prefix(name)
-                .and_then(|rest| rest.strip_prefix('='))
-            {
+            if let Some(raw) = raw_assignment {
                 if values.is_some() {
                     return None;
                 }
-                values = Some(vec![
-                    literal_assignment_value(raw)
-                        .or_else(|| mktemp_scratch_assignment_value(raw))?,
-                ]);
+                values = if let Some(value) = literal_assignment_value(raw)
+                    .or_else(|| mktemp_scratch_assignment_value(raw))
+                    .or_else(|| redirect_depth.and_then(|_| mktemp_explicit_tmp_value(raw)))
+                {
+                    Some(vec![value])
+                } else {
+                    let depth = redirect_depth?.checked_sub(1)?;
+                    let token = raw.trim();
+                    let token = token
+                        .strip_prefix('"')
+                        .and_then(|rest| rest.strip_suffix('"'))
+                        .unwrap_or(token);
+                    let (dependency, suffix) = parse_posix_variable_with_literal_suffix(token)?;
+                    let candidates = resolved_variable_values_inner(
+                        source,
+                        segment_ranges,
+                        start,
+                        dependency,
+                        Some(depth),
+                    )?;
+                    // Assignment words do not split or glob. Keep synthesized
+                    // values inert so every later use is safe in either form.
+                    Some(
+                        candidates
+                            .into_iter()
+                            .map(|value| {
+                                let resolved = format!("{value}{suffix}");
+                                value_is_inert_when_substituted(&resolved).then_some(resolved)
+                            })
+                            .collect::<Option<Vec<_>>>()?,
+                    )
+                };
                 continue;
             }
             if posix_for_loop_binds(segment, name) {
@@ -22494,6 +22558,39 @@ fn resolved_variable_values(
         }
     }
     values
+}
+
+/// In an uninterrupted AND-list, reaching the use implies that the binding
+/// ran successfully. A semicolon, OR-list, pipeline, background job, or group
+/// breaks that implication and must keep the ambient value untrusted (#536).
+fn conditional_assignment_reaches_redirect(
+    source: &str,
+    start: usize,
+    end: usize,
+    use_start: usize,
+) -> bool {
+    if !source[..start].trim_end().ends_with("&&") {
+        return false;
+    }
+    let Some(between) = source.get(end..use_start) else {
+        return false;
+    };
+    let tokens = tokenize_for_shell_dialect(between, ShellDialect::Posix);
+    let mut saw_and = false;
+    for token in tokens {
+        let Some(text) = token.text(between) else {
+            return false;
+        };
+        if token.kind == NormalizeTokenKind::Separator {
+            if text != "&&" {
+                return false;
+            }
+            saw_and = true;
+        } else if text.contains(['(', ')', '{', '}']) {
+            return false;
+        }
+    }
+    saw_and
 }
 
 /// First word of a segment with command-position prefixes stripped:
@@ -22918,6 +23015,65 @@ fn mktemp_scratch_assignment_value(raw: &str) -> Option<String> {
         return None;
     }
     Some(MKTEMP_SCRATCH_STAND_IN.to_string())
+}
+
+/// Only explicit, literal /tmp roots qualify here. No ambient TMPDIR,
+/// optional-argument --tmpdir, dry-run, suffix, or unknown option is modeled.
+/// Retain a component for every template component so a later `..` cannot
+/// escape by traversing a fictitiously deeper stand-in path.
+fn mktemp_explicit_tmp_value(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let raw = raw
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(raw);
+    let inner = raw.strip_prefix("$(")?.strip_suffix(')')?;
+    let mut words = inner.split_ascii_whitespace();
+    if words.next()? != "mktemp" {
+        return None;
+    }
+    let mut root = None;
+    let mut template = None;
+    // Parse only two root-setting argv forms, without executing the producer.
+    let mut words = inner.split_ascii_whitespace().skip(1);
+    while let Some(word) = words.next() {
+        match word {
+            "-d" | "--directory" | "-q" | "--quiet" => {}
+            "-p" => {
+                if root.is_some() {
+                    return None;
+                }
+                root = Some(words.next()?);
+            }
+            _ if word.starts_with("--tmpdir=") => {
+                if root.is_some() {
+                    return None;
+                }
+                root = word.strip_prefix("--tmpdir=");
+            }
+            _ if !word.starts_with('-') && template.is_none() => template = Some(word),
+            _ => return None,
+        }
+    }
+    let path = match (root, template) {
+        (None, Some(template)) => template.to_string(),
+        (Some(root), template) => {
+            let template = template.unwrap_or("tmp.XXXXXXXXXX");
+            if template.starts_with('/') {
+                return None;
+            }
+            format!("{root}/{template}")
+        }
+        _ => return None,
+    };
+    if !path.starts_with("/tmp/")
+        || !resolved_redirect_target_is_benign(&path)
+        || !value_is_inert_when_substituted(&path)
+        || !path.ends_with("XXX")
+    {
+        return None;
+    }
+    Some(path.replace('X', "x"))
 }
 
 /// A whole-segment assignment value that is one literal shell word.
@@ -36900,6 +37056,72 @@ mod tests {
     }
 
     #[test]
+    fn redirect_tmp_symbolic_resolution_issue_536() {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for command in [
+                "mkdir -p /tmp/d && S=/tmp/d && echo hi > \"$S/x\"",
+                "true && S=/tmp/d && echo hi > \"$S/x\"",
+                "S=/tmp/d; T=\"$S/sub\"; echo hi > \"$T/x\"",
+                "S=/tmp/d && T=\"$S/sub\" && echo hi > \"$T/x\"",
+                "true && S=/tmp/d && T=\"${S}/sub\" && echo hi > \"${T}/x\"",
+                "echo hi > /tmp/d-$$/x",
+                "echo hi > \"/tmp/d-$$.log\"",
+                "D=$(mktemp -d /tmp/v-XXXXXX); echo a > \"$D/p\"",
+                "D=$(mktemp -d -p /tmp); echo a > \"$D/p\"",
+                "D=$(mktemp -d --tmpdir=/tmp v-XXXXXX); echo a > \"$D/p\"",
+            ] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_allowed(),
+                    "{command:?} ({dialect:?}): {:?}",
+                    result.pattern_info
+                );
+            }
+            for command in [
+                "true && S=/etc && echo x > \"$S/passwd\"",
+                "S=/tmp/d; T=\"$S/../../etc\"; echo x > \"$T/passwd\"",
+                "echo x > /etc/d-$$/passwd",
+                "D=$(mktemp -d /etc/v-XXXXXX); echo a > \"$D/p\"",
+                "D=$(mktemp -d -p /etc); echo a > \"$D/p\"",
+                "false && S=/tmp/d; echo x > \"$S/passwd\"",
+                "false && S=/tmp/d || echo x > \"$S/passwd\"",
+                "false && S=/tmp/d && true; echo x > \"$S/passwd\"",
+                "true | S=/tmp/d; echo x > \"$S/passwd\"",
+                "S=/tmp/d & echo x > \"$S/passwd\"",
+                "S=/tmp/d; T=\"$S/sub\"; T=/etc; echo x > \"$T/passwd\"",
+                "S=/tmp/d; read S; T=\"$S/sub\"; echo x > \"$T/passwd\"",
+                "S=/tmp/d; T=\"$S/$UNKNOWN\"; echo x > \"$T/passwd\"",
+                "echo x > /tmp/d-$$/../../etc/passwd",
+                "echo x > /tmp/d-$$-$UNKNOWN/x",
+                "echo x > /tmp/d-$$/x > \"$UNKNOWN\"",
+                "D=$(mktemp -d -u /tmp/v-XXXXXX); echo a > \"$D/p\"",
+                "D=$(mktemp -d -p /tmp ../etc/v-XXXXXX); echo a > \"$D/p\"",
+                "D=$(mktemp -d --tmpdir); echo a > \"$D/p\"",
+            ] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_denied(),
+                    "{command:?} ({dialect:?}): {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn redirect_resolution_dependency_budget_is_bounded() {
+        let source = "A=/tmp/d; B=$A/b; C=$B/c; D=$C/d; E=$D/e; F=$E/f; G=$F/g; H=$G/h; I=$H/i; J=$I/j; echo > \"$J/x\"";
+        let result =
+            evaluate_with_pack_ids_in_dialect(source, &["core.filesystem"], ShellDialect::Posix);
+        assert!(
+            result.is_denied(),
+            "over-budget dependency chain must fail closed"
+        );
+    }
+
+    #[test]
     fn mktemp_scratch_roots_prove_variable_redirect_targets() {
         // #275: a variable bound to `$(mktemp)` / `$(mktemp -d)` in the same
         // command is a freshly minted, caller-owned temp path — redirects into
@@ -36928,8 +37150,8 @@ mod tests {
             );
         }
 
-        // Only the no-argument (plus -d/-q) mktemp forms qualify: templates,
-        // `-p`, `-t`, and `-u` can escape the system temp dir or skip
+        // Explicit /tmp roots also qualify (#536). Sensitive templates,
+        // `-p /etc`, `-t`, and `-u` can escape the system temp dir or skip
         // creation, and traversal / concatenation past the proven value keeps
         // the fail-closed denial. Ambient $TMPDIR stays untrusted, matching
         // the long-documented `rm -rf $TMPDIR` position.

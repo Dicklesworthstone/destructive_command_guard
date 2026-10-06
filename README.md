@@ -3020,12 +3020,20 @@ a home directory (`~/proj/dist`) or outside the system directories
 (`/data/proj/dist`) is `rm-rf-general`. Check `dcg explain "<command>"` for the
 rule id you actually need.
 
-**Dynamic paths are never exempted.**
+**Unresolved dynamic paths are never exempted by configuration.**
 `core.filesystem:redirect-truncate-dynamic-path` deliberately supports no
-exemptions. It exists precisely because the runtime target cannot be proven, so
-a glob over it would be a bypass, not a carve-out. `echo x > $DIR/log` stays
-denied no matter what is configured. The same rule applies inside the supported
-rules: a target containing a variable, command substitution, backtick, glob, or
+exemptions. When the runtime target cannot be proven, a glob over it would be a
+bypass, not a carve-out. An ambient `echo x > $DIR/log`
+stays denied no matter what is configured. Independently of exemption globs,
+dcg can prove a bounded set of POSIX redirect targets benign: preceding literal
+assignments, up to eight assignments derived from proven variables with literal
+suffixes, decimal `$$` text, and `mktemp` with an explicit literal `/tmp` template
+or `-p /tmp` / `--tmpdir=/tmp`. An assignment after `&&` qualifies only when an
+uninterrupted `&&` chain guarantees it ran before the use. The complete resolved
+path must still pass the benign-target check; sensitive roots, `..` traversal,
+unknown expansions, ambiguous bindings, and unsupported `mktemp` options remain
+denied. No command is executed to resolve a target. The same rule applies inside
+the supported rules: a target containing a variable, command substitution, backtick, glob, or
 `%VAR%` is not a literal, and is never matched against an exemption glob.
 
 **Credential and login files are never exempted by path.**
