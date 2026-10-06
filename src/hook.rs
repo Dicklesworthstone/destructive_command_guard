@@ -3234,23 +3234,12 @@ pub fn write_denial_to(
         warning_audience,
     );
 
-    // GH#332: name the allow-once remedy in the reason text for protocols
-    // whose JSON already carries the code. Codex is excluded on purpose — its
-    // output deliberately strips all allow-once metadata (see the Codex arm
-    // below and `WarningAudience::CodexModel`), and the reason string must
-    // not reintroduce what the protocol's design withholds.
-    let reason_allow_once_code = match protocol {
-        HookProtocol::Codex => None,
-        _ => allow_once_code,
-    };
-    let message = format_denial_message(
-        command,
-        reason,
-        explanation,
-        pack,
-        pattern,
-        reason_allow_once_code,
-    );
+    // GH#332/#537: expose a successfully minted review identifier through the
+    // supported reason text, including Codex's strict three-field contract.
+    // This remains a denial; only explicit human redemption grants an exception.
+    // If persistence failed (including lock timeout), there is no code to expose.
+    let message =
+        format_denial_message(command, reason, explanation, pack, pattern, allow_once_code);
     let rule_id = build_rule_id(pack, pattern);
     let remediation = allow_once.map(|info| {
         let explanation_text = format_explanation_text(explanation, rule_id.as_deref(), pack);
@@ -7418,6 +7407,11 @@ mod tests {
             specific.as_object().map(serde_json::Map::len),
             Some(3),
             "Codex payload must omit dcg-only fields: {json}"
+        );
+        assert!(
+            specific["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("dcg allow-once abc123"))
         );
         assert!(
             !stderr.is_empty(),

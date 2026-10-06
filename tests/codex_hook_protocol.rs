@@ -2207,8 +2207,8 @@ fn disable_core_filesystem_still_blocks_git_claude() {
 // P2.11 — Allow-once round-trip under Codex
 //
 // Under Codex, the model-visible stderr denial must not expose allow-once
-// tokens. The pending store still records the generated code so a human or
-// harness can redeem it explicitly, then retry — the command must pass.
+// tokens. The supported JSON reason exposes the identifier for human review;
+// redemption permits only the exact command and consumes a single-use grant.
 // ===========================================================================
 
 /// Extract the allow-once short_code from the pending_exceptions.jsonl
@@ -2235,7 +2235,8 @@ fn allow_once_path(home: &std::path::Path) -> std::path::PathBuf {
 /// Apply both store overrides to a spawned dcg invocation.
 fn pin_exception_stores(cmd: &mut Command, home: &std::path::Path) {
     cmd.env("DCG_PENDING_EXCEPTIONS_PATH", pending_exceptions_path(home))
-        .env("DCG_ALLOW_ONCE_PATH", allow_once_path(home));
+        .env("DCG_ALLOW_ONCE_PATH", allow_once_path(home))
+        .env("DCG_SELF_HEAL_HOOK", "0");
 }
 
 fn extract_allow_once_code_from_pending_store(home: &std::path::Path) -> Option<String> {
@@ -2350,15 +2351,28 @@ fn codex_allow_once_round_trip() {
         "initial Codex deny expected\n{deny_outcome}"
     );
 
-    // Extract the allow-once code from the pending store
-    let allow_code = extract_allow_once_code_from_pending_store(&home_path)
-        .unwrap_or_else(|| panic!("pending store must contain short_code\n{deny_outcome}"));
+    // Capture the identifier from the channel Codex actually surfaces (#537).
+    let deny_json = deny_outcome.stdout_json();
+    let reason = deny_json["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .expect("Codex denial reason");
+    let allow_code = reason
+        .split("the user can approve it with: dcg allow-once ")
+        .nth(1)
+        .and_then(|suffix| suffix.split_whitespace().next())
+        .unwrap_or_else(|| panic!("Codex reason must expose review code\n{deny_outcome}"));
+    assert_eq!(
+        Some(allow_code),
+        extract_allow_once_code_from_pending_store(&home_path).as_deref(),
+        "surfaced identifier must refer to the persisted exact-command denial"
+    );
 
     // Step 2: Redeem the allow-once code
     let mut redeem_cmd = Command::new(dcg_binary());
     redeem_cmd
         .arg("allow-once")
-        .arg(&allow_code)
+        .arg(allow_code)
+        .arg("--single-use")
         .arg("--yes")
         .env_clear()
         .env("PATH", &system_path)
@@ -2379,6 +2393,14 @@ fn codex_allow_once_round_trip() {
         redeem_output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&redeem_output.stdout),
         String::from_utf8_lossy(&redeem_output.stderr),
+    );
+
+    // A different command matching the same destructive rule stays denied,
+    // without consuming the approved command's grant.
+    let other = run_codex_in_home("git reset --hard HEAD~2", &home_path);
+    assert!(
+        other.is_codex_block_shape(),
+        "different command denied\n{other}"
     );
 
     // Step 3: Retry under Codex — must now be allowed (exit 0)
@@ -2416,6 +2438,72 @@ fn codex_allow_once_round_trip() {
         retry_outcome.is_allow_shape(),
         "after allow-once redeem, Codex retry must be allowed (exit 0)\n{retry_outcome}"
     );
+    let consumed = run_codex_in_home("git reset --hard HEAD~1", &home_path);
+    assert!(
+        consumed.is_codex_block_shape(),
+        "single-use grant must not permit a second retry\n{consumed}"
+    );
+}
+
+/// Repeat a Codex hook invocation against the same isolated exception stores.
+fn run_codex_in_home(command: &str, home: &std::path::Path) -> HookOutcome {
+    let payload = build_codex_payload(command);
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("TMPDIR", home.join("tmp"))
+        .env("TEMP", home.join("tmp"))
+        .env("TMP", home.join("tmp"))
+        .env("NO_COLOR", "1")
+        .env("DCG_SELF_HEAL_HOOK", "0")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    pin_exception_stores(&mut cmd, home);
+    let mut child = cmd.spawn().expect("spawn Codex retry");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().expect("wait Codex retry");
+    HookOutcome {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: output.status.code().unwrap_or(-1),
+        stdin_sent: payload.into_bytes(),
+        home_dir: home.to_path_buf(),
+    }
+}
+
+#[test]
+fn codex_contended_pending_store_denies_without_review_code() {
+    let home = make_hermetic_home();
+    let pending = pending_exceptions_path(home.path());
+    std::fs::create_dir_all(pending.parent().unwrap()).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&pending)
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    let outcome = run_codex_in_home("git reset --hard HEAD~1", home.path());
+    fs2::FileExt::unlock(&lock).unwrap();
+    assert!(
+        outcome.is_codex_block_shape(),
+        "fallback must deny\n{outcome}"
+    );
+    assert!(
+        !outcome.stdout_str().contains("dcg allow-once"),
+        "failed persistence must not advertise redemption\n{outcome}"
+    );
+    assert!(std::fs::read_to_string(pending).unwrap().trim().is_empty());
 }
 
 // ===========================================================================

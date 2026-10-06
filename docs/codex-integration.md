@@ -1,6 +1,6 @@
 # Codex Integration
 
-Last updated: 2026-07-11
+Last updated: 2026-10-06
 
 This document is the maintainer reference for dcg's Codex CLI hook path. It
 explains how dcg distinguishes Codex from Claude-compatible hook payloads, why
@@ -83,6 +83,43 @@ The exit-code split is intentional:
 
 For Codex hook integrations, parse the minimal stdout JSON. Empty stdout with
 exit 0 still means allow.
+
+## Exact-Command Human Review
+
+After #537, a denial with a successfully persisted pending exception includes
+`dcg allow-once <code>` in `permissionDecisionReason`. The JSON still has only
+the three documented fields above and the decision remains `deny`. No
+`allowOnceCode`, hash, rule metadata, or remediation fields are added to the
+Codex payload. stderr retains the rule diagnostic and instruction against
+self-bypass; the review identifier is surfaced through the supported JSON
+reason instead.
+
+The human must inspect the actual blocked command and approve it explicitly
+using `dcg allow-once <code> --single-use` in the same home/project context as
+the hook. The CLI displays the pending command and asks for confirmation.
+After approval, retry that exact command through Codex: one matching hook
+invocation is permitted, a different command remains denied, and another retry
+is denied after the grant is consumed. The agent must not redeem the code or
+change policy on its own. Approval does not certify script contents as safe.
+
+Code issuance is best effort. If the pending store cannot be written, including
+a lock timeout, dcg still emits the minimal JSON denial without a code. There
+is no redeemable identifier to infer or invent. Resolve the store problem and
+obtain a fresh denial through the normal guarded path before requesting review;
+do not disable dcg, broaden an allowlist, or rewrite the rejected command to
+evade classification. Older builds that omit the code from the reason do not
+provide this surfaced review path; this change does not establish that either
+PowerShell classification reported in #537 is fixed.
+
+For diagnostics, first identify the executable actually configured in the Codex
+hook, then run that executable's `--version` and `doctor`. A `dcg` found on PATH
+alone does not establish the active hook build. The manual protocol probe below
+checks that executable's output without executing the command in the payload.
+The reason identifies the blocked command and rule when available; the code
+correlates a persisted pending denial for review. Share only version/protocol
+and necessary sanitized diagnostics: command text and diagnostic output may
+contain private paths or configuration. A sanitized command is not an exact
+target for an exception.
 
 ## Manual Protocol Probe
 
