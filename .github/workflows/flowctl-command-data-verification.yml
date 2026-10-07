@@ -16,8 +16,8 @@ concurrency:
 
 jobs:
   verify:
-    if: github.repository == 'Dicklesworthstone/destructive_command_guard' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04-arm
+    if: github.repository == 'Dicklesworthstone/destructive_command_guard'
+    runs-on: macos-latest
     timeout-minutes: 60
     permissions:
       contents: write
@@ -29,8 +29,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       RCH_ENABLED: '0'
       RUST_BACKTRACE: '1'
-      PATCH_BLOB: ca33890d6fa7db0c75e08bc908608251e27eaeaf
-      BOUNDARY_PATCH_BLOB: d6675eba0dc5e85966f9c95cabff0f517e380cdc
+      PATCH_BLOB: f1650462660a9ed1981a50b9416a72f554782584
     defaults:
       run:
         shell: bash
@@ -46,8 +45,12 @@ jobs:
           set -euo pipefail
           mkdir -p target/flowctl-538
           git rev-parse HEAD > target/flowctl-538/base-revision.txt
+          test "$(git rev-parse HEAD:src/context.rs)" = 4bb2a61161c127233351181e61693acc623753cf
+          test "$(git rev-parse HEAD:src/evaluator.rs)" = 8d0bfb6f8e1d3a998d73791e2a1f6d297b2d5728
           toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+          brew install bash jq
+          echo "HARNESS_BASH=$(brew --prefix bash)/bin/bash" >> "$GITHUB_ENV"
 
       - uses: actions/cache@v6
         with:
@@ -55,21 +58,18 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/debug
-          key: flowctl-538-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
+          key: flowctl-538-fixed-argv-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
 
-      - name: Retrieve and check the reviewed source patches
+      - name: Retrieve and check the fixed-argv source patch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           gh api "repos/$GITHUB_REPOSITORY/git/blobs/$PATCH_BLOB" --jq .content \
-            | base64 --decode > "$RUNNER_TEMP/flowctl-538.patch"
+            | python3 -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' \
+            > "$RUNNER_TEMP/flowctl-538.patch"
           test "$(git hash-object "$RUNNER_TEMP/flowctl-538.patch")" = "$PATCH_BLOB"
-          gh api "repos/$GITHUB_REPOSITORY/git/blobs/$BOUNDARY_PATCH_BLOB" --jq .content \
-            | base64 --decode > "$RUNNER_TEMP/flowctl-538-boundaries.patch"
-          test "$(git hash-object "$RUNNER_TEMP/flowctl-538-boundaries.patch")" = "$BOUNDARY_PATCH_BLOB"
           cp "$RUNNER_TEMP/flowctl-538.patch" target/flowctl-538/reviewed.patch
-          cp "$RUNNER_TEMP/flowctl-538-boundaries.patch" target/flowctl-538/boundaries.patch
           git apply --check "$RUNNER_TEMP/flowctl-538.patch"
 
       - name: Reproduce both reported failures before the implementation change
@@ -92,8 +92,6 @@ jobs:
           set -euo pipefail
           git apply --check --exclude=tests/repro_538_flowctl_command_data.rs "$RUNNER_TEMP/flowctl-538.patch"
           git apply --exclude=tests/repro_538_flowctl_command_data.rs "$RUNNER_TEMP/flowctl-538.patch"
-          git apply --check "$RUNNER_TEMP/flowctl-538-boundaries.patch"
-          git apply "$RUNNER_TEMP/flowctl-538-boundaries.patch"
           rustfmt --edition 2024 --config skip_children=true \
             src/context.rs src/evaluator.rs tests/repro_538_flowctl_command_data.rs
 
@@ -119,11 +117,11 @@ jobs:
           cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee target/flowctl-538/clippy.log
           cargo fmt --all --check 2>&1 | tee target/flowctl-538/fmt.log
           cargo build --locked --bin dcg 2>&1 | tee target/flowctl-538/build.log
-          bash scripts/e2e_harness_matrix.sh --binary "$PWD/target/debug/dcg" \
+          "$HARNESS_BASH" scripts/e2e_harness_matrix.sh --binary "$PWD/target/debug/dcg" \
             2>&1 | tee target/flowctl-538/harness.log
           git diff --check
 
-      - name: Store and publish the verified source directly to main
+      - name: Publish only the verified source directly to unchanged main
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -158,7 +156,6 @@ jobs:
               'base_commit': parent,
               'base_tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(),
               'patch_blob': os.environ['PATCH_BLOB'],
-              'boundary_patch_blob': os.environ['BOUNDARY_PATCH_BLOB'],
               'files': [],
           }
           for path in paths:
@@ -172,11 +169,12 @@ jobs:
               manifest['files'].append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': blob['sha']})
           tree = api('git/trees', {'base_tree': manifest['base_tree'], 'tree': manifest['files']})
           message = (
-              'fix: distinguish flowctl receipt data from dynamic inline launchers (#538)\n\n'
-              'Scope receipt data to the complete flowctl gate check/receipt grammar. '
-              'Preserve unknown executable and genuine inline-code denials, including '
-              'attached long flags. Never mask shell substitutions, chained commands, '
-              'or glued redirection targets.\n\n'
+              'fix: distinguish fixed-argv flowctl receipt data from inline launchers (#538)\n\n'
+              'Share a bounded gate check/receipt data contract between the sanitizer and '
+              'launcher classifier. Recognize documented quoted scalar spellings, not bare '
+              'executable expansions or array-produced arguments. Keep substitutions, '
+              'redirections, extra flags and unknown executables conservative. Reuse the '
+              'existing wrapper grammar and retain unknown attached-code flag denials.\n\n'
               'Validated paired before/after reproductions, real-binary regression cases, '
               'existing context and launcher tests, argv-spawn regressions, all-target '
               'check and Clippy, formatting, and real hook protocols.\n\n'
