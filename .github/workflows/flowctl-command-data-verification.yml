@@ -1,0 +1,176 @@
+name: Flowctl receipt command-data verification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/flowctl-command-data-verification.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flowctl-command-data-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'Dicklesworthstone/destructive_command_guard'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RCH_ENABLED: '0'
+      RUST_BACKTRACE: '1'
+      PATCH_BLOB: ca33890d6fa7db0c75e08bc908608251e27eaeaf
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record the exact base and activate the pinned toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p target/flowctl-538
+          git rev-parse HEAD > target/flowctl-538/base-revision.txt
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: flowctl-538-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
+
+      - name: Retrieve and check the reviewed source patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/git/blobs/$PATCH_BLOB" --jq .content \
+            | base64 --decode > "$RUNNER_TEMP/flowctl-538.patch"
+          test "$(git hash-object "$RUNNER_TEMP/flowctl-538.patch")" = "$PATCH_BLOB"
+          cp "$RUNNER_TEMP/flowctl-538.patch" target/flowctl-538/reviewed.patch
+          git apply --check "$RUNNER_TEMP/flowctl-538.patch"
+
+      - name: Reproduce both reported failures before the implementation change
+        run: |
+          set -euo pipefail
+          git apply --include=tests/repro_538_flowctl_command_data.rs "$RUNNER_TEMP/flowctl-538.patch"
+          for name in reported_variable_assignment_is_data reported_variable_receipt_is_data; do
+            set +e
+            cargo test --locked --test repro_538_flowctl_command_data "$name" -- --exact \
+              2>&1 | tee "target/flowctl-538/baseline-$name.log"
+            result=${PIPESTATUS[0]}
+            set -e
+            test "$result" -eq 101
+            grep -F "test $name ... FAILED" "target/flowctl-538/baseline-$name.log"
+            grep -F 'test result: FAILED. 0 passed; 1 failed;' "target/flowctl-538/baseline-$name.log"
+          done
+
+      - name: Apply the implementation and format the touched source
+        run: |
+          set -euo pipefail
+          git apply --check --exclude=tests/repro_538_flowctl_command_data.rs "$RUNNER_TEMP/flowctl-538.patch"
+          git apply --exclude=tests/repro_538_flowctl_command_data.rs "$RUNNER_TEMP/flowctl-538.patch"
+          rustfmt --edition 2024 --config skip_children=true \
+            src/context.rs src/evaluator.rs tests/repro_538_flowctl_command_data.rs
+
+      - name: Run focused real-binary and existing launcher/context regressions
+        run: |
+          set -euo pipefail
+          cargo test --locked --test repro_538_flowctl_command_data \
+            2>&1 | tee target/flowctl-538/regression.log
+          cargo test --locked --lib context:: -- --test-threads=1 \
+            2>&1 | tee target/flowctl-538/context.log
+          cargo test --locked --lib inline_launcher -- --test-threads=1 \
+            2>&1 | tee target/flowctl-538/launchers.log
+          cargo test --locked --test repro_459_argv_split_spawns \
+            2>&1 | tee target/flowctl-538/argv-spawns.log
+          for log in regression context launchers argv-spawns; do
+            grep -E 'test result: ok\. [1-9][0-9]* passed;' "target/flowctl-538/$log.log"
+          done
+
+      - name: Check all targets, Clippy, formatting, and real hook protocols
+        run: |
+          set -euo pipefail
+          cargo check --locked --all-targets 2>&1 | tee target/flowctl-538/check.log
+          cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee target/flowctl-538/clippy.log
+          cargo fmt --all --check 2>&1 | tee target/flowctl-538/fmt.log
+          cargo build --locked --bin dcg 2>&1 | tee target/flowctl-538/build.log
+          bash scripts/e2e_harness_matrix.sh --binary "$PWD/target/debug/dcg" \
+            2>&1 | tee target/flowctl-538/harness.log
+          git diff --check
+
+      - name: Store verified source blobs for a separately reviewed main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          paths = ['src/context.rs', 'src/evaluator.rs', 'tests/repro_538_flowctl_command_data.rs']
+          manifest = {
+              'base_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'base_tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(),
+              'patch_blob': os.environ['PATCH_BLOB'],
+              'files': [],
+          }
+          for path in paths:
+              payload = json.dumps({
+                  'encoding': 'base64',
+                  'content': base64.b64encode(pathlib.Path(path).read_bytes()).decode('ascii'),
+              })
+              result = subprocess.run(
+                  ['gh', 'api', '--method', 'POST', f"repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs", '--input', '-'],
+                  input=payload, text=True, check=True, capture_output=True,
+              )
+              sha = json.loads(result.stdout)['sha']
+              expected = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              if sha != expected:
+                  raise SystemExit(f'blob hash mismatch for {path}')
+              manifest['files'].append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': sha})
+          encoded = json.dumps(manifest, sort_keys=True)
+          pathlib.Path('target/flowctl-538/verified-source.json').write_text(encoded + '\n')
+          print('FLOWCTL538_VERIFIED_SOURCE=' + encoded)
+          PY
+          # This job deliberately never updates a branch or closes the issue.
+          # The verified blobs are reviewed and committed through the GitHub connector.
+
+      - name: Retain exact source and diagnostics
+        if: always()
+        run: |
+          mkdir -p target/flowctl-538
+          git rev-parse HEAD > target/flowctl-538/checked-out-revision.txt
+          git diff --binary > target/flowctl-538/uncommitted.patch
+          if test -f tests/repro_538_flowctl_command_data.rs; then
+            tar -czf target/flowctl-538/source.tar.gz \
+              src/context.rs src/evaluator.rs tests/repro_538_flowctl_command_data.rs
+          fi
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: flowctl-538-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/flowctl-538/
+          if-no-files-found: error
