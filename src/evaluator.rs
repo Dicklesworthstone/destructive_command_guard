@@ -5942,6 +5942,11 @@ fn posix_inline_code_flag_cluster(flag: &str) -> Option<&str> {
 }
 
 fn posix_inline_flag_position(name: Option<&str>, words: &[&str]) -> Option<usize> {
+    // Only the complete static flowctl gate grammar withdraws the generic
+    // dynamic-launcher interpretation; arbitrary executables remain fail-closed.
+    if name.is_none() && crate::context::flowctl_gate_data_values(words).is_some() {
+        return None;
+    }
     words.iter().enumerate().skip(1).find_map(|(index, raw)| {
         let flag = shell_word_value(raw, ShellDialect::Posix)?;
         if !flag.starts_with('-') || flag == "-" {
@@ -5974,8 +5979,11 @@ fn posix_inline_flag_position(name: Option<&str>, words: &[&str]) -> Option<usiz
             matches!(
                 lower.as_str(),
                 "-c" | "-e" | "-p" | "-r" | "--eval" | "--print" | "--command"
-            ) || posix_inline_code_flag_cluster(&flag)
-                .is_some_and(|cluster| cluster.to_ascii_lowercase().contains('c'))
+            ) || ["--command=", "--eval=", "--print="]
+                .iter()
+                .any(|prefix| lower.starts_with(prefix))
+                || posix_inline_code_flag_cluster(&flag)
+                    .is_some_and(|cluster| cluster.to_ascii_lowercase().contains('c'))
         };
         is_inline.then_some(index)
     })
