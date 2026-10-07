@@ -1,0 +1,394 @@
+name: GNU tar helper verification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/tar-helper-verification.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tar-helper-verification-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'Dicklesworthstone/destructive_command_guard'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      # Used only to retain immutable source blobs. This workflow never creates
+      # commits, trees, branches, tags, or ref updates.
+      contents: write
+    env:
+      SOURCE_BASE: 74902e5468fa3e001c66caea508bea041d08983f
+      PATCH_BLOB: 19d875304108d7777bf2bdbbbccc91cfba6ac1d0
+      UBS_COMMIT: d1cf8ea8f74d4559331f7c96bf268414815850b8
+      UBS_ARCHIVE_SHA256: bd96276968632fb4156ed79198c7a6cfa1596b69534b91d1cee58debd005aa65
+      DOWNLOAD_USER_AGENT: OpenAI File Downloader, XaiImageApiFetch/1.0
+      CARGO_HTTP_USER_AGENT: OpenAI File Downloader, XaiImageApiFetch/1.0
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RCH_ENABLED: '0'
+      RUST_BACKTRACE: '1'
+      EVIDENCE: target/tar-helper-verification
+      SOURCE_PATHS: |
+        README.md
+        docs/packs/core.md
+        docs/codex-integration.md
+        src/evaluator.rs
+        src/packs/core/filesystem.rs
+        tests/codex_hook_protocol.rs
+        tests/repro_498_warn_masks_later_deny.rs
+        tests/repro_wrapper_bypass.rs
+        tests/repro_538_flowctl_command_data.rs
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the workflow-only parent and exact source identity
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE"
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+
+          expected_repo = 'Dicklesworthstone/destructive_command_guard'
+          if os.environ['GITHUB_REPOSITORY'] != expected_repo or os.environ['GITHUB_REF'] != 'refs/heads/main':
+              raise SystemExit('Unexpected repository or ref')
+          base, trigger = os.environ['SOURCE_BASE'], os.environ['GITHUB_SHA']
+          if not re.fullmatch(r'[0-9a-f]{40}', os.environ['PATCH_BLOB']):
+              raise SystemExit('PATCH_BLOB must name the immutable reviewed source patch')
+          if git('rev-parse', 'HEAD') != trigger:
+              raise SystemExit('Checkout does not match the triggering revision')
+          if git('rev-list', '--parents', '-n', '1', trigger).split() != [trigger, base]:
+              raise SystemExit('Trigger must have exactly the reviewed source base as parent')
+          workflow = '.github/workflows/tar-helper-verification.yml'
+          if git('diff', '--name-only', base, trigger).splitlines() != [workflow]:
+              raise SystemExit('Trigger must change only this verifier workflow')
+          if git('status', '--porcelain', '--untracked-files=no'):
+              raise SystemExit('Checkout is not clean')
+          paths = os.environ['SOURCE_PATHS'].splitlines()
+          if len(paths) != 9 or len(set(paths)) != 9:
+              raise SystemExit('Expected exactly nine distinct reviewed source paths')
+          files = []
+          for path in paths:
+              entry = git('ls-tree', base, '--', path).split()
+              if entry[:2] != ['100644', 'blob'] or entry[3] != path:
+                  raise SystemExit(f'Unexpected source entry: {path}')
+              if git('rev-parse', f'{trigger}:{path}') != entry[2]:
+                  raise SystemExit(f'Trigger changed source: {path}')
+              files.append({'path': path, 'mode': '100644', 'type': 'blob', 'base_blob': entry[2]})
+          manifest = {'source_base': base, 'trigger_commit': trigger,
+                      'patch_blob': os.environ['PATCH_BLOB'], 'files': files}
+          pathlib.Path(os.environ['EVIDENCE'], 'input-source.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+
+      - name: Activate the repository-pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+          rustc --version --verbose | tee "$EVIDENCE/rustc-version.log"
+          cargo --version | tee "$EVIDENCE/cargo-version.log"
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: tar-helper-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
+
+      - name: Retrieve and check the immutable nine-file patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/git/blobs/$PATCH_BLOB" --jq .content \
+            | python3 -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode("".join(sys.stdin.read().split()), validate=True))' \
+            > "$EVIDENCE/reviewed.patch"
+          test "$(git hash-object "$EVIDENCE/reviewed.patch")" = "$PATCH_BLOB"
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+
+          patch = pathlib.Path(os.environ['EVIDENCE'], 'reviewed.patch')
+          entries = subprocess.check_output(['git', 'apply', '--numstat', '-z', str(patch)]).split(b'\0')
+          paths = [entry.split(b'\t', 2)[2].decode('utf-8') for entry in entries if entry]
+          if sorted(paths) != sorted(os.environ['SOURCE_PATHS'].splitlines()):
+              raise SystemExit(f'Patch does not match the exact source allowlist: {paths}')
+          if subprocess.check_output(['git', 'apply', '--summary', str(patch)]).strip():
+              raise SystemExit('Patch may not create, remove, rename, or change modes of source files')
+          subprocess.run(['git', 'apply', '--check', str(patch)], check=True)
+          PY
+
+      - name: Require the checkpoint regression to fail on unchanged production
+        run: |
+          set -euo pipefail
+          git apply --include=tests/repro_wrapper_bypass.rs "$EVIDENCE/reviewed.patch"
+          test "$(git diff --name-only)" = tests/repro_wrapper_bypass.rs
+          test_name=tar_checkpoint_actions_reach_nested_rules_after_tar_decoding
+          set +e
+          cargo test --locked --test repro_wrapper_bypass "$test_name" -- --exact --nocapture \
+            2>&1 | tee "$EVIDENCE/baseline-checkpoint.log"
+          baseline_status=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$baseline_status" > "$EVIDENCE/baseline-exit-status.txt"
+          test "$baseline_status" -eq 101
+          grep -F "test $test_name ... FAILED" "$EVIDENCE/baseline-checkpoint.log"
+          grep -F 'test result: FAILED. 0 passed; 1 failed;' "$EVIDENCE/baseline-checkpoint.log"
+
+      - name: Apply reviewed production changes and format only touched Rust
+        run: |
+          set -euo pipefail
+          git apply --check --exclude=tests/repro_wrapper_bypass.rs "$EVIDENCE/reviewed.patch"
+          git apply --exclude=tests/repro_wrapper_bypass.rs "$EVIDENCE/reviewed.patch"
+          mapfile -t rust_paths < <(printf '%s\n' "$SOURCE_PATHS" | grep -E '\.rs$')
+          test "${#rust_paths[@]}" -eq 6
+          rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
+          git diff --check
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          evidence = pathlib.Path(os.environ['EVIDENCE'])
+          manifest = json.loads((evidence / 'input-source.json').read_text())
+          paths = os.environ['SOURCE_PATHS'].splitlines()
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          if sorted(changed) != sorted(paths):
+              raise SystemExit(f'Unexpected post-format source changes: {changed}')
+          for entry in manifest['files']:
+              path = pathlib.Path(entry['path'])
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit(f'Expected a regular source file: {path}')
+              data = path.read_bytes()
+              entry.update(sha=subprocess.check_output(['git', 'hash-object', str(path)], text=True).strip(),
+                           sha256=hashlib.sha256(data).hexdigest(), bytes=len(data))
+          (evidence / 'formatted-source.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+
+      - name: Run GNU tar helper unit tests
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib tar_helper_tests -- --test-threads=1 \
+            2>&1 | tee "$EVIDENCE/tar-helper-unit.log"
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$EVIDENCE/tar-helper-unit.log"
+
+      - name: Run all selected real-binary regressions
+        run: |
+          set -euo pipefail
+          for suite in repro_wrapper_bypass codex_hook_protocol repro_498_warn_masks_later_deny \
+              repro_534_nonlocal_filesystem repro_heredoc_pipeline_producer_bypass \
+              repro_env_parsing repro_538_flowctl_command_data; do
+            cargo test --locked --test "$suite" -- --test-threads=1 \
+              2>&1 | tee "$EVIDENCE/$suite.log"
+            grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$EVIDENCE/$suite.log"
+          done
+
+      - name: Check all targets, strict Clippy, formatting, and patch whitespace
+        run: |
+          set -euo pipefail
+          cargo check --locked --all-targets 2>&1 | tee "$EVIDENCE/check.log"
+          cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee "$EVIDENCE/clippy.log"
+          cargo fmt --check 2>&1 | tee "$EVIDENCE/fmt.log"
+          git diff --check
+
+      - name: Build the real binary and require all 48 harness cases
+        run: |
+          set -euo pipefail
+          cargo build --locked --bin dcg 2>&1 | tee "$EVIDENCE/build.log"
+          bash scripts/e2e_harness_matrix.sh --binary "$PWD/target/debug/dcg" --json \
+            > "$EVIDENCE/harness.jsonl" 2> "$EVIDENCE/harness.stderr"
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          records = [json.loads(line) for line in pathlib.Path(os.environ['EVIDENCE'], 'harness.jsonl').read_text().splitlines() if line.strip()]
+          cases = [item for item in records if item.get('event') == 'case']
+          summaries = [item for item in records if item.get('event') == 'summary']
+          if len(cases) != 48 or any(item.get('status') != 'pass' for item in cases):
+              raise SystemExit('Expected exactly 48 passing protocol cases')
+          if len(summaries) != 1 or any(summaries[0].get(key) != value for key, value in {'passed': 48, 'failed': 0, 'result': 'pass'}.items()):
+              raise SystemExit('Harness summary does not report 48 passes and zero failures')
+          print(json.dumps(summaries[0], sort_keys=True))
+          PY
+
+      - name: Install checksum-verified UBS and ast-grep without Cargo
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/tar-helper-tools"
+          mkdir -p "$tools_dir"
+          curl --fail --location --user-agent "$DOWNLOAD_USER_AGENT" \
+            "https://codeload.github.com/Dicklesworthstone/ultimate_bug_scanner/tar.gz/$UBS_COMMIT" \
+            --output "$tools_dir/ubs.tar.gz"
+          printf '%s  %s\n' "$UBS_ARCHIVE_SHA256" "$tools_dir/ubs.tar.gz" | sha256sum --check
+          tar -xzf "$tools_dir/ubs.tar.gz" -C "$tools_dir"
+          ubs_dir="$tools_dir/ultimate_bug_scanner-$UBS_COMMIT"
+          bash "$ubs_dir/scripts/verify_checksums.sh" > "$EVIDENCE/ubs-integrity.log" 2>&1
+          mkdir -p "$tools_dir/ast-grep"
+          curl --fail --location --user-agent "$DOWNLOAD_USER_AGENT" \
+            https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-x86_64-unknown-linux-gnu.zip \
+            --output "$tools_dir/ast-grep.zip"
+          printf '%s  %s\n' f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8 "$tools_dir/ast-grep.zip" | sha256sum --check
+          unzip -q "$tools_dir/ast-grep.zip" -d "$tools_dir/ast-grep"
+          chmod u+x "$tools_dir/ast-grep/ast-grep"
+          "$tools_dir/ast-grep/ast-grep" --version | tee "$EVIDENCE/ast-grep-version.log"
+          printf '%s\n' "$tools_dir/ast-grep" >> "$GITHUB_PATH"
+          printf 'TAR_UBS_DIR=%s\n' "$ubs_dir" >> "$GITHUB_ENV"
+
+      - name: Record unsuppressed UBS results for all six changed Rust files
+        id: ubs
+        run: |
+          set -euo pipefail
+          mapfile -t rust_paths < <(printf '%s\n' "$SOURCE_PATHS" | grep -E '\.rs$')
+          test "${#rust_paths[@]}" -eq 6
+          # Override the repository's test-directory exclusions and reject
+          # inline suppression markers instead of silently hiding findings.
+          if grep -nEi 'ubs:ignore|ubs:[[:space:]]*disable|nolint|noqa' "${rust_paths[@]}"; then
+            echo '::error::Inline suppression marker found in the exact reviewed scan scope'
+            exit 1
+          fi
+          export XDG_DATA_HOME="$RUNNER_TEMP/tar-ubs-data"
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/tar-ubs-config"
+          export XDG_CACHE_HOME="$RUNNER_TEMP/tar-ubs-cache"
+          selected_files=$(IFS=,; printf '%s' "${rust_paths[*]}")
+          printf '%s\n' "${rust_paths[@]}" > "$EVIDENCE/ubs-files.txt"
+          set +e
+          bash "$TAR_UBS_DIR/ubs" --module-dir="$TAR_UBS_DIR/modules" \
+            --ci --no-auto-update --no-cache --no-cargo --only=rust --jobs=1 \
+            --ignore-file=/dev/null --format=json --files="$selected_files" "$PWD" \
+            > "$EVIDENCE/ubs.json" 2> "$EVIDENCE/ubs.stderr"
+          ubs_status=$?
+          set -e
+          printf '%s\n' "$ubs_status" > "$EVIDENCE/ubs-exit-status.txt"
+          printf 'exit_status=%s\n' "$ubs_status" >> "$GITHUB_OUTPUT"
+          python3 -m json.tool "$EVIDENCE/ubs.json" > "$EVIDENCE/ubs-pretty.json"
+          jq --exit-status '
+            .status == "ok" and (.failed_modules | length) == 0 and
+            .totals.files == 6 and (.scanners | length) == 1 and
+            .scanners[0].language == "rust" and .scanners[0].status == "ok" and
+            .scanners[0].files == 6
+          ' "$EVIDENCE/ubs.json" > "$EVIDENCE/ubs-coverage-check.txt"
+          if test "$ubs_status" -eq 0; then
+            echo 'UBS exited 0; exact source and full report are retained for review.'
+          elif test "$ubs_status" -eq 1; then
+            echo '::warning::UBS exited 1. This is not a scanner pass; findings require review before any source commit.'
+          else
+            echo "::error::UBS did not complete a reviewable scan (exit $ubs_status)"
+            exit "$ubs_status"
+          fi
+
+      - name: Retain exact verified source blobs without creating commits or refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          repository = os.environ['GITHUB_REPOSITORY']
+          evidence = pathlib.Path(os.environ['EVIDENCE'])
+          manifest = json.loads((evidence / 'formatted-source.json').read_text())
+          if repository != 'Dicklesworthstone/destructive_command_guard' or os.environ['GITHUB_REF'] != 'refs/heads/main':
+              raise SystemExit('Unexpected repository or ref')
+          if subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() != manifest['trigger_commit']:
+              raise SystemExit('Checked-out identity changed during validation')
+
+          def read_api(path):
+              return json.loads(subprocess.check_output(['gh', 'api', f'repos/{repository}/{path}'], text=True))
+
+          current_main = read_api('git/ref/heads/main')['object']['sha']
+          tree_sha = read_api(f'git/commits/{current_main}')['tree']['sha']
+          tree = read_api(f'git/trees/{tree_sha}?recursive=1')
+          if tree.get('truncated'):
+              raise SystemExit('Cannot prove source identity from a truncated tree')
+          current_files = {entry['path']: entry for entry in tree['tree']}
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          if sorted(changed) != sorted(os.environ['SOURCE_PATHS'].splitlines()):
+              raise SystemExit('Validation changed files outside the reviewed allowlist')
+          for entry in manifest['files']:
+              current = current_files.get(entry['path'], {})
+              if current.get('sha') != entry['base_blob'] or current.get('mode') != '100644' or current.get('type') != 'blob':
+                  raise SystemExit(f'Main changed concurrently at {entry["path"]}; do not publish stale source')
+              path = pathlib.Path(entry['path'])
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit(f'Source type changed during validation: {path}')
+              data = path.read_bytes()
+              if hashlib.sha256(data).hexdigest() != entry['sha256']:
+                  raise SystemExit(f'Source changed after formatting and before evidence export: {path}')
+              payload = json.dumps({'encoding': 'base64', 'content': base64.b64encode(data).decode('ascii')})
+              # This is the only mutation endpoint used: immutable blobs only.
+              blob = json.loads(subprocess.check_output(
+                  ['gh', 'api', '--method', 'POST', f'repos/{repository}/git/blobs', '--input', '-'],
+                  input=payload, text=True))
+              if blob['sha'] != entry['sha']:
+                  raise SystemExit(f'Uploaded blob differs from verified source: {path}')
+          ubs_status = int((evidence / 'ubs-exit-status.txt').read_text())
+          manifest.update(observed_main=current_main, run_id=os.environ['GITHUB_RUN_ID'],
+                          run_attempt=os.environ['GITHUB_RUN_ATTEMPT'], compiler_and_runtime_gates_passed=True,
+                          ubs_commit=os.environ['UBS_COMMIT'], ubs_exit_code=ubs_status,
+                          ubs_passed=ubs_status == 0, review_required=True,
+                          source_commit_created=False, refs_updated=False)
+          encoded = json.dumps(manifest, indent=2)
+          (evidence / 'verified-source.json').write_text(encoded + '\n')
+          print('TAR_HELPER_VERIFIED_SOURCE=' + json.dumps(manifest, sort_keys=True))
+          PY
+
+      - name: Retain logs and candidate source even when a gate fails
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE"
+          git rev-parse HEAD > "$EVIDENCE/checked-out-revision.txt"
+          git diff --binary > "$EVIDENCE/candidate.patch"
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import shutil
+
+          destination = pathlib.Path(os.environ['EVIDENCE'], 'candidate-source')
+          for name in os.environ['SOURCE_PATHS'].splitlines():
+              source = pathlib.Path(name)
+              if source.is_file() and not source.is_symlink():
+                  target = destination / name
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(source, target)
+          PY
+
+      - name: Upload revision-bound verification evidence for review
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tar-helper-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/tar-helper-verification/
+          retention-days: 14
+          if-no-files-found: error
