@@ -14818,10 +14818,48 @@ enum IndirectInputSource {
     Unverified(String),
 }
 
+/// File evidence is valid only in the environment that opens the file. This
+/// also covers substitutions within a child shell, without invalidating
+/// literal payloads that can still be checked under their consumer's rules.
+fn invalidate_indirect_file_source(source: &mut IndirectInputSource) {
+    match source {
+        IndirectInputSource::File(_) => {
+            *source = IndirectInputSource::Unverified(
+                "a wrapper changes the execution directory, user, or filesystem; the caller's local file cannot verify the executable input"
+                    .to_string(),
+            );
+        }
+        IndirectInputSource::PsqlStartupFile { .. } => {
+            *source = IndirectInputSource::Unverified(
+                "psql startup files belong to another execution environment and cannot be inspected on this machine; use -X/--no-psqlrc to disable startup files"
+                    .to_string(),
+            );
+        }
+        IndirectInputSource::Template { replacements, .. } => {
+            for (_, replacement) in replacements {
+                invalidate_indirect_file_source(replacement);
+            }
+        }
+        IndirectInputSource::StaticProducer(_) | IndirectInputSource::Unverified(_) => {}
+    }
+}
+
+fn invocation_file_source(path: PathBuf, nonlocal_filesystem: bool) -> IndirectInputSource {
+    let mut source = IndirectInputSource::File(path);
+    if nonlocal_filesystem {
+        invalidate_indirect_file_source(&mut source);
+    }
+    source
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IndirectInputFlow {
     pack_id: &'static str,
     source: IndirectInputSource,
+    /// The client can resolve includes and execute shell escapes after its
+    /// wrapper changes the directory, user, or filesystem. The root source
+    /// has its own owner: an outer shell redirect is still opened locally.
+    consumer_nonlocal_filesystem: bool,
     psql_interpolates_variables: bool,
     snowflake_templating: crate::packs::database::snowflake::SnowflakeTemplating,
     snowflake_retain_comments: bool,
@@ -15634,6 +15672,7 @@ fn unverified_indirect_wildcard(reason: String) -> IndirectInputFlow {
     IndirectInputFlow {
         pack_id: "*",
         source: IndirectInputSource::Unverified(reason),
+        consumer_nonlocal_filesystem: false,
         psql_interpolates_variables: false,
         snowflake_templating: crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
         snowflake_retain_comments: false,
@@ -15645,6 +15684,7 @@ fn unverified_indirect_pack(pack_id: &'static str, reason: &str) -> IndirectInpu
     IndirectInputFlow {
         pack_id,
         source: IndirectInputSource::Unverified(reason.to_string()),
+        consumer_nonlocal_filesystem: false,
         psql_interpolates_variables: pack_id == "database.postgresql",
         snowflake_templating: crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
         snowflake_retain_comments: false,
@@ -15675,6 +15715,7 @@ fn indirect_flow_for_consumer(
     IndirectInputFlow {
         pack_id,
         source,
+        consumer_nonlocal_filesystem: script_segment_is_nonlocal(consumer),
         psql_interpolates_variables: pack_id == "database.postgresql",
         snowflake_templating: snowflake.as_ref().map_or(
             crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
@@ -15785,12 +15826,18 @@ fn collect_indirect_input_flows_from_node<D: Doc>(
             match shell_command_script(&text) {
                 Ok(Some(script)) => {
                     let nested_ranges = command_segment_ranges(&script);
-                    for flow in collect_indirect_input_flows_at_depth(
+                    for mut flow in collect_indirect_input_flows_at_depth(
                         &script,
                         &nested_ranges,
                         shell_depth + 1,
                         ShellDialect::Posix,
                     ) {
+                        if script_segment_is_nonlocal(&text) {
+                            // The child shell opens even its own redirects
+                            // after the wrapper has changed its environment.
+                            invalidate_indirect_file_source(&mut flow.source);
+                            flow.consumer_nonlocal_filesystem = true;
+                        }
                         push_indirect_flow(flows, flow);
                     }
                 }
@@ -17704,7 +17751,7 @@ fn static_producer_source(command: &str) -> IndirectInputSource {
         "cat" | "get-content" | "gc" => {
             let files: Vec<_> = args.iter().filter(|arg| !arg.starts_with('-')).collect();
             if files.len() == 1 {
-                IndirectInputSource::File(PathBuf::from(files[0]))
+                invocation_file_source(PathBuf::from(files[0]), script_segment_is_nonlocal(command))
             } else {
                 IndirectInputSource::Unverified(
                     "file producer must name exactly one literal file".to_string(),
@@ -18021,7 +18068,16 @@ enum SedShellSource {
     Unverified(String),
 }
 
-fn collect_sed_shell_sources(command: &str, project_path: Option<&Path>) -> Vec<SedShellSource> {
+#[derive(Debug)]
+struct ScopedSedShellSource {
+    source: SedShellSource,
+    nonlocal_filesystem: bool,
+}
+
+fn collect_sed_shell_sources(
+    command: &str,
+    project_path: Option<&Path>,
+) -> Vec<ScopedSedShellSource> {
     if !command
         .as_bytes()
         .windows(3)
@@ -18034,30 +18090,42 @@ fn collect_sed_shell_sources(command: &str, project_path: Option<&Path>) -> Vec<
     let segment_ranges = command_segment_ranges(command);
     let compound_command = segment_ranges.len() > 1;
     for (start, end) in segment_ranges {
-        let Some((executable, args)) = command_tokens(&command[start..end]) else {
+        let segment = &command[start..end];
+        let Some((executable, args)) = command_tokens(segment) else {
             continue;
         };
         if executable != "sed" || sed_sandbox_option_is_active(&args) {
             continue;
         }
+        let nonlocal_filesystem = script_segment_is_nonlocal(segment);
+        let _filesystem_scope = NonlocalFilesystemScope::enter(nonlocal_filesystem);
+        let mut segment_sources = Vec::new();
         for script in sed_expression_scripts(&args) {
-            sources.extend(sed_script_shell_sources(&script));
+            segment_sources.extend(sed_script_shell_sources(&script));
         }
         for path in sed_program_files(&args) {
             if compound_command {
-                sources.push(SedShellSource::Unverified(
+                segment_sources.push(SedShellSource::Unverified(
                     "sed program file is consumed in a compound command and could be modified after inspection"
                         .to_string(),
                 ));
                 continue;
             }
             match read_indirect_input_file(&path, project_path) {
-                Ok(script) => sources.extend(sed_script_shell_sources(&script)),
-                Err(detail) => sources.push(SedShellSource::Unverified(format!(
+                Ok(script) => segment_sources.extend(sed_script_shell_sources(&script)),
+                Err(detail) => segment_sources.push(SedShellSource::Unverified(format!(
                     "sed program file cannot be safely inspected: {detail}"
                 ))),
             }
         }
+        sources.extend(
+            segment_sources
+                .into_iter()
+                .map(|source| ScopedSedShellSource {
+                    source,
+                    nonlocal_filesystem,
+                }),
+        );
     }
     sources
 }
@@ -18115,7 +18183,7 @@ fn sed_sandbox_option_is_active(args: &[String]) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn evaluate_sed_shell_sources(
-    sources: &[SedShellSource],
+    sources: &[ScopedSedShellSource],
     enabled_keywords: &[&str],
     ordered_packs: &[String],
     keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
@@ -18133,12 +18201,13 @@ fn evaluate_sed_shell_sources(
         .iter()
         .any(|pack_id| pack_id == "core.filesystem");
 
-    for source in sources {
+    for scoped_source in sources {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
         }
 
-        match source {
+        let _filesystem_scope = NonlocalFilesystemScope::enter(scoped_source.nonlocal_filesystem);
+        match &scoped_source.source {
             SedShellSource::Static(shell_command) => {
                 let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
                     shell_command,
@@ -18823,6 +18892,7 @@ fn command_argument_payloads(
     command: &str,
     compound_command: bool,
 ) -> Result<Vec<IndirectInputFlow>, String> {
+    let consumer_nonlocal_filesystem = script_segment_is_nonlocal(command);
     let masked = mask_command_substitutions(command)?;
     let Some((executable, args)) = command_tokens(&masked.command) else {
         return Ok(Vec::new());
@@ -18864,6 +18934,7 @@ fn command_argument_payloads(
         flows.push(IndirectInputFlow {
             pack_id,
             source,
+            consumer_nonlocal_filesystem,
             psql_interpolates_variables: false,
             snowflake_templating: snowflake_analysis.as_ref().map_or(
                 crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
@@ -18903,11 +18974,12 @@ fn command_argument_payloads(
                     .to_string(),
             )
         } else {
-            IndirectInputSource::File(PathBuf::from(value))
+            invocation_file_source(PathBuf::from(value), consumer_nonlocal_filesystem)
         };
         flows.push(IndirectInputFlow {
             pack_id,
             source,
+            consumer_nonlocal_filesystem,
             psql_interpolates_variables: pack_id == "database.postgresql",
             snowflake_templating: snowflake_analysis.as_ref().map_or(
                 crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
@@ -18925,7 +18997,7 @@ fn command_argument_payloads(
     if psql_analysis
         .as_ref()
         .is_some_and(|analysis| !analysis.no_psqlrc && !analysis.skips_startup_files)
-        && NonlocalFilesystemScope::active()
+        && (NonlocalFilesystemScope::active() || consumer_nonlocal_filesystem)
     {
         flows.push(IndirectInputFlow {
             pack_id: "database.postgresql",
@@ -18934,6 +19006,7 @@ fn command_argument_payloads(
                  inspected on this machine; use -X/--no-psqlrc to disable startup files"
                     .to_string(),
             ),
+            consumer_nonlocal_filesystem,
             psql_interpolates_variables: true,
             snowflake_templating: crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
             snowflake_retain_comments: false,
@@ -18982,6 +19055,7 @@ fn command_argument_payloads(
             flows.push(IndirectInputFlow {
                 pack_id: "database.postgresql",
                 source,
+                consumer_nonlocal_filesystem,
                 psql_interpolates_variables: true,
                 snowflake_templating:
                     crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
@@ -19006,6 +19080,7 @@ fn command_argument_payloads(
                 "an executable database include/load command has no static file operand"
                     .to_string(),
             ),
+            consumer_nonlocal_filesystem,
             psql_interpolates_variables: pack_id == "database.postgresql",
             snowflake_templating: snowflake_analysis.as_ref().map_or(
                 crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
@@ -19034,6 +19109,7 @@ fn collect_dialect_snowflake_flows(
         )];
     }
 
+    let consumer_nonlocal_filesystem = script_segment_is_nonlocal(command);
     let arg_sets = crate::packs::database::snowflake::snow_cli_args_in_dialect(command, dialect);
     let has_complete_unknown_dialect_parse = dialect == ShellDialect::Unknown
         && arg_sets.iter().any(|args| {
@@ -19050,6 +19126,7 @@ fn collect_dialect_snowflake_flows(
                 source: IndirectInputSource::Unverified(
                     crate::packs::database::snowflake::DYNAMIC_EXECUTABLE_REASON.to_string(),
                 ),
+                consumer_nonlocal_filesystem,
                 psql_interpolates_variables: false,
                 snowflake_templating:
                     crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
@@ -19084,6 +19161,7 @@ fn collect_dialect_snowflake_flows(
                 IndirectInputFlow {
                     pack_id: "database.snowflake",
                     source: IndirectInputSource::StaticProducer(value.to_string()),
+                    consumer_nonlocal_filesystem,
                     psql_interpolates_variables: false,
                     snowflake_templating: templating,
                     snowflake_retain_comments: retain_comments,
@@ -19098,13 +19176,14 @@ fn collect_dialect_snowflake_flows(
                         .to_string(),
                 )
             } else {
-                IndirectInputSource::File(PathBuf::from(value))
+                invocation_file_source(PathBuf::from(value), consumer_nonlocal_filesystem)
             };
             push_indirect_flow(
                 &mut flows,
                 IndirectInputFlow {
                     pack_id: "database.snowflake",
                     source,
+                    consumer_nonlocal_filesystem,
                     psql_interpolates_variables: false,
                     snowflake_templating: templating,
                     snowflake_retain_comments: retain_comments,
@@ -19121,6 +19200,7 @@ fn collect_dialect_snowflake_flows(
                         "a shell-obfuscated Snowflake executable reads SQL from stdin whose dialect-specific producer cannot be proven by the generic shell-flow parser"
                             .to_string(),
                     ),
+                    consumer_nonlocal_filesystem,
                     psql_interpolates_variables: false,
                     snowflake_templating: templating,
                     snowflake_retain_comments: retain_comments,
@@ -19134,6 +19214,7 @@ fn collect_dialect_snowflake_flows(
                 IndirectInputFlow {
                     pack_id: "database.snowflake",
                     source: IndirectInputSource::Unverified(reason.to_string()),
+                    consumer_nonlocal_filesystem,
                     psql_interpolates_variables: false,
                     snowflake_templating: templating,
                     snowflake_retain_comments: retain_comments,
@@ -19702,8 +19783,9 @@ fn read_indirect_input_file_with_origin(
 ) -> Result<ResolvedIndirectInput, String> {
     if NonlocalFilesystemScope::active() {
         return Err(format!(
-            "input file {} belongs to another machine or filesystem; local file contents \
-             cannot verify the script's input",
+            "input file {} may be resolved in another machine or filesystem, a changed \
+             working directory, or another user's environment; local file contents cannot \
+             verify the script's input",
             path.display()
         ));
     }
@@ -20548,6 +20630,13 @@ fn evaluate_indirect_inputs_for_pack(
                 continue;
             }
         };
+
+        // Resolve caller-owned stdin (including `< file` and command
+        // substitutions) before entering the client's execution context.
+        // Includes and shell escapes below are opened/executed by the client,
+        // so they cannot reuse that local evidence after a context change.
+        let _consumer_filesystem_scope =
+            NonlocalFilesystemScope::enter(flow.consumer_nonlocal_filesystem);
 
         #[derive(Debug)]
         struct PayloadWork {
@@ -26115,14 +26204,10 @@ fn parallel_uses_remote_hosts(args: &[String]) -> bool {
 }
 
 fn script_segment_is_nonlocal(segment: &str) -> bool {
-    // Executable normalization removes sudo. Its identity still matters for
-    // an extracted script: that shell may have another user's HOME. This is
-    // never applied to an outer redirect, which the caller's shell performs.
-    let stripped = strip_wrapper_prefixes(segment);
-    stripped
-        .stripped_wrappers
-        .iter()
-        .any(|wrapper| wrapper.wrapper_type == "sudo")
+    // Executable normalization can remove directory/user/environment
+    // changes. Retain those effects for a child script or file consumer,
+    // never for an outer redirect performed by the caller's shell.
+    crate::normalize::wrapper_changes_filesystem_context(segment)
         || segment_invokes_executable_in_dialect(
             segment,
             NONLOCAL_SCRIPT_CARRIERS,

@@ -167,6 +167,105 @@ pub fn strip_wrapper_prefixes(command: &str) -> NormalizedCommand<'_> {
     }
 }
 
+/// Whether a recognized wrapper invalidates evidence from the caller's cwd or
+/// home. This observes the existing normalization proof; it never strips an
+/// additional wrapper or changes the command used for pattern matching.
+///
+/// The result belongs to the wrapped process. A redirect on the outside of
+/// `env -C other command < local.sql` is still opened by the caller's shell.
+pub(crate) fn wrapper_changes_filesystem_context(command: &str) -> bool {
+    wrapper_changes_filesystem_context_at_depth(command, 0)
+}
+
+fn wrapper_changes_filesystem_context_at_depth(command: &str, depth: usize) -> bool {
+    // Split-string options can contain further env options or wrappers. The
+    // bound is independent of normalization's own wrapper iteration limit.
+    if depth >= 8 {
+        return true;
+    }
+    let normalized = strip_wrapper_prefixes(command);
+    normalized.wrapper_limit_reached
+        || normalized
+            .stripped_wrappers
+            .iter()
+            .any(|wrapper| match wrapper.wrapper_type {
+                "sudo" | "mise-exec" => true,
+                "assignment" => assignment_changes_filesystem_context(&wrapper.stripped_text),
+                "env" => {
+                    let text = wrapper.stripped_text.trim_start();
+                    let options_start = text.find(char::is_whitespace).unwrap_or(text.len());
+                    env_prefix_changes_filesystem_context(&text[options_start..], depth, false)
+                }
+                "exec" => {
+                    let tokens = tokenize_for_normalization(&wrapper.stripped_text);
+                    let mut changed = false;
+                    let _ =
+                        exec_wrapper_command_index(&wrapper.stripped_text, &tokens, &mut changed);
+                    changed
+                }
+                _ => false,
+            })
+}
+
+fn home_environment_name(name: &str) -> bool {
+    matches!(name, "HOME" | "USERPROFILE" | "HOMEDRIVE" | "HOMEPATH")
+}
+
+fn filesystem_context_env_name(raw: &str) -> bool {
+    let raw = raw.trim();
+    let decoded = decode_posix_syntax_token(raw);
+    // An unresolved unset operand could expand to one of these names. A
+    // successfully decoded quoted literal such as '$HOME' is ordinary data.
+    (matches!(&decoded, Cow::Borrowed(_)) && raw.contains(['$', '`']))
+        || decoded.contains(['*', '?', '['])
+        || home_environment_name(decoded.as_ref())
+        || decoded == "PSQLRC"
+}
+
+fn assignment_changes_filesystem_context(raw: &str) -> bool {
+    let decoded = decode_posix_syntax_token(raw);
+    let Some((name, _)) = decoded.split_once('=') else {
+        return false;
+    };
+    let name = name.strip_suffix('+').unwrap_or(name);
+    let name = name.split_once('[').map_or(name, |(name, _)| name);
+    // Explicit PSQLRC assignments already have their own file-source proof.
+    (matches!(&decoded, Cow::Borrowed(_)) && name.contains(['$', '`']))
+        || home_environment_name(name)
+}
+
+fn env_prefix_changes_filesystem_context(rest: &str, depth: usize, inspect_command: bool) -> bool {
+    if depth >= 8 {
+        return true;
+    }
+    let bytes = rest.as_bytes();
+    let mut changed = false;
+    let parsed = parse_env_options(rest, bytes, 0, &mut changed);
+    if changed {
+        return true;
+    }
+    match parsed {
+        EnvParseResult::Continue(index) => {
+            let end = parse_env_assignments(bytes, index);
+            let assignments = &rest[index..end];
+            tokenize_for_normalization(assignments)
+                .iter()
+                .filter_map(|token| token.text(assignments))
+                .any(assignment_changes_filesystem_context)
+                || (inspect_command
+                    && !rest[end..].trim().is_empty()
+                    && wrapper_changes_filesystem_context_at_depth(&rest[end..], depth + 1))
+        }
+        EnvParseResult::SplitString(_, remaining) => {
+            env_prefix_changes_filesystem_context(&remaining, depth + 1, true)
+        }
+        // The main parser has already accepted the actual wrapper. If a
+        // nested split-string option cannot be proved, no local file proof is
+        // valid; this does not change normalization of that nested command.
+        EnvParseResult::Abort => true,
+    }
+}
+
 /// Strip `sudo` prefix with its options.
 ///
 /// Handles: `-E`, `-H`, `-n`, `-k`, `-K`, `-S`, `-s`, `-b`, `-i`, `-P`, `-A`, `-B`,
@@ -365,7 +464,8 @@ fn strip_env(command: &str) -> Option<(String, StrippedWrapper)> {
     let mut idx = 0;
 
     // Phase 1: Parse options (including -S/--split-string special case)
-    match parse_env_options(rest, bytes, idx) {
+    let mut filesystem_context_changed = false;
+    match parse_env_options(rest, bytes, idx, &mut filesystem_context_changed) {
         EnvParseResult::Continue(new_idx) => idx = new_idx,
         EnvParseResult::Abort => return None,
         EnvParseResult::SplitString(idx, remaining) => {
@@ -415,7 +515,12 @@ enum EnvParseResult {
 }
 
 #[allow(clippy::too_many_lines)]
-fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult {
+fn parse_env_options(
+    rest: &str,
+    bytes: &[u8],
+    mut idx: usize,
+    filesystem_context_changed: &mut bool,
+) -> EnvParseResult {
     let consume_env_arg = |mut idx: usize| -> Option<usize> {
         while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
             idx += 1;
@@ -454,6 +559,7 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
         let word = &rest[word_start..word_end];
         if word == "-" {
             // A lone "-" implies -i (ignore environment)
+            *filesystem_context_changed = true;
             idx = word_end;
             continue;
         }
@@ -476,20 +582,26 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
                     if value_opt.is_some() {
                         return EnvParseResult::Abort;
                     }
+                    *filesystem_context_changed |= name == "--ignore-environment";
                     idx = word_end;
                     continue;
                 }
                 "--unset" | "--chdir" | "--file" | "--argv0" | "--ignore-signal" => {
+                    *filesystem_context_changed |= matches!(name, "--chdir" | "--file");
                     if let Some(value) = value_opt {
                         if token_has_shell_effect(value.as_bytes()) {
                             return EnvParseResult::Abort;
                         }
+                        *filesystem_context_changed |=
+                            name == "--unset" && filesystem_context_env_name(value);
                         idx = word_end;
                         continue;
                     }
                     let Some(next_idx) = consume_env_arg(word_end) else {
                         return EnvParseResult::Abort;
                     };
+                    *filesystem_context_changed |=
+                        name == "--unset" && filesystem_context_env_name(&rest[word_end..next_idx]);
                     idx = next_idx;
                     continue;
                 }
@@ -538,6 +650,7 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
             let flag = word_bytes[pos] as char;
             match flag {
                 'i' | '0' | 'v' => {
+                    *filesystem_context_changed |= flag == 'i';
                     pos += 1;
                 }
                 'S' => {
@@ -572,15 +685,20 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
                     return EnvParseResult::SplitString(idx, remaining);
                 }
                 'u' | 'P' | 'C' | 'f' | 'a' => {
+                    *filesystem_context_changed |= matches!(flag, 'C' | 'f');
                     if pos + 1 < word_bytes.len() {
                         if token_has_shell_effect(&word_bytes[pos + 1..]) {
                             return EnvParseResult::Abort;
                         }
+                        *filesystem_context_changed |=
+                            flag == 'u' && filesystem_context_env_name(&word[pos + 1..]);
                         idx = word_end;
                     } else {
                         let Some(next_idx) = consume_env_arg(word_end) else {
                             return EnvParseResult::Abort;
                         };
+                        *filesystem_context_changed |=
+                            flag == 'u' && filesystem_context_env_name(&rest[word_end..next_idx]);
                         idx = next_idx;
                     }
                     pos = word_bytes.len();
@@ -910,7 +1028,11 @@ fn wrapper_terminal_option(word: &str) -> bool {
     matches!(word, "-h" | "--help" | "-V" | "--version")
 }
 
-fn exec_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
+fn exec_wrapper_command_index(
+    command: &str,
+    tokens: &[NormalizeToken],
+    filesystem_context_changed: &mut bool,
+) -> Option<usize> {
     let mut index = 1usize;
     while let Some(word) = wrapper_word(command, tokens, index) {
         if word == "--" {
@@ -924,6 +1046,7 @@ fn exec_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Optio
         if word.strip_prefix('-').is_some_and(|flags| {
             !flags.is_empty() && flags.bytes().all(|b| matches!(b, b'c' | b'l'))
         }) {
+            *filesystem_context_changed |= word.contains('c');
             index += 1;
             continue;
         }
@@ -1411,8 +1534,9 @@ pub(crate) fn strip_posix_execution_frontend(command: &str) -> Option<(&str, &'s
     let tokens = tokenize_for_normalization(trimmed);
     let executable = wrapper_word(trimmed, &tokens, 0)?;
     let basename = executable.rsplit(['/', '\\']).next().unwrap_or(&executable);
+    let mut filesystem_context_changed = false;
     let command_index = match basename {
-        "exec" => exec_wrapper_command_index(trimmed, &tokens)?,
+        "exec" => exec_wrapper_command_index(trimmed, &tokens, &mut filesystem_context_changed)?,
         "nohup" => {
             let word = wrapper_word(trimmed, &tokens, 1)?;
             if word == "--" {
@@ -5126,6 +5250,99 @@ mod tests {
             );
             assert_eq!(result.normalized, expected, "for {cmd}");
         }
+    }
+
+    #[test]
+    fn wrapper_filesystem_context_tracks_cwd_home_and_environment_changes() {
+        for command in [
+            "sudo psql -X -f safe.sql",
+            "sudo -D /elsewhere -u other psql -X -f safe.sql",
+            "command /usr/bin/env -C /elsewhere psql -X -f safe.sql",
+            "env -C/elsewhere psql -X -f safe.sql",
+            "env -vC '/another directory' psql -X -f safe.sql",
+            "env --chdir=/elsewhere psql -X -f safe.sql",
+            "env --chdir /elsewhere psql -X -f safe.sql",
+            "env HOME=/elsewhere psql -c 'SELECT 1'",
+            "HOME=/elsewhere command psql -c 'SELECT 1'",
+            "env -- HOME=/elsewhere psql -c 'SELECT 1'",
+            "env USERPROFILE=/elsewhere psql -c 'SELECT 1'",
+            "env -i psql -c 'SELECT 1'",
+            "env --ignore-environment psql -c 'SELECT 1'",
+            "env -u HOME psql -c 'SELECT 1'",
+            "env -uHOMEPATH psql -c 'SELECT 1'",
+            "env --unset=HOMEDRIVE psql -c 'SELECT 1'",
+            "env --unset 'HOME' psql -c 'SELECT 1'",
+            "env -u PSQLRC psql -c 'SELECT 1'",
+            "env -u \"$NAME\" psql -c 'SELECT 1'",
+            "env -u H* psql -c 'SELECT 1'",
+            "env -f environment.txt psql -c 'SELECT 1'",
+            "env --file=environment.txt psql -c 'SELECT 1'",
+            "exec -c psql -c 'SELECT 1'",
+            "exec -lc -a label psql -c 'SELECT 1'",
+            "mise exec -- psql -c 'SELECT 1'",
+        ] {
+            assert!(wrapper_changes_filesystem_context(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn wrapper_filesystem_context_respects_option_operands_and_command_boundaries() {
+        for command in [
+            "psql -X -c 'SELECT 1'",
+            "printf '%s' 'env -C /elsewhere HOME=/elsewhere sudo'",
+            "command psql -X -c 'SELECT 1'",
+            "nice -n 5 psql -X -c 'SELECT 1'",
+            "env LABEL=value psql -X -f safe.sql",
+            "env LABEL='HOME=/elsewhere' psql -X -f safe.sql",
+            "env '$HOME'=value psql -X -f safe.sql",
+            "env PSQLRC=safe.psql psql -c 'SELECT 1'",
+            "PSQLRC=safe.psql psql -c 'SELECT 1'",
+            "env -u LABEL psql -X -f safe.sql",
+            "env -u -C psql -X -f safe.sql",
+            "env -u--chdir psql -X -f safe.sql",
+            "env --unset=-C psql -X -f safe.sql",
+            "env -a -C psql -X -f safe.sql",
+            "env --argv0 HOME psql -X -f safe.sql",
+            "env --ignore-signal -C psql -X -f safe.sql",
+            "env -u '$HOME' psql -X -f safe.sql",
+            "env -- psql -X -c '--chdir=/elsewhere'",
+            "env -- -C /elsewhere psql -X -f safe.sql",
+            "env LABEL=value psql -X -c 'HOME=/elsewhere'",
+            "exec -l psql -X -c 'SELECT 1'",
+            "exec -a -c psql -X -c 'SELECT 1'",
+            "exec -- psql -X -c 'SELECT 1'",
+            "mise list --current",
+        ] {
+            assert!(!wrapper_changes_filesystem_context(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn wrapper_filesystem_context_bounds_split_string_analysis_without_new_normalization() {
+        for command in [
+            "env -S '-C /elsewhere psql -X -f safe.sql'",
+            "env --split-string='HOME=/elsewhere psql -c SELECT'",
+            "env -S '-u LABEL env -C /elsewhere psql -X -f safe.sql'",
+            "env -S 'exec -c psql -c SELECT'",
+            "env -S '--unknown-option psql -X -f safe.sql'",
+        ] {
+            assert!(wrapper_changes_filesystem_context(command), "{command}");
+        }
+        for command in [
+            "env -S 'psql -X -f safe.sql'",
+            "env -S '-u LABEL psql -X -f safe.sql'",
+            "env -S '-a -C psql -X -f safe.sql'",
+            "env -S '-- psql -X -c --chdir=/elsewhere'",
+        ] {
+            assert!(!wrapper_changes_filesystem_context(command), "{command}");
+        }
+        assert_eq!(
+            strip_wrapper_prefixes("env -S '-C /elsewhere psql -X -f safe.sql'").normalized,
+            "-C /elsewhere psql -X -f safe.sql",
+            "context observation must not add a new normalization rule"
+        );
+        let beyond_wrapper_limit = format!("{}psql -X -f safe.sql", "command ".repeat(40));
+        assert!(wrapper_changes_filesystem_context(&beyond_wrapper_limit));
     }
 
     #[test]

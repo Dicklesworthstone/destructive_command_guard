@@ -20,6 +20,25 @@ impl Fixture {
         Self { dir }
     }
 
+    fn with_shadowed_inputs() -> Self {
+        let fixture = Self::new();
+        std::fs::create_dir(fixture.dir.path().join("other")).expect("other working directory");
+        for (name, local, other) in [
+            (
+                "migration.sql",
+                "SELECT 1;\n",
+                "DROP TABLE important_data;\n",
+            ),
+            ("program.sed", "s/x/y/\n", "e rm -rf /\n"),
+        ] {
+            std::fs::write(fixture.dir.path().join(name), local).expect("local benign input");
+            std::fs::write(fixture.dir.path().join("other").join(name), other)
+                .expect("same-named input in other directory");
+        }
+        std::fs::write(fixture.dir.path().join("input.txt"), "x\n").expect("sed input");
+        fixture
+    }
+
     fn judge(&self, command: &str) -> (String, String, String) {
         let home = self.dir.path().join("home");
         let payload = serde_json::json!({
@@ -684,4 +703,303 @@ fn remote_parallel_payloads_use_the_consumers_filesystem() {
     ] {
         fixture.denied(&command, "database.postgresql:stdin-unverified");
     }
+}
+
+#[test]
+fn changed_cwd_database_file_sources_do_not_borrow_local_files() {
+    let fixture = Fixture::with_shadowed_inputs();
+    fixture.allowed("psql -X -f migration.sql");
+    fixture.denied(
+        "psql -X -f other/migration.sql",
+        "database.postgresql:drop-table",
+    );
+    for wrapper in [
+        "env -C other",
+        "env -Cother",
+        "env -iCother",
+        "env --chdir other",
+        "env --chdir=other",
+        "env -u UNUSED -C other",
+        "sudo -D other",
+        "sudo -Dother",
+        "sudo -nDother",
+        "sudo -u other",
+    ] {
+        fixture.denied(
+            &format!("{wrapper} psql -X -f migration.sql"),
+            "database.postgresql:stdin-unverified",
+        );
+    }
+}
+
+#[test]
+fn changed_cwd_file_producers_do_not_borrow_local_sql() {
+    let fixture = Fixture::with_shadowed_inputs();
+    fixture.allowed("cat migration.sql | psql -X");
+    for producer in [
+        "env -C other cat migration.sql",
+        "env --chdir=other cat migration.sql",
+        "env -iCother cat migration.sql",
+        "sudo -D other cat migration.sql",
+    ] {
+        fixture.denied(
+            &format!("{producer} | psql -X"),
+            "database.postgresql:stdin-unverified",
+        );
+    }
+}
+
+#[test]
+fn wrapped_consumers_keep_caller_owned_argument_substitutions() {
+    let fixture = Fixture::with_shadowed_inputs();
+    // Argument substitutions run in the caller's shell, before env changes
+    // the client's directory. A wrapper inside the substitution changes
+    // the producer's own file context instead.
+    for consumer in ["env -C other psql -X", "sudo -D other psql -X"] {
+        fixture.allowed(&format!("{consumer} -c \"$(cat migration.sql)\""));
+        fixture.denied(
+            &format!("{consumer} -c \"$(cat other/migration.sql)\""),
+            "database.postgresql:drop-table",
+        );
+        fixture.denied(
+            &format!("{consumer} -c \"$(env -C other cat migration.sql)\""),
+            "database.postgresql:stdin-unverified",
+        );
+        fixture.allowed(&format!("{consumer} -c 'SELECT 1;'"));
+        fixture.denied(
+            &format!("{consumer} -c 'DROP TABLE important_data;'"),
+            "database.postgresql:drop-table",
+        );
+    }
+    fixture.denied(
+        "psql -X -c \"$(env -C other cat migration.sql)\"",
+        "database.postgresql:stdin-unverified",
+    );
+}
+
+#[test]
+fn changed_context_file_protection_is_shared_by_database_clients() {
+    let fixture = Fixture::with_shadowed_inputs();
+    std::fs::write(
+        fixture.dir.path().join("config.toml"),
+        "[history]\nenabled = false\n[packs]\nenabled = [\"core.filesystem\", \
+         \"core.git\", \"database.mysql\", \"database.mongodb\", \"database.sqlite\", \
+         \"database.redis\", \"database.snowflake\"]\n",
+    )
+    .expect("isolated multi-client configuration");
+    for (pack, name, safe, dangerous, command, rule) in [
+        (
+            "database.mysql",
+            "query.mysql",
+            "SELECT 1;\n",
+            "DROP TABLE important_data;\n",
+            "mysql --no-defaults app -e 'source query.mysql'",
+            "drop-table",
+        ),
+        (
+            "database.mongodb",
+            "query.js",
+            "db.users.find({});\n",
+            "db.users.drop();\n",
+            "mongosh --norc --file query.js",
+            "drop-collection",
+        ),
+        (
+            "database.sqlite",
+            "query.sqlite",
+            "SELECT 1;\n",
+            "DROP TABLE important_data;\n",
+            "sqlite3 -init query.sqlite app.db 'SELECT 1;'",
+            "drop-table",
+        ),
+        (
+            "database.redis",
+            "query.lua",
+            "return redis.call('GET', 'account:1')\n",
+            "return redis.call('FLUSHALL')\n",
+            "redis-cli --eval query.lua",
+            "flushall",
+        ),
+        (
+            "database.snowflake",
+            "query.snow",
+            "SELECT 1;\n",
+            "DROP TABLE important_data;\n",
+            "snow sql -f query.snow",
+            "drop-table",
+        ),
+    ] {
+        std::fs::write(fixture.dir.path().join(name), safe).expect("local client script");
+        std::fs::write(fixture.dir.path().join("other").join(name), dangerous)
+            .expect("same-named client script in other directory");
+        fixture.allowed(command);
+        fixture.denied(
+            &command.replace(name, &format!("other/{name}")),
+            &format!("{pack}:{rule}"),
+        );
+        for wrapper in ["env -C other", "sudo -D other"] {
+            fixture.denied(
+                &format!("{wrapper} {command}"),
+                &format!("{pack}:stdin-unverified"),
+            );
+        }
+    }
+}
+
+#[test]
+fn changed_context_consumers_preserve_local_outer_input_redirects() {
+    let fixture = Fixture::with_shadowed_inputs();
+    // The caller's shell opens these files before env/sudo changes the
+    // consumer's context. Their bytes are still legitimate local evidence.
+    for consumer in [
+        "env -C other psql -X",
+        "env --chdir=other psql -X",
+        "sudo -D other psql -X",
+        "sudo -u other psql -X",
+    ] {
+        fixture.allowed(&format!("{consumer} < migration.sql"));
+        fixture.denied(
+            &format!("{consumer} < other/migration.sql"),
+            "database.postgresql:drop-table",
+        );
+        fixture.allowed(&format!("printf 'SELECT 1;\\n' | {consumer}"));
+    }
+}
+
+#[test]
+fn changed_context_sql_includes_cannot_reuse_local_root_input_proof() {
+    let fixture = Fixture::with_shadowed_inputs();
+    for include in [r"\i migration.sql", r"\ir migration.sql"] {
+        std::fs::write(
+            fixture.dir.path().join("include.sql"),
+            format!("{include}\n"),
+        )
+        .expect("local include source");
+        fixture.allowed("psql -X < include.sql");
+        for consumer in ["env -C other psql -X", "sudo -D other psql -X"] {
+            // The outer input is local; an include inside it is opened by
+            // psql in its changed context, and must not inherit that proof.
+            fixture.denied(
+                &format!("{consumer} < include.sql"),
+                "database.postgresql:stdin-unverified",
+            );
+            fixture.denied(
+                &format!(
+                    "printf '%s\\n' {} | {consumer}",
+                    shell_words::quote(include)
+                ),
+                "database.postgresql:stdin-unverified",
+            );
+        }
+    }
+}
+
+#[test]
+fn identical_sql_inputs_keep_their_consumers_context_when_deduplicated() {
+    let fixture = Fixture::with_shadowed_inputs();
+    let producer = "printf '%s\\n' '\\i migration.sql'";
+    fixture.allowed(&format!("{producer} | psql -X"));
+    for command in [
+        format!("{producer} | psql -X; {producer} | env -C other psql -X"),
+        format!("{producer} | env -C other psql -X; {producer} | psql -X"),
+    ] {
+        fixture.denied(&command, "database.postgresql:stdin-unverified");
+    }
+}
+
+#[test]
+fn changed_user_database_startup_files_need_the_consumers_context() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.dir.path().join("home/.psqlrc"), "SELECT 1;\n")
+        .expect("benign caller startup file");
+    fixture.allowed("psql -c 'SELECT 1'");
+    for wrapper in ["sudo", "sudo -u other", "sudo -H"] {
+        fixture.denied(
+            &format!("{wrapper} psql -c 'SELECT 1'"),
+            "database.postgresql:stdin-unverified",
+        );
+        fixture.allowed(&format!("{wrapper} psql -X -c 'SELECT 1'"));
+        fixture.allowed(&format!("{wrapper} psql --no-psqlrc -c 'SELECT 1'"));
+    }
+}
+
+#[test]
+fn changed_cwd_sed_program_files_do_not_borrow_local_scripts() {
+    let fixture = Fixture::with_shadowed_inputs();
+    fixture.allowed("sed -f program.sed input.txt");
+    fixture.denied(
+        "sed -f other/program.sed input.txt",
+        "core.filesystem:rm-rf-root-home",
+    );
+    for wrapper in [
+        "env -C other",
+        "env --chdir=other",
+        "env -iCother",
+        "sudo -D other",
+    ] {
+        fixture.denied(
+            &format!("{wrapper} sed -f program.sed input.txt"),
+            "core.filesystem:sed-exec-unverified",
+        );
+    }
+}
+
+#[test]
+fn sed_shell_escapes_inherit_the_sed_consumers_context() {
+    let fixture = Fixture::with_shadowed_inputs();
+    fixture.allowed("sed 'e psql -X -f migration.sql' input.txt");
+    for wrapper in ["env -C other", "sudo -D other"] {
+        fixture.denied(
+            &format!("{wrapper} sed 'e psql -X -f migration.sql' input.txt"),
+            "database.postgresql:stdin-unverified",
+        );
+        fixture.allowed(&format!("{wrapper} sed 'e echo safe' input.txt"));
+        fixture.allowed(&format!(
+            "{wrapper} sed --sandbox 'e psql -X -f migration.sql' input.txt"
+        ));
+    }
+}
+
+#[test]
+fn nested_shell_file_consumers_inherit_changed_wrapper_context() {
+    let fixture = Fixture::with_shadowed_inputs();
+    for wrapper in ["env -C other", "sudo -D other"] {
+        fixture.denied(
+            &format!("{wrapper} sh -c 'psql -X -f migration.sql'"),
+            "database.postgresql:stdin-unverified",
+        );
+        fixture.denied(
+            &format!("{wrapper} sh -c 'sed -f program.sed input.txt'"),
+            "core.filesystem:sed-exec-unverified",
+        );
+        // These quotes defer the substitution to the child shell, which
+        // opens the file only after its wrapper has changed the directory.
+        fixture.denied(
+            &format!("{wrapper} sh -c 'psql -X -c \"$(cat migration.sql)\"'"),
+            "database.postgresql:stdin-unverified",
+        );
+    }
+}
+
+#[test]
+fn ordinary_wrappers_keep_local_file_evidence() {
+    let fixture = Fixture::with_shadowed_inputs();
+    for wrapper in ["command", "env MODE=test", "env -u UNUSED", "env --"] {
+        fixture.allowed(&format!("{wrapper} psql -X -f migration.sql"));
+        fixture.allowed(&format!("{wrapper} sed -f program.sed input.txt"));
+    }
+    // Keep the existing compound-command guard for client-owned files. A
+    // preceding local redirect and a later shell's local home proof have
+    // independent owners without requiring that guard to be weakened.
+    fixture.allowed("psql -X < migration.sql; env -C other true");
+    fixture.allowed("env -C other true; psql -X -c 'SELECT 1;'");
+    fixture.allowed("sudo -D other true; sh -c 'echo x > ~/new-note'");
+    assert_eq!(
+        std::fs::read_to_string(fixture.dir.path().join("migration.sql")).expect("local SQL"),
+        "SELECT 1;\n",
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.dir.path().join("other/migration.sql")).expect("other SQL"),
+        "DROP TABLE important_data;\n",
+    );
 }
