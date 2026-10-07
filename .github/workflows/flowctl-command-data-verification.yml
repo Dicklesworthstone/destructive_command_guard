@@ -30,6 +30,7 @@ jobs:
       RCH_ENABLED: '0'
       RUST_BACKTRACE: '1'
       PATCH_BLOB: f1650462660a9ed1981a50b9416a72f554782584
+      PROVENANCE_PATCH_BLOB: ac040c397880978731cce0f20027d2cc0a8caab0
     defaults:
       run:
         shell: bash
@@ -71,6 +72,11 @@ jobs:
           test "$(git hash-object "$RUNNER_TEMP/flowctl-538.patch")" = "$PATCH_BLOB"
           cp "$RUNNER_TEMP/flowctl-538.patch" target/flowctl-538/reviewed.patch
           git apply --check "$RUNNER_TEMP/flowctl-538.patch"
+          gh api "repos/$GITHUB_REPOSITORY/git/blobs/$PROVENANCE_PATCH_BLOB" --jq .content \
+            | python3 -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' \
+            > "$RUNNER_TEMP/flowctl-538-provenance.patch"
+          test "$(git hash-object "$RUNNER_TEMP/flowctl-538-provenance.patch")" = "$PROVENANCE_PATCH_BLOB"
+          cp "$RUNNER_TEMP/flowctl-538-provenance.patch" target/flowctl-538/provenance.patch
 
       - name: Reproduce both reported failures before the implementation change
         run: |
@@ -92,6 +98,8 @@ jobs:
           set -euo pipefail
           git apply --check --exclude=tests/repro_538_flowctl_command_data.rs "$RUNNER_TEMP/flowctl-538.patch"
           git apply --exclude=tests/repro_538_flowctl_command_data.rs "$RUNNER_TEMP/flowctl-538.patch"
+          git apply --check "$RUNNER_TEMP/flowctl-538-provenance.patch"
+          git apply "$RUNNER_TEMP/flowctl-538-provenance.patch"
           rustfmt --edition 2024 --config skip_children=true \
             src/context.rs src/evaluator.rs tests/repro_538_flowctl_command_data.rs
 
@@ -156,6 +164,7 @@ jobs:
               'base_commit': parent,
               'base_tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(),
               'patch_blob': os.environ['PATCH_BLOB'],
+              'provenance_patch_blob': os.environ['PROVENANCE_PATCH_BLOB'],
               'files': [],
           }
           for path in paths:
@@ -173,7 +182,8 @@ jobs:
               'Share a bounded gate check/receipt data contract between the sanitizer and '
               'launcher classifier. Recognize documented quoted scalar spellings, not bare '
               'executable expansions or array-produced arguments. Keep substitutions, '
-              'redirections, extra flags and unknown executables conservative. Reuse the '
+              'redirections, extra flags and unknown executables conservative, including '
+              'the substitution projection\'s dynamic placeholders. Reuse the '
               'existing wrapper grammar and retain unknown attached-code flag denials.\n\n'
               'Validated paired before/after reproductions, real-binary regression cases, '
               'existing context and launcher tests, argv-spawn regressions, all-target '
