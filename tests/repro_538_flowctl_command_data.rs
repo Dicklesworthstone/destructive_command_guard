@@ -9,29 +9,47 @@ fn isolated_dcg(temp: &tempfile::TempDir) -> Command {
     let config = temp.path().join("config.toml");
     std::fs::write(&config, "[history]\nenabled = false\n").expect("isolated config");
     let mut command = Command::new(env!("CARGO_BIN_EXE_dcg"));
-    command.env_clear().env("HOME", &home).env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join("config")).env("DCG_CONFIG", &config)
-        .env("DCG_ALLOWLIST_SYSTEM_PATH", "").env("DCG_SELF_HEAL_HOOK", "0")
-        .env("DCG_HOOK_TIMEOUT_MS", "5000").current_dir(temp.path());
+    command
+        .env_clear()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("DCG_CONFIG", &config)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_SELF_HEAL_HOOK", "0")
+        .env("DCG_HOOK_TIMEOUT_MS", "5000")
+        .current_dir(temp.path());
     command
 }
 
 fn assert_decision(command: &str, allowed: bool, expected_rule: Option<&str>) {
     let temp = tempfile::tempdir().expect("tempdir");
-    let cli = isolated_dcg(&temp).args(["test", command]).stdin(Stdio::null())
-        .output().expect("dcg test");
+    let cli = isolated_dcg(&temp)
+        .args(["test", command])
+        .stdin(Stdio::null())
+        .output()
+        .expect("dcg test");
     let stdout = String::from_utf8_lossy(&cli.stdout);
     let stderr = String::from_utf8_lossy(&cli.stderr);
-    let result = stdout.lines().chain(stderr.lines())
-        .find(|line| line.trim_start().starts_with("Result:")).map(str::trim).unwrap_or_default();
+    let result = stdout
+        .lines()
+        .chain(stderr.lines())
+        .find(|line| line.trim_start().starts_with("Result:"))
+        .map(str::trim)
+        .unwrap_or_default();
     if allowed {
         assert_eq!(result, "Result: ALLOWED", "{command}: {stdout}\n{stderr}");
     } else {
-        assert!(result.starts_with("Result: BLOCKED") || result.starts_with("Result: REVIEW REQUIRED"),
-            "{command}: {stdout}\n{stderr}");
+        assert!(
+            result.starts_with("Result: BLOCKED") || result.starts_with("Result: REVIEW REQUIRED"),
+            "{command}: {stdout}\n{stderr}"
+        );
     }
     if let Some(rule) = expected_rule {
-        assert!(stdout.contains(rule) || stderr.contains(rule), "{command}: expected {rule}\n{stdout}\n{stderr}");
+        assert!(
+            stdout.contains(rule) || stderr.contains(rule),
+            "{command}: expected {rule}\n{stdout}\n{stderr}"
+        );
     }
 }
 
@@ -64,7 +82,7 @@ fn unknown_and_dynamic_near_misses_keep_launcher_denial() {
         r#""$FLOWCTL" gate check --command "npm test" -c 'echo example'"#,
         r#""$FLOWCTL" gate check --command "npm test" --eval='console.log(1)'"#,
         r#""$FLOWCTL" gate check --unknown value --command "npm test""#,
-        r#"$FLOWCTL gate check --command 'npm test'"#,
+        r"$FLOWCTL gate check --command 'npm test'",
         r#""$FLOWCTL" gate check --command $ARGS"#,
         r#""$FLOWCTL" gate check --command "$ARGS""#,
         r#""$FLOWCTL" gate check --command *.sh"#,
@@ -76,13 +94,13 @@ fn unknown_and_dynamic_near_misses_keep_launcher_denial() {
 #[test]
 fn genuine_inline_execution_stays_fail_closed() {
     for command in [
-        r#"$tool -c 'echo example'"#,
-        r#"$tool -lc 'echo example'"#,
-        r#"$tool -e 'print(1)'"#,
-        r#"$tool -Command 'Write-Output example'"#,
+        r"$tool -c 'echo example'",
+        r"$tool -lc 'echo example'",
+        r"$tool -e 'print(1)'",
+        r"$tool -Command 'Write-Output example'",
         r#"FLOWCTL=sh; "$FLOWCTL" -c 'git reset --hard'"#,
         r#"FLOWCTL=python3; "$FLOWCTL" -c 'import os; os.system("git reset --hard")'"#,
-        r#"FLOWCTL='bash -c'; $FLOWCTL gate check --command 'npm test'"#,
+        r"FLOWCTL='bash -c'; $FLOWCTL gate check --command 'npm test'",
         r#"sh -c "$SCRIPT""#,
         r#"python3 -c "$SCRIPT""#,
         r#"powershell -Command "$SCRIPT""#,

@@ -14204,6 +14204,7 @@ fn evaluate_command_in_single_dialect_view(
     // Extract the executable payload now so the quick-reject paths below do
     // not discard it before semantic evaluation.
     let sed_shell_sources = collect_sed_shell_sources(command, project_path);
+    let tar_helper_sources = collect_tar_helper_sources(command, shell_dialect);
     let force_core_git = dialect_may_hide_core_git(command, shell_dialect, ordered_packs);
     let force_core_filesystem = ordered_packs
         .iter()
@@ -14258,6 +14259,7 @@ fn evaluate_command_in_single_dialect_view(
         // The hook path already disables the index when external packs exist;
         // this keeps every other entry point honest too (issue #402).
         if sed_shell_sources.is_empty()
+            && tar_helper_sources.is_empty()
             && !crate::packs::get_external_packs()
                 .is_some_and(crate::packs::ExternalPackStore::has_keywordless_pack)
             && !index.has_any_keyword(command)
@@ -14276,6 +14278,7 @@ fn evaluate_command_in_single_dialect_view(
             return EvaluationResult::allowed_by_quick_reject();
         }
     } else if sed_shell_sources.is_empty()
+        && tar_helper_sources.is_empty()
         && !force_core_git
         && !force_core_filesystem
         && !force_cloudflare_workers
@@ -14372,6 +14375,7 @@ fn evaluate_command_in_single_dialect_view(
         pack_aware_quick_reject_with_normalized(dialect_normalized.as_ref(), enabled_keywords)
     };
     if sed_shell_sources.is_empty()
+        && tar_helper_sources.is_empty()
         && quick_reject
         && !force_core_git
         && !force_core_filesystem
@@ -14459,6 +14463,24 @@ fn evaluate_command_in_single_dialect_view(
             .is_some()
     {
         return EvaluationResult::allowed();
+    }
+
+    if let Some(result) = evaluate_tar_helper_sources(
+        &tar_helper_sources,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        allow_once_audit,
+        project_path,
+        deadline,
+        &mut heredoc_allowlist_hit,
+        nested_command_depth,
+        inherited_automated_stdin,
+    ) {
+        return result;
     }
 
     if let Some(result) = evaluate_sed_shell_sources(
@@ -18068,6 +18090,1218 @@ fn decode_backslash_escapes(value: &str) -> Option<String> {
         index += 1;
     }
     Some(output)
+}
+
+const TAR_EXEC_UNVERIFIED_RULE: &str = "tar-exec-unverified";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TarHelperSource {
+    Command {
+        command: String,
+        automated_stdin: bool,
+        nonlocal_filesystem: bool,
+        unverified: bool,
+    },
+    Unverified(&'static str),
+    AnalysisLimit(&'static str),
+}
+
+#[derive(Default)]
+struct TarHelperOptions {
+    mode: Option<char>,
+    to_stdout: bool,
+    force_local: bool,
+    terminal: bool,
+    uncertain: bool,
+    auto_compress: bool,
+    writes_local_files: bool,
+    checkpoints: Vec<String>,
+    to_commands: Vec<String>,
+    compressors: Vec<String>,
+    info_scripts: Vec<String>,
+    rmt_commands: Vec<String>,
+    rsh_command: Option<String>,
+    archives: Vec<String>,
+}
+
+// GNU tar 1.35's tar.c/names.c option tables. Keeping operand arity here is
+// essential: an archive, exclude pattern, or option value resembling a helper
+// option is data. Optional operands are accepted only after '='. Exact names
+// win over unique prefixes, just as GNU argp does.
+fn tar_long_option(name: &str) -> Option<(&'static str, bool)> {
+    const REQUIRED: &[&str] = &[
+        "hole-detection",
+        "sparse-version",
+        "listed-incremental",
+        "level",
+        "to-command",
+        "owner",
+        "group",
+        "owner-map",
+        "group-map",
+        "mtime",
+        "mode",
+        "sort",
+        "xattrs-include",
+        "xattrs-exclude",
+        "file",
+        "rmt-command",
+        "rsh-command",
+        "tape-length",
+        "info-script",
+        "new-volume-script",
+        "volno-file",
+        "blocking-factor",
+        "record-size",
+        "format",
+        "pax-option",
+        "label",
+        "use-compress-program",
+        "starting-file",
+        "newer",
+        "after-date",
+        "newer-mtime",
+        "suffix",
+        "strip-components",
+        "transform",
+        "xform",
+        "checkpoint-action",
+        "index-file",
+        "quoting-style",
+        "quote-chars",
+        "no-quote-chars",
+        "warning",
+        "add-file",
+        "directory",
+        "files-from",
+        "exclude",
+        "exclude-from",
+        "exclude-tag",
+        "exclude-ignore",
+        "exclude-ignore-recursive",
+        "exclude-tag-under",
+        "exclude-tag-all",
+    ];
+    const OTHER: &[&str] = &[
+        "list",
+        "extract",
+        "get",
+        "create",
+        "diff",
+        "compare",
+        "append",
+        "update",
+        "catenate",
+        "concatenate",
+        "delete",
+        "test-label",
+        "sparse",
+        "incremental",
+        "ignore-failed-read",
+        "occurrence",
+        "seek",
+        "no-seek",
+        "no-check-device",
+        "check-device",
+        "verify",
+        "remove-files",
+        "keep-old-files",
+        "skip-old-files",
+        "keep-newer-files",
+        "overwrite",
+        "unlink-first",
+        "recursive-unlink",
+        "no-overwrite-dir",
+        "overwrite-dir",
+        "keep-directory-symlink",
+        "one-top-level",
+        "to-stdout",
+        "ignore-command-error",
+        "no-ignore-command-error",
+        "clamp-mtime",
+        "atime-preserve",
+        "touch",
+        "same-owner",
+        "no-same-owner",
+        "numeric-owner",
+        "preserve-permissions",
+        "same-permissions",
+        "no-same-permissions",
+        "preserve-order",
+        "same-order",
+        "delay-directory-restore",
+        "no-delay-directory-restore",
+        "xattrs",
+        "no-xattrs",
+        "selinux",
+        "no-selinux",
+        "acls",
+        "no-acls",
+        "force-local",
+        "multi-volume",
+        "ignore-zeros",
+        "read-full-records",
+        "old-archive",
+        "portability",
+        "posix",
+        "auto-compress",
+        "no-auto-compress",
+        "bzip2",
+        "gzip",
+        "gunzip",
+        "ungzip",
+        "compress",
+        "uncompress",
+        "lzip",
+        "lzma",
+        "lzop",
+        "xz",
+        "zstd",
+        "one-file-system",
+        "absolute-names",
+        "dereference",
+        "hard-dereference",
+        "backup",
+        "checkpoint",
+        "check-links",
+        "totals",
+        "utc",
+        "full-time",
+        "block-number",
+        "show-defaults",
+        "show-snapshot-field-ranges",
+        "show-omitted-dirs",
+        "show-transformed-names",
+        "show-stored-names",
+        "interactive",
+        "confirmation",
+        "verbose",
+        "restrict",
+        "null",
+        "no-null",
+        "unquote",
+        "no-unquote",
+        "verbatim-files-from",
+        "no-verbatim-files-from",
+        "exclude-caches",
+        "exclude-caches-under",
+        "exclude-caches-all",
+        "exclude-vcs",
+        "exclude-vcs-ignores",
+        "exclude-backups",
+        "recursion",
+        "no-recursion",
+        "anchored",
+        "no-anchored",
+        "ignore-case",
+        "no-ignore-case",
+        "wildcards",
+        "no-wildcards",
+        "wildcards-match-slash",
+        "no-wildcards-match-slash",
+        "help",
+        "usage",
+        "version",
+    ];
+    let candidates = || {
+        REQUIRED
+            .iter()
+            .map(|&option| (option, true))
+            .chain(OTHER.iter().map(|&option| (option, false)))
+    };
+    if let Some(exact) = candidates().find(|(option, _)| *option == name) {
+        return Some(exact);
+    }
+    let mut matching = candidates().filter(|(option, _)| option.starts_with(name));
+    let first = matching.next()?;
+    matching.next().is_none().then_some(first)
+}
+
+impl TarHelperOptions {
+    fn option(&mut self, name: &str, value: Option<&str>) {
+        match name {
+            "create" | "c" => self.mode = Some('c'),
+            "extract" | "get" | "x" => self.mode = Some('x'),
+            "list" | "t" => self.mode = Some('t'),
+            "diff" | "compare" | "d" => self.mode = Some('d'),
+            "append" | "r" | "update" | "u" | "catenate" | "concatenate" | "A" | "delete" => {
+                self.mode = Some('u');
+            }
+            "to-stdout" | "O" => self.to_stdout = true,
+            "force-local" => self.force_local = true,
+            "auto-compress" | "a" => self.auto_compress = true,
+            "no-auto-compress" => self.auto_compress = false,
+            "help" | "usage" | "version" | "show-defaults" | "show-snapshot-field-ranges" | "?" => {
+                self.terminal = true;
+            }
+            "checkpoint-action" => {
+                if let Some(value) = value {
+                    self.checkpoints.push(value.to_string());
+                }
+            }
+            "to-command" => {
+                if let Some(value) = value {
+                    self.to_commands.push(value.to_string());
+                }
+            }
+            "use-compress-program" | "I" => {
+                if let Some(value) = value {
+                    self.compressors.push(value.to_string());
+                }
+            }
+            "info-script" | "new-volume-script" | "F" => {
+                if !self.uncertain {
+                    self.info_scripts.clear();
+                }
+                if let Some(value) = value {
+                    self.info_scripts.push(value.to_string());
+                }
+            }
+            "rmt-command" => {
+                if !self.uncertain {
+                    self.rmt_commands.clear();
+                }
+                if let Some(value) = value {
+                    self.rmt_commands.push(value.to_string());
+                }
+            }
+            "rsh-command" => self.rsh_command = value.map(str::to_string),
+            "index-file" | "volno-file" => {
+                // These outputs can replace inspected code even in list/diff
+                // mode. An unresolved later option cannot clear that effect.
+                self.writes_local_files |= value.is_none_or(|path| path != "/dev/null");
+            }
+            "file" | "f" => {
+                if let Some(value) = value {
+                    self.archives.push(value.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn parsed_option(
+        &mut self,
+        name: &str,
+        value: Option<&str>,
+        command_line: bool,
+        seen_compressor: &mut bool,
+    ) {
+        if matches!(
+            name,
+            "use-compress-program"
+                | "I"
+                | "gzip"
+                | "gunzip"
+                | "ungzip"
+                | "z"
+                | "bzip2"
+                | "j"
+                | "xz"
+                | "J"
+                | "compress"
+                | "uncompress"
+                | "Z"
+                | "lzip"
+                | "lzma"
+                | "lzop"
+                | "zstd"
+        ) {
+            // GNU tar lets a later environment default replace an earlier
+            // one, and the first explicit compressor replaces that default.
+            // Conflicting explicit options are not proof a helper is inactive.
+            if !self.uncertain && (!command_line || !*seen_compressor) {
+                self.compressors.clear();
+            }
+            *seen_compressor = true;
+        }
+        self.option(name, value);
+    }
+
+    fn parse(&mut self, args: &[String], traditional_options: bool, masked: &MaskedCommand) {
+        let dynamic = |value: &str| tar_value_is_dynamic(value, masked);
+        let mut index = 0usize;
+        let mut seen_compressor = false;
+        let mut uncertain_operands = VecDeque::new();
+        while index < args.len() || !uncertain_operands.is_empty() {
+            let replaying_operand = index >= args.len();
+            let position = if replaying_operand {
+                let Some(position) = uncertain_operands.pop_front() else {
+                    break;
+                };
+                position
+            } else {
+                let position = index;
+                index += 1;
+                position
+            };
+            let arg = &args[position];
+            let traditional = traditional_options && position == 0 && !arg.starts_with('-');
+            let mut operand_index = position + 1;
+            if arg == "--" {
+                if !self.uncertain {
+                    break;
+                }
+                continue;
+            }
+            if traditional && dynamic(arg) {
+                // A runtime old-style option word can select any operation.
+                // Internal masking bytes are never real option letters.
+                self.uncertain = true;
+                continue;
+            }
+            if let Some(long) = arg.strip_prefix("--") {
+                let (name, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                let Some((name, required)) = tar_long_option(name) else {
+                    self.uncertain = true;
+                    continue;
+                };
+                let value = if required && attached.is_none() {
+                    let value = args.get(operand_index).map(String::as_str);
+                    if !replaying_operand {
+                        if self.uncertain && value.is_some() {
+                            uncertain_operands.push_back(operand_index);
+                        }
+                        index = operand_index.saturating_add(1);
+                    }
+                    if value.is_none() {
+                        self.uncertain = true;
+                    }
+                    value
+                } else {
+                    attached
+                };
+                self.parsed_option(name, value, traditional_options, &mut seen_compressor);
+            } else if traditional || arg.starts_with('-') && arg != "-" {
+                let flags = if traditional { arg.as_str() } else { &arg[1..] };
+                let mut consumed_operand = false;
+                for (offset, flag) in flags.char_indices() {
+                    if masked
+                        .dynamic_markers
+                        .iter()
+                        .chain(masked.substitutions.iter().map(|(marker, _)| marker))
+                        .any(|marker| flags[offset..].starts_with(marker.as_str()))
+                    {
+                        self.uncertain = true;
+                        break;
+                    }
+                    let mut encoded = [0; 4];
+                    let name = flag.encode_utf8(&mut encoded);
+                    if "bCfFgHIKLNTVX".contains(flag) {
+                        let attached = &flags[offset + flag.len_utf8()..];
+                        let value = if traditional || attached.is_empty() {
+                            let value = args.get(operand_index).map(String::as_str);
+                            if !replaying_operand {
+                                if self.uncertain && value.is_some() {
+                                    uncertain_operands.push_back(operand_index);
+                                }
+                                index = operand_index.saturating_add(1);
+                            }
+                            operand_index = operand_index.saturating_add(1);
+                            if value.is_none() {
+                                self.uncertain = true;
+                            }
+                            value
+                        } else {
+                            Some(attached)
+                        };
+                        self.parsed_option(name, value, traditional_options, &mut seen_compressor);
+                        consumed_operand = true;
+                        if !traditional {
+                            break;
+                        }
+                    } else {
+                        self.parsed_option(name, None, traditional_options, &mut seen_compressor);
+                    }
+                }
+                if dynamic(arg) && (traditional || !consumed_operand) {
+                    self.uncertain = true;
+                }
+            } else if dynamic(arg) {
+                self.uncertain = true;
+            }
+            // GNU tar continues option processing after member operands.
+            // After unresolved argv, an apparent operand may itself be a
+            // helper option. Revisit each skipped word once, without changing
+            // the primary parse's traditional-bundle argument ordering.
+        }
+    }
+}
+
+fn tar_value_is_dynamic(value: &str, masked: &MaskedCommand) -> bool {
+    masked
+        .dynamic_markers
+        .iter()
+        .any(|marker| value.contains(marker))
+        || masked
+            .substitutions
+            .iter()
+            .any(|(marker, _)| value.contains(marker))
+}
+
+// checkpoint.c:copy_string_unquote additionally unquotes matching outer
+// quotes and misc.c:unquote_string escapes before system.c:xexec runs sh -c.
+// Unknown escapes retain their backslash. NUL/non-UTF-8 are not safe evidence.
+fn tar_checkpoint_command(value: &str) -> Option<String> {
+    let mut bytes = value.as_bytes();
+    if bytes.len() >= 2 && matches!(bytes[0], b'\'' | b'"') && bytes.last() == Some(&bytes[0]) {
+        bytes = &bytes[1..bytes.len() - 1];
+    }
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while let Some(&byte) = bytes.get(index) {
+        index += 1;
+        if byte != b'\\' {
+            output.push(byte);
+            continue;
+        }
+        let Some(&escaped) = bytes.get(index) else {
+            output.push(b'\\');
+            break;
+        };
+        index += 1;
+        let decoded = match escaped {
+            b'\\' => b'\\',
+            b'a' => 7,
+            b'b' => 8,
+            b'f' => 12,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'v' => 11,
+            b'?' => 127,
+            b'0'..=b'7' => {
+                let mut octal = u16::from(escaped - b'0');
+                for _ in 0..2 {
+                    let Some(&digit @ b'0'..=b'7') = bytes.get(index) else {
+                        break;
+                    };
+                    octal = octal * 8 + u16::from(digit - b'0');
+                    index += 1;
+                }
+                u8::try_from(octal).ok()?
+            }
+            other => {
+                output.push(b'\\');
+                other
+            }
+        };
+        output.push(decoded);
+    }
+    if output.contains(&0) {
+        return None;
+    }
+    String::from_utf8(output).ok()
+}
+
+fn push_tar_helper(sources: &mut Vec<TarHelperSource>, source: TarHelperSource) {
+    if sources.len() < MAX_EXECUTABLE_TEXT_SINKS {
+        sources.push(source);
+    } else if !matches!(sources.last(), Some(TarHelperSource::AnalysisLimit(_))) {
+        sources.pop();
+        sources.push(TarHelperSource::AnalysisLimit(
+            "too many tar helper analysis sources",
+        ));
+    }
+}
+
+/// Caller-owned redirects open before tar or its callbacks run. Walk actual
+/// redirect nodes so quoted helper text stays data, while enclosing groups
+/// and substitutions cannot hide a write from the local-file evidence check.
+fn tar_callsite_may_write_files(command: &str) -> bool {
+    if !command.contains('>') {
+        return false;
+    }
+    if command.len() as u64 > MAX_INDIRECT_INPUT_BYTES {
+        return true;
+    }
+    let ast = AstGrep::new(command, SupportLang::Bash);
+    if ast_contains_error(ast.root()) {
+        return true;
+    }
+    let mut pending = vec![ast.root()];
+    let mut visited = 0usize;
+    const MAX_TAR_REDIRECT_NODES: usize = 4096;
+    while let Some(node) = pending.pop() {
+        visited += 1;
+        if visited > MAX_TAR_REDIRECT_NODES {
+            return true;
+        }
+        if node.kind().as_ref() == "file_redirect" {
+            let source = node.text();
+            if first_unquoted_output_redirect(source.as_ref(), ShellDialect::Posix).is_some()
+                && !trailing_redirects_are_fd_duplications(source.as_ref())
+            {
+                let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+                let null_only =
+                    unquoted_output_redirect_targets(source.as_ref(), ShellDialect::Posix)
+                        .is_some_and(|targets| {
+                            targets.iter().all(|target| {
+                                decoder
+                                    .decode(target, ShellTokenRole::Syntax)
+                                    .is_some_and(|path| path == "/dev/null")
+                            })
+                        });
+                if !null_only {
+                    return true;
+                }
+            }
+        }
+        pending.extend(node.children());
+    }
+    false
+}
+
+fn collect_tar_helper_sources(command: &str, dialect: ShellDialect) -> Vec<TarHelperSource> {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        || (!command
+            .as_bytes()
+            .windows(3)
+            .any(|word| word.eq_ignore_ascii_case(b"tar"))
+            && !contains_shell_word_obfuscation(command, dialect))
+    {
+        return Vec::new();
+    }
+    let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    let mut sources = Vec::new();
+    let mut caller_writes_files = None;
+    for (start, end) in command_segment_ranges(data_view.as_ref()) {
+        let segment = &data_view[start..end];
+        let Ok(masked) = mask_command_substitutions(segment) else {
+            continue;
+        };
+        // Redirect operands are owned by the caller shell, not tar's option
+        // parser. Keep raw quoting until after dynamic expansions are masked.
+        let tokens = tokenize_for_shell_dialect(&masked.command, ShellDialect::Posix);
+        let argv = crate::heredoc::local_command_argv(&masked.command, &tokens, 0)
+            .and_then(|words| {
+                words
+                    .iter()
+                    .map(|token| token.text(&masked.command))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .map(|words| words.join(" "));
+        let invocation = argv.as_deref().unwrap_or(&masked.command);
+        let stripped = strip_wrapper_prefixes(invocation);
+        let stripped_tokens =
+            tokenize_for_shell_dialect(stripped.normalized.as_ref(), ShellDialect::Posix);
+        let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+        let decoded = stripped_tokens
+            .iter()
+            .filter(|token| token.kind == NormalizeTokenKind::Word)
+            .map(|token| {
+                decoder
+                    .decode(
+                        token.text(stripped.normalized.as_ref())?,
+                        ShellTokenRole::Syntax,
+                    )
+                    .map(Cow::into_owned)
+            })
+            .collect::<Option<Vec<_>>>();
+        let decoded_command = decoded.as_ref().map(|words| posix_command_from_argv(words));
+        let Some((executable, args)) =
+            command_tokens(decoded_command.as_deref().unwrap_or(invocation))
+        else {
+            continue;
+        };
+        if !matches!(executable.as_str(), "tar" | "gtar") {
+            continue;
+        }
+        if segment.len() as u64 > MAX_INDIRECT_INPUT_BYTES {
+            push_tar_helper(
+                &mut sources,
+                TarHelperSource::AnalysisLimit("tar invocation exceeds the byte limit"),
+            );
+            continue;
+        }
+        let mut options = TarHelperOptions {
+            uncertain: decoded.is_none(),
+            ..TarHelperOptions::default()
+        };
+        let mut environment_decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+        let environment_tokens = tokenize_for_shell_dialect(invocation, ShellDialect::Posix);
+        let environment_words = environment_tokens
+            .iter()
+            .filter(|token| token.kind == NormalizeTokenKind::Word)
+            .map(|token| {
+                environment_decoder
+                    .decode(token.text(invocation)?, ShellTokenRole::Syntax)
+                    .map(Cow::into_owned)
+            })
+            .collect::<Option<Vec<_>>>();
+        let environment_command = environment_words
+            .as_ref()
+            .map(|words| posix_command_from_argv(words));
+        let environment_command = environment_command.as_deref().unwrap_or(invocation);
+        let environment_options =
+            env_split_string_assignment(environment_command, "TAR_OPTIONS", &executable).or_else(
+                || {
+                    shell_assignment_value_before_executable(
+                        environment_command,
+                        "TAR_OPTIONS",
+                        &executable,
+                    )
+                },
+            );
+        if let Some(value) = environment_options.filter(|value| !value.is_empty()) {
+            // GNU wordsplit additionally decodes C escapes. This bounded path
+            // accepts its quote/whitespace subset and refuses other decoding;
+            // it never reads the hook process's ambient TAR_OPTIONS.
+            if tar_value_is_dynamic(&value, &masked) || value.contains('\\') {
+                options.uncertain = true;
+            } else if let Ok(defaults) = shell_words::split(&value) {
+                options.parse(&defaults, false, &masked);
+            } else {
+                options.uncertain = true;
+            }
+        }
+        options.parse(&args, true, &masked);
+        if options.terminal && !options.uncertain {
+            continue;
+        }
+        if options.auto_compress && options.mode == Some('c') && !options.compressors.is_empty() {
+            // Suffix-driven compressor selection is outside this bounded
+            // parser. Preserve the visible helper as well as the uncertainty.
+            options.uncertain = true;
+        }
+        if options.uncertain {
+            push_tar_helper(
+                &mut sources,
+                TarHelperSource::Unverified(
+                    "tar options contain unresolved expansion or unsupported option syntax",
+                ),
+            );
+        }
+        // Creation/update can overwrite the archive before a callback reads
+        // it as code; extraction can replace arbitrary callback input files.
+        // Native tar -C is virtual and does not change a helper's process cwd.
+        let nonlocal_filesystem = script_segment_is_nonlocal(segment)
+            || options.uncertain
+            || options.writes_local_files
+            || *caller_writes_files
+                .get_or_insert_with(|| tar_callsite_may_write_files(data_view.as_ref()))
+            || !matches!(options.mode, Some('t' | 'd'));
+        let automated_stdin = source_position_receives_automated_stdin(command, start, dialect);
+        let mut push_command = |value: &str,
+                                archive_stdin: bool,
+                                remote: bool,
+                                checkpoint: bool,
+                                read_compressor: bool| {
+            // Keep the masked literal view: an unresolved value must not hide
+            // a separate destructive command in the same shell helper.
+            let unverified = tar_value_is_dynamic(value, &masked);
+            let source = if checkpoint {
+                tar_checkpoint_command(value)
+            } else if read_compressor {
+                // Reading uses wordsplit + execvp(argv, "-d"), whereas
+                // writing uses sh -c. Never promote argv metacharacters to
+                // shell syntax. Environment/C-escape decoding is unproven.
+                if value.contains(['$', '\\']) {
+                    None
+                } else {
+                    shell_words::split(value)
+                        .ok()
+                        .filter(|words| !words.is_empty())
+                        .map(|mut words| {
+                            words.push("-d".to_string());
+                            posix_command_from_argv(&words)
+                        })
+                }
+            } else {
+                Some(value.to_string())
+            };
+            if let Some(source) = source {
+                push_tar_helper(
+                    &mut sources,
+                    TarHelperSource::Command {
+                        command: source,
+                        automated_stdin: archive_stdin || automated_stdin,
+                        nonlocal_filesystem: remote || nonlocal_filesystem,
+                        unverified,
+                    },
+                );
+            } else {
+                push_tar_helper(
+                    &mut sources,
+                    TarHelperSource::Unverified("tar helper decoding cannot be verified"),
+                );
+            }
+        };
+        for action in &options.checkpoints {
+            if let Some(value) = action.strip_prefix("exec=") {
+                push_command(value, false, false, true, false);
+            } else if tar_value_is_dynamic(action, &masked) {
+                push_command(action, false, false, false, false);
+            }
+        }
+        if (options.uncertain || matches!(options.mode, Some('x') | None))
+            && (options.uncertain || !options.to_stdout)
+        {
+            // Unresolved option ownership may select extraction or consume
+            // a later apparent -O. Preserve visible helper code independently
+            // of a grant for the generic uncertainty finding.
+            for value in &options.to_commands {
+                push_command(value, true, false, false, false);
+            }
+        }
+        for value in &options.compressors {
+            if options.uncertain || options.mode != Some('u') {
+                // Only a proven read operation establishes argv semantics.
+                // Unresolved options may create and use sh -c instead.
+                push_command(
+                    value,
+                    true,
+                    false,
+                    false,
+                    !options.uncertain && matches!(options.mode, Some('x' | 't' | 'd')),
+                );
+            }
+        }
+        for value in &options.info_scripts {
+            push_command(value, false, false, false, false);
+        }
+        if (options.uncertain || !options.force_local)
+            && (options.uncertain
+                || options.archives.is_empty()
+                || options.archives.iter().any(|archive| {
+                    tar_value_is_dynamic(archive, &masked)
+                        || archive
+                            .split_once(':')
+                            .is_some_and(|(host, _)| !host.contains('/'))
+                }))
+        {
+            // Without a verified explicit archive, a default may select a
+            // remote host. Never use ambient hook state to prove inactivity.
+            // rsh/ssh interpret this final operand on the remote shell. The
+            // rsh-command option itself is one executable pathname, never a
+            // shell command. An unknown launcher cannot prove that a visible
+            // rmt payload is harmless, or hide it behind the review finding.
+            let unresolved_launcher = options.rsh_command.as_ref().is_some_and(|program| {
+                tar_value_is_dynamic(program, &masked)
+                    || !options.rmt_commands.is_empty()
+                        && !matches!(program.rsplit('/').next(), Some("rsh" | "ssh"))
+            });
+            for value in &options.rmt_commands {
+                push_command(value, true, true, false, false);
+            }
+            if unresolved_launcher {
+                push_tar_helper(
+                    &mut sources,
+                    TarHelperSource::Unverified("tar remote helper launcher cannot be verified"),
+                );
+            }
+        }
+    }
+    sources
+}
+
+fn tar_helper_unverified_source(
+    command: &str,
+    automated_stdin: bool,
+    ordered_packs: &[String],
+) -> bool {
+    for (start, end) in command_segment_ranges(command) {
+        let segment = &command[start..end];
+        let Ok(masked) = mask_command_substitutions(segment) else {
+            return true;
+        };
+        if command_tokens(&masked.command).is_some_and(|(executable, _)| {
+            masked
+                .dynamic_markers
+                .iter()
+                .chain(masked.substitutions.iter().map(|(marker, _)| marker))
+                .any(|marker| executable.contains(&marker.to_ascii_lowercase()))
+        }) {
+            return true;
+        }
+        if !automated_stdin {
+            continue;
+        }
+        if matches!(
+            pipeline_shell_input_mode(segment),
+            PipelineShellInputMode::ReadsStdin(_)
+                | PipelineShellInputMode::Unverified
+                | PipelineShellInputMode::FixedTemplate(_)
+        ) {
+            return true;
+        }
+        if protected_consumer_pack(segment)
+            .is_some_and(|pack_id| ordered_packs.iter().any(|enabled| enabled == pack_id))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_tar_helper_sources(
+    sources: &[TarHelperSource],
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    nested_command_depth: usize,
+    inherited_automated_stdin: bool,
+) -> Option<EvaluationResult> {
+    let filesystem_enabled = ordered_packs.iter().any(|pack| pack == "core.filesystem");
+    for source in sources {
+        if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
+            return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+        let detail = match source {
+            TarHelperSource::Unverified(detail) => *detail,
+            TarHelperSource::AnalysisLimit(detail) => {
+                return Some(EvaluationResult::denied_by_incomplete_analysis(detail));
+            }
+            TarHelperSource::Command {
+                command,
+                automated_stdin,
+                nonlocal_filesystem,
+                unverified,
+            } => {
+                if nested_command_depth >= MAX_EMBEDDED_SHELL_DEPTH
+                    || command.len() as u64 > MAX_INDIRECT_INPUT_BYTES
+                {
+                    return Some(EvaluationResult::denied_by_incomplete_analysis(
+                        "GNU tar helper exceeds the nested command analysis limit.",
+                    ));
+                } else {
+                    let _filesystem_scope = NonlocalFilesystemScope::enter(*nonlocal_filesystem);
+                    let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+                        command,
+                        enabled_keywords,
+                        ordered_packs,
+                        keyword_index,
+                        compiled_overrides,
+                        allowlists,
+                        heredoc_settings,
+                        allow_once_audit,
+                        project_path,
+                        deadline,
+                        ShellDialect::Posix,
+                        nested_command_depth + 1,
+                        *automated_stdin || inherited_automated_stdin,
+                    );
+                    if nested_result_decides(&result) {
+                        if let Some(info) = result.pattern_info.as_mut() {
+                            info.reason =
+                                format!("GNU tar executes an embedded helper: {}", info.reason);
+                            info.matched_span = None;
+                            info.matched_text_preview = None;
+                        }
+                        return Some(result);
+                    }
+                    record_nested_allowlist_hit(first_allowlist_hit, &mut result);
+                    if !unverified
+                        && !tar_helper_unverified_source(
+                            command,
+                            *automated_stdin || inherited_automated_stdin,
+                            ordered_packs,
+                        )
+                    {
+                        continue;
+                    }
+                    "tar helper selects executable code dynamically or consumes unverified archive/automated input as code"
+                }
+            }
+        };
+        if !filesystem_enabled {
+            continue;
+        }
+        let reason =
+            format!("GNU tar executes a helper that dcg cannot statically verify: {detail}.");
+        let mut result = EvaluationResult::denied_by_pack_pattern(
+            "core.filesystem",
+            TAR_EXEC_UNVERIFIED_RULE,
+            &reason,
+            Some(
+                "Inspect the fully resolved tar helper and any archive data it executes before using an exact-command allow-once review. Prefer literal helper commands; archive bytes are not verified shell or database input.",
+            ),
+            crate::packs::Severity::High,
+            &[],
+        );
+        if let Some(hit) =
+            allowlists.match_rule_at_path("core.filesystem", TAR_EXEC_UNVERIFIED_RULE, project_path)
+        {
+            if first_allowlist_hit.is_none()
+                && let Some(matched) = result.pattern_info.take()
+            {
+                *first_allowlist_hit = Some((matched, hit.layer, hit.entry.reason.clone()));
+            }
+            continue;
+        }
+        return Some(result);
+    }
+    None
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tar_helper_tests {
+    use super::{
+        ShellDialect, TarHelperOptions, TarHelperSource, collect_tar_helper_sources,
+        command_tokens, mask_command_substitutions, tar_callsite_may_write_files,
+        tar_checkpoint_command, tar_long_option,
+    };
+
+    fn parse_into(options: &mut TarHelperOptions, args: &[&str], command_line: bool) {
+        let masked = mask_command_substitutions("tar").expect("literal executable");
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        options.parse(&args, command_line, &masked);
+    }
+
+    fn parse_command(options: &mut TarHelperOptions, command: &str) {
+        let masked = mask_command_substitutions(command).expect("valid shell command");
+        let (_, args) = command_tokens(&masked.command).expect("tar command");
+        options.parse(&args, true, &masked);
+    }
+
+    #[test]
+    fn checkpoint_decodes_tar_quotes_c_escapes_and_octal_bytes() {
+        for (input, expected) in [
+            (r"\147it reset\040--hard", "git reset --hard"),
+            (r#""git reset --hard""#, "git reset --hard"),
+            ("'git reset --hard'", "git reset --hard"),
+            (r"\a\b\f\n\r\t\v\?", "\x07\x08\x0c\n\r\t\x0b\x7f"),
+            (r"\0407", " 7"),
+            (r"\303\251", "\u{00e9}"),
+            (r"echo \\ \q", r"echo \ \q"),
+            ("echo \\", "echo \\"),
+        ] {
+            assert_eq!(
+                tar_checkpoint_command(input).as_deref(),
+                Some(expected),
+                "checkpoint decoding of {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_refuses_nul_non_utf8_and_out_of_range_octal() {
+        for input in ["\0", r"echo \0", r"echo \000", r"\377", r"\400", r"\777"] {
+            assert_eq!(tar_checkpoint_command(input), None, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn tar_options_preserve_value_ownership_and_traditional_bundles() {
+        let mut options = TarHelperOptions::default();
+        parse_into(
+            &mut options,
+            &[
+                "-cf",
+                "--checkpoint-action=exec=git reset --hard",
+                "--exclude",
+                "--to-command=git reset --hard",
+                "--",
+                "--checkpoint-action=exec=git reset --hard",
+            ],
+            true,
+        );
+        assert_eq!(
+            options.archives,
+            ["--checkpoint-action=exec=git reset --hard"]
+        );
+        assert!(options.checkpoints.is_empty());
+        assert!(options.to_commands.is_empty());
+        assert!(!options.uncertain);
+
+        let mut traditional = TarHelperOptions::default();
+        parse_into(&mut traditional, &["cfI", "archive", "gzip"], true);
+        assert_eq!(traditional.archives, ["archive"]);
+        assert_eq!(traditional.compressors, ["gzip"]);
+
+        let mut dashed = TarHelperOptions::default();
+        parse_into(&mut dashed, &["-cfI", "archive", "gzip"], true);
+        assert_eq!(dashed.archives, ["I"]);
+        assert!(dashed.compressors.is_empty());
+
+        let mut optional = TarHelperOptions::default();
+        parse_into(
+            &mut optional,
+            &[
+                "-cf",
+                "out",
+                "--checkpoint",
+                "--checkpoint-action=exec=true",
+            ],
+            true,
+        );
+        assert_eq!(optional.checkpoints, ["exec=true"]);
+    }
+
+    #[test]
+    fn tar_long_options_require_an_exact_or_unique_name() {
+        assert_eq!(tar_long_option("checkpoint"), Some(("checkpoint", false)));
+        assert_eq!(
+            tar_long_option("checkpoint-act"),
+            Some(("checkpoint-action", true))
+        );
+        assert_eq!(tar_long_option("to-com"), Some(("to-command", true)));
+        assert_eq!(
+            tar_long_option("use-compress-prog"),
+            Some(("use-compress-program", true))
+        );
+        for ambiguous in ["", "check", "to-", "not-a-tar-option"] {
+            assert_eq!(tar_long_option(ambiguous), None, "{ambiguous:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_compressors_replace_environment_defaults() {
+        for (command_args, expected) in [
+            (&["-czf", "out", "file"][..], None),
+            (&["-cf", "out", "-I", "gzip", "file"][..], Some("gzip")),
+        ] {
+            let mut options = TarHelperOptions::default();
+            parse_into(
+                &mut options,
+                &["--use-compress-program=git reset --hard"],
+                false,
+            );
+            parse_into(&mut options, command_args, true);
+            match expected {
+                Some(program) => assert_eq!(options.compressors, [program]),
+                None => assert!(options.compressors.is_empty()),
+            }
+        }
+
+        let mut defaults = TarHelperOptions::default();
+        parse_into(
+            &mut defaults,
+            &[
+                "--use-compress-program=first",
+                "--use-compress-program=second",
+            ],
+            false,
+        );
+        assert_eq!(defaults.compressors, ["second"]);
+    }
+
+    #[test]
+    fn uncertain_overrides_preserve_earlier_helper_candidates() {
+        let mut options = TarHelperOptions::default();
+        parse_into(
+            &mut options,
+            &[
+                "--use-compress-program=git reset --hard",
+                "--info-script=git reset --hard",
+                "--rmt-command=git reset --hard",
+            ],
+            false,
+        );
+        parse_command(
+            &mut options,
+            r#"tar -c "$PREFIX" --gzip --info-script=true --rmt-command=true"#,
+        );
+        assert!(options.uncertain);
+        assert_eq!(options.compressors, ["git reset --hard"]);
+        assert_eq!(options.info_scripts, ["git reset --hard", "true"]);
+        assert_eq!(options.rmt_commands, ["git reset --hard", "true"]);
+
+        let mut literal = TarHelperOptions::default();
+        parse_into(
+            &mut literal,
+            &[
+                "--info-script=git reset --hard",
+                "--rmt-command=git reset --hard",
+                "--info-script=true",
+                "--rmt-command=true",
+            ],
+            true,
+        );
+        assert_eq!(literal.info_scripts, ["true"]);
+        assert_eq!(literal.rmt_commands, ["true"]);
+        assert!(!literal.uncertain);
+    }
+
+    #[test]
+    fn uncertain_option_ownership_does_not_hide_later_helpers() {
+        for command in [
+            r#"tar -c "$PREFIX" -- --checkpoint-action='exec=git reset --hard'"#,
+            r#"tar -c "$PREFIX" --exclude --checkpoint-action='exec=git reset --hard'"#,
+            r#"tar -c "$PREFIX" --exclude --checkpoint-action 'exec=git reset --hard'"#,
+            r#"tar -c "$PREFIX" -X --checkpoint-action='exec=git reset --hard'"#,
+        ] {
+            let mut options = TarHelperOptions::default();
+            parse_command(&mut options, command);
+            assert!(options.uncertain, "{command}");
+            assert_eq!(options.checkpoints, ["exec=git reset --hard"], "{command}");
+        }
+
+        // Unresolved environment options must not disturb the known argument
+        // order of traditional short-option bundles in the explicit argv.
+        let mut traditional = TarHelperOptions {
+            uncertain: true,
+            ..TarHelperOptions::default()
+        };
+        parse_into(&mut traditional, &["cfI", "archive", "gzip"], true);
+        assert_eq!(traditional.archives, ["archive"]);
+        assert_eq!(traditional.compressors, ["gzip"]);
+    }
+
+    #[test]
+    fn tar_callsite_writes_require_actual_file_redirects() {
+        for command in [
+            "tar -tf archive > safe.sql",
+            "{ tar -tf archive; } > safe.sql",
+            "tar -tf archive $(printf SELECT > safe.sql)",
+            "tar -tf archive <> safe.sql",
+        ] {
+            assert!(tar_callsite_may_write_files(command), "{command}");
+        }
+        for command in [
+            "tar -tf archive < safe.sql",
+            "tar -tf archive 2>&1",
+            "tar -tf archive >/dev/null",
+            "tar -tf archive > '/dev/null' 2>&1",
+            r#"tar -tf archive --checkpoint-action='exec=printf "> safe.sql"'"#,
+        ] {
+            assert!(!tar_callsite_may_write_files(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn read_mode_output_files_invalidate_helper_file_evidence() {
+        for (command, expected_nonlocal) in [
+            (
+                "tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql'",
+                false,
+            ),
+            (
+                "tar -tf archive --index-file=safe.sql --checkpoint-action='exec=psql -X -f safe.sql'",
+                true,
+            ),
+            (
+                "tar -tf archive --volno-file=safe.sql --checkpoint-action='exec=psql -X -f safe.sql'",
+                true,
+            ),
+            (
+                "tar -tf archive --index-file=/dev/null --checkpoint-action='exec=psql -X -f safe.sql'",
+                false,
+            ),
+            (
+                "tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql' > safe.sql",
+                true,
+            ),
+        ] {
+            let sources = collect_tar_helper_sources(command, ShellDialect::Posix);
+            assert!(sources.iter().any(|source| matches!(
+                source,
+                TarHelperSource::Command { command, nonlocal_filesystem, .. }
+                    if command == "psql -X -f safe.sql" && *nonlocal_filesystem == expected_nonlocal
+            )), "{command}");
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -4837,6 +4837,15 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             High,
             "Use a literal sed replacement or inspect the fully rendered shell command before allowing execution. Backreferences, '&', and an empty `e` command depend on runtime input."
         ),
+        // Emitted by the bounded tar helper semantic pass, never by a raw
+        // command regex. Keep metadata available for diagnostics and review.
+        destructive_pattern!(
+            "tar-exec-unverified",
+            r"(?!)",
+            "GNU tar executes a helper whose command or executable input dcg cannot statically verify.",
+            High,
+            "Inspect the fully resolved tar helper and any archive data it executes before using an exact-command allow-once review. Prefer literal helper commands; archive bytes are not verified shell or database input."
+        ),
         // ----- cross-segment sensitive propagation before rm fallbacks -----
         //
         // These patterns must run before the general rm rules below. Otherwise

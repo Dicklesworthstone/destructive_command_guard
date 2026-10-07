@@ -108,6 +108,14 @@ or add an allowlist rule. The agent must not redeem the code or change policy
 on its own. Approval of an exact command does not certify the contents of any
 referenced script as safe.
 
+This scope also applies when the blocked command invokes an embedded helper,
+such as a GNU tar checkpoint action, extraction command, compressor, or remote
+archive helper. Review the complete outer invocation and any input the helper
+will execute. Redeeming its code does not authorize the helper by itself, a
+different archive, or another spelling of the outer command. Unverified helper
+input is reported in the normal denial reason; no additional Codex JSON fields
+are needed.
+
 1. Keep the original denied tool request and its `permissionDecisionReason`.
    Review the complete command, intended effect, working directory, and matching
    rule. Correlate the response with that request's `turn_id` and `tool_use_id`

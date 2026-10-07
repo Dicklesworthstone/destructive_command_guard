@@ -1139,29 +1139,49 @@ fn flowctl_static_word(raw: &str) -> Option<String> {
     // Reject shell expansion and control metacharacters. Numeric byte values
     // keep this boundary explicit and independent of quote-removal behavior.
     if raw.is_empty()
-        || raw.bytes().any(|byte| matches!(
-            byte,
-            36 | 96 | 42 | 63 | 91 | 123 | 126 | 59 | 124 | 38 | 40 | 41 | 60 | 62
-        ))
+        || raw.bytes().any(|byte| {
+            matches!(
+                byte,
+                36 | 96 | 42 | 63 | 91 | 123 | 126 | 59 | 124 | 38 | 40 | 41 | 60 | 62
+            )
+        })
     {
         return None;
     }
     let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
-    decoder.decode(raw, ShellTokenRole::Syntax).map(Cow::into_owned)
+    decoder
+        .decode(raw, ShellTokenRole::Syntax)
+        .map(Cow::into_owned)
 }
 
 /// Return static data operand indices for flowctl gate check/receipt (#538).
 #[must_use]
 pub(crate) fn flowctl_gate_data_values(words: &[&str]) -> Option<SmallVec<[usize; 4]>> {
-    if words.len() > 128 { return None; }
+    if words.len() > 128 {
+        return None;
+    }
     let raw_executable = *words.first()?;
     let documented_handle = raw_executable == "\"$FLOWCTL\"";
     let literal_flowctl = flowctl_static_word(raw_executable)
         .is_some_and(|executable| executable.rsplit('/').next() == Some("flowctl"));
-    if !documented_handle && !literal_flowctl { return None; }
-    if words.get(1).and_then(|word| flowctl_static_word(word)).as_deref() != Some("gate")
-        || !matches!(words.get(2).and_then(|word| flowctl_static_word(word)).as_deref(), Some("check" | "receipt"))
-    { return None; }
+    if !documented_handle && !literal_flowctl {
+        return None;
+    }
+    if words
+        .get(1)
+        .and_then(|word| flowctl_static_word(word))
+        .as_deref()
+        != Some("gate")
+        || !matches!(
+            words
+                .get(2)
+                .and_then(|word| flowctl_static_word(word))
+                .as_deref(),
+            Some("check" | "receipt")
+        )
+    {
+        return None;
+    }
     let mut values = SmallVec::new();
     let mut index = 3;
     let mut command_seen = false;
@@ -1169,7 +1189,9 @@ pub(crate) fn flowctl_gate_data_values(words: &[&str]) -> Option<SmallVec<[usize
         let flag = flowctl_static_word(raw_flag)?;
         if matches!(flag.as_str(), "--gate" | "--command") {
             let value = flowctl_static_word(words.get(index + 1)?)?;
-            if value.starts_with('-') { return None; }
+            if value.starts_with('-') {
+                return None;
+            }
             values.push(index + 1);
             command_seen |= flag == "--command";
             index += 2;
@@ -1177,8 +1199,11 @@ pub(crate) fn flowctl_gate_data_values(words: &[&str]) -> Option<SmallVec<[usize
             values.push(index);
             command_seen |= flag.starts_with("--command=");
             index += 1;
-        } else if flag == "--json" { index += 1; }
-        else { return None; }
+        } else if flag == "--json" {
+            index += 1;
+        } else {
+            return None;
+        }
     }
     command_seen.then_some(values)
 }
@@ -1339,11 +1364,15 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
             }
 
             if may_have_flowctl_data {
-                let command_tokens: Vec<_> = tokens[token_index..].iter()
+                let command_tokens: Vec<_> = tokens[token_index..]
+                    .iter()
                     .take_while(|token| token.kind == SanitizeTokenKind::Word)
-                    .take(129).collect();
-                if let Some(words) = command_tokens.iter()
-                    .map(|token| token.text(command)).collect::<Option<Vec<_>>>()
+                    .take(129)
+                    .collect();
+                if let Some(words) = command_tokens
+                    .iter()
+                    .map(|token| token.text(command))
+                    .collect::<Option<Vec<_>>>()
                     && let Some(values) = flowctl_gate_data_values(&words)
                 {
                     for index in values {

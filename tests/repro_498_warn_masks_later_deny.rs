@@ -119,6 +119,58 @@ impl Lab {
 
 const DEFAULTS: &str = "[general]\ncolor = \"never\"\n";
 
+#[test]
+fn tar_uncertain_mode_review_never_grants_visible_destructive_helpers() {
+    for allowlisted in [false, true] {
+        let config = if allowlisted {
+            DEFAULTS
+        } else {
+            "[general]\ncolor = \"never\"\n[policy.rules]\n\"core.filesystem:tar-exec-unverified\" = \"warn\"\n"
+        };
+        let lab = Lab::new(config);
+        if allowlisted {
+            let allowlist = "[[allow]]\nrule = \"core.filesystem:tar-exec-unverified\"\nreason = \"review only the unresolved tar context\"\n";
+            for dir in ["xdg/dcg", "home/.config/dcg"] {
+                let dir = lab.dir.path().join(dir);
+                std::fs::create_dir_all(&dir).expect("isolated allowlist directory");
+                std::fs::write(dir.join("allowlist.toml"), allowlist)
+                    .expect("isolated tar review grant");
+            }
+        }
+        assert!(
+            !lab.claude_hook_denies("tar \"$MODE\" -f archive --to-command='printf safe'"),
+            "the generic review exception must work independently: allowlisted={allowlisted}"
+        );
+        for command in [
+            "tar \"$MODE\" -f archive --to-command='git reset --hard'",
+            "tar -\"$MODE\" -f archive --to-command='git reset --hard'",
+            "tar -f archive \"$MODE\" --to-command='git reset --hard'",
+            "tar \"$MODE\" -f out -I 'echo safe; git reset --hard'",
+            // PREFIX may be --exclude, making the apparent --help its
+            // operand; a terminal-looking token cannot erase later helpers.
+            "tar -c \"$PREFIX\" --help --checkpoint-action='exec=git reset --hard' file",
+            // An unresolved preceding option can consume an apparent
+            // override. Earlier and later visible helpers must both survive.
+            "TAR_OPTIONS=\"--use-compress-program='git reset --hard'\" tar -c \"$PREFIX\" -z -f out file",
+            "tar -cf out --info-script='git reset --hard' \"$PREFIX\" --info-script='printf safe' file",
+            "tar -cf out --info-script='printf safe' \"$PREFIX\" --info-script='git reset --hard' file",
+            "tar -cf host:out --rmt-command='git reset --hard' \"$PREFIX\" --rmt-command='printf safe' file",
+            "tar -cf host:out --rmt-command='printf safe' \"$PREFIX\" --rmt-command='git reset --hard' file",
+            // PREFIX can own -- or --exclude as its operand, leaving the
+            // following helper active in tar's argument parser.
+            "tar -cf out \"$PREFIX\" -- --checkpoint-action='exec=git reset --hard' file",
+            "tar -cf out \"$PREFIX\" --exclude --checkpoint-action='exec=git reset --hard' file",
+        ] {
+            assert!(lab.claude_hook_denies(command), "{command:?}");
+            assert_eq!(
+                lab.batch_decision(command),
+                ("deny".to_string(), "core.git:reset-hard".to_string()),
+                "generic tar review must not cover a visible destructive helper: {command:?}"
+            );
+        }
+    }
+}
+
 /// A warn-severity first finding followed by a deny, in every separator and
 /// wrapper shape an agent could chain them with.
 const MASKED_DENIES: &[&str] = &[
@@ -292,6 +344,51 @@ fn an_allowlisted_rule_in_a_nested_piece_covers_only_that_rule() {
         "alias x=\"rm -rf ./build\"; git reset --hard",
         "d=rm; $d -rf ./build; git reset --hard",
         "rm -rf ./build; git reset --hard",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
+#[test]
+fn tar_helper_warnings_do_not_hide_later_destructive_actions() {
+    let lab = Lab::new(
+        "[general]\ncolor = \"never\"\n\n[policy.rules]\n\"core.filesystem:tar-exec-unverified\" = \"warn\"\n",
+    );
+    assert!(!lab.claude_hook_denies(r#"tar -xf archive.tar --to-command="$HELPER""#));
+    assert!(!lab.claude_hook_denies(
+        "tar -cf backup.tar --checkpoint-action='exec=git stash drop' payload"
+    ));
+    for command in [
+        r#"tar -cf backup.tar --checkpoint-action="exec=$HELPER" --checkpoint-action='exec=git reset --hard' payload"#,
+        r#"tar -cf backup.tar --checkpoint-action="exec=$HELPER; git reset --hard" payload"#,
+        "tar -cf backup.tar --checkpoint-action='exec=git stash drop' --checkpoint-action='exec=git reset --hard' payload",
+        r#"tar -xf archive.tar --to-command="$HELPER"; git reset --hard"#,
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+        assert_eq!(
+            lab.batch_decision(command),
+            ("deny".to_string(), "core.git:reset-hard".to_string()),
+            "{command:?}"
+        );
+    }
+}
+
+#[test]
+fn tar_helper_review_rule_does_not_grant_nested_destructive_rules() {
+    let lab = Lab::new(DEFAULTS);
+    let allowlist =
+        "[[allow]]\nrule = \"core.filesystem:tar-exec-unverified\"\nreason = \"test\"\n";
+    for dir in ["xdg/dcg", "home/.config/dcg"] {
+        let dir = lab.dir.path().join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("allowlist.toml"), allowlist).unwrap();
+    }
+    assert!(!lab.claude_hook_denies(r#"tar -xf archive.tar --to-command="$HELPER""#));
+    for command in [
+        r#"tar -cf backup.tar --checkpoint-action="exec=$HELPER" --checkpoint-action='exec=git reset --hard' payload"#,
+        r#"tar -cf backup.tar --checkpoint-action='exec=git reset --hard' --checkpoint-action="exec=$HELPER" payload"#,
+        r#"tar -cf backup.tar --checkpoint-action="exec=$HELPER; git reset --hard" payload"#,
+        r#"tar -xf archive.tar --to-command="$HELPER"; rm -rf /"#,
     ] {
         assert!(lab.claude_hook_denies(command), "{command:?}");
     }

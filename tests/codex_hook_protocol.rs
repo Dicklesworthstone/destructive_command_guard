@@ -2477,6 +2477,35 @@ fn codex_allow_once_preserves_raw_diagnostic_prefix() {
     );
 }
 
+#[test]
+fn codex_allow_once_tar_helper_binds_to_the_complete_invocation() {
+    assert_codex_allow_once_round_trip(
+        "Bash",
+        "tar -cf backup.tar --checkpoint-action='exec=git reset --hard HEAD~1' payload",
+        &[
+            "git reset --hard HEAD~1",
+            "tar -cf other.tar --checkpoint-action='exec=git reset --hard HEAD~1' payload",
+            "tar -cf backup.tar --checkpoint-action='exec=git reset --hard HEAD~2' payload",
+        ],
+        &[],
+        &["--single-use"],
+    );
+}
+
+#[test]
+fn codex_allow_once_unverified_tar_helper_round_trip() {
+    assert_codex_allow_once_round_trip(
+        "Bash",
+        r#"tar -xf archive.tar --to-command="$HELPER""#,
+        &[
+            r#"tar -xf other.tar --to-command="$HELPER""#,
+            r#"tar -xf archive.tar --to-command="$OTHER_HELPER""#,
+        ],
+        &[],
+        &["--single-use"],
+    );
+}
+
 fn assert_codex_denial_without_review_code(outcome: &HookOutcome) {
     assert!(
         outcome.is_codex_block_shape(),
