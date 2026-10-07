@@ -16,8 +16,8 @@ concurrency:
 
 jobs:
   verify:
-    if: github.repository == 'Dicklesworthstone/destructive_command_guard'
-    runs-on: ubuntu-24.04
+    if: github.repository == 'Dicklesworthstone/destructive_command_guard' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     permissions:
       contents: write
@@ -37,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -55,7 +55,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/debug
-          key: flowctl-538-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
+          key: flowctl-538-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
 
       - name: Retrieve and check the reviewed source patches
         env:
@@ -123,7 +123,7 @@ jobs:
             2>&1 | tee target/flowctl-538/harness.log
           git diff --check
 
-      - name: Store verified source blobs for a separately reviewed main commit
+      - name: Store and publish the verified source directly to main
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -135,34 +135,62 @@ jobs:
           import pathlib
           import subprocess
 
+          repository = os.environ['GITHUB_REPOSITORY']
+          if repository != 'Dicklesworthstone/destructive_command_guard' or os.environ['GITHUB_REF'] != 'refs/heads/main':
+              raise SystemExit('Refusing publication outside the authorized repository/main branch')
+
+          def api(path, payload=None, method='POST'):
+              args = ['gh', 'api']
+              if payload is not None:
+                  args += ['--method', method, '--input', '-']
+              args += [f'repos/{repository}/{path}']
+              result = subprocess.run(args, input=None if payload is None else json.dumps(payload),
+                                      text=True, check=True, capture_output=True)
+              return json.loads(result.stdout)
+
           paths = ['src/context.rs', 'src/evaluator.rs', 'tests/repro_538_flowctl_command_data.rs']
+          parent = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          if parent != os.environ['GITHUB_SHA']:
+              raise SystemExit('Checked-out source does not match the triggering revision')
+          if api('git/ref/heads/main')['object']['sha'] != parent:
+              raise SystemExit('Main advanced during verification; refusing to overwrite concurrent changes')
           manifest = {
-              'base_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'base_commit': parent,
               'base_tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(),
               'patch_blob': os.environ['PATCH_BLOB'],
               'boundary_patch_blob': os.environ['BOUNDARY_PATCH_BLOB'],
               'files': [],
           }
           for path in paths:
-              payload = json.dumps({
+              blob = api('git/blobs', {
                   'encoding': 'base64',
                   'content': base64.b64encode(pathlib.Path(path).read_bytes()).decode('ascii'),
               })
-              result = subprocess.run(
-                  ['gh', 'api', '--method', 'POST', f"repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs", '--input', '-'],
-                  input=payload, text=True, check=True, capture_output=True,
-              )
-              sha = json.loads(result.stdout)['sha']
               expected = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
-              if sha != expected:
+              if blob['sha'] != expected:
                   raise SystemExit(f'blob hash mismatch for {path}')
-              manifest['files'].append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': sha})
+              manifest['files'].append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': blob['sha']})
+          tree = api('git/trees', {'base_tree': manifest['base_tree'], 'tree': manifest['files']})
+          message = (
+              'fix: distinguish flowctl receipt data from dynamic inline launchers (#538)\n\n'
+              'Scope receipt data to the complete flowctl gate check/receipt grammar. '
+              'Preserve unknown executable and genuine inline-code denials, including '
+              'attached long flags. Never mask shell substitutions, chained commands, '
+              'or glued redirection targets.\n\n'
+              'Validated paired before/after reproductions, real-binary regression cases, '
+              'existing context and launcher tests, argv-spawn regressions, all-target '
+              'check and Clippy, formatting, and real hook protocols.\n\n'
+              f'Validation: https://github.com/{repository}/actions/runs/{os.environ["GITHUB_RUN_ID"]}\n\n'
+              'Fixes #538'
+          )
+          commit = api('git/commits', {'message': message, 'tree': tree['sha'], 'parents': [parent]})
+          # A non-force update also rejects a race after the head check above.
+          api('git/refs/heads/main', {'sha': commit['sha'], 'force': False}, method='PATCH')
+          manifest['source_commit'] = commit['sha']
           encoded = json.dumps(manifest, sort_keys=True)
           pathlib.Path('target/flowctl-538/verified-source.json').write_text(encoded + '\n')
           print('FLOWCTL538_VERIFIED_SOURCE=' + encoded)
           PY
-          # This job deliberately never updates a branch or closes the issue.
-          # The verified blobs are reviewed and committed through the GitHub connector.
 
       - name: Retain exact source and diagnostics
         if: always()
