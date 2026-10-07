@@ -30,6 +30,7 @@ jobs:
       RCH_ENABLED: '0'
       RUST_BACKTRACE: '1'
       PATCH_BLOB: ca33890d6fa7db0c75e08bc908608251e27eaeaf
+      BOUNDARY_PATCH_BLOB: d6675eba0dc5e85966f9c95cabff0f517e380cdc
     defaults:
       run:
         shell: bash
@@ -56,7 +57,7 @@ jobs:
             target/debug
           key: flowctl-538-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
 
-      - name: Retrieve and check the reviewed source patch
+      - name: Retrieve and check the reviewed source patches
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -64,7 +65,11 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/git/blobs/$PATCH_BLOB" --jq .content \
             | base64 --decode > "$RUNNER_TEMP/flowctl-538.patch"
           test "$(git hash-object "$RUNNER_TEMP/flowctl-538.patch")" = "$PATCH_BLOB"
+          gh api "repos/$GITHUB_REPOSITORY/git/blobs/$BOUNDARY_PATCH_BLOB" --jq .content \
+            | base64 --decode > "$RUNNER_TEMP/flowctl-538-boundaries.patch"
+          test "$(git hash-object "$RUNNER_TEMP/flowctl-538-boundaries.patch")" = "$BOUNDARY_PATCH_BLOB"
           cp "$RUNNER_TEMP/flowctl-538.patch" target/flowctl-538/reviewed.patch
+          cp "$RUNNER_TEMP/flowctl-538-boundaries.patch" target/flowctl-538/boundaries.patch
           git apply --check "$RUNNER_TEMP/flowctl-538.patch"
 
       - name: Reproduce both reported failures before the implementation change
@@ -87,6 +92,8 @@ jobs:
           set -euo pipefail
           git apply --check --exclude=tests/repro_538_flowctl_command_data.rs "$RUNNER_TEMP/flowctl-538.patch"
           git apply --exclude=tests/repro_538_flowctl_command_data.rs "$RUNNER_TEMP/flowctl-538.patch"
+          git apply --check "$RUNNER_TEMP/flowctl-538-boundaries.patch"
+          git apply "$RUNNER_TEMP/flowctl-538-boundaries.patch"
           rustfmt --edition 2024 --config skip_children=true \
             src/context.rs src/evaluator.rs tests/repro_538_flowctl_command_data.rs
 
@@ -133,6 +140,7 @@ jobs:
               'base_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
               'base_tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(),
               'patch_blob': os.environ['PATCH_BLOB'],
+              'boundary_patch_blob': os.environ['BOUNDARY_PATCH_BLOB'],
               'files': [],
           }
           for path in paths:
