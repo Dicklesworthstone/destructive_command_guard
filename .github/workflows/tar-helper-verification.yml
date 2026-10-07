@@ -16,14 +16,14 @@ concurrency:
 jobs:
   verify:
     if: github.repository == 'Dicklesworthstone/destructive_command_guard'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     permissions:
       # Used only to retain immutable source blobs. This workflow never creates
       # commits, trees, branches, tags, or ref updates.
       contents: write
     env:
-      SOURCE_BASE: 74902e5468fa3e001c66caea508bea041d08983f
+      SOURCE_BASE: 00c926f13e40f723a65bcda2639ceaac6339ff5b
       PATCH_BLOB: 19d875304108d7777bf2bdbbbccc91cfba6ac1d0
       UBS_COMMIT: d1cf8ea8f74d4559331f7c96bf268414815850b8
       UBS_ARCHIVE_SHA256: bd96276968632fb4156ed79198c7a6cfa1596b69534b91d1cee58debd005aa65
@@ -251,9 +251,9 @@ jobs:
           bash "$ubs_dir/scripts/verify_checksums.sh" > "$EVIDENCE/ubs-integrity.log" 2>&1
           mkdir -p "$tools_dir/ast-grep"
           curl --fail --location --user-agent "$DOWNLOAD_USER_AGENT" \
-            https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-x86_64-unknown-linux-gnu.zip \
+            https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-aarch64-unknown-linux-gnu.zip \
             --output "$tools_dir/ast-grep.zip"
-          printf '%s  %s\n' f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8 "$tools_dir/ast-grep.zip" | sha256sum --check
+          printf '%s  %s\n' b39cfbc58da4b869a88b8a4bc57bd5deb0d24541e704cf7c257da7b53ec81c8f "$tools_dir/ast-grep.zip" | sha256sum --check
           unzip -q "$tools_dir/ast-grep.zip" -d "$tools_dir/ast-grep"
           chmod u+x "$tools_dir/ast-grep/ast-grep"
           "$tools_dir/ast-grep/ast-grep" --version | tee "$EVIDENCE/ast-grep-version.log"
