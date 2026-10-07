@@ -23,8 +23,8 @@ jobs:
       # commits, trees, branches, tags, or ref updates.
       contents: write
     env:
-      SOURCE_BASE: 00c926f13e40f723a65bcda2639ceaac6339ff5b
-      PATCH_BLOB: 19d875304108d7777bf2bdbbbccc91cfba6ac1d0
+      SOURCE_BASE: e3b7609da1301e7b4fbcfbf4429850d5768b9fb6
+      PATCH_BLOB: b152bc2aab61679c3fa7617241d42feca28a6bfd
       UBS_COMMIT: d1cf8ea8f74d4559331f7c96bf268414815850b8
       UBS_ARCHIVE_SHA256: bd96276968632fb4156ed79198c7a6cfa1596b69534b91d1cee58debd005aa65
       DOWNLOAD_USER_AGENT: OpenAI File Downloader, XaiImageApiFetch/1.0
@@ -41,6 +41,7 @@ jobs:
         README.md
         docs/packs/core.md
         docs/codex-integration.md
+        src/context.rs
         src/evaluator.rs
         src/packs/core/filesystem.rs
         tests/codex_hook_protocol.rs
@@ -87,8 +88,8 @@ jobs:
           if git('status', '--porcelain', '--untracked-files=no'):
               raise SystemExit('Checkout is not clean')
           paths = os.environ['SOURCE_PATHS'].splitlines()
-          if len(paths) != 9 or len(set(paths)) != 9:
-              raise SystemExit('Expected exactly nine distinct reviewed source paths')
+          if len(paths) != 10 or len(set(paths)) != 10:
+              raise SystemExit('Expected exactly ten distinct reviewed source paths')
           files = []
           for path in paths:
               entry = git('ls-tree', base, '--', path).split()
@@ -118,7 +119,7 @@ jobs:
             target/debug
           key: tar-helper-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
 
-      - name: Retrieve and check the immutable nine-file patch
+      - name: Retrieve and check the immutable ten-file patch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -164,7 +165,7 @@ jobs:
           git apply --check --exclude=tests/repro_wrapper_bypass.rs "$EVIDENCE/reviewed.patch"
           git apply --exclude=tests/repro_wrapper_bypass.rs "$EVIDENCE/reviewed.patch"
           mapfile -t rust_paths < <(printf '%s\n' "$SOURCE_PATHS" | grep -E '\.rs$')
-          test "${#rust_paths[@]}" -eq 6
+          test "${#rust_paths[@]}" -eq 7
           rustfmt --edition 2024 --config skip_children=true "${rust_paths[@]}"
           git diff --check
           python3 - <<'PY'
@@ -260,12 +261,12 @@ jobs:
           printf '%s\n' "$tools_dir/ast-grep" >> "$GITHUB_PATH"
           printf 'TAR_UBS_DIR=%s\n' "$ubs_dir" >> "$GITHUB_ENV"
 
-      - name: Record unsuppressed UBS results for all six changed Rust files
+      - name: Record unsuppressed UBS results for all seven changed Rust files
         id: ubs
         run: |
           set -euo pipefail
           mapfile -t rust_paths < <(printf '%s\n' "$SOURCE_PATHS" | grep -E '\.rs$')
-          test "${#rust_paths[@]}" -eq 6
+          test "${#rust_paths[@]}" -eq 7
           # Override the repository's test-directory exclusions and reject
           # inline suppression markers instead of silently hiding findings.
           if grep -nEi 'ubs:ignore|ubs:[[:space:]]*disable|nolint|noqa' "${rust_paths[@]}"; then
@@ -289,9 +290,9 @@ jobs:
           python3 -m json.tool "$EVIDENCE/ubs.json" > "$EVIDENCE/ubs-pretty.json"
           jq --exit-status '
             .status == "ok" and (.failed_modules | length) == 0 and
-            .totals.files == 6 and (.scanners | length) == 1 and
+            .totals.files == 7 and (.scanners | length) == 1 and
             .scanners[0].language == "rust" and .scanners[0].status == "ok" and
-            .scanners[0].files == 6
+            .scanners[0].files == 7
           ' "$EVIDENCE/ubs.json" > "$EVIDENCE/ubs-coverage-check.txt"
           if test "$ubs_status" -eq 0; then
             echo 'UBS exited 0; exact source and full report are retained for review.'
@@ -335,10 +336,17 @@ jobs:
           changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
           if sorted(changed) != sorted(os.environ['SOURCE_PATHS'].splitlines()):
               raise SystemExit('Validation changed files outside the reviewed allowlist')
+          if any(current_files.get(entry['path'], {}).get('mode') != '100644' or
+                 current_files.get(entry['path'], {}).get('type') != 'blob'
+                 for entry in manifest['files']):
+              raise SystemExit('Main changed a reviewed source mode or type; do not publish stale source')
+          source_unchanged = all(current_files[entry['path']]['sha'] == entry['base_blob']
+                                 for entry in manifest['files'])
+          source_already_published = all(current_files[entry['path']]['sha'] == entry['sha']
+                                         for entry in manifest['files'])
+          if not (source_unchanged or source_already_published):
+              raise SystemExit('Main contains mixed or unrelated source changes; do not publish stale source')
           for entry in manifest['files']:
-              current = current_files.get(entry['path'], {})
-              if current.get('sha') != entry['base_blob'] or current.get('mode') != '100644' or current.get('type') != 'blob':
-                  raise SystemExit(f'Main changed concurrently at {entry["path"]}; do not publish stale source')
               path = pathlib.Path(entry['path'])
               if path.is_symlink() or not path.is_file():
                   raise SystemExit(f'Source type changed during validation: {path}')
@@ -357,6 +365,7 @@ jobs:
                           run_attempt=os.environ['GITHUB_RUN_ATTEMPT'], compiler_and_runtime_gates_passed=True,
                           ubs_commit=os.environ['UBS_COMMIT'], ubs_exit_code=ubs_status,
                           ubs_passed=ubs_status == 0, review_required=True,
+                          source_already_published=source_already_published,
                           source_commit_created=False, refs_updated=False)
           encoded = json.dumps(manifest, indent=2)
           (evidence / 'verified-source.json').write_text(encoded + '\n')
