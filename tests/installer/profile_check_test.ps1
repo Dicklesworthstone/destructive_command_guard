@@ -32,7 +32,23 @@ try {
 
     $content = Get-Content -Raw $profilePath
     Check ($content.Contains('# dcg: warn if the Claude Code hook')) "marker present"
-    Check ($content.Contains('Hook missing from ~/.claude/settings.json')) "warning text present"
+    Check ($content.Contains('Hook missing from $dcgSettings')) "warning names the checked settings path"
+    Check ($content.Contains('$env:CLAUDE_CONFIG_DIR')) "startup check resolves the active Claude configuration"
+
+    $savedClaudeDir = $env:CLAUDE_CONFIG_DIR
+    try {
+        $env:CLAUDE_CONFIG_DIR = Join-Path $tmp 'active config'
+        New-Item -ItemType Directory -Force $env:CLAUDE_CONFIG_DIR | Out-Null
+        $activeSettings = Join-Path $env:CLAUDE_CONFIG_DIR 'settings.json'
+        [System.IO.File]::WriteAllText($activeSettings, '{}')
+        # A function is sufficient for the profile's Get-Command dcg guard.
+        function dcg { }
+        $warning = (& ([scriptblock]::Create($script:DcgProfileCheckBlock)) 6>&1 | Out-String)
+        Check ($warning.Contains($activeSettings)) "missing active hook warns with its path"
+        [System.IO.File]::WriteAllText($activeSettings, '{"hooks":{"PreToolUse":[{"hooks":[{"command":"dcg"}]}]}}')
+        $warning = (& ([scriptblock]::Create($script:DcgProfileCheckBlock)) 6>&1 | Out-String)
+        Check ([string]::IsNullOrWhiteSpace($warning)) "protected active configuration is quiet"
+    } finally { $env:CLAUDE_CONFIG_DIR = $savedClaudeDir }
 
     $perr = $null
     [void][System.Management.Automation.Language.Parser]::ParseInput($content, [ref]$null, [ref]$perr)

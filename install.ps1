@@ -574,12 +574,22 @@ function Configure-CodexHook {
 # Windows path is not reinterpreted by Git Bash (#232).
 # Configures when ~/.claude exists or `claude` is on PATH (or always under -Force,
 # used by -EasyMode). Returns "created" | "already" | "merged" | "skipped".
+function Get-ClaudeConfigDir {
+  param([string]$HomeDir = $HOME)
+  $dir = $env:CLAUDE_CONFIG_DIR
+  if ([string]::IsNullOrEmpty($dir)) { return (Join-Path $HomeDir '.claude') }
+  if ($dir -eq '~') { $dir = $HomeDir }
+  elseif ($dir.StartsWith('~/') -or $dir.StartsWith('~\')) { $dir = Join-Path $HomeDir $dir.Substring(2) }
+  if (-not [System.IO.Path]::IsPathRooted($dir)) { $dir = Join-Path (Get-Location).Path $dir }
+  return $dir
+}
+
 function Configure-ClaudeHook {
   param([string]$DcgPath, [switch]$Force, [string]$HomeDir = $HOME)
 
-  $claudeDir = Join-Path $HomeDir ".claude"
+  $claudeDir = Get-ClaudeConfigDir -HomeDir $HomeDir
   $settingsFile = Join-Path $claudeDir "settings.json"
-  $claudeInstalled = (Test-Path $claudeDir -PathType Container) -or
+  $claudeInstalled = (-not [string]::IsNullOrEmpty($env:CLAUDE_CONFIG_DIR)) -or (Test-Path $claudeDir -PathType Container) -or
     ($null -ne (Get-Command claude -ErrorAction SilentlyContinue))
 
   if (-not $claudeInstalled -and -not $Force) { return "skipped" }
@@ -734,7 +744,7 @@ function Remove-DcgPredecessor {
   param([string]$HomeDir = $HOME)
 
   $removed = $false
-  $claudeDir = Join-Path $HomeDir ".claude"
+  $claudeDir = Get-ClaudeConfigDir -HomeDir $HomeDir
   $settingsFile = Join-Path $claudeDir "settings.json"
 
   if (Test-Path $settingsFile -PathType Leaf) {
@@ -791,9 +801,14 @@ function Remove-DcgPredecessor {
 # (DCG_PROFILE_CHECK_BLOCK) is pinned to this one by a test.
 $script:DcgProfileCheckMarker = "# dcg: warn if the Claude Code hook was silently removed"
 $script:DcgProfileCheckBlock = @'
-if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
+if (Get-Command dcg -ErrorAction SilentlyContinue) {
   try {
-    $dcgCfg = Get-Content -Raw "$HOME\.claude\settings.json" | ConvertFrom-Json
+    $dcgDir = $env:CLAUDE_CONFIG_DIR
+    if ([string]::IsNullOrEmpty($dcgDir)) { $dcgDir = Join-Path $HOME '.claude' }
+    if ($dcgDir -eq '~') { $dcgDir = $HOME }
+    elseif ($dcgDir.StartsWith('~/') -or $dcgDir.StartsWith('~\')) { $dcgDir = Join-Path $HOME $dcgDir.Substring(2) }
+    $dcgSettings = Join-Path $dcgDir 'settings.json'
+    $dcgCfg = Get-Content -Raw $dcgSettings -ErrorAction Stop | ConvertFrom-Json
     $dcgHas = $false
     foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
       foreach ($dcgH in @($dcgE.hooks)) {
@@ -804,7 +819,7 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         if ((($dcgExe -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
       }
     }
-    if (-not $dcgHas) { Write-Host '[dcg] Hook missing from ~/.claude/settings.json - run: dcg install' -ForegroundColor Yellow }
+    if (-not $dcgHas) { Write-Host "[dcg] Hook missing from $dcgSettings - run: dcg install" -ForegroundColor Yellow }
   } catch { }
 }
 '@
@@ -1993,7 +2008,8 @@ function Detect-Agents {
     (Join-Path $HomeDir '.reasonix')
   ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
   [ordered]@{
-    'Claude'  = ((_dir '.claude')  -or (_has 'claude'))
+    'Claude'  = ((-not [string]::IsNullOrEmpty($env:CLAUDE_CONFIG_DIR)) -or
+      (Test-Path -LiteralPath (Get-ClaudeConfigDir -HomeDir $HomeDir) -PathType Container) -or (_has 'claude'))
     'Codex'   = ((_dir '.codex')   -or (_has 'codex'))
     'Gemini'  = ((_dir '.gemini')  -or (_has 'gemini'))
     'Cursor'  = ((_dir '.cursor')  -or (_has 'cursor'))
@@ -2346,8 +2362,8 @@ try {
 try {
   $claudeStatus = Configure-ClaudeHook -DcgPath $dcgExe -Force:$forceConfig
   switch ($claudeStatus) {
-    "created" { Write-Ok "Created Claude Code hook at $HOME\.claude\settings.json" }
-    "merged" { Write-Ok "Added Claude Code hook to $HOME\.claude\settings.json" }
+    "created" { Write-Ok "Created Claude Code hook at $(Get-ClaudeConfigDir)\settings.json" }
+    "merged" { Write-Ok "Added Claude Code hook to $(Get-ClaudeConfigDir)\settings.json" }
     "already" { Write-Ok "Claude Code hook already configured" }
     "skipped" { Write-Info "Claude Code not detected; re-run with -EasyMode to configure it anyway" }
     default { Write-Warn "Claude Code hook status: $claudeStatus" }

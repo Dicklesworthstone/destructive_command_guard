@@ -725,5 +725,29 @@ try {
     }
 }
 
+$savedClaudeConfigDir = $env:CLAUDE_CONFIG_DIR
+$claudeHome = New-Tmp
+New-Item -ItemType Directory -Force $claudeHome | Out-Null
+Push-Location $claudeHome
+try {
+    foreach ($form in @('absolute', 'relative', 'tilde', 'home', 'empty', 'unset')) {
+        switch ($form) {
+            'absolute' { $env:CLAUDE_CONFIG_DIR = Join-Path $claudeHome 'absolute config'; $expected = $env:CLAUDE_CONFIG_DIR }
+            'relative' { $env:CLAUDE_CONFIG_DIR = 'relative config'; $expected = Join-Path $claudeHome 'relative config' }
+            'tilde' { $env:CLAUDE_CONFIG_DIR = '~/alternate config'; $expected = Join-Path $claudeHome 'alternate config' }
+            'home' { $env:CLAUDE_CONFIG_DIR = '~'; $expected = $claudeHome }
+            'empty' { $env:CLAUDE_CONFIG_DIR = ''; $expected = Join-Path $claudeHome '.claude' }
+            'unset' { $env:CLAUDE_CONFIG_DIR = $null; $expected = Join-Path $claudeHome '.claude' }
+        }
+        $settings = Join-Path (Get-ClaudeConfigDir -HomeDir $claudeHome) 'settings.json'
+        Check ($settings -eq (Join-Path $expected 'settings.json')) "Claude uninstall resolver: $form"
+        New-Item -ItemType Directory -Force $expected | Out-Null
+        [System.IO.File]::WriteAllText($settings, '{"theme":"dark","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"dcg"},{"type":"command","command":"unrelated"}]}]}}')
+        Check (Remove-DcgHooksFromJsonFile -Path $settings -EventName 'PreToolUse') "Claude uninstall removed active hook: $form"
+        $value = Get-Content -Raw $settings | ConvertFrom-Json
+        Check ($value.theme -eq 'dark' -and $value.hooks.PreToolUse[0].hooks[0].command -eq 'unrelated') "Claude uninstall preserved settings: $form"
+    }
+} finally { Pop-Location; $env:CLAUDE_CONFIG_DIR = $savedClaudeConfigDir }
+
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
 Write-Host "All uninstall parity tests passed." -ForegroundColor Green

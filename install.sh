@@ -27,6 +27,17 @@ set -euo pipefail
 umask 022
 shopt -s lastpipe 2>/dev/null || true
 
+# Match Claude Code's active user configuration; do not eval path contents.
+claude_config_dir() {
+  local dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  case "$dir" in
+    '~') dir="$HOME" ;;
+    '~/'*) dir="$HOME/${dir#\~/}" ;;
+  esac
+  case "$dir" in /*) ;; *) dir="$PWD/$dir" ;; esac
+  printf '%s\n' "$dir"
+}
+
 VERSION="${VERSION:-}"
 OWNER="${OWNER:-Dicklesworthstone}"
 REPO="${REPO:-destructive_command_guard}"
@@ -404,7 +415,7 @@ detect_agents() {
   DETECTED_AGENTS=()
 
   # Claude Code
-  if [[ -d "$HOME/.claude" ]] || command -v claude &>/dev/null; then
+  if [[ -n "${CLAUDE_CONFIG_DIR:-}" || -d "$(claude_config_dir)" ]] || command -v claude &>/dev/null; then
     DETECTED_AGENTS+=("claude-code")
     CLAUDE_VERSION=$(try_version claude)
   fi
@@ -1062,11 +1073,14 @@ maybe_add_shell_check() {
 
 # dcg: warn if hook was silently removed from Claude Code settings
 if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
-  if [ -f "$HOME/.claude/settings.json" ] && \
+  dcg_claude_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  case "$dcg_claude_dir" in '~') dcg_claude_dir="$HOME" ;; '~/'*) dcg_claude_dir="$HOME/${dcg_claude_dir#\~/}" ;; esac
+  if { [ -n "${CLAUDE_CONFIG_DIR:-}" ] || [ -f "$dcg_claude_dir/settings.json" ]; } && \
      ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg\"?$"))' \
-       "$HOME/.claude/settings.json" &>/dev/null; then
-    printf '\033[1;33m[dcg] Hook missing from ~/.claude/settings.json — run: dcg install\033[0m\n'
+       "$dcg_claude_dir/settings.json" &>/dev/null; then
+    printf '\033[1;33m[dcg] Hook missing from %s/settings.json — run: dcg install\033[0m\n' "$dcg_claude_dir"
   fi
+  unset dcg_claude_dir
 fi
 EOFSNIPPET
   )
@@ -1831,7 +1845,7 @@ PREDECESSOR_LOCATIONS=()
 detect_predecessor() {
   # Check common file locations for the predecessor script
   local locations=(
-    "$HOME/.claude/hooks/$PREDECESSOR_SCRIPT"
+    "$(claude_config_dir)/hooks/$PREDECESSOR_SCRIPT"
     ".claude/hooks/$PREDECESSOR_SCRIPT"
   )
 
@@ -1910,7 +1924,7 @@ remove_predecessor() {
 # Claude Code / Gemini CLI / Cursor Auto-Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+CLAUDE_SETTINGS="$(claude_config_dir)/settings.json"
 GEMINI_SETTINGS="$HOME/.gemini/settings.json"
 AIDER_SETTINGS="$HOME/.aider.conf.yml"
 CODEX_SETTINGS="$HOME/.codex/hooks.json"

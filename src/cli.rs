@@ -320,7 +320,7 @@ pub enum Command {
         force: bool,
 
         /// Install to project-level `.claude/settings.json` (in the current repo)
-        /// instead of user-level `~/.claude/settings.json`
+        /// instead of user-level settings in CLAUDE_CONFIG_DIR (default: ~/.claude)
         #[arg(long)]
         project: bool,
 
@@ -10995,11 +10995,12 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     // Check 2: Claude Code settings file exists
     print!("Checking Claude Code settings... ");
     let settings_path = claude_settings_path();
+    println!("{}", settings_path.display());
     if settings_path.exists() {
         println!("{}", "OK".green());
     } else {
         println!("{}", "NOT FOUND".yellow());
-        println!("  ~/.claude/settings.json not found");
+        println!("  {} not found", settings_path.display());
         println!("  This is normal if Claude Code hasn't been configured yet");
         wired_to_an_agent = false;
     }
@@ -11010,8 +11011,18 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     issues += hook_diagnostics_issue_count(&hook_diag);
 
     if !hook_diag.settings_exists {
-        println!("{}", "SKIPPED".yellow());
-        println!("  No settings file to check");
+        if claude_config_dir_override().is_some() {
+            println!("{}", "NOT REGISTERED".red());
+            if fix && install_hook(false, false).is_ok() {
+                fixed += 1;
+                println!("  {}", "Fixed!".green());
+            } else {
+                println!("  → Run 'dcg install' to protect the active configuration");
+            }
+        } else {
+            println!("{}", "SKIPPED".yellow());
+            println!("  No settings file to check");
+        }
     } else if let Some(ref err) = hook_diag.settings_error {
         println!("{}", "ERROR".red());
         println!("  {err}");
@@ -11129,7 +11140,8 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
 
         let user_hook = grok_user_hook_path();
         let user_hook_exists = user_hook.exists();
-        let claude_compat_path = claude_settings_path();
+        let claude_compat_path = default_claude_settings_path();
+        let compat_diag = diagnose_hook_wiring_at(&claude_compat_path);
         let claude_compat_exists = claude_compat_path.exists();
 
         if user_hook_exists {
@@ -11141,7 +11153,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                     claude_compat_path.display()
                 );
             }
-        } else if claude_compat_exists && hook_diag.dcg_hook_count >= 1 {
+        } else if claude_compat_exists && compat_diag.dcg_hook_count >= 1 {
             // Grok will use the Claude-compat path; this still works but the
             // native path is preferred. Surface as a friendly note, not an
             // error, so users who deliberately rely on Claude-compat aren't
@@ -12086,7 +12098,10 @@ fn collect_doctor_report(
     } else {
         (
             DoctorCheckStatus::Warning,
-            "settings.json not found (Claude Code not configured)".to_string(),
+            format!(
+                "{} not found (Claude Code not configured)",
+                settings_path.display()
+            ),
         )
     };
     checks.push(DoctorCheck {
@@ -12103,7 +12118,7 @@ fn collect_doctor_report(
     issues += hook_diagnostics_issue_count(&hook_diag);
     let mut hook_fixed = false;
     let hook_repair = if fix
-        && hook_diag.settings_exists
+        && (hook_diag.settings_exists || claude_config_dir_override().is_some())
         && hook_diag.settings_error.is_none()
         && hook_diag.has_issues()
     {
@@ -12111,99 +12126,100 @@ fn collect_doctor_report(
     } else {
         None
     };
-    let (status, message, remediation) = if !hook_diag.settings_exists {
-        (
-            DoctorCheckStatus::Skipped,
-            "No settings file to check".to_string(),
-            None,
-        )
-    } else if let Some(ref err) = hook_diag.settings_error {
-        (
-            DoctorCheckStatus::Error,
-            format!("Settings error: {err}"),
-            Some("Fix settings.json or reinstall Claude Code".to_string()),
-        )
-    } else if let Some(repair) = hook_repair {
-        match repair {
-            Ok(true) => {
-                fixed += 1;
-                hook_fixed = true;
-                (
-                    DoctorCheckStatus::Ok,
-                    "Hook repaired with the current absolute dcg executable path".to_string(),
-                    None,
-                )
-            }
-            Ok(false) => (
+    let (status, message, remediation) =
+        if !hook_diag.settings_exists && claude_config_dir_override().is_none() {
+            (
+                DoctorCheckStatus::Skipped,
+                "No settings file to check".to_string(),
+                None,
+            )
+        } else if let Some(ref err) = hook_diag.settings_error {
+            (
                 DoctorCheckStatus::Error,
-                "Hook repair made no changes".to_string(),
-                Some("Run 'dcg install --force' to replace the hook safely".to_string()),
-            ),
-            Err(error) => (
-                DoctorCheckStatus::Error,
-                format!("Failed to repair hook: {error}"),
-                Some("Run 'dcg install --force' to replace the hook safely".to_string()),
-            ),
-        }
-    } else if hook_diag.dcg_hook_count == 0 {
-        (
-            DoctorCheckStatus::Error,
-            "dcg hook not registered".to_string(),
-            Some("Run 'dcg install' to register the hook".to_string()),
-        )
-    } else if hook_diag.dcg_hook_count > 1 {
-        (
-            DoctorCheckStatus::Warning,
-            format!(
-                "Found {} dcg hook entries (expected 1)",
-                hook_diag.dcg_hook_count
-            ),
-            Some("Run 'dcg install --force' to reconcile duplicates safely".to_string()),
-        )
-    } else if !hook_diag.wrong_matcher_hooks.is_empty() {
-        (
-            DoctorCheckStatus::Error,
-            format!(
-                "Hook registered with wrong matcher: {:?}",
-                hook_diag.wrong_matcher_hooks
-            ),
-            Some(format!(
-                "dcg must use matcher {CLAUDE_SHELL_MATCHER}; run 'dcg install --force'"
-            )),
-        )
-    } else if !hook_diag.misconfigured_hooks.is_empty() {
-        (
-            DoctorCheckStatus::Error,
-            format!(
-                "Hook cannot synchronously enforce a block: {:?}",
-                hook_diag.misconfigured_hooks
-            ),
-            Some("Run 'dcg install --force' to replace the hook safely".to_string()),
-        )
-    } else if !hook_diag.missing_executable_hooks.is_empty() {
-        (
-            DoctorCheckStatus::Error,
-            format!(
-                "Hook points to missing executable: {:?}",
-                hook_diag.missing_executable_hooks
-            ),
-            Some("Run 'dcg install --force' to replace the broken entry".to_string()),
-        )
-    } else {
-        (
-            DoctorCheckStatus::Ok,
-            format!(
-                "Exactly one dcg hook registered; {} unrelated hook{} preserved",
-                hook_diag.other_hooks_count,
-                if hook_diag.other_hooks_count == 1 {
-                    ""
-                } else {
-                    "s"
+                format!("Settings error: {err}"),
+                Some("Fix settings.json or reinstall Claude Code".to_string()),
+            )
+        } else if let Some(repair) = hook_repair {
+            match repair {
+                Ok(true) => {
+                    fixed += 1;
+                    hook_fixed = true;
+                    (
+                        DoctorCheckStatus::Ok,
+                        "Hook repaired with the current absolute dcg executable path".to_string(),
+                        None,
+                    )
                 }
-            ),
-            None,
-        )
-    };
+                Ok(false) => (
+                    DoctorCheckStatus::Error,
+                    "Hook repair made no changes".to_string(),
+                    Some("Run 'dcg install --force' to replace the hook safely".to_string()),
+                ),
+                Err(error) => (
+                    DoctorCheckStatus::Error,
+                    format!("Failed to repair hook: {error}"),
+                    Some("Run 'dcg install --force' to replace the hook safely".to_string()),
+                ),
+            }
+        } else if hook_diag.dcg_hook_count == 0 {
+            (
+                DoctorCheckStatus::Error,
+                "dcg hook not registered".to_string(),
+                Some("Run 'dcg install' to register the hook".to_string()),
+            )
+        } else if hook_diag.dcg_hook_count > 1 {
+            (
+                DoctorCheckStatus::Warning,
+                format!(
+                    "Found {} dcg hook entries (expected 1)",
+                    hook_diag.dcg_hook_count
+                ),
+                Some("Run 'dcg install --force' to reconcile duplicates safely".to_string()),
+            )
+        } else if !hook_diag.wrong_matcher_hooks.is_empty() {
+            (
+                DoctorCheckStatus::Error,
+                format!(
+                    "Hook registered with wrong matcher: {:?}",
+                    hook_diag.wrong_matcher_hooks
+                ),
+                Some(format!(
+                    "dcg must use matcher {CLAUDE_SHELL_MATCHER}; run 'dcg install --force'"
+                )),
+            )
+        } else if !hook_diag.misconfigured_hooks.is_empty() {
+            (
+                DoctorCheckStatus::Error,
+                format!(
+                    "Hook cannot synchronously enforce a block: {:?}",
+                    hook_diag.misconfigured_hooks
+                ),
+                Some("Run 'dcg install --force' to replace the hook safely".to_string()),
+            )
+        } else if !hook_diag.missing_executable_hooks.is_empty() {
+            (
+                DoctorCheckStatus::Error,
+                format!(
+                    "Hook points to missing executable: {:?}",
+                    hook_diag.missing_executable_hooks
+                ),
+                Some("Run 'dcg install --force' to replace the broken entry".to_string()),
+            )
+        } else {
+            (
+                DoctorCheckStatus::Ok,
+                format!(
+                    "Exactly one dcg hook registered; {} unrelated hook{} preserved",
+                    hook_diag.other_hooks_count,
+                    if hook_diag.other_hooks_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+                None,
+            )
+        };
     checks.push(DoctorCheck {
         id: "hook_wiring",
         name: "Hook wiring",
@@ -12549,7 +12565,7 @@ fn collect_doctor_report(
     let grok_home_exists = grok_home.as_ref().is_some_and(|p| p.exists() && p.is_dir());
     if grok_session_present || grok_home_exists {
         let user_hook = grok_user_hook_path();
-        let claude_compat_exists = claude_settings_path().exists();
+        let compat_diag = diagnose_hook_wiring_at(&default_claude_settings_path());
         let mut grok_fixed = false;
         let (status, message, remediation) = if user_hook.exists() {
             (
@@ -12557,7 +12573,7 @@ fn collect_doctor_report(
                 format!("Native Grok hook found at {}", user_hook.display()),
                 None,
             )
-        } else if claude_compat_exists && hook_diag.dcg_hook_count >= 1 {
+        } else if compat_diag.dcg_hook_count >= 1 {
             // Wired via the Claude compatibility layer. Deliberately not an
             // error: users who rely on compat should not be pestered.
             (
@@ -16779,9 +16795,14 @@ const DCG_PROFILE_CHECK_MARKER: &str = "# dcg: warn if the Claude Code hook was 
 /// missing although it is installed (#503), and the warning's own advice —
 /// `dcg install` — is where the stale block gets repaired.
 #[cfg(any(windows, test))]
-const DCG_PROFILE_CHECK_BLOCK: &str = r#"if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
+const DCG_PROFILE_CHECK_BLOCK: &str = r#"if (Get-Command dcg -ErrorAction SilentlyContinue) {
   try {
-    $dcgCfg = Get-Content -Raw "$HOME\.claude\settings.json" | ConvertFrom-Json
+    $dcgDir = $env:CLAUDE_CONFIG_DIR
+    if ([string]::IsNullOrEmpty($dcgDir)) { $dcgDir = Join-Path $HOME '.claude' }
+    if ($dcgDir -eq '~') { $dcgDir = $HOME }
+    elseif ($dcgDir.StartsWith('~/') -or $dcgDir.StartsWith('~\')) { $dcgDir = Join-Path $HOME $dcgDir.Substring(2) }
+    $dcgSettings = Join-Path $dcgDir 'settings.json'
+    $dcgCfg = Get-Content -Raw $dcgSettings -ErrorAction Stop | ConvertFrom-Json
     $dcgHas = $false
     foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
       foreach ($dcgH in @($dcgE.hooks)) {
@@ -16792,7 +16813,7 @@ const DCG_PROFILE_CHECK_BLOCK: &str = r#"if ((Get-Command dcg -ErrorAction Silen
         if ((($dcgExe -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
       }
     }
-    if (-not $dcgHas) { Write-Host '[dcg] Hook missing from ~/.claude/settings.json - run: dcg install' -ForegroundColor Yellow }
+    if (-not $dcgHas) { Write-Host "[dcg] Hook missing from $dcgSettings - run: dcg install" -ForegroundColor Yellow }
   } catch { }
 }"#;
 
@@ -16903,11 +16924,14 @@ fn repair_powershell_profile_checks() -> Vec<std::path::PathBuf> {
 const DCG_SHELL_CHECK_SNIPPET: &str = r#"
 # dcg: warn if hook was silently removed from Claude Code settings
 if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
-  if [ -f "$HOME/.claude/settings.json" ] && \
+  dcg_claude_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  case "$dcg_claude_dir" in '~') dcg_claude_dir="$HOME" ;; '~/'*) dcg_claude_dir="$HOME/${dcg_claude_dir#\~/}" ;; esac
+  if { [ -n "${CLAUDE_CONFIG_DIR:-}" ] || [ -f "$dcg_claude_dir/settings.json" ]; } && \
      ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg\"?$"))' \
-       "$HOME/.claude/settings.json" &>/dev/null; then
-    printf '\033[1;33m[dcg] Hook missing from ~/.claude/settings.json — run: dcg install\033[0m\n'
+       "$dcg_claude_dir/settings.json" &>/dev/null; then
+    printf '\033[1;33m[dcg] Hook missing from %s/settings.json — run: dcg install\033[0m\n' "$dcg_claude_dir"
   fi
+  unset dcg_claude_dir
 fi
 "#;
 
@@ -17893,12 +17917,32 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Get the path to user-level Claude Code settings (`~/.claude/settings.json`).
-fn claude_settings_path() -> std::path::PathBuf {
+/// Grok's Claude compatibility layer always reads the default location.
+fn default_claude_settings_path() -> std::path::PathBuf {
     crate::config::home_dir()
         .unwrap_or_default()
         .join(".claude")
         .join("settings.json")
+}
+
+fn claude_config_dir_override() -> Option<std::ffi::OsString> {
+    std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty())
+}
+
+/// Active Claude user settings. Project settings remain repository-relative.
+/// Expand only a leading home component; never evaluate shell expressions.
+fn claude_settings_path() -> std::path::PathBuf {
+    let Some(directory) = claude_config_dir_override() else {
+        return default_claude_settings_path();
+    };
+    let mut directory = std::path::PathBuf::from(directory);
+    if let Ok(suffix) = directory.strip_prefix("~") {
+        directory = crate::config::home_dir().unwrap_or_default().join(suffix);
+    }
+    if directory.is_relative() {
+        directory = std::env::current_dir().unwrap_or_default().join(directory);
+    }
+    directory.join("settings.json")
 }
 
 /// Get the path to project-level Claude Code settings (`.claude/settings.json`
@@ -18341,14 +18385,20 @@ impl HookDiagnostics {
 }
 
 fn hook_diagnostics_issue_count(diagnostics: &HookDiagnostics) -> usize {
-    usize::from(diagnostics.settings_exists && diagnostics.has_issues())
+    usize::from(
+        (diagnostics.settings_exists || claude_config_dir_override().is_some())
+            && diagnostics.has_issues(),
+    )
 }
 
 /// Diagnose hook wiring in detail.
 #[allow(dead_code)]
 fn diagnose_hook_wiring() -> HookDiagnostics {
+    diagnose_hook_wiring_at(&claude_settings_path())
+}
+
+fn diagnose_hook_wiring_at(settings_path: &std::path::Path) -> HookDiagnostics {
     let mut diag = HookDiagnostics::default();
-    let settings_path = claude_settings_path();
 
     if !settings_path.exists() {
         return diag;
@@ -18356,7 +18406,7 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
     diag.settings_exists = true;
 
     // Read and parse settings
-    let content = match std::fs::read_to_string(&settings_path) {
+    let content = match std::fs::read_to_string(settings_path) {
         Ok(c) => c,
         Err(e) => {
             diag.settings_error = Some(format!("Failed to read settings: {e}"));

@@ -36,6 +36,31 @@ teardown() {
 # Claude Code Configuration Tests
 # ============================================================================
 
+@test "Claude config directory: install and uninstall honor absolute relative tilde empty and unset" {
+    for form in absolute relative tilde home empty unset; do
+        case "$form" in
+            absolute) export CLAUDE_CONFIG_DIR="$TEST_TMPDIR/absolute config"; expected="$CLAUDE_CONFIG_DIR" ;;
+            relative) export CLAUDE_CONFIG_DIR="relative config"; expected="$PWD/relative config" ;;
+            tilde) export CLAUDE_CONFIG_DIR='~/alternate config'; expected="$HOME/alternate config" ;;
+            home) export CLAUDE_CONFIG_DIR='~'; expected="$HOME" ;;
+            empty) export CLAUDE_CONFIG_DIR=''; expected="$HOME/.claude" ;;
+            unset) unset CLAUDE_CONFIG_DIR; expected="$HOME/.claude" ;;
+        esac
+        extract_install_functions
+        [ "$(claude_config_dir)" = "$expected" ]
+        [ "$CLAUDE_SETTINGS" = "$expected/settings.json" ]
+        mkdir -p "$expected"
+        printf '%s\n' '{"theme":"dark","hooks":{"PreToolUse":[{"matcher":"Read","hooks":[{"type":"command","command":"unrelated"}]}]}}' > "$expected/settings.json"
+        configure_claude_code "$CLAUDE_SETTINGS" "0"
+        grep -q 'dcg' "$expected/settings.json"
+        extract_uninstall_functions
+        unconfigure_claude_code
+        ! grep -q 'dcg' "$expected/settings.json"
+        grep -q 'dark' "$expected/settings.json"
+        grep -q 'unrelated' "$expected/settings.json"
+    done
+}
+
 @test "configure_claude_code: creates settings.json when directory missing" {
     log_test "Testing Claude Code configuration with missing directory..."
 

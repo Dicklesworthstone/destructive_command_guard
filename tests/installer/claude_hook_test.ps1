@@ -7,6 +7,8 @@
 # param so a temp home can be injected ($HOME is read-only in PowerShell).
 
 $ErrorActionPreference = 'Stop'
+$savedClaudeConfigDir = $env:CLAUDE_CONFIG_DIR
+$env:CLAUDE_CONFIG_DIR = $null
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $installPs1 = Join-Path $repoRoot 'install.ps1'
@@ -265,6 +267,30 @@ try {
     $status2 = Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $h9
     Check ($status2 -eq 'already') "mixed matcher migration is idempotent"
 } finally { Remove-Item -Recurse -Force $h9 -ErrorAction SilentlyContinue }
+
+# Active configuration overrides HomeDir's default and preserves settings.
+$activeHome = New-TempHome
+Push-Location $activeHome
+try {
+    foreach ($form in @('absolute', 'relative', 'tilde', 'home', 'empty')) {
+        switch ($form) {
+            'absolute' { $env:CLAUDE_CONFIG_DIR = Join-Path $activeHome 'absolute config'; $expected = $env:CLAUDE_CONFIG_DIR }
+            'relative' { $env:CLAUDE_CONFIG_DIR = 'relative config'; $expected = Join-Path (Get-Location).Path 'relative config' }
+            'tilde' { $env:CLAUDE_CONFIG_DIR = '~/alternate config'; $expected = Join-Path $activeHome 'alternate config' }
+            'home' { $env:CLAUDE_CONFIG_DIR = '~'; $expected = $activeHome }
+            'empty' { $env:CLAUDE_CONFIG_DIR = ''; $expected = Join-Path $activeHome '.claude' }
+        }
+        Check ((Get-ClaudeConfigDir -HomeDir $activeHome) -eq $expected) "resolver: $form"
+        New-Item -ItemType Directory -Force $expected | Out-Null
+        $settings = Join-Path $expected 'settings.json'
+        [System.IO.File]::WriteAllText($settings, '{"theme":"dark"}')
+        $status = Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $activeHome
+        Check ($status -eq 'merged') "active configuration installed: $form"
+        $value = Get-Content -Raw $settings | ConvertFrom-Json
+        Check ($value.theme -eq 'dark') "settings preserved: $form"
+        Check (@($value.hooks.PreToolUse).Count -eq 1) "hook present: $form"
+    }
+} finally { Pop-Location; $env:CLAUDE_CONFIG_DIR = $savedClaudeConfigDir }
 
 if ($script:failures -gt 0) {
     Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red

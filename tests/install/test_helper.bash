@@ -90,6 +90,10 @@ setup_isolated_home() {
     export ORIGINAL_PATH="$PATH"
     export ORIGINAL_WORKING_DIRECTORY="$PWD"
 
+    export DCG_TEST_SAVED_CLAUDE_CONFIG_DIR_SET="${CLAUDE_CONFIG_DIR+x}"
+    export DCG_TEST_SAVED_CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR-}"
+    unset CLAUDE_CONFIG_DIR
+
     # OMP resolves extension targets from ambient process state, independently
     # of HOME. Preserve set-vs-unset (an explicitly empty OMP_PROFILE is
     # meaningful), then remove every supported selector before any installer or
@@ -159,6 +163,12 @@ teardown_isolated_home() {
     fi
     if [[ -n "${ORIGINAL_HOME:-}" ]]; then
         export HOME="$ORIGINAL_HOME"
+    fi
+
+    if [[ "${DCG_TEST_SAVED_CLAUDE_CONFIG_DIR_SET:-}" = "x" ]]; then
+        export CLAUDE_CONFIG_DIR="${DCG_TEST_SAVED_CLAUDE_CONFIG_DIR-}"
+    else
+        unset CLAUDE_CONFIG_DIR
     fi
 
     if [[ "${DCG_TEST_SAVED_OMP_PROFILE_SET:-}" = "x" ]]; then

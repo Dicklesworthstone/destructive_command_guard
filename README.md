@@ -1295,6 +1295,22 @@ Options:
 
 ## Claude Code Configuration
 
+`dcg install`, `dcg uninstall`, `dcg doctor`, and hook self-healing use
+`$CLAUDE_CONFIG_DIR/settings.json` when `CLAUDE_CONFIG_DIR` is non-empty.
+The Bash and PowerShell installers follow the same rule. Unset or empty values
+use `~/.claude/settings.json`. A leading `~` is expanded to the user's home;
+relative directories resolve against the current working directory. Use an
+absolute directory when launching Claude Code from different working directories.
+Existing settings and unrelated hooks are preserved. Doctor names the checked
+path and `--strict` fails if the selected configuration has no protection;
+`doctor --fix` can install into a missing selected configuration.
+`install --project` continues to use the repository's `.claude/settings.json`.
+
+Grok's Claude compatibility layer continues to read `~/.claude/settings.json`
+and does **not** honor `CLAUDE_CONFIG_DIR`; doctor checks that default file
+separately. Other integrations keep their own configuration locations. For Grok
+with an alternate Claude configuration, prefer `dcg install --grok`.
+
 Add to `~/.claude/settings.json`:
 
 ```json

@@ -28,6 +28,16 @@ Param(
 
 $ErrorActionPreference = "Stop"
 
+function Get-ClaudeConfigDir {
+  param([string]$HomeDir = $HOME)
+  $dir = $env:CLAUDE_CONFIG_DIR
+  if ([string]::IsNullOrEmpty($dir)) { return (Join-Path $HomeDir '.claude') }
+  if ($dir -eq '~') { $dir = $HomeDir }
+  elseif ($dir.StartsWith('~/') -or $dir.StartsWith('~\')) { $dir = Join-Path $HomeDir $dir.Substring(2) }
+  if (-not [System.IO.Path]::IsPathRooted($dir)) { $dir = Join-Path (Get-Location).Path $dir }
+  return $dir
+}
+
 function Write-Info { param($msg) if (-not $Quiet) { Write-Host "[*] $msg" -ForegroundColor Cyan } }
 function Write-Ok { param($msg) if (-not $Quiet) { Write-Host "[+] $msg" -ForegroundColor Green } }
 function Write-Warn { param($msg) if (-not $Quiet) { Write-Host "[!] $msg" -ForegroundColor Yellow } }
@@ -864,7 +874,7 @@ if (-not $Yes) {
 
 $binary = Join-Path $Dest "dcg.exe"
 
-$claudeSettings = Join-Path (Join-Path $HOME ".claude") "settings.json"
+$claudeSettings = Join-Path (Get-ClaudeConfigDir) "settings.json"
 if (Remove-DcgHooksFromJsonFile -Path $claudeSettings) {
   Write-Ok "Removed Claude Code hook"
 }
