@@ -6762,6 +6762,29 @@ fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     );
     println!("  Hook self-heal: {}", config.general.self_heal_hook);
     println!("  Fail closed: {}", config.general.fail_closed);
+    // The same effective values `--format json` reports (#530).
+    println!(
+        "  Unverified decision: {}",
+        if config.unverified_denies() {
+            "deny"
+        } else {
+            "ask"
+        }
+    );
+    println!("  Update pin: {}", config.general.update_pin);
+    println!("  Check updates: {}", config.general.check_updates);
+    println!(
+        "  Max hook input bytes: {}",
+        config.general.max_hook_input_bytes()
+    );
+    println!(
+        "  Max command bytes: {}",
+        config.general.max_command_bytes()
+    );
+    println!(
+        "  Max findings per command: {}",
+        config.general.max_findings_per_command()
+    );
     println!();
     let (active_packs, unloaded_packs) = resolved_pack_listing(config);
     let keywordless: &[String] =
@@ -6921,6 +6944,17 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
             "hook_timeout_source": config.hook_timeout_source(),
             "self_heal_hook": config.general.self_heal_hook,
             "fail_closed": config.general.fail_closed,
+            // Effective values (#530): the hand-written list above used to stop
+            // here, so these settings, and their DCG_* overrides, were invisible
+            // to `dcg config --format json`. `unverified_decision` reads through
+            // `unverified_denies`, which applies `DCG_UNVERIFIED_DECISION` at
+            // use time; the size limits report their defaults when unset.
+            "unverified_decision": if config.unverified_denies() { "deny" } else { "ask" },
+            "update_pin": config.general.update_pin,
+            "check_updates": config.general.check_updates,
+            "max_hook_input_bytes": config.general.max_hook_input_bytes(),
+            "max_command_bytes": config.general.max_command_bytes(),
+            "max_findings_per_command": config.general.max_findings_per_command(),
         },
         "packs": {
             "enabled": enabled_packs,
@@ -18375,7 +18409,6 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
                     }
 
                     let hook_object = hook.as_object();
-                    let expected_property_count = if cfg!(windows) { 3 } else { 2 };
                     let type_is_command =
                         hook.get("type").and_then(serde_json::Value::as_str) == Some("command");
                     let is_synchronous =
@@ -18385,15 +18418,24 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
                     } else {
                         hook.get("shell").is_none()
                     };
-                    let exact_owned_shape =
-                        hook_object.is_some_and(|object| object.len() == expected_property_count);
-                    if !type_is_command || !is_synchronous || !shell_is_safe || !exact_owned_shape {
+                    // Judged on dcg-owned keys only, exactly as install and
+                    // hook-mode self-heal judge it (#528, #345): a host- or
+                    // operator-owned field such as `"timeout": 10` is carried
+                    // forward by `dcg install --force`, so counting it as a
+                    // defect produced a finding no remedy could clear. The one
+                    // host key that changes enforcement, `async`, is still
+                    // checked above.
+                    if hook_object.is_none()
+                        || !type_is_command
+                        || !is_synchronous
+                        || !shell_is_safe
+                    {
                         diag.misconfigured_hooks.push(format!(
                             "{cmd} (expected a synchronous command hook with the platform-safe shell)"
                         ));
                     }
                     match &desired_hook {
-                        Ok(expected) if hook != expected => {
+                        Ok(expected) if !hook_has_dcg_identity(hook, expected) => {
                             diag.misconfigured_hooks.push(format!(
                                 "{cmd} (hook does not invoke this dcg executable with \
                                  platform-safe quoting)"
