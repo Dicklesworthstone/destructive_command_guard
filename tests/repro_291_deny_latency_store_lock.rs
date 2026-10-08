@@ -43,6 +43,8 @@ fn run_hook_with_pending_store(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("XDG_CONFIG_HOME", home.join("xdg_config"))
         .env("DCG_CONFIG", &config_path)
         .env("DCG_PENDING_EXCEPTIONS_PATH", pending_path)

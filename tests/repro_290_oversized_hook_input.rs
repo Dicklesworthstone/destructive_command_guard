@@ -50,6 +50,8 @@ fn run_hook_raw_with_budget(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("XDG_CONFIG_HOME", home.join("xdg_config"))
         .env("DCG_CONFIG", &config_path)
         .env(
@@ -394,6 +396,8 @@ fn run_hook_raw_windows(input: &str, home: &Path) -> (String, String, i32) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("XDG_CONFIG_HOME", home.join("xdg_config"))
         .env("DCG_CONFIG", &config_path)
         .env("DCG_PACKS", "windows.filesystem")

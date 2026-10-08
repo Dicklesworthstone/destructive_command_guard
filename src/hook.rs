@@ -39,6 +39,13 @@ pub struct HookInput {
     )]
     pub hook_event_name: Option<String>,
 
+    /// Cursor's native Claude-compatible envelope identifies its host with
+    /// this marker. Populated best-effort by [`parse_hook_input`], outside the
+    /// primary parser, so duplicate or malformed metadata cannot reject a
+    /// command that was previously readable.
+    #[serde(skip)]
+    pub cursor_version: Option<String>,
+
     /// Session id (Gemini snake_case; VS Code Agent Host camelCase).
     #[serde(
         alias = "sessionId",
@@ -1104,7 +1111,10 @@ pub fn parse_hook_input(json: &str) -> Result<HookInput, serde_json::Error> {
     let neutralized = neutralize_lone_surrogate_escapes(json);
     let json = neutralized.as_ref();
     let first_error = match serde_json::from_str::<HookInput>(json) {
-        Ok(input) => return Ok(input),
+        Ok(mut input) => {
+            input.cursor_version = cursor_version_from_json_metadata(json);
+            return Ok(input);
+        }
         Err(err) => err,
     };
 
@@ -1139,10 +1149,60 @@ pub fn parse_hook_input(json: &str) -> Result<HookInput, serde_json::Error> {
     match serde_json::from_value::<HookInput>(serde_json::Value::Object(object)) {
         Ok(mut input) => {
             input.alias_conflict_commands = displaced_commands;
+            input.cursor_version = cursor_version_from_json_metadata(json);
             Ok(input)
         }
         Err(_) => Err(first_error),
     }
+}
+
+/// Read only Cursor's optional host marker after the primary hook parse has
+/// succeeded. The literal key spelling used by Cursor triggers this extra
+/// scan; payloads without it pay only for the presence check. JSON-escaped
+/// spellings of the key leave this optional self-heal hint unset.
+///
+/// Do not flatten metadata into HookInput: Serde buffers flattened unknown
+/// values, which can reject numbers or nesting that IgnoredAny used to skip.
+/// Here unrelated values stay ignored, duplicate markers are harmless, and
+/// any metadata error leaves the successful command/protocol parse intact.
+fn cursor_version_from_json_metadata(json: &str) -> Option<String> {
+    if !json.contains("\"cursor_version\"") {
+        return None;
+    }
+
+    struct CursorMetadataVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for CursorMetadataVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a hook envelope object")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut marker = None;
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "cursor_version" {
+                    if let serde_json::Value::String(version) = map.next_value()?
+                        && !version.trim().is_empty()
+                    {
+                        marker = Some(version);
+                    }
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok(marker)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    serde::Deserializer::deserialize_map(&mut deserializer, CursorMetadataVisitor)
+        .ok()
+        .flatten()
 }
 
 /// Collapse duplicate alias spellings in a raw hook envelope.
@@ -1810,6 +1870,29 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
 }
 
 impl HookInput {
+    /// Identify an unambiguous non-Claude host sharing Claude's response
+    /// protocol, solely to select its self-healing settings path. Call only
+    /// after [`detect_protocol`] returned [`HookProtocol::ClaudeCompatible`]
+    /// so these markers never override another protocol's wire identity.
+    #[must_use]
+    pub fn claude_compatible_host_for_self_heal(&self) -> Option<crate::agent::Agent> {
+        if self
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| calls.iter().any(is_batch_shell_call))
+        {
+            return Some(crate::agent::Agent::Custom("vscode-agent-host".to_owned()));
+        }
+        if self
+            .cursor_version
+            .as_deref()
+            .is_some_and(|version| !version.trim().is_empty())
+        {
+            return Some(crate::agent::Agent::CursorIde);
+        }
+        None
+    }
+
     /// Whether the caller asked for an explicit allow line (see
     /// [`Self::dcg_explicit_verdict`]). Only a JSON `true` counts.
     #[must_use]
@@ -5598,7 +5681,7 @@ mod tests {
     fn envelope_fields_of_the_wrong_type_never_fail_the_parse() {
         for bad in ["42", "true", "[1,2]", r#"{"k":"v"}"#, "null"] {
             let json = format!(
-                r#"{{"event":{bad},"hook_event_name":{bad},"session_id":{bad},"transcript_path":{bad},"cwd":{bad},"timestamp":{bad},"turn_id":{bad},"tool_use_id":{bad},"permission_mode":{bad},"toolCall":{bad},"toolCalls":{bad},"tool_name":"Bash","tool_input":{{"command":"git reset --hard"}}}}"#
+                r#"{{"event":{bad},"hook_event_name":{bad},"cursor_version":{bad},"session_id":{bad},"transcript_path":{bad},"cwd":{bad},"timestamp":{bad},"turn_id":{bad},"tool_use_id":{bad},"permission_mode":{bad},"toolCall":{bad},"toolCalls":{bad},"tool_name":"Bash","tool_input":{{"command":"git reset --hard"}}}}"#
             );
             let input: HookInput = serde_json::from_str(&json)
                 .unwrap_or_else(|error| panic!("{bad}: parse failed ({error}), which fails open"));
@@ -5620,6 +5703,33 @@ mod tests {
             parse_hook_input(r#"{"tool_name":{"nested":true},"tool_input":{"command":"ls"}}"#)
                 .expect("a wrong-typed tool name degrades, it does not fail the parse");
         assert!(input.tool_name.is_none());
+    }
+
+    #[test]
+    fn cursor_metadata_scan_preserves_native_batch_parsing() {
+        for (metadata, expected_marker) in [
+            (
+                r#""cursor_version":42,"cursor_version":"2026.09.28","cursor_version":null,"cursor_version":{}"#,
+                Some("2026.09.28"),
+            ),
+            (
+                r#""cursor_version":"2026.09.28","unknown":1e1000,"unknown":{"nested":[false,null]}"#,
+                Some("2026.09.28"),
+            ),
+            (r#""cursor_version":1e1000"#, None),
+            (r#""unknown":1e1000"#, None),
+            (r#""unknown":{"cursor_version":"2026.09.28"}"#, None),
+        ] {
+            let payload = format!(
+                r#"{{{metadata},"toolCalls":[{{"name":"bash","args":"{{\"command\":\"git reset --hard\"}}"}}]}}"#
+            );
+            let input = parse_hook_input(&payload)
+                .unwrap_or_else(|error| panic!("metadata rejected a native batch: {error}"));
+            assert_eq!(input.cursor_version.as_deref(), expected_marker);
+            let command = extract_command_with_context(&input).expect("native shell batch");
+            assert_eq!(command.protocol, HookProtocol::ClaudeCompatible);
+            assert_eq!(command.command, "git reset --hard");
+        }
     }
 
     #[test]

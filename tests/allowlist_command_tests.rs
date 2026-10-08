@@ -28,6 +28,7 @@ fn run_hook_with_allowlist(command: &str, allowlist_content: &str) -> String {
     let mut child = Command::new(dcg_binary())
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("XDG_CONFIG_HOME", &xdg_config_dir)
         // Ensure system allowlist doesn't interfere
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "/nonexistent")
@@ -144,6 +145,7 @@ fn run_fallback_hook(allowlist_content: &str) -> String {
     let mut child = Command::new(dcg_binary())
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("XDG_CONFIG_HOME", &xdg_config_dir)
         .env("DCG_CONFIG", &config_path)
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "/nonexistent")

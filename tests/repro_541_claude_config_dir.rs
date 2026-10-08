@@ -4,16 +4,27 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 struct Sandbox {
-    temp: tempfile::TempDir,
+    _temp: tempfile::TempDir,
+    root: PathBuf,
     home: PathBuf,
 }
 
 impl Sandbox {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        // Match current_dir's physical path on Unix, including macOS /var
+        // aliases, without introducing Windows verbatim-path prefixes.
+        #[cfg(unix)]
+        let root = temp.path().canonicalize().unwrap();
+        #[cfg(not(unix))]
+        let root = temp.path().to_path_buf();
+        let home = root.join("home");
         std::fs::create_dir_all(&home).unwrap();
-        Self { temp, home }
+        Self {
+            _temp: temp,
+            root,
+            home,
+        }
     }
 
     fn run(&self, dir: Option<&str>, args: &[&str], input: Option<&str>) -> Output {
@@ -30,7 +41,7 @@ impl Sandbox {
                 "DCG_SELF_HEAL_HOOK",
                 if input.is_some() { "1" } else { "0" },
             )
-            .current_dir(self.temp.path())
+            .current_dir(&self.root)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -66,29 +77,47 @@ fn json(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
+fn assert_reported_settings_path(output: &Output, settings: &Path, json_output: bool) {
+    let message = if json_output {
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "claude_settings")
+            .unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    } else {
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    assert!(message.contains(settings.to_str().unwrap()), "{message}");
+}
+
 #[test]
 fn active_configuration_lifecycle_and_self_heal() {
     for form in ["absolute", "relative", "tilde", "home", "empty", "unset"] {
         let sandbox = Sandbox::new();
-        let absolute = sandbox.temp.path().join("alternate config");
+        let absolute = sandbox.root.join("alternate config");
         let absolute_string = absolute.to_str().unwrap();
         let (dir, settings) = match form {
             "absolute" => (Some(absolute_string), absolute.join("settings.json")),
             "relative" => (
                 Some("relative config"),
-                sandbox.temp.path().join("relative config/settings.json"),
+                sandbox.root.join("relative config").join("settings.json"),
             ),
             "tilde" => (
                 Some("~/alternate config"),
-                sandbox.home.join("alternate config/settings.json"),
+                sandbox.home.join("alternate config").join("settings.json"),
             ),
             "home" => (Some("~"), sandbox.home.join("settings.json")),
-            "empty" => (Some(""), sandbox.home.join(".claude/settings.json")),
-            _ => (None, sandbox.home.join(".claude/settings.json")),
+            "empty" => (Some(""), sandbox.home.join(".claude").join("settings.json")),
+            _ => (None, sandbox.home.join(".claude").join("settings.json")),
         };
         // A valid default hook must never conceal missing active protection.
         success(&sandbox.run(None, &["install"], None));
-        let default = sandbox.home.join(".claude/settings.json");
+        let default = sandbox.home.join(".claude").join("settings.json");
         let original_default = std::fs::read(&default).unwrap();
         if settings != default {
             for args in [
@@ -100,9 +129,7 @@ fn active_configuration_lifecycle_and_self_heal() {
                     !output.status.success(),
                     "{form}: absent active config passed doctor"
                 );
-                assert!(
-                    String::from_utf8_lossy(&output.stdout).contains(settings.to_str().unwrap())
-                );
+                assert_reported_settings_path(&output, &settings, args.contains(&"json"));
             }
         }
         success(&sandbox.run(dir, &["install"], None));
@@ -140,7 +167,7 @@ fn active_configuration_lifecycle_and_self_heal() {
         ] {
             let output = sandbox.run(dir, &args, None);
             success(&output);
-            assert!(String::from_utf8_lossy(&output.stdout).contains(settings.to_str().unwrap()));
+            assert_reported_settings_path(&output, &settings, args.contains(&"json"));
         }
         success(&sandbox.run(dir, &["uninstall"], None));
         assert_eq!(
@@ -195,7 +222,7 @@ fn doctor_fix_creates_missing_active_settings_and_grok_uses_default() {
         &["doctor", "--fix", "--strict", "--format", "json"],
         None,
     ));
-    assert!(sandbox.temp.path().join("active/settings.json").exists());
+    assert!(sandbox.root.join("active").join("settings.json").exists());
     success(&sandbox.run(Some("active"), &["doctor", "--strict"], None));
     // A protected alternate directory does not protect Grok's default file.
     success(&sandbox.run(None, &["uninstall"], None));
@@ -221,7 +248,7 @@ fn doctor_fix_creates_missing_active_settings_and_grok_uses_default() {
 fn invalid_active_settings_are_preserved_and_project_install_takes_precedence() {
     let sandbox = Sandbox::new();
     success(&sandbox.run(None, &["install"], None));
-    let active = sandbox.temp.path().join("active/settings.json");
+    let active = sandbox.root.join("active").join("settings.json");
     std::fs::create_dir_all(active.parent().unwrap()).unwrap();
     let corrupt = b"{invalid JSON";
     std::fs::write(&active, corrupt).unwrap();
@@ -233,8 +260,8 @@ fn invalid_active_settings_are_preserved_and_project_install_takes_precedence() 
         assert!(!sandbox.run(Some("active"), &args, None).status.success());
         assert_eq!(std::fs::read(&active).unwrap(), corrupt);
     }
-    std::fs::create_dir(sandbox.temp.path().join(".git")).unwrap();
+    std::fs::create_dir(sandbox.root.join(".git")).unwrap();
     success(&sandbox.run(Some("active"), &["install", "--project"], None));
-    assert!(sandbox.temp.path().join(".claude/settings.json").exists());
+    assert!(sandbox.root.join(".claude").join("settings.json").exists());
     assert_eq!(std::fs::read(active).unwrap(), corrupt);
 }

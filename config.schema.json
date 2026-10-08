@@ -284,7 +284,7 @@
           "default": true
         },
         "self_heal_hook": {
-          "description": "Whether to self-heal the hook registration in settings.json.\nWhen enabled, every hook invocation checks that the dcg entry is still\npresent in `~/.claude/settings.json` and re-registers it if missing.\nThis protects against Claude Code silently overwriting settings.json\nmid-session.\nDefault: true. Disable with `DCG_NO_SELF_HEAL` or `self_heal_hook = false`.",
+          "description": "Whether to self-heal the hook registration in settings.json.\nWhen enabled, each Claude hook invocation checks that the dcg entry is still\npresent in the active Claude settings (`CLAUDE_CONFIG_DIR/settings.json`,\ndefault `~/.claude/settings.json`) and re-registers it if missing.\nOther identified hosts keep their fixed Claude-compatible location.\nThis protects against Claude Code silently overwriting settings.json\nmid-session.\nDefault: true. Disable with `DCG_NO_SELF_HEAL` or `self_heal_hook = false`.",
           "type": "boolean",
           "default": true
         },

@@ -68,6 +68,7 @@ fn configure_isolated_hook_child(command: &mut Command) {
     command
         .env("HOME", &test_home)
         .env("USERPROFILE", &test_home)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("XDG_CONFIG_HOME", test_home.join(".config"))
         .env("XDG_DATA_HOME", test_home.join(".local/share"))
         .env("APPDATA", test_home.join("AppData/Roaming"))

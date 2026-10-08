@@ -1148,7 +1148,7 @@ present.
 - **VS Code Copilot Chat:** Current VS Code releases load `~/.claude/settings.json` by default, so the Claude Code hook installed by dcg also protects Copilot Chat without a second bridge or duplicate hook. dcg recognizes VS Code's documented `runTerminalCommand` shell tool plus the observed compatibility names `run_in_terminal` and `runInTerminal`, reads `tool_input.command`, and returns VS Code's documented `hookSpecificOutput` deny. The newer Copilot **Agent Host** (and the Agents window built on it) sends a batched envelope instead — `{"toolCalls": [{"name": "powershell", "args": "{\"command\": …}"}]}` with JSON-encoded argument strings; dcg evaluates every shell entry in the batch independently and a single destructive entry denies the request (#252). Agent hooks are still a VS Code preview feature and can be disabled by organization policy; use **Developer: Show Agent Debug Logs** or the **GitHub Copilot Chat Hooks** output channel to confirm that the hook loaded.
 - **Cursor IDE:** Hooks are configured through `~/.cursor/hooks.json` plus a generated bridge (`dcg-pre-shell.ps1` on Windows). The installer inserts dcg first in `beforeShellExecution`, collapses duplicate dcg entries, and preserves coexisting Cursor hooks. The bridge blocks a command it cannot verify: a payload it cannot read, or a dcg that ran but gave no verdict (killed, timed out, non-zero exit, no answer). Set `DCG_BRIDGE_CRASH_DECISION=allow` to let those through instead; only a dcg that cannot be started at all is allowed, with a notice on stderr. Cursor also runs the `PreToolUse` hooks in `~/.claude/settings.json` for its `Shell` tool, and dcg judges those payloads too.
 - **Hermes Agent:** [NousResearch's Hermes Agent](https://github.com/NousResearch/hermes-agent) declares shell hooks in its `config.yaml` under `hooks.pre_tool_call`. Hermes resolves its data root from `HERMES_HOME` when set, else `%LOCALAPPDATA%\hermes` on native Windows and `~/.hermes` on Linux/macOS — both installers write the hook to that resolved path (`install.ps1` never writes to `%USERPROFILE%\.hermes` unless `HERMES_HOME` points there, since native Windows Hermes would never read it). The installer merges a single `matcher: "terminal"` entry that invokes dcg directly — no wrapper script — because Hermes' input JSON (`hook_event_name: "pre_tool_call"`, `tool_name: "terminal"`, `tool_input.command`) deserializes straight into dcg's existing `HookInput`. Hermes [explicitly documents](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/hooks.md) that "non-zero exit codes... never abort the agent loop", so dcg switches to Hermes' JSON block protocol on output: `{"decision":"block","reason":...}` (plus the alternate `{"action":"block","message":...}` form for cross-version compatibility). The installer also sets `hooks_auto_accept: true` if not already set; Hermes silently drops un-allowlisted hooks in non-TTY runs (gateway/cron) without it. `unconfigure_hermes` in `uninstall.sh` removes only the dcg-owned entry and leaves `hooks_auto_accept` alone (other Hermes hooks may rely on it).
-- **Grok (xAI):** [Grok Build / Grok CLI](https://x.ai/news/grok-build-cli) auto-discovers every `*.json` under `~/.grok/hooks/`. `dcg install --grok` writes a self-contained `~/.grok/hooks/dcg.json` with a `PreToolUse` / `matcher: "Bash"` entry — Grok internally aliases Claude-style `"Bash"` to its own `run_terminal_cmd` tool, so a single rule covers every shell command. dcg detects Grok at runtime from the camelCase wire shape (`hookEventName: "pre_tool_use"`, `toolName: "run_terminal_cmd"`) or from the `GROK_SESSION_ID` / `GROK_HOOK_EVENT` / `GROK_WORKSPACE_ROOT` environment variables, and switches its output to Grok's JSON contract: `{"decision":"deny","reason":...}` (note `"deny"`, not Hermes' `"block"`). Grok also picks up dcg automatically through its `~/.claude/settings.json` compatibility layer, so existing Claude Code users get protection with no additional install step. Add `--project` to write `<repo>/.grok/hooks/dcg.json` for a per-repo install (Grok requires `/hooks-trust` the first time it opens a repo with hooks).
+- **Grok (xAI):** [Grok Build / Grok CLI](https://x.ai/news/grok-build-cli) auto-discovers every `*.json` under `~/.grok/hooks/`. `dcg install --grok` writes a self-contained `~/.grok/hooks/dcg.json` with a `PreToolUse` / `matcher: "Bash"` entry — Grok internally aliases Claude-style `"Bash"` to its own `run_terminal_cmd` tool, so a single rule covers every shell command. dcg detects Grok at runtime from the camelCase wire shape (`hookEventName: "pre_tool_use"`, `toolName: "run_terminal_cmd"`) or from the `GROK_SESSION_ID` / `GROK_HOOK_EVENT` / `GROK_WORKSPACE_ROOT` environment variables, and switches its output to Grok's JSON contract: `{"decision":"deny","reason":...}` (note `"deny"`, not Hermes' `"block"`). Grok also reads `~/.claude/settings.json` when its Claude compatibility hooks are enabled, as documented in its [hook locations](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/10-hooks.md#hook-locations). That compatibility location does **not** follow `CLAUDE_CONFIG_DIR`: DCG checks Grok's default compatibility file separately, and a hook installed only in a relocated Claude directory does not protect Grok. Use `dcg install --grok` for that setup. Add `--project` to write `<repo>/.grok/hooks/dcg.json` for a per-repo install (Grok requires `/hooks-trust` the first time it opens a repo with hooks).
 - **Antigravity CLI (`agy`):** [Google Antigravity's `agy` CLI](https://antigravity.google) ships a Claude-Code-compatible hooks system. `dcg install --agy` merges a `PreToolUse` / `matcher: "Bash"` entry into `~/.gemini/config/hooks.json` (the canonical path; `agy` migrates the legacy `~/.gemini/antigravity-cli/hooks.json` here and symlinks the old path to it). `agy` runs the hook before its `run_command` shell tool; dcg detects `agy` at runtime from the distinctive nested `toolCall` envelope (`{"toolCall":{"name":"run_command","args":{"CommandLine":"…"}},"conversationId":…,"stepIdx":…}`) — the shell command is read from `toolCall.args.CommandLine` — or from the `ANTIGRAVITY_CONVERSATION_ID` environment variable / `agy` parent-process name. dcg switches its output to `agy`'s JSON contract: `{"decision":"block","reason":…}` with exit code 0 (verified: `agy` honors both `"block"` and `"deny"` and aborts the tool; a non-zero exit code is only logged and does NOT reliably block, so dcg always emits exit 0 + JSON). Add `--project` to write `<repo>/.gemini/config/hooks.json` for a per-repo install. Restart `agy` (start a new session) after installing.
 - **Posit Assistant:** [Posit Assistant](https://positron.posit.co/assistant/) reads Claude-Code-compatible lifecycle hooks from `~/.posit/assistant/settings.json` (global) and `<workspace>/.posit/assistant/settings.json` (project). The installer merges one `PreToolUse` entry into the **global** file, so a single install covers the Positron/RStudio extension, the standalone server, and the `pa` terminal client across every workspace. No protocol work was needed on dcg's side: the `PreToolUse` stdin is the snake_case Claude shape (`tool_name`, `tool_input.command`, `tool_use_id`, `permission_mode`), exit code 2 blocks with stderr shown as the reason, and `hookSpecificOutput.permissionDecision` (`allow`/`deny`/`ask`) is read on exit 0 — dcg's existing Claude-compatible response answers all of it. Three details differ from the Claude Code entry: the matcher is **lowercase** `"bash|powershell"` (a simple matcher string is an *exact* match — or a `|`/`,`-separated list of exact matches — against the tool name, so a copied Claude `"Bash"` matcher would never fire; listing both names covers a Windows PowerShell host with one entry); only documented handler fields are written (`type`, `command`, `timeout`), so there is **no `shell` field** — the command path is quoted instead, since shell-form hooks run through `cmd.exe` on Windows; and `timeout` is in **seconds**. dcg identifies the agent at runtime from `PA_PROJECT_DIR`, which the hook contract sets in the hook subprocess (also used to keep a `powershell` tool name from being answered with Codex's minimal deny shape). Existing matcher groups are left structurally intact rather than consolidated — hook config is additive, so a user's `matcher: "bash,edit"` group keeps working untouched — and `unconfigure_posit_assistant` in `uninstall.sh` removes only dcg-owned entries and never deletes the settings file, since unrelated settings live there too. Note: Posit's hooks documentation is not public yet; this contract was verified empirically and is pinned by tests in `src/hook.rs`.
 - **OpenCode:** First-party plugin support (#318). `dcg install --opencode` writes a native `tool.execute.before` plugin to `~/.config/opencode/plugins/dcg-guard.js` (add `--project` for `<repo>/.opencode/plugins/dcg-guard.js`). The plugin routes every OpenCode `bash` tool call through dcg's Claude-compatible hook protocol — spawning the absolute dcg binary path embedded at install time with `OPENCODE=1` in the environment — and aborts the tool call by throwing when dcg denies (an `ask` verdict also fails closed, since OpenCode has no operator-review state). The plugin asks dcg for an explicit allow line, so a dcg that ran but gave no verdict (killed, a non-zero exit, or exit 0 with nothing on stdout) blocks the command unless `DCG_BRIDGE_CRASH_DECISION=allow`; only a dcg that cannot be started at all (missing) fails open, with a stderr notice. The file carries a `dcg-opencode-plugin` ownership marker: the installer refuses to overwrite a user-owned file of the same name, and the uninstaller deletes only marker-carrying files. `install.sh` configures it automatically when OpenCode is detected; `dcg doctor` reports an `opencode_plugin` check (error + `--fix`able when OpenCode is in use but unguarded, since there is no Claude-compat fallback). Restart OpenCode after installing. See [docs/opencode-integration.md](docs/opencode-integration.md). An earlier [community plugin](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js) by aspiers pioneered this approach.
@@ -1295,23 +1295,46 @@ Options:
 
 ## Claude Code Configuration
 
-`dcg install`, `dcg uninstall`, `dcg doctor`, and hook self-healing use
-`$CLAUDE_CONFIG_DIR/settings.json` when `CLAUDE_CONFIG_DIR` is non-empty.
-The Bash and PowerShell installers follow the same rule. Unset or empty values
-use `~/.claude/settings.json`. A leading `~` is expanded to the user's home;
-relative directories resolve against the current working directory. Use an
-absolute directory when launching Claude Code from different working directories.
-Existing settings and unrelated hooks are preserved. Doctor names the checked
-path and `--strict` fails if the selected configuration has no protection;
-`doctor --fix` can install into a missing selected configuration.
-`install --project` continues to use the repository's `.claude/settings.json`.
+DCG uses `$CLAUDE_CONFIG_DIR/settings.json` when `CLAUDE_CONFIG_DIR` is set
+and non-empty; otherwise it uses `~/.claude/settings.json` (on Windows,
+`%USERPROFILE%\.claude\settings.json`). This applies to `dcg install`,
+`dcg uninstall`, `dcg doctor`, `dcg setup`, hook self-healing, the shell
+startup check, and the Bash and PowerShell installers. `XDG_CONFIG_HOME` does
+not override this choice. The [Claude Code environment-variable reference](https://code.claude.com/docs/en/env-vars)
+documents `CLAUDE_CONFIG_DIR` as the user configuration directory override.
+
+Use the same environment for Claude Code and DCG when installing or checking
+a separate profile. For example:
+
+```bash
+export CLAUDE_CONFIG_DIR="$HOME/.nightforge/claude"
+dcg install
+dcg doctor --strict
+```
+
+In PowerShell, set `$env:CLAUDE_CONFIG_DIR = "$HOME\.nightforge\claude"`
+before running the same DCG commands or the installer. A leading `~`, `~/`,
+or native Windows `~\` is expanded to the user's home; relative paths are
+resolved from the command's current directory. Prefer an absolute path when
+starting sessions in different workspaces. An unset or empty value preserves
+the default location. Only the selected user settings are changed, with
+unrelated keys and hooks preserved. Project installation with `--project`
+continues to use `<repo>/.claude/settings.json`.
+
+Doctor reports the settings path it checked in both human-readable and JSON
+output. A hook in the default directory cannot satisfy the check for a
+different active directory: `dcg doctor --strict` fails until the selected
+settings have a valid hook. `dcg doctor --fix` repairs that selected file.
 
 Grok's Claude compatibility layer continues to read `~/.claude/settings.json`
 and does **not** honor `CLAUDE_CONFIG_DIR`; doctor checks that default file
 separately. Other integrations keep their own configuration locations. For Grok
 with an alternate Claude configuration, prefer `dcg install --grok`.
+Self-healing also uses the identified host's settings: an invocation from
+another recognized host does not repair the relocated Claude configuration
+merely because it inherited `CLAUDE_CONFIG_DIR`.
 
-Add to `~/.claude/settings.json`:
+For a manual installation, add the following to the active `settings.json`:
 
 ```json
 {
@@ -2883,14 +2906,15 @@ This hook assumes the AI agent is **well-intentioned but fallible**. It's design
 
 ### Hook not blocking commands
 
-1. **Check hook registration**: Verify `~/.claude/settings.json` contains the hook configuration
+1. **Check hook registration**: Run `dcg doctor --strict` with the same `CLAUDE_CONFIG_DIR` as Claude Code and verify the reported settings path contains the hook configuration
 2. **Restart Claude Code**: Configuration changes require a restart
 3. **Check binary location**: Ensure `dcg` is in your PATH
 4. **Test manually**: Run `echo '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}' | dcg`
 
 ### Hook silently removed (recommended: add shell startup check)
 
-Claude Code can silently remove the dcg hook when it rewrites `~/.claude/settings.json`. This means you may lose protection without any warning.
+Claude Code can silently remove the dcg hook when it rewrites the active user
+`settings.json`. This means you may lose protection without any warning.
 
 **Automatic setup** -- `dcg setup` installs the hook *and* offers to add a shell startup check:
 

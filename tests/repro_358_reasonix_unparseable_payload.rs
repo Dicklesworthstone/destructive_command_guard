@@ -36,6 +36,8 @@ fn run_hook(agent: &str, input: &[u8], home: &Path, fail_closed: bool) -> (Strin
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("XDG_CONFIG_HOME", home.join("xdg_config"))
         .env("DCG_CONFIG", &config_path)
         .env(

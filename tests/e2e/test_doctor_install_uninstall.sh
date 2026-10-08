@@ -69,6 +69,8 @@ log_verbose() {
 
 setup_isolated_env() {
     # Create isolated HOME and XDG directories
+    # A relocated Claude configuration takes precedence over HOME (#541).
+    unset CLAUDE_CONFIG_DIR
     TEST_TMPDIR="$(mktemp -d)"
     export HOME="$TEST_TMPDIR/home"
     export XDG_CONFIG_HOME="$TEST_TMPDIR/config"

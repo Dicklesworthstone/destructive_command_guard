@@ -1912,8 +1912,10 @@ pub struct GeneralConfig {
     pub check_updates: bool,
 
     /// Whether to self-heal the hook registration in settings.json.
-    /// When enabled, every hook invocation checks that the dcg entry is still
-    /// present in `~/.claude/settings.json` and re-registers it if missing.
+    /// When enabled, each Claude hook invocation checks that the dcg entry is still
+    /// present in the active Claude settings (`CLAUDE_CONFIG_DIR/settings.json`,
+    /// default `~/.claude/settings.json`) and re-registers it if missing.
+    /// Other identified hosts keep their fixed Claude-compatible location.
     /// This protects against Claude Code silently overwriting settings.json
     /// mid-session.
     /// Default: true. Disable with `DCG_NO_SELF_HEAL` or `self_heal_hook = false`.

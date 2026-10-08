@@ -1999,7 +1999,23 @@ fn main() {
         .remaining()
         .is_none_or(|remaining| remaining >= SELF_HEAL_MIN_BUDGET);
     if config.general.self_heal_hook && self_heal_budget_ok {
-        cli::ensure_hook_registered();
+        // Grok, Reasonix, and other hosts can identify themselves only in the
+        // already-parsed payload. Their compatibility settings must not move
+        // with an inherited Claude-only configuration override.
+        let self_heal_agent = hook_read.as_ref().map_or_else(
+            |_| detected_agent.clone(),
+            |input| {
+                let protocol = hook::detect_protocol(input);
+                if protocol == hook::HookProtocol::ClaudeCompatible {
+                    input
+                        .claude_compatible_host_for_self_heal()
+                        .unwrap_or_else(|| detected_agent.clone())
+                } else {
+                    effective_agent_for_hook_protocol(protocol, &detected_agent)
+                }
+            },
+        );
+        cli::ensure_hook_registered_for_agent(&self_heal_agent);
     }
 
     // Compile overrides once (precompiled regexes, no per-command compilation)
@@ -2354,7 +2370,8 @@ fn print_help() {
     emit_stderr!("  {}", "─".repeat(50).bright_black());
     emit_stderr!("    Installers configure supported agent hooks automatically.");
     emit_stderr!(
-        "    Common Claude Code config in {}:",
+        "    Claude Code user config: {} (default {}).",
+        "$CLAUDE_CONFIG_DIR/settings.json".cyan(),
         "~/.claude/settings.json".cyan()
     );
     emit_stderr!();

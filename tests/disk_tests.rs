@@ -33,6 +33,7 @@ fn run_hook_with_packs(command: &str, packs: Option<&str>) -> String {
     hook.current_dir(root)
         .env("HOME", root)
         .env("USERPROFILE", root)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_STATE_HOME", root.join("state"))
