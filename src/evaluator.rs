@@ -18836,9 +18836,7 @@ fn collect_tar_helper_sources(command: &str, dialect: ShellDialect) -> Vec<TarHe
                 push_command(action, false, false, false, false);
             }
         }
-        if (options.uncertain || matches!(options.mode, Some('x') | None))
-            && (options.uncertain || !options.to_stdout)
-        {
+        if options.uncertain || (matches!(options.mode, Some('x') | None) && !options.to_stdout) {
             // Unresolved option ownership may select extraction or consume
             // a later apparent -O. Preserve visible helper code independently
             // of a grant for the generic uncertainty finding.
@@ -18974,44 +18972,43 @@ fn evaluate_tar_helper_sources(
                     return Some(EvaluationResult::denied_by_incomplete_analysis(
                         "GNU tar helper exceeds the nested command analysis limit.",
                     ));
-                } else {
-                    let _filesystem_scope = NonlocalFilesystemScope::enter(*nonlocal_filesystem);
-                    let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
-                        command,
-                        enabled_keywords,
-                        ordered_packs,
-                        keyword_index,
-                        compiled_overrides,
-                        allowlists,
-                        heredoc_settings,
-                        allow_once_audit,
-                        project_path,
-                        deadline,
-                        ShellDialect::Posix,
-                        nested_command_depth + 1,
-                        *automated_stdin || inherited_automated_stdin,
-                    );
-                    if nested_result_decides(&result) {
-                        if let Some(info) = result.pattern_info.as_mut() {
-                            info.reason =
-                                format!("GNU tar executes an embedded helper: {}", info.reason);
-                            info.matched_span = None;
-                            info.matched_text_preview = None;
-                        }
-                        return Some(result);
-                    }
-                    record_nested_allowlist_hit(first_allowlist_hit, &mut result);
-                    if !unverified
-                        && !tar_helper_unverified_source(
-                            command,
-                            *automated_stdin || inherited_automated_stdin,
-                            ordered_packs,
-                        )
-                    {
-                        continue;
-                    }
-                    "tar helper selects executable code dynamically or consumes unverified archive/automated input as code"
                 }
+                let _filesystem_scope = NonlocalFilesystemScope::enter(*nonlocal_filesystem);
+                let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+                    command,
+                    enabled_keywords,
+                    ordered_packs,
+                    keyword_index,
+                    compiled_overrides,
+                    allowlists,
+                    heredoc_settings,
+                    allow_once_audit,
+                    project_path,
+                    deadline,
+                    ShellDialect::Posix,
+                    nested_command_depth + 1,
+                    *automated_stdin || inherited_automated_stdin,
+                );
+                if nested_result_decides(&result) {
+                    if let Some(info) = result.pattern_info.as_mut() {
+                        info.reason =
+                            format!("GNU tar executes an embedded helper: {}", info.reason);
+                        info.matched_span = None;
+                        info.matched_text_preview = None;
+                    }
+                    return Some(result);
+                }
+                record_nested_allowlist_hit(first_allowlist_hit, &mut result);
+                if !unverified
+                    && !tar_helper_unverified_source(
+                        command,
+                        *automated_stdin || inherited_automated_stdin,
+                        ordered_packs,
+                    )
+                {
+                    continue;
+                }
+                "tar helper selects executable code dynamically or consumes unverified archive/automated input as code"
             }
         };
         if !filesystem_enabled {
