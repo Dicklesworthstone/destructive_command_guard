@@ -395,6 +395,12 @@ const POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME: &str = "powershell-remove-item-recu
 const POWERSHELL_REMOVE_ITEM_RECURSIVE_REASON: &str = "PowerShell Remove-Item (or an alias) with -Recurse permanently deletes an entire item tree without using the Recycle Bin.";
 const RM_PROTECTED_FILE_NAME: &str = "rm-protected-file";
 const RM_PROTECTED_FILE_REASON: &str = "rm on a protected credential or login-startup file is one-shot data destruction with no recovery. EXTREMELY DANGEROUS.";
+/// The same rule's reason when every protected target is inside a `.git`
+/// directory (#533): that is repository state, not a credential, so saying
+/// "credential or login-startup file" sent users looking for the wrong thing.
+/// The rule id, severity and decision are unchanged, so existing allowlist
+/// entries for `rm-protected-file` keep working.
+const RM_PROTECTED_GIT_INTERNAL_REASON: &str = "rm inside a .git directory deletes the repository's own state (index, refs, HEAD, config, hooks or objects), which git cannot rebuild. Requires human approval; for a stale index.lock, first confirm no git process is running in this repository.";
 
 // ============================================================================
 // Guidance for classifier-only rules (#348)
@@ -508,12 +514,20 @@ const RM_BARE_GLOB_EXPLANATION: &str = "A bare * (or ./*) handed to rm is expand
      rm -i *                          # interactive; needs a terminal - with stdin closed it deletes nothing and exits 0\n  \
      mv ./file /tmp/delete-me-<literal-timestamp>   # move aside instead of deleting";
 
-const RM_PROTECTED_FILE_EXPLANATION: &str = "This deletes a protected credential or login-startup file: an SSH or GPG key, a \
-     cloud or container credential, a shell startup file, or a system account \
-     file such as /etc/shadow or /etc/sudoers. Losing one of these is not a file \
-     you can rebuild from the repository - it is a locked-out account, a revoked \
-     deploy key, or a machine that no longer authenticates.\n\n\
+const RM_PROTECTED_FILE_EXPLANATION: &str = "This deletes a protected file: an SSH or GPG key, a \
+     cloud or container credential, a shell startup file, a system account \
+     file such as /etc/shadow or /etc/sudoers, or a file inside a repository's \
+     .git directory. Losing a credential is not a file you can rebuild from the \
+     repository - it is a locked-out account, a revoked deploy key, or a machine \
+     that no longer authenticates. Inside .git the files are the repository's own \
+     state (the index, refs, HEAD, config with its remotes and credential \
+     helpers, hooks and the object store), and git cannot rebuild them either.\n\n\
      There is NO recovery without backups.\n\n\
+     A stale .git/index.lock left behind by a crashed git process is the common \
+     legitimate case. Removing it while a git command is still running can \
+     corrupt the index, so first confirm that no git process is using this \
+     repository (for example `pgrep -fl git`), and get explicit human approval \
+     for the removal.\n\n\
      dcg already blocks every other single-file spelling of this - unlink, \
      shred -u, truncate -s 0 - and every embedded-language spelling. Plain rm was \
      the one that got through, because the rm rules all require a recursive flag \
@@ -1451,6 +1465,32 @@ fn parse_windows_rm_segment(
 /// Everything else is left alone, so a target the classifier cannot prove
 /// literal still declines there rather than here.
 fn windows_target_is_protected(target: &str) -> bool {
+    let candidate = windows_protected_candidate(target);
+    crate::packs::core::credential_files::may_name_protected_path(&candidate)
+        && crate::packs::core::credential_files::names_protected_file(&candidate)
+}
+
+/// The `rm-protected-file` reason for the Windows targets this rule denies
+/// (#533), judged on the same normalized spelling as
+/// [`windows_target_is_protected`]: the git-internals wording only when every
+/// one of them is inside `.git`.
+fn windows_rm_protected_files_reason<S: AsRef<str>>(protected_targets: &[S]) -> &'static str {
+    let git_only = !protected_targets.is_empty()
+        && protected_targets.iter().all(|target| {
+            crate::packs::core::credential_files::names_protected_git_internal(
+                &windows_protected_candidate(target.as_ref()),
+            )
+        });
+    if git_only {
+        RM_PROTECTED_GIT_INTERNAL_REASON
+    } else {
+        RM_PROTECTED_FILE_REASON
+    }
+}
+
+/// A Windows target rewritten for the POSIX protected-file classifier:
+/// backslashes as slashes and a leading Windows home alias as `$HOME`.
+fn windows_protected_candidate(target: &str) -> String {
     /// Windows home anchors, longest first so `%HOMEDRIVE%%HOMEPATH%` is not
     /// half-consumed by the `%HOMEPATH%` entry.
     const HOME_ALIASES: &[&str] = &[
@@ -1471,8 +1511,7 @@ fn windows_target_is_protected(target: &str) -> bool {
             break;
         }
     }
-    crate::packs::core::credential_files::may_name_protected_path(&candidate)
-        && crate::packs::core::credential_files::names_protected_file(&candidate)
+    candidate
 }
 
 /// A plain `del`/`erase` of a protected file, in the cmd dialect (#451).
@@ -1502,6 +1541,10 @@ fn parse_cmd_protected_file_segment(command: &str) -> RmParseDecision {
         return RmParseDecision::NoMatch;
     }
 
+    // Every protected target is collected (the decision is unchanged: any one
+    // denies) so the reason can say "credential" whenever any target is one
+    // (#533).
+    let mut protected_targets: Vec<String> = Vec::new();
     for word in words {
         // cmd switches are `/f`, `/q`, `/s`, … — a leading slash is an option
         // here, never a POSIX root.
@@ -1515,14 +1558,17 @@ fn parse_cmd_protected_file_segment(command: &str) -> RmParseDecision {
         if target.is_empty() || !windows_target_is_protected(target) {
             continue;
         }
-        return RmParseDecision::Deny(RmParseMatch {
-            pattern_name: RM_PROTECTED_FILE_NAME,
-            reason: RM_PROTECTED_FILE_REASON,
-            severity: Severity::Critical,
-            span: None,
-        });
+        protected_targets.push(target.to_string());
     }
-    RmParseDecision::NoMatch
+    if protected_targets.is_empty() {
+        return RmParseDecision::NoMatch;
+    }
+    RmParseDecision::Deny(RmParseMatch {
+        pattern_name: RM_PROTECTED_FILE_NAME,
+        reason: windows_rm_protected_files_reason(&protected_targets),
+        severity: Severity::Critical,
+        span: None,
+    })
 }
 
 /// `str::strip_prefix` with an ASCII case-insensitive comparison, because
@@ -2264,9 +2310,13 @@ fn parse_powershell_remove_item_segment(command: &str, automated_stdin: bool) ->
                 .iter()
                 .find(|target| windows_target_is_protected(target))
         {
+            let protected_targets: Vec<&String> = literal_targets
+                .iter()
+                .filter(|target| windows_target_is_protected(target))
+                .collect();
             return RmParseDecision::Deny(RmParseMatch {
                 pattern_name: RM_PROTECTED_FILE_NAME,
-                reason: RM_PROTECTED_FILE_REASON,
+                reason: windows_rm_protected_files_reason(&protected_targets),
                 severity: Severity::Critical,
                 span: command
                     .find(target.as_str())
@@ -3538,12 +3588,57 @@ fn parse_protected_file_rm(
         return RmParseDecision::NoMatch;
     }
 
+    // The git-internals wording only when every protected operand is inside
+    // `.git` (#533); one credential anywhere keeps the credential wording.
+    let git_only = paths
+        .iter()
+        .filter(|candidate| {
+            names_protected(candidate.raw)
+                || literal_brace_expansions(candidate.raw)
+                    .is_some_and(|expansions| expansions.iter().any(|word| names_protected(word)))
+        })
+        .all(|candidate| {
+            rm_protected_file_reason(candidate.raw) == RM_PROTECTED_GIT_INTERNAL_REASON
+        });
     RmParseDecision::Deny(RmParseMatch {
         pattern_name: RM_PROTECTED_FILE_NAME,
-        reason: RM_PROTECTED_FILE_REASON,
+        reason: if git_only {
+            RM_PROTECTED_GIT_INTERNAL_REASON
+        } else {
+            RM_PROTECTED_FILE_REASON
+        },
         severity: Severity::Critical,
         span: Some(path.range.clone()),
     })
+}
+
+/// The `rm-protected-file` reason for one POSIX operand that this rule denies
+/// (#533): the git-internals wording only when every protected target the
+/// operand (or its literal brace expansions) names is inside `.git`.
+fn rm_protected_file_reason(raw: &str) -> &'static str {
+    use crate::packs::core::credential_files::{
+        may_name_protected_path, names_protected_file, names_protected_git_internal,
+    };
+    let names_protected = |word: &str| may_name_protected_path(word) && names_protected_file(word);
+    let git_only = if names_protected(raw) {
+        names_protected_git_internal(raw)
+    } else {
+        literal_brace_expansions(raw).is_some_and(|expansions| {
+            let protected: Vec<&String> = expansions
+                .iter()
+                .filter(|word| names_protected(word))
+                .collect();
+            !protected.is_empty()
+                && protected
+                    .iter()
+                    .all(|word| names_protected_git_internal(word))
+        })
+    };
+    if git_only {
+        RM_PROTECTED_GIT_INTERNAL_REASON
+    } else {
+        RM_PROTECTED_FILE_REASON
+    }
 }
 
 /// The words bash brace-expands an unquoted `a{b,c}d` operand into, when every
@@ -10200,6 +10295,95 @@ mod cmd_protected_file_tests {
                 ),
                 "{command} must not deny under {RM_PROTECTED_FILE_NAME}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod git_internals_rm_reason_tests {
+    //! #533: `rm .git/index.lock` was denied as "a protected credential or
+    //! login-startup file". The decision and rule id stay; only the reason
+    //! now names the repository state actually at risk.
+    use super::*;
+
+    fn deny(command: &str, dialect: ShellDialect) -> RmParseMatch {
+        match parse_rm_command_segment_in_dialect(command, false, dialect) {
+            RmParseDecision::Deny(hit) => hit,
+            other => unreachable!("{command} must stay denied: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rm_of_git_internals_denies_with_a_git_reason_issue_533() {
+        for command in [
+            "rm .git/index.lock",
+            "rm -f .git/index.lock",
+            "rm repo/.git/index.lock",
+            "rm .git/HEAD.lock",
+            "rm .git/notes.txt",
+        ] {
+            let hit = deny(command, ShellDialect::Posix);
+            assert_eq!(hit.pattern_name, RM_PROTECTED_FILE_NAME, "{command}");
+            assert_eq!(hit.severity, Severity::Critical, "{command}");
+            assert_eq!(hit.reason, RM_PROTECTED_GIT_INTERNAL_REASON, "{command}");
+        }
+    }
+
+    #[test]
+    fn rm_of_credentials_keeps_the_credential_reason_issue_533() {
+        for command in [
+            "rm ~/.ssh/id_rsa",
+            "rm ~/.aws/credentials",
+            "rm /etc/shadow",
+        ] {
+            let hit = deny(command, ShellDialect::Posix);
+            assert_eq!(hit.pattern_name, RM_PROTECTED_FILE_NAME, "{command}");
+            assert_eq!(hit.reason, RM_PROTECTED_FILE_REASON, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_credential_anywhere_keeps_the_credential_reason_issue_533() {
+        // The git operand comes first, so the reported span is the git path;
+        // the reason must still not understate the credential deletion.
+        let hit = deny("rm .git/index.lock ~/.ssh/id_rsa", ShellDialect::Posix);
+        assert_eq!(hit.pattern_name, RM_PROTECTED_FILE_NAME);
+        assert_eq!(hit.reason, RM_PROTECTED_FILE_REASON);
+    }
+
+    #[test]
+    fn unprotected_lock_files_stay_allowed_issue_533() {
+        for command in ["rm index.lock", "rm notes.lock", "rm lock", "rm .gitignore"] {
+            assert!(
+                matches!(
+                    parse_rm_command_segment_in_dialect(command, false, ShellDialect::Posix),
+                    RmParseDecision::NoMatch
+                ),
+                "{command} must not deny under {RM_PROTECTED_FILE_NAME}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_deletes_of_git_internals_use_the_git_reason_issue_533() {
+        for (command, dialect) in [
+            ("Remove-Item .git\\index.lock", ShellDialect::PowerShell),
+            ("del .git\\index.lock", ShellDialect::Cmd),
+        ] {
+            let hit = deny(command, dialect);
+            assert_eq!(hit.pattern_name, RM_PROTECTED_FILE_NAME, "{command}");
+            assert_eq!(hit.reason, RM_PROTECTED_GIT_INTERNAL_REASON, "{command}");
+        }
+        for (command, dialect) in [
+            ("Remove-Item $HOME\\.ssh\\id_rsa", ShellDialect::PowerShell),
+            (
+                "Remove-Item .git\\index.lock $HOME\\.ssh\\id_rsa",
+                ShellDialect::PowerShell,
+            ),
+            ("del %USERPROFILE%\\.ssh\\id_rsa", ShellDialect::Cmd),
+        ] {
+            let hit = deny(command, dialect);
+            assert_eq!(hit.reason, RM_PROTECTED_FILE_REASON, "{command}");
         }
     }
 }

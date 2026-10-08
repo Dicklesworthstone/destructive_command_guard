@@ -277,6 +277,37 @@ pub(crate) fn names_protected_file(operand: &str) -> bool {
     })
 }
 
+/// Whether every protected reading of `operand` is repository state inside a
+/// `.git` directory, rather than a credential or login-startup file (#533).
+///
+/// Uses exactly the spelling filters of [`names_protected_file`]; it does not
+/// change WHAT is protected, only lets a caller word its denial correctly. An
+/// operand with no protected reading, or with any protected reading outside
+/// `.git`, returns `false`, so a mixed or credential target keeps the
+/// credential wording.
+pub(crate) fn names_protected_git_internal(operand: &str) -> bool {
+    let (word, _) = read_word(operand, 0);
+    let protected: Vec<Spelling> = resolve_all(&word)
+        .into_iter()
+        .filter(|spelling| {
+            !spelling.speculative
+                && !spelling.escaped
+                && spelling.partial.is_none()
+                && matches!(
+                    exact(spelling.root, &spelling.comps),
+                    Exact::Protected { .. }
+                )
+        })
+        .collect();
+    !protected.is_empty()
+        && protected.iter().all(|spelling| {
+            spelling
+                .comps
+                .first()
+                .is_some_and(|first| first.eq_ignore_ascii_case(GIT_ANCHOR))
+        })
+}
+
 /// Cheap lexical superset of every spelling [`resolve`] can turn into a
 /// protected root: `~`/`~user`, `$HOME` and the relocation variables, and the
 /// absolute `/etc`, `/private/etc`, `/home/<u>`, `/Users/<u>`, `/root`,
