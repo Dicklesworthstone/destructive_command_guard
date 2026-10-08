@@ -762,6 +762,23 @@ const MOVED_PATH_SUGGESTION_RULES: &[&str] = &[
 /// Register suggestions for core.filesystem pack rules.
 fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>) {
     m.insert(
+        "core.filesystem:tar-exec-unverified",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List the archive with `tar -tvf archive.tar` and read the exact helper command tar would run before running it",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Drop the helper option (`--checkpoint-action=exec=`, `--to-command`, `-I`, `--info-script`, `--rmt-command`) and run any reviewed command as a separate step",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Use a literal, bounded helper command; archive bytes are not verified shell or database input",
+            ),
+        ],
+    );
+    m.insert(
         "core.filesystem:sed-exec-unverified",
         vec![
             Suggestion::new(
@@ -2373,6 +2390,7 @@ mod tests {
         // These must match actual pattern names from src/packs/core/filesystem.rs
         let expected_rules = [
             "core.filesystem:sed-exec-unverified",
+            "core.filesystem:tar-exec-unverified",
             "core.filesystem:rm-rf-root-home",
             "core.filesystem:rm-r-f-separate-root-home",
             "core.filesystem:rm-recursive-force-root-home",

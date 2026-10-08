@@ -8961,7 +8961,8 @@ def cleanup():
                     "cp.spawnSync('dd', ['if=/dev/zero', 'of=/dev/sda'])",
                     ScriptLanguage::JavaScript
                 ),
-                vec!["dd if=/dev/zero of=/dev/sda".to_string()]
+                // Each argv literal is shell-quoted so it stays one word (#527).
+                vec!["dd 'if=/dev/zero' 'of=/dev/sda'".to_string()]
             );
             assert_eq!(
                 lines(
@@ -8975,7 +8976,8 @@ def cleanup():
                     "system('dd', 'if=/dev/zero', 'of=/dev/sda')",
                     ScriptLanguage::Perl
                 ),
-                vec!["dd if=/dev/zero of=/dev/sda".to_string()]
+                // Each argv literal is shell-quoted so it stays one word (#527).
+                vec!["dd 'if=/dev/zero' 'of=/dev/sda'".to_string()]
             );
             // rm and git are the backstop's; they are not reconstructed here.
             assert!(

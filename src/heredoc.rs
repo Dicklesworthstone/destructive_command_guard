@@ -7869,7 +7869,7 @@ pub(crate) fn mask_inert_interpreter_stdin(command: &str) -> Cow<'_, str> {
     // Each proof inspects the owning command and visible executable lookup.
     // Bound their count before those scans, just as extraction bounds bodies;
     // exceeding the bound keeps all source visible to the conservative path.
-    if heredocs.len() > ExtractionLimits::default().max_heredocs {
+    if heredocs.len() > ExtractionLimits::structural_scan().max_heredocs {
         return Cow::Borrowed(command);
     }
     let bodies: Vec<_> = heredocs
