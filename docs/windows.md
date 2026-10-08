@@ -145,7 +145,7 @@ wire format is recognized on Windows. Hook *configuration* coverage:
 | Agent | Config path | Configured by |
 |-------|-------------|---------------|
 | Codex CLI | `%USERPROFILE%\.codex\hooks.json` | `install.ps1` (automatic full JSON merge, UTF-8 **no BOM**) |
-| Claude Code | `%USERPROFILE%\.claude\settings.json` | `install.ps1` (`Bash\|PowerShell\|Monitor` matcher, PowerShell-safe absolute command, full JSON merge, UTF-8 **no BOM**) |
+| Claude Code | `%CLAUDE_CONFIG_DIR%\settings.json` when non-empty, else `%USERPROFILE%\.claude\settings.json` | `install.ps1` (`Bash\|PowerShell\|Monitor` matcher, PowerShell-safe absolute command, full JSON merge, UTF-8 **no BOM**) |
 | Gemini CLI | `%USERPROFILE%\.gemini\settings.json` | `install.ps1` (full JSON merge, UTF-8 **no BOM**) |
 | GitHub Copilot CLI | `%COPILOT_HOME%\hooks\dcg.json` or `%USERPROFILE%\.copilot\hooks\dcg.json` | `install.ps1` (automatic user-level JSON merge) when Copilot is detected, or with `-EasyMode` / `-Force`; protects every workspace |
 | Cursor IDE | `%USERPROFILE%\.cursor\hooks.json` plus `%USERPROFILE%\.cursor\hooks\dcg-pre-shell.ps1` | `install.ps1` (pure PowerShell bridge; no Python dependency) |

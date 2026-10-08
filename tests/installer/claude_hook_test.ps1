@@ -3,7 +3,8 @@
 # install.ps1 by dot-sourcing it with -LoadFunctionsOnly (so the install body
 # does not run). Runnable on any OS with PowerShell. Covers: create, merge with a
 # coexisting Bash-only hook, legacy/wrong-matcher migration, idempotency,
-# UTF-8-no-BOM, refuse-invalid-JSON, and skip. The functions take a -HomeDir
+# UTF-8-no-BOM, refuse-invalid-JSON, skip, and CLAUDE_CONFIG_DIR install/uninstall
+# and predecessor migration. The functions take a -HomeDir
 # param so a temp home can be injected ($HOME is read-only in PowerShell).
 
 $ErrorActionPreference = 'Stop'
@@ -29,6 +30,8 @@ function Test-NoBom([string]$path) {
 }
 
 $dcgPath = 'C:\Users\me\.local\bin\dcg.exe'
+try {
+    $env:CLAUDE_CONFIG_DIR = $null
 
 # --- Test 1: create + idempotent + no BOM ---
 Write-Host "Test 1: create / idempotent / no-BOM"
@@ -291,6 +294,99 @@ try {
         Check (@($value.hooks.PreToolUse).Count -eq 1) "hook present: $form"
     }
 } finally { Pop-Location; $env:CLAUDE_CONFIG_DIR = $savedClaudeConfigDir }
+
+# --- Test 10: every supported selector applies to installation and removal ---
+foreach ($selection in @('unset', 'empty', 'absolute', 'tilde', 'tilde-backslash', 'home', 'relative')) {
+    Write-Host "Test 10: CLAUDE_CONFIG_DIR $selection install / migration / uninstall"
+    $h10 = New-TempHome
+    Push-Location $h10
+    try {
+        $defaultDir = Join-Path $h10 '.claude'
+        $defaultSettings = Join-Path $defaultDir 'settings.json'
+        New-Item -ItemType Directory -Path $defaultDir | Out-Null
+        $defaultConfig = '{"model":"default-model","hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell|Monitor","hooks":[{"type":"command","command":"dcg"}]}]}}'
+        Set-Content -LiteralPath $defaultSettings -Value $defaultConfig -NoNewline
+        switch ($selection) {
+            'unset' { $env:CLAUDE_CONFIG_DIR = $null; $expectedDir = $defaultDir }
+            'empty' { $env:CLAUDE_CONFIG_DIR = ''; $expectedDir = $defaultDir }
+            'absolute' { $expectedDir = Join-Path $h10 'active config [work]'; $env:CLAUDE_CONFIG_DIR = $expectedDir }
+            'tilde' { $env:CLAUDE_CONFIG_DIR = '~/active config'; $expectedDir = Join-Path $h10 'active config' }
+            'tilde-backslash' { $env:CLAUDE_CONFIG_DIR = '~\active config'; $expectedDir = Join-Path $h10 'active config' }
+            'home' { $env:CLAUDE_CONFIG_DIR = '~'; $expectedDir = $h10 }
+            'relative' { $env:CLAUDE_CONFIG_DIR = 'active config'; $expectedDir = Join-Path $h10 'active config' }
+        }
+        $settings = Join-Path $expectedDir 'settings.json'
+        Check ((Get-ClaudeConfigDir -HomeDir $h10) -eq $expectedDir) "$selection resolves the active directory"
+        New-Item -ItemType Directory -Force -Path $expectedDir | Out-Null
+        @{
+            model = 'active-model'
+            permissions = @{ allow = @('Read') }
+            hooks = @{
+                PreToolUse = @(@{ matcher = 'Bash'; hooks = @(
+                    @{ type = 'command'; command = 'keep-active-hook' },
+                    @{ type = 'command'; command = 'python3 legacy/git_safety_guard.py' }
+                ) })
+                PostToolUse = @(@{ matcher = 'Write'; hooks = @(@{ type = 'command'; command = 'keep-after-hook' }) })
+            }
+        } | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settings
+        Check (Remove-DcgPredecessor -HomeDir $h10) "$selection migrates the active predecessor"
+        $migrated = Get-Content -Raw -LiteralPath $settings | ConvertFrom-Json
+        $migratedCommands = @($migrated.hooks.PreToolUse | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })
+        Check (-not ($migratedCommands -match 'git_safety_guard')) "$selection removes the active predecessor only"
+        $status = Configure-ClaudeHook -DcgPath $dcgPath -HomeDir $h10
+        Check ($status -eq 'merged') "$selection installs in the selected settings"
+        $p = Get-Content -Raw -LiteralPath $settings | ConvertFrom-Json
+        Check ($p.model -eq 'active-model') "$selection preserves the active model"
+        Check ($p.permissions.allow[0] -eq 'Read') "$selection preserves permissions"
+        $commands = @($p.hooks.PreToolUse | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })
+        Check ($commands -contains 'keep-active-hook') "$selection preserves the third-party hook"
+        Check ($p.hooks.PostToolUse[0].hooks[0].command -eq 'keep-after-hook') "$selection preserves other hook events"
+        Check (Test-NoBom $settings) "$selection writes valid UTF-8 without a BOM"
+        $installed = Get-Content -Raw -LiteralPath $settings
+        Check ((Configure-ClaudeHook -DcgPath $dcgPath -HomeDir $h10) -eq 'already') "$selection installation is idempotent"
+        Check ((Get-Content -Raw -LiteralPath $settings) -eq $installed) "$selection second install leaves bytes unchanged"
+        if ($settings -ne $defaultSettings) {
+            Check ((Get-Content -Raw -LiteralPath $defaultSettings) -eq $defaultConfig) "$selection install and migration preserve the default settings byte-for-byte"
+        }
+
+        # Load the uninstaller in its own scope to exercise its independently
+        # shipped resolver without replacing the installer functions above.
+        $removed = & {
+            . (Join-Path $repoRoot 'uninstall.ps1') -LoadFunctionsOnly
+            Check ((Get-ClaudeConfigDir -HomeDir $h10) -eq $expectedDir) "$selection uninstall resolves the same directory"
+            Unconfigure-ClaudeHook -HomeDir $h10
+        }
+        Check ($removed -eq $true) "$selection uninstall removes the active hook"
+        $after = Get-Content -Raw -LiteralPath $settings | ConvertFrom-Json
+        $remaining = @($after.hooks.PreToolUse | ForEach-Object { $_.hooks })
+        Check (@($remaining | Where-Object { Test-DcgHookCommand $_ }).Count -eq 0) "$selection uninstall removes all active dcg entries"
+        Check ($remaining[0].command -eq 'keep-active-hook') "$selection uninstall preserves the third-party hook"
+        Check ($after.model -eq 'active-model') "$selection uninstall preserves other settings"
+        if ($settings -ne $defaultSettings) {
+            Check ((Get-Content -Raw -LiteralPath $defaultSettings) -eq $defaultConfig) "$selection uninstall leaves the default protected settings unchanged"
+        }
+    } finally {
+        Pop-Location
+        Remove-Item -Recurse -Force -LiteralPath $h10 -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host 'Test 11: an explicit directory creates a fresh installation with an empty PATH and without -Force'
+$h11 = New-TempHome
+$savedPath11 = $env:PATH
+try {
+    $env:PATH = ''
+    $env:CLAUDE_CONFIG_DIR = Join-Path $h11 'new/active config'
+    $freshSettings = Join-Path $env:CLAUDE_CONFIG_DIR 'settings.json'
+    Check ((Configure-ClaudeHook -DcgPath $dcgPath -HomeDir $h11) -eq 'created') 'fresh selected config is installed automatically'
+    Check (Test-Path -LiteralPath $freshSettings) 'selected directory and settings are created'
+    Check (-not (Test-Path -LiteralPath (Join-Path $h11 '.claude'))) 'default directory is not created'
+} finally {
+    $env:PATH = $savedPath11
+    Remove-Item -Recurse -Force -LiteralPath $h11 -ErrorAction SilentlyContinue
+}
+
+} finally { $env:CLAUDE_CONFIG_DIR = $savedClaudeConfigDir }
 
 if ($script:failures -gt 0) {
     Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red

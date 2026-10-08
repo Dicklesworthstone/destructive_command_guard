@@ -90,6 +90,8 @@ setup_isolated_home() {
     export ORIGINAL_PATH="$PATH"
     export ORIGINAL_WORKING_DIRECTORY="$PWD"
 
+    # Claude Code's active config is another filesystem capability independent
+    # of HOME. Fence it before any installer or uninstaller code can run.
     export DCG_TEST_SAVED_CLAUDE_CONFIG_DIR_SET="${CLAUDE_CONFIG_DIR+x}"
     export DCG_TEST_SAVED_CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR-}"
     unset CLAUDE_CONFIG_DIR

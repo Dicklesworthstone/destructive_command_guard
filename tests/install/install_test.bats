@@ -465,6 +465,86 @@ MOCKEOF
 # Agent Detection Tests
 # ============================================================================
 
+@test "Claude settings resolver: default, empty, absolute, relative, tilde and literal path values" {
+    unset CLAUDE_CONFIG_DIR
+    [ "$(claude_config_dir)" = "$HOME/.claude" ]
+    export CLAUDE_CONFIG_DIR=""
+    [ "$(claude_config_dir)" = "$HOME/.claude" ]
+
+    export CLAUDE_CONFIG_DIR="$TEST_TMPDIR/active Claude"
+    [ "$(claude_config_dir)" = "$TEST_TMPDIR/active Claude" ]
+    export CLAUDE_CONFIG_DIR="relative Claude/../active"
+    [ "$(claude_config_dir)" = "$PWD/relative Claude/../active" ]
+    export CLAUDE_CONFIG_DIR='~/active Claude'
+    [ "$(claude_config_dir)" = "$HOME/active Claude" ]
+    export CLAUDE_CONFIG_DIR='~'
+    [ "$(claude_config_dir)" = "$HOME" ]
+
+    export CLAUDE_CONFIG_DIR='~someone/$HOME/$(touch should-not-execute)'
+    [ "$(claude_config_dir)" = "$PWD/~someone/\$HOME/\$(touch should-not-execute)" ]
+    [ ! -e "$PWD/should-not-execute" ]
+    export CLAUDE_CONFIG_DIR=$'active\n'
+    # Keep the helper's terminating newline distinct from the literal path.
+    local resolved
+    resolved="$(claude_config_dir; printf .)"
+    [ "${resolved%$'\n.'}" = "$PWD/"$'active\n' ]
+}
+
+@test "detect_agents: explicit CLAUDE_CONFIG_DIR detects Claude before its directory exists" {
+    setup_mock_codex
+    export CLAUDE_CONFIG_DIR="$TEST_TMPDIR/active Claude"
+    detect_agents
+    [[ " ${DETECTED_AGENTS[*]} " =~ " claude-code " ]]
+    [[ " ${DETECTED_AGENTS[*]} " =~ " codex-cli " ]]
+    [ ! -e "$CLAUDE_CONFIG_DIR" ]
+
+    mkdir -p "$CLAUDE_CONFIG_DIR"
+    detect_agents
+    [[ " ${DETECTED_AGENTS[*]} " =~ " claude-code " ]]
+}
+
+@test "shell startup check: resolves active Claude directory each time and warns when missing" {
+    command -v jq >/dev/null || skip "jq not available"
+    cat > "$TEST_TMPDIR/bin/dcg" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+    chmod +x "$TEST_TMPDIR/bin/dcg"
+    mkdir -p "$HOME/.claude" "$HOME/active Claude"
+    printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"dcg"}]}]}}' > "$HOME/.claude/settings.json"
+    printf '{}\n' > "$HOME/active Claude/settings.json"
+
+    maybe_add_shell_check
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+
+    export CLAUDE_CONFIG_DIR='~/active Claude'
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Hook missing from $HOME/active Claude/settings.json"* ]]
+
+    export CLAUDE_CONFIG_DIR='missing Claude'
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Hook missing from $PWD/missing Claude/settings.json"* ]]
+
+    export CLAUDE_CONFIG_DIR=""
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+
+    mv "$HOME/.claude/settings.json" "$TEST_TMPDIR/protected-default.json"
+    unset CLAUDE_CONFIG_DIR
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    export CLAUDE_CONFIG_DIR=""
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
 @test "detect_agents: finds Claude Code when directory exists" {
     log_test "Testing Claude Code detection via directory..."
 

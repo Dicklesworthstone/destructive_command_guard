@@ -107,6 +107,52 @@ teardown() {
 # Claude Code Uninstall Tests
 # ============================================================================
 
+@test "uninstall: CLAUDE_CONFIG_DIR targets only active settings and reports their path" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    export CLAUDE_CONFIG_DIR="$TEST_TMPDIR/active Claude"
+    mkdir -p "$HOME/.claude" "$CLAUDE_CONFIG_DIR"
+    printf '%s\n' '{"sentinel":"default","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/default/dcg"}]}]}}' > "$HOME/.claude/settings.json"
+    cp "$HOME/.claude/settings.json" "$TEST_TMPDIR/default.snapshot"
+    printf '%s\n' '{"sentinel":"active","hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell|Monitor","hooks":[{"type":"command","command":"/active/dcg"},{"type":"command","command":"/other-hook"}]}]}}' > "$CLAUDE_CONFIG_DIR/settings.json"
+
+    run bash "$UNINSTALL_SCRIPT" --yes
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Claude Code hook ($CLAUDE_CONFIG_DIR/settings.json)"* ]]
+    [[ "$output" != *"Claude Code hook ($HOME/.claude/settings.json)"* ]]
+    cmp -s "$TEST_TMPDIR/default.snapshot" "$HOME/.claude/settings.json"
+    python3 - "$CLAUDE_CONFIG_DIR/settings.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as f:
+    settings = json.load(f)
+assert settings["sentinel"] == "active"
+assert settings["hooks"]["PreToolUse"][0]["hooks"] == [{"type": "command", "command": "/other-hook"}]
+PY
+}
+
+@test "isolated setup fences and restores inherited CLAUDE_CONFIG_DIR" {
+    local outside="$BATS_TEST_TMPDIR/ambient-Claude"
+    mkdir -p "$outside"
+    printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/outside/dcg"}]}]}}' > "$outside/settings.json"
+    cp "$outside/settings.json" "$BATS_TEST_TMPDIR/ambient-Claude.snapshot"
+
+    run env CLAUDE_CONFIG_DIR="$outside" \
+        DCG_TEST_HELPER="$PROJECT_ROOT/tests/install/test_helper.bash" \
+        DCG_OUTSIDE_CLAUDE="$outside" \
+        bash -c '
+            set -e
+            source "$DCG_TEST_HELPER"
+            setup_isolated_home
+            [ "${CLAUDE_CONFIG_DIR+x}" != x ]
+            extract_uninstall_functions
+            unconfigure_claude_code
+            teardown_isolated_home
+            [ "$CLAUDE_CONFIG_DIR" = "$DCG_OUTSIDE_CLAUDE" ]
+        '
+    [ "$status" -eq 0 ]
+    cmp -s "$BATS_TEST_TMPDIR/ambient-Claude.snapshot" "$outside/settings.json"
+}
+
 @test "uninstall: removes dcg hook from Claude Code settings" {
     log_test "Testing Claude Code hook removal..."
 

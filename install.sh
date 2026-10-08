@@ -298,6 +298,12 @@ try_version() {
   fi
 }
 
+# Capture before any download or source-build work can change directories.
+# A sentinel preserves literal trailing newlines in the directory name.
+CLAUDE_SETTINGS="$(claude_config_dir; printf .)"
+CLAUDE_SETTINGS="${CLAUDE_SETTINGS%$'\n.'}"
+CLAUDE_SETTINGS="${CLAUDE_SETTINGS%/}/settings.json"
+
 # Posit Assistant ships as an IDE extension (Positron/RStudio), a standalone
 # server, and the `pa` terminal client, so no single probe covers every
 # install. Any one of these is enough to configure the shared global settings
@@ -1066,21 +1072,31 @@ repair_shell_check_region() {
 
 maybe_add_shell_check() {
   # Add a shell startup check that warns if the DCG hook has been silently
-  # removed from ~/.claude/settings.json. Silent when present, fast (ms),
+  # removed from the active Claude Code settings. Silent when present, fast (ms),
   # and only runs when both dcg and jq are on PATH.
   local snippet
   snippet=$(cat <<'EOFSNIPPET'
 
 # dcg: warn if hook was silently removed from Claude Code settings
 if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
-  dcg_claude_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-  case "$dcg_claude_dir" in '~') dcg_claude_dir="$HOME" ;; '~/'*) dcg_claude_dir="$HOME/${dcg_claude_dir#\~/}" ;; esac
-  if { [ -n "${CLAUDE_CONFIG_DIR:-}" ] || [ -f "$dcg_claude_dir/settings.json" ]; } && \
-     ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg\"?$"))' \
-       "$dcg_claude_dir/settings.json" &>/dev/null; then
-    printf '\033[1;33m[dcg] Hook missing from %s/settings.json — run: dcg install\033[0m\n' "$dcg_claude_dir"
-  fi
-  unset dcg_claude_dir
+  (
+    dcg_claude_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    case "$dcg_claude_dir" in
+      "~") dcg_claude_dir="$HOME" ;;
+      "~/"*) dcg_claude_dir="$HOME/${dcg_claude_dir#"~/"}" ;;
+    esac
+    case "$dcg_claude_dir" in
+      /*) ;;
+      *) dcg_claude_dir="$PWD/$dcg_claude_dir" ;;
+    esac
+    dcg_claude_settings="${dcg_claude_dir%/}/settings.json"
+    if { [ -n "${CLAUDE_CONFIG_DIR:-}" ] || [ -f "$dcg_claude_settings" ]; } && \
+       { [ ! -f "$dcg_claude_settings" ] || \
+         ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg\"?$"))' \
+           "$dcg_claude_settings" &>/dev/null; }; then
+      printf '\033[1;33m[dcg] Hook missing from %s — run: dcg install\033[0m\n' "$dcg_claude_settings"
+    fi
+  )
 fi
 EOFSNIPPET
   )
@@ -1660,15 +1676,10 @@ mkdir -p "$DEST" 2>/dev/null || true
 
 preflight_checks
 
-# Check if already at target version (skip download if so, unless --force)
-if [ "$FORCE_INSTALL" -eq 0 ] && [ "$REQUIRE_MINISIGN" -eq 0 ] && check_installed_version "$VERSION"; then
-  assert_installed_version "$VERSION" || exit 1
-  ok "dcg $VERSION is already installed at $DEST/dcg"
-  info "Use --force to reinstall"
-  maybe_install_completions
-  exit 0
-fi
-
+# Every successful binary path returns here so hook configuration below also
+# runs for an existing version or a source build (including a relocated Claude
+# configuration). Only acquisition/verification failures abort installation.
+install_binary() {
 # Cross-platform locking using mkdir (atomic on all POSIX systems including macOS)
 LOCK_DIR="${LOCK_FILE}.d"
 LOCKED=0
@@ -1700,6 +1711,16 @@ cleanup() {
 
 TMP=$(mktemp -d)
 trap cleanup EXIT
+
+# Reusing an installed version still configures the active agent settings, so
+# keep that mutation under the same lock as a fresh or source installation.
+if [ "$FORCE_INSTALL" -eq 0 ] && [ "$REQUIRE_MINISIGN" -eq 0 ] && check_installed_version "$VERSION"; then
+  assert_installed_version "$VERSION" || exit 1
+  ok "dcg $VERSION is already installed at $DEST/dcg"
+  info "Use --force to reinstall"
+  maybe_install_completions
+  return 0
+fi
 
 if [ "$FROM_SOURCE" -eq 0 ]; then
   info "Downloading $URL"
@@ -1734,7 +1755,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   fi
   ok "Done. Binary at: $DEST/dcg"
   maybe_install_completions
-  exit 0
+  return 0
 fi
 
 # Checksum verification (can be skipped with --no-verify for testing)
@@ -1833,6 +1854,9 @@ fi
 ok "Done. Binary at: $DEST/dcg"
 maybe_install_completions
 echo ""
+}
+
+install_binary
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Predecessor Detection & Removal
@@ -1845,9 +1869,15 @@ PREDECESSOR_LOCATIONS=()
 detect_predecessor() {
   # Check common file locations for the predecessor script
   local locations=(
-    "$(claude_config_dir)/hooks/$PREDECESSOR_SCRIPT"
-    ".claude/hooks/$PREDECESSOR_SCRIPT"
+    "${CLAUDE_SETTINGS%/*}/hooks/$PREDECESSOR_SCRIPT"
   )
+  # From HOME (or a project with a symlink to the default hooks directory),
+  # the project candidate aliases ~/.claude. An active override must leave
+  # that inactive installation intact. Distinct project hooks still migrate.
+  if [ -z "${CLAUDE_CONFIG_DIR:-}" ] || \
+     ! [ ".claude/hooks" -ef "$HOME/.claude/hooks" ]; then
+    locations+=(".claude/hooks/$PREDECESSOR_SCRIPT")
+  fi
 
   for loc in "${locations[@]}"; do
     if [ -f "$loc" ]; then
@@ -1924,7 +1954,6 @@ remove_predecessor() {
 # Claude Code / Gemini CLI / Cursor Auto-Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CLAUDE_SETTINGS="$(claude_config_dir)/settings.json"
 GEMINI_SETTINGS="$HOME/.gemini/settings.json"
 AIDER_SETTINGS="$HOME/.aider.conf.yml"
 CODEX_SETTINGS="$HOME/.codex/hooks.json"
@@ -1981,7 +2010,12 @@ configure_claude_code() {
   # Default to cleaning up predecessor if not specified or empty
   [ -z "$cleanup_predecessor" ] && cleanup_predecessor=1
   local settings_dir
-  settings_dir=$(dirname "$settings_file")
+  # Keep every pathname byte, including a trailing newline in the directory.
+  # A plain $(dirname ...) capture would trim it and create the wrong location.
+  case "$settings_file" in
+    */*) settings_dir="${settings_file%/*}"; [ -n "$settings_dir" ] || settings_dir="/" ;;
+    *) settings_dir="." ;;
+  esac
 
   # Always create the config directory if it doesn't exist
   if [ ! -d "$settings_dir" ]; then

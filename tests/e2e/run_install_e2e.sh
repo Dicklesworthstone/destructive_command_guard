@@ -40,6 +40,8 @@ NC='\033[0m' # No Color
 # Test environment
 TEST_HOME=""
 ORIGINAL_HOME="$HOME"
+# An inherited active Claude directory must never escape the temporary HOME.
+unset CLAUDE_CONFIG_DIR
 
 log() {
     echo "$@" | tee -a "$LOG_FILE"
@@ -155,7 +157,7 @@ test_agent_detection() {
     # Keep this extraction narrow so the e2e does not run installer top-level code.
     AGENT_VERSION_LOOKUP=0
     AGENT_VERSION_TIMEOUT=1
-    source <(sed -n '/^try_version()/,/^}/p;/^detect_agents()/,/^}/p' "$INSTALL_SCRIPT")
+    source <(sed -n '/^try_version()/,/^}/p;/^claude_config_dir()/,/^}/p;/^detect_agents()/,/^}/p' "$INSTALL_SCRIPT")
     detect_agents
 
     log_verbose "Detected agents: ${DETECTED_AGENTS[*]:-none}"

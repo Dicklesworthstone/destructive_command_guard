@@ -18,6 +18,7 @@ function New-TempHome {
 }
 
 $savedPath = $env:PATH
+$savedClaudeConfigDir = $env:CLAUDE_CONFIG_DIR
 $savedGrok = $env:GROK_SESSION_ID
 $savedHermesHome = $env:HERMES_HOME
 $savedLocalAppData = $env:LOCALAPPDATA
@@ -47,6 +48,7 @@ try {
     . (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
 
     $env:PATH = ''                 # no CLI probing leaks
+    $env:CLAUDE_CONFIG_DIR = $null
     $env:GROK_SESSION_ID = $null
     $env:HERMES_HOME = $null       # no Hermes home-resolution leaks (issue #270)
     $env:LOCALAPPDATA = $null
@@ -227,6 +229,18 @@ try {
     Check ($a3WithCopilot['Copilot'] -eq $true) "Copilot detected from ~/.copilot"
     Remove-Item -Recurse -Force $h3 -ErrorAction SilentlyContinue
 
+    Write-Host 'Test 3b: CLAUDE_CONFIG_DIR selects a new config directory without ~/.claude'
+    $h3b = New-TempHome
+    try {
+        $env:CLAUDE_CONFIG_DIR = Join-Path $h3b 'new-claude-config'
+        $a3b = Detect-Agents -HomeDir $h3b
+        Check ($a3b['Claude'] -eq $true) 'Claude detected from an explicit new configuration directory'
+        Check ($a3b['Grok'] -eq $false) 'Claude override does not imply Grok detection'
+    } finally {
+        $env:CLAUDE_CONFIG_DIR = $null
+        Remove-Item -Recurse -Force $h3b -ErrorAction SilentlyContinue
+    }
+
     Write-Host "Test 4: GROK_SESSION_ID env triggers Grok detection without ~/.grok"
     $h4 = New-TempHome
     $env:GROK_SESSION_ID = 'sess-123'
@@ -249,6 +263,7 @@ try {
     Check ($a5b['Hermes'] -eq $false) "Hermes NOT detected once the native dir is out of scope"
     Remove-Item -Recurse -Force $h5 -ErrorAction SilentlyContinue
 } finally {
+    $env:CLAUDE_CONFIG_DIR = $savedClaudeConfigDir
     $env:PATH = $savedPath
     $env:GROK_SESSION_ID = $savedGrok
     $env:HERMES_HOME = $savedHermesHome

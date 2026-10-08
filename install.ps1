@@ -416,7 +416,7 @@ function Write-JsonFileNoBom {
   $dir = Split-Path -Parent $Path
   $tmp = Join-Path $dir (".dcg-tmp-" + [System.Guid]::NewGuid().ToString("N"))
   Write-Utf8NoBomText -Path $tmp -Text $json
-  Move-Item -Force -Path $tmp -Destination $Path
+  Move-Item -Force -LiteralPath $tmp -Destination $Path
 }
 
 # Shared create-or-merge for a Claude-Code-style hooks file. Ensures
@@ -438,7 +438,7 @@ function Merge-AgentHookFile {
     [string[]]$OwnedMatchers = @($Matcher)
   )
 
-  if (-not (Test-Path $HooksFile -PathType Leaf)) {
+  if (-not (Test-Path -LiteralPath $HooksFile -PathType Leaf)) {
     $innerHooks = [pscustomobject][ordered]@{}
     Set-ObjectPropertyValue $innerHooks $Event @(
       [pscustomobject][ordered]@{ matcher = $Matcher; hooks = @($DcgHook) }
@@ -449,7 +449,7 @@ function Merge-AgentHookFile {
   }
 
   try {
-    $config = Get-Content -Raw -Path $HooksFile | ConvertFrom-Json
+    $config = Get-Content -Raw -LiteralPath $HooksFile | ConvertFrom-Json
   } catch {
     throw "$Label is invalid JSON; leaving it unchanged: $HooksFile"
   }
@@ -569,32 +569,45 @@ function Configure-CodexHook {
   Merge-AgentHookFile -HooksFile $hooksFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "Bash" -Label "Codex hooks.json"
 }
 
-# Configure Claude Code's PreToolUse hook for Bash, PowerShell, and Monitor in
-# ~/.claude/settings.json. The hook itself runs in PowerShell so an absolute
-# Windows path is not reinterpreted by Git Bash (#232).
-# Configures when ~/.claude exists or `claude` is on PATH (or always under -Force,
-# used by -EasyMode). Returns "created" | "already" | "merged" | "skipped".
+# Resolve only Claude Code's user configuration. Other agents' Claude-compatible
+# settings remain at their own locations, including Grok's ~/.claude fallback.
+# Empty means the default; whitespace and shell metacharacters are literal path
+# content. Do not evaluate the environment variable as PowerShell code.
 function Get-ClaudeConfigDir {
   param([string]$HomeDir = $HOME)
-  $dir = $env:CLAUDE_CONFIG_DIR
-  if ([string]::IsNullOrEmpty($dir)) { return (Join-Path $HomeDir '.claude') }
-  if ($dir -eq '~') { $dir = $HomeDir }
-  elseif ($dir.StartsWith('~/') -or $dir.StartsWith('~\')) { $dir = Join-Path $HomeDir $dir.Substring(2) }
-  if (-not [System.IO.Path]::IsPathRooted($dir)) { $dir = Join-Path (Get-Location).Path $dir }
-  return $dir
+
+  $configDir = $env:CLAUDE_CONFIG_DIR
+  if ([string]::IsNullOrEmpty($configDir)) {
+    $configDir = Join-Path $HomeDir '.claude'
+  } elseif ($configDir -eq '~') {
+    $configDir = $HomeDir
+  } elseif ($configDir.StartsWith('~/') -or $configDir.StartsWith('~\')) {
+    $configDir = Join-Path $HomeDir $configDir.Substring(2)
+  }
+  if (-not (Split-Path -Path $configDir -IsAbsolute)) {
+    $configDir = Join-Path (Get-Location).ProviderPath $configDir
+  }
+  $configDir
 }
 
+# Configure Claude Code's PreToolUse hook for Bash, PowerShell, and Monitor in
+# the active configuration directory. The hook itself runs in PowerShell so an absolute
+# Windows path is not reinterpreted by Git Bash (#232).
+# Configures when CLAUDE_CONFIG_DIR is set, the active directory exists, or
+# `claude` is on PATH (or always under -Force, used by -EasyMode).
+# Returns "created" | "already" | "merged" | "skipped".
 function Configure-ClaudeHook {
   param([string]$DcgPath, [switch]$Force, [string]$HomeDir = $HOME)
 
   $claudeDir = Get-ClaudeConfigDir -HomeDir $HomeDir
   $settingsFile = Join-Path $claudeDir "settings.json"
-  $claudeInstalled = (-not [string]::IsNullOrEmpty($env:CLAUDE_CONFIG_DIR)) -or (Test-Path $claudeDir -PathType Container) -or
+  $claudeInstalled = (-not [string]::IsNullOrEmpty($env:CLAUDE_CONFIG_DIR)) -or
+    (Test-Path -LiteralPath $claudeDir -PathType Container) -or
     ($null -ne (Get-Command claude -ErrorAction SilentlyContinue))
 
   if (-not $claudeInstalled -and -not $Force) { return "skipped" }
 
-  if (-not (Test-Path $claudeDir -PathType Container)) {
+  if (-not (Test-Path -LiteralPath $claudeDir -PathType Container)) {
     New-Item -ItemType Directory -Force -Path $claudeDir | Out-Null
   }
 
@@ -736,8 +749,8 @@ function Test-PredecessorHookCommand {
 }
 
 # Remove the legacy `git_safety_guard` Python predecessor: strip ONLY its hook
-# entries from ~/.claude/settings.json (preserving the modern dcg hook and any
-# coexisting hooks) and delete its script under ~/.claude/hooks. Returns $true if
+# entries from the active Claude settings (preserving the modern dcg hook and any
+# coexisting hooks) and delete its script under that directory's hooks. Returns $true if
 # anything was removed. Safe to call before Configure-ClaudeHook so a migrating
 # user never runs both the old and new hooks.
 function Remove-DcgPredecessor {
@@ -747,9 +760,9 @@ function Remove-DcgPredecessor {
   $claudeDir = Get-ClaudeConfigDir -HomeDir $HomeDir
   $settingsFile = Join-Path $claudeDir "settings.json"
 
-  if (Test-Path $settingsFile -PathType Leaf) {
+  if (Test-Path -LiteralPath $settingsFile -PathType Leaf) {
     $config = $null
-    try { $config = Get-Content -Raw -Path $settingsFile | ConvertFrom-Json } catch { $config = $null }
+    try { $config = Get-Content -Raw -LiteralPath $settingsFile | ConvertFrom-Json } catch { $config = $null }
     if ($null -ne $config) {
       $hooks = Get-ObjectPropertyValue $config "hooks"
       if ($null -ne $hooks) {
@@ -777,12 +790,12 @@ function Remove-DcgPredecessor {
   }
 
   $predScript = Join-Path (Join-Path $claudeDir "hooks") "git_safety_guard.py"
-  if (Test-Path $predScript -PathType Leaf) {
-    Remove-Item -Force $predScript -ErrorAction SilentlyContinue
+  if (Test-Path -LiteralPath $predScript -PathType Leaf) {
+    Remove-Item -Force -LiteralPath $predScript -ErrorAction SilentlyContinue
     $removed = $true
     $hookDir = Split-Path -Parent $predScript
-    if ((Test-Path $hookDir) -and -not (Get-ChildItem -Path $hookDir -Force)) {
-      Remove-Item -Force $hookDir -ErrorAction SilentlyContinue
+    if ((Test-Path -LiteralPath $hookDir) -and -not (Get-ChildItem -LiteralPath $hookDir -Force)) {
+      Remove-Item -Force -LiteralPath $hookDir -ErrorAction SilentlyContinue
     }
   }
 
@@ -801,14 +814,17 @@ function Remove-DcgPredecessor {
 # (DCG_PROFILE_CHECK_BLOCK) is pinned to this one by a test.
 $script:DcgProfileCheckMarker = "# dcg: warn if the Claude Code hook was silently removed"
 $script:DcgProfileCheckBlock = @'
-if (Get-Command dcg -ErrorAction SilentlyContinue) {
+if ((Get-Command dcg -ErrorAction SilentlyContinue) -and
+    ((-not [string]::IsNullOrEmpty($env:CLAUDE_CONFIG_DIR)) -or
+     (Test-Path -LiteralPath (Join-Path (Join-Path $HOME '.claude') 'settings.json') -PathType Leaf))) {
   try {
-    $dcgDir = $env:CLAUDE_CONFIG_DIR
-    if ([string]::IsNullOrEmpty($dcgDir)) { $dcgDir = Join-Path $HOME '.claude' }
-    if ($dcgDir -eq '~') { $dcgDir = $HOME }
-    elseif ($dcgDir.StartsWith('~/') -or $dcgDir.StartsWith('~\')) { $dcgDir = Join-Path $HOME $dcgDir.Substring(2) }
-    $dcgSettings = Join-Path $dcgDir 'settings.json'
-    $dcgCfg = Get-Content -Raw $dcgSettings -ErrorAction Stop | ConvertFrom-Json
+    $dcgClaudeDir = $env:CLAUDE_CONFIG_DIR
+    if ([string]::IsNullOrEmpty($dcgClaudeDir)) { $dcgClaudeDir = Join-Path $HOME '.claude' }
+    elseif ($dcgClaudeDir -eq '~') { $dcgClaudeDir = $HOME }
+    elseif ($dcgClaudeDir.StartsWith('~/') -or $dcgClaudeDir.StartsWith('~\')) { $dcgClaudeDir = Join-Path $HOME $dcgClaudeDir.Substring(2) }
+    if (-not (Split-Path -Path $dcgClaudeDir -IsAbsolute)) { $dcgClaudeDir = Join-Path (Get-Location).ProviderPath $dcgClaudeDir }
+    $dcgSettings = Join-Path $dcgClaudeDir 'settings.json'
+    $dcgCfg = if (Test-Path -LiteralPath $dcgSettings -PathType Leaf) { Get-Content -Raw -LiteralPath $dcgSettings | ConvertFrom-Json } else { $null }
     $dcgHas = $false
     foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
       foreach ($dcgH in @($dcgE.hooks)) {
@@ -839,7 +855,7 @@ function Repair-DcgProfileCheckContent {
 }
 
 # Append a guarded check to the user's PowerShell profile that warns, on each new
-# session, if the dcg PreToolUse hook has gone missing from ~/.claude/settings.json
+# session, if the dcg PreToolUse hook has gone missing from the active Claude settings
 # (Claude Code can silently drop it when it rewrites settings). Idempotent
 # (marker-guarded), and self-repairing: a marker whose block text differs from
 # the current one (e.g. the pre-#282 naive path split that warned on every
@@ -2009,7 +2025,7 @@ function Detect-Agents {
   ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
   [ordered]@{
     'Claude'  = ((-not [string]::IsNullOrEmpty($env:CLAUDE_CONFIG_DIR)) -or
-      (Test-Path -LiteralPath (Get-ClaudeConfigDir -HomeDir $HomeDir) -PathType Container) -or (_has 'claude'))
+      (Test-Path -LiteralPath (Get-ClaudeConfigDir -HomeDir $HomeDir) -PathType Container -ErrorAction SilentlyContinue) -or (_has 'claude'))
     'Codex'   = ((_dir '.codex')   -or (_has 'codex'))
     'Gemini'  = ((_dir '.gemini')  -or (_has 'gemini'))
     'Cursor'  = ((_dir '.cursor')  -or (_has 'cursor'))
@@ -2072,7 +2088,8 @@ Options:
   -Help             Print this help and exit
 
 Configured agents (when detected, or with -Force/-EasyMode):
-  Claude Code  (~/.claude/settings.json)      Codex CLI   (~/.codex/hooks.json)
+  Claude Code  (CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json)
+  Codex CLI    (~/.codex/hooks.json)
   Gemini CLI   (~/.gemini/settings.json)      Copilot CLI (~/.copilot/hooks/dcg.json)
   Cursor IDE   (~/.cursor/hooks.json)         Hermes      (HERMES_HOME, else %LOCALAPPDATA%\hermes\config.yaml)
   Posit Assistant (~/.posit/assistant/settings.json)
@@ -2356,15 +2373,15 @@ try {
   Write-Warn "Could not remove legacy predecessor: $_"
 }
 
-# Configure Claude Code by merging into ~/.claude/settings.json. Under -EasyMode,
-# force-configure even if ~/.claude does not exist yet; otherwise only when Claude
-# Code is detected.
+# Configure Claude Code by merging into its active user settings. An explicit
+# CLAUDE_CONFIG_DIR also enables configuration when that directory is not created yet.
 try {
+  $claudeSettings = Join-Path (Get-ClaudeConfigDir) 'settings.json'
   $claudeStatus = Configure-ClaudeHook -DcgPath $dcgExe -Force:$forceConfig
   switch ($claudeStatus) {
-    "created" { Write-Ok "Created Claude Code hook at $(Get-ClaudeConfigDir)\settings.json" }
-    "merged" { Write-Ok "Added Claude Code hook to $(Get-ClaudeConfigDir)\settings.json" }
-    "already" { Write-Ok "Claude Code hook already configured" }
+    "created" { Write-Ok "Created Claude Code hook at $claudeSettings" }
+    "merged" { Write-Ok "Added Claude Code hook to $claudeSettings" }
+    "already" { Write-Ok "Claude Code hook already configured at $claudeSettings" }
     "skipped" { Write-Info "Claude Code not detected; re-run with -EasyMode to configure it anyway" }
     default { Write-Warn "Claude Code hook status: $claudeStatus" }
   }

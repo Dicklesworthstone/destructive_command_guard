@@ -61,6 +61,189 @@ teardown() {
     done
 }
 
+make_claude_installer_artifact() {
+    CLAUDE_FIXTURE_PAYLOAD="$TEST_TMPDIR/claude-installer-payload"
+    CLAUDE_FIXTURE_ARTIFACT="$TEST_TMPDIR/claude-installer.tar"
+    mkdir -p "$CLAUDE_FIXTURE_PAYLOAD"
+    cat > "$CLAUDE_FIXTURE_PAYLOAD/dcg" <<'EOF'
+#!/bin/bash
+case "${1:-}" in
+    --version) printf 'dcg 9.9.9\n' ;;
+    completions) exit 1 ;;
+esac
+EOF
+    chmod +x "$CLAUDE_FIXTURE_PAYLOAD/dcg"
+    COPYFILE_DISABLE=1 tar -cf "$CLAUDE_FIXTURE_ARTIFACT" -C "$CLAUDE_FIXTURE_PAYLOAD" dcg
+}
+
+run_claude_fixture_installer() {
+    run env DCG_SELF_HEAL_HOOK=0 SHELL=/bin/false \
+        bash "$INSTALL_SCRIPT" \
+            --version v9.9.9 \
+            --artifact-url "file://$CLAUDE_FIXTURE_ARTIFACT" \
+            --dest "$HOME/.local/bin" \
+            --offline --no-verify --no-gum "$@"
+}
+
+@test "installer: CLAUDE_CONFIG_DIR creates active settings and reconfigures an installed version" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    make_claude_installer_artifact
+    mkdir -p "$HOME/.claude"
+    printf '%s\n' '{"sentinel":"default","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/default/dcg"}]}]}}' > "$HOME/.claude/settings.json"
+    cp "$HOME/.claude/settings.json" "$TEST_TMPDIR/default.snapshot"
+
+    export CLAUDE_CONFIG_DIR="$TEST_TMPDIR/active Claude"
+    run_claude_fixture_installer
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Created $CLAUDE_CONFIG_DIR/settings.json"* ]]
+    grep -qF '"matcher": "Bash|PowerShell|Monitor"' "$CLAUDE_CONFIG_DIR/settings.json"
+    grep -qF "$HOME/.local/bin/dcg" "$CLAUDE_CONFIG_DIR/settings.json"
+    cmp -s "$TEST_TMPDIR/default.snapshot" "$HOME/.claude/settings.json"
+    cp "$CLAUDE_CONFIG_DIR/settings.json" "$TEST_TMPDIR/active.snapshot"
+
+    # The installed version is reused without reading another artifact. Hook
+    # configuration must still run, including when the active directory changes.
+    run_claude_fixture_installer --artifact-url "file://$TEST_TMPDIR/not-an-artifact"
+    [ "$status" -eq 0 ]
+    cmp -s "$TEST_TMPDIR/active.snapshot" "$CLAUDE_CONFIG_DIR/settings.json"
+
+    export CLAUDE_CONFIG_DIR="$TEST_TMPDIR/opted-out Claude"
+    run_claude_fixture_installer --no-configure --artifact-url "file://$TEST_TMPDIR/not-an-artifact"
+    [ "$status" -eq 0 ]
+    [ ! -e "$CLAUDE_CONFIG_DIR/settings.json" ]
+
+    export CLAUDE_CONFIG_DIR="$TEST_TMPDIR/second active Claude"
+    run_claude_fixture_installer --artifact-url "file://$TEST_TMPDIR/not-an-artifact"
+    [ "$status" -eq 0 ]
+    grep -qF "$HOME/.local/bin/dcg" "$CLAUDE_CONFIG_DIR/settings.json"
+    cmp -s "$TEST_TMPDIR/default.snapshot" "$HOME/.claude/settings.json"
+
+    export CLAUDE_CONFIG_DIR="$TEST_TMPDIR/"$'active-newline\n'
+    run_claude_fixture_installer --artifact-url "file://$TEST_TMPDIR/not-an-artifact"
+    [ "$status" -eq 0 ]
+    grep -qF "$HOME/.local/bin/dcg" "$CLAUDE_CONFIG_DIR/settings.json"
+    [ ! -e "$TEST_TMPDIR/active-newline" ]
+}
+
+@test "installer and uninstaller: Claude directory forms preserve settings and unrelated hooks" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    make_claude_installer_artifact
+    local -a directories=(
+        'relative Claude'
+        '~/tilde Claude'
+        '~'
+        ''
+        '~someone/$(touch should-not-execute)'
+        $'trailing-newline\n'
+    )
+    local -a settings_paths=(
+        "$PWD/relative Claude/settings.json"
+        "$HOME/tilde Claude/settings.json"
+        "$HOME/settings.json"
+        "$HOME/.claude/settings.json"
+        "$PWD/~someone/\$(touch should-not-execute)/settings.json"
+        "$PWD/"$'trailing-newline\n/settings.json'
+    )
+    local index settings
+    for index in "${!directories[@]}"; do
+        export CLAUDE_CONFIG_DIR="${directories[$index]}"
+        settings="${settings_paths[$index]}"
+        mkdir -p "${settings%/*}"
+        printf '%s\n' '{"sentinel":"keep settings","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/other-hook"}]}],"Stop":[{"hooks":[{"type":"command","command":"/stop-hook"}]}]}}' > "$settings"
+
+        run_claude_fixture_installer
+        [ "$status" -eq 0 ]
+        python3 - "$settings" "$HOME/.local/bin/dcg" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as f:
+    settings = json.load(f)
+commands = [hook["command"] for entry in settings["hooks"]["PreToolUse"] for hook in entry["hooks"]]
+assert commands.count(sys.argv[2]) == 1, commands
+assert commands.count("/other-hook") == 1, commands
+assert settings["sentinel"] == "keep settings"
+assert settings["hooks"]["Stop"][0]["hooks"][0]["command"] == "/stop-hook"
+PY
+
+        unconfigure_claude_code
+        python3 - "$settings" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as f:
+    settings = json.load(f)
+commands = [hook["command"] for entry in settings["hooks"]["PreToolUse"] for hook in entry["hooks"]]
+assert commands == ["/other-hook"], commands
+assert settings["sentinel"] == "keep settings"
+assert settings["hooks"]["Stop"][0]["hooks"][0]["command"] == "/stop-hook"
+PY
+    done
+    [ ! -e "$PWD/should-not-execute" ]
+}
+
+@test "installer: source build configures relative CLAUDE_CONFIG_DIR from invocation cwd" {
+    make_claude_installer_artifact
+    export CLAUDE_CONFIG_DIR='source-build Claude'
+    export RUSTUP_INIT_SKIP=1
+    export MOCK_DCG_SOURCE_BINARY="$CLAUDE_FIXTURE_PAYLOAD/dcg"
+    export MOCK_DCG_BUILD_CWD="$TEST_TMPDIR/build-cwd"
+    cat > "$TEST_TMPDIR/bin/git" <<'EOF'
+#!/bin/bash
+[ "$1" = clone ] || exit 91
+for destination in "$@"; do :; done
+mkdir -p "$destination"
+EOF
+    cat > "$TEST_TMPDIR/bin/cargo" <<'EOF'
+#!/bin/bash
+[ "$*" = 'build --release' ] || exit 92
+printf '%s\n' "$PWD" > "$MOCK_DCG_BUILD_CWD"
+mkdir -p target/release
+cp "$MOCK_DCG_SOURCE_BINARY" target/release/dcg
+EOF
+    chmod +x "$TEST_TMPDIR/bin/git" "$TEST_TMPDIR/bin/cargo"
+
+    run_claude_fixture_installer --from-source
+    [ "$status" -eq 0 ]
+    [ -f "$MOCK_DCG_BUILD_CWD" ]
+    [ "$(cat "$MOCK_DCG_BUILD_CWD")" != "$PWD" ]
+    grep -qF "$HOME/.local/bin/dcg" "$PWD/source-build Claude/settings.json"
+    [ ! -e "$HOME/.claude/settings.json" ]
+
+    export CLAUDE_CONFIG_DIR='source-build opted-out Claude'
+    run_claude_fixture_installer --from-source --force --no-configure
+    [ "$status" -eq 0 ]
+    [ ! -e "$PWD/source-build opted-out Claude/settings.json" ]
+}
+
+@test "installer: CLAUDE_CONFIG_DIR preserves the default predecessor when invoked from HOME" {
+    make_claude_installer_artifact
+    local default_script="$HOME/.claude/hooks/git_safety_guard.py"
+    local project_script="$TEST_WORKDIR/.claude/hooks/git_safety_guard.py"
+    mkdir -p "$HOME/.claude/hooks"
+    printf 'print("default predecessor must survive")\n' > "$default_script"
+    printf '%s\n' '{"sentinel":"default","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/default/dcg"}]}]}}' > "$HOME/.claude/settings.json"
+    cp "$default_script" "$TEST_TMPDIR/default-predecessor.snapshot"
+    cp "$HOME/.claude/settings.json" "$TEST_TMPDIR/default-settings.snapshot"
+
+    export CLAUDE_CONFIG_DIR="$TEST_TMPDIR/active Claude"
+    cd "$HOME" || return 1
+    run_claude_fixture_installer
+    [ "$status" -eq 0 ]
+    cmp -s "$TEST_TMPDIR/default-predecessor.snapshot" "$default_script"
+    cmp -s "$TEST_TMPDIR/default-settings.snapshot" "$HOME/.claude/settings.json"
+    grep -qF "$HOME/.local/bin/dcg" "$CLAUDE_CONFIG_DIR/settings.json"
+
+    # A genuinely separate project hook remains eligible for the existing
+    # predecessor migration; only an alias of the inactive default is excluded.
+    mkdir -p "${project_script%/*}"
+    printf 'print("project predecessor")\n' > "$project_script"
+    cd "$TEST_WORKDIR" || return 1
+    run_claude_fixture_installer
+    [ "$status" -eq 0 ]
+    [ ! -e "$project_script" ]
+    cmp -s "$TEST_TMPDIR/default-predecessor.snapshot" "$default_script"
+    cmp -s "$TEST_TMPDIR/default-settings.snapshot" "$HOME/.claude/settings.json"
+}
+
 @test "configure_claude_code: creates settings.json when directory missing" {
     log_test "Testing Claude Code configuration with missing directory..."
 
@@ -4491,6 +4674,10 @@ PY
     local user_snapshot="$TEST_TMPDIR/dcg-guard.user.ts"
     local install_dest="$TEST_TMPDIR/full-install-bin"
     mkdir -p "$payload_dir" "$(dirname "$user_extension")"
+    # Stale .omp files alone deliberately do not detect an installed agent.
+    # Supply the external executable so this fixture reaches the conflict path.
+    printf '#!/bin/bash\nprintf "omp 1.0.0\\n"\n' > "$TEST_TMPDIR/bin/omp"
+    chmod +x "$TEST_TMPDIR/bin/omp"
     cat > "$payload_dir/dcg" <<'MOCKEOF'
 #!/bin/bash
 printf '%s\n' "$*" >> "$MOCK_DCG_CALLS"
@@ -4549,7 +4736,8 @@ MOCKEOF
         "$HOME/.omp/profiles/default-inactive/agent/extensions/dcg-guard.ts"
         "$HOME/.custom-omp/profiles/custom-inactive/agent/extensions/dcg-guard.ts"
         "$PI_CODING_AGENT_DIR/extensions/dcg-guard.ts"
-        "$PWD/.omp/extensions/dcg-guard.ts"
+        # Project inventory is reported relative to the invocation directory.
+        ".omp/extensions/dcg-guard.ts"
     )
     local extension
     for extension in "${extensions[@]}"; do
