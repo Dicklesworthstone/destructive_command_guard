@@ -37,8 +37,15 @@ code** and a machine-readable JSON payload — no hook-protocol envelope to
 construct:
 
 ```bash
-dcg --robot test "<command>"
+dcg --robot test --dialect posix "<command>"
 ```
+
+`--dialect posix` matters. Without it `dcg test` defaults to `unknown` and
+checks every shell dialect, zsh included, because the CLI cannot know the
+source shell. Pi's bash tool runs bash (or `sh`), never zsh, so zsh-only
+readings (for example `>!` as zsh's clobber redirect inside a JavaScript
+`r=>!x` arrow) would deny commands the Claude Code Bash hook allows (#532).
+`--dialect posix` is the evaluation path that hook takes.
 
 - **exit 0** → allowed
 - **exit 1** → denied (JSON on stdout carries `reason`, `rule_id`, `pack_id`,
@@ -94,7 +101,7 @@ function dcgDecision(command: string): Promise<{ deny: boolean; reason: string }
     // host aborts the tool call instead of failing open.
     let child;
     try {
-      child = spawn(DCG_BIN, ["--robot", "test", command], {
+      child = spawn(DCG_BIN, ["--robot", "test", "--dialect", "posix", command], {
         stdio: ["ignore", "pipe", "ignore"],
       });
     } catch {
@@ -171,8 +178,8 @@ its shell tool differently, and set `DCG_BIN` if `dcg` is not on Pi's `PATH`
 4. Sanity-check the underlying decision directly:
 
    ```bash
-   dcg --robot test "git reset --hard HEAD~1"; echo "exit=$?"   # exit=1 (denied)
-   dcg --robot test "ls -la"; echo "exit=$?"                    # exit=0 (allowed)
+   dcg --robot test --dialect posix "git reset --hard HEAD~1"; echo "exit=$?"   # exit=1 (denied)
+   dcg --robot test --dialect posix "ls -la"; echo "exit=$?"                    # exit=0 (allowed)
    ```
 
 ## Limitations
