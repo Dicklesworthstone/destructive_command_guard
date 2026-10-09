@@ -116,6 +116,7 @@ EOF";
             .env("LOCALAPPDATA", home.join("localappdata"))
             .env("TEMP", temporary.path())
             .env("TMP", temporary.path())
+            .env("TMPDIR", temporary.path())
             .env("DCG_CONFIG", &config)
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
             .env(
@@ -263,6 +264,217 @@ EOF";
             assert_eq!(
                 decision, "deny",
                 "real shell evidence must survive: {command:?}: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_544_reported_python_and_node_documentation_strings_are_allowed() {
+        for command in [
+            "python3 - <<'PY'\ns = \"run `git branch -d x` later\"\nprint(s)\nPY",
+            "python3 - <<'PY'\ns = 'run `git branch -d x` later'\nprint(s)\nPY",
+            "node - <<'JS'\nconst s = \"run `git branch -d x` later\";\nJS",
+            "cat > m.txt <<'EOF'\ns = \"run `git branch -d x` later\"\nEOF",
+            "python3 - <<'PY'\ns = \"run `git status` later\"\nprint(s)\nPY",
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(
+                decision, "allow",
+                "language string contents are not shell substitutions: {command:?}: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_544_python_string_literal_forms_remain_inert() {
+        for body in [
+            "s = '''run `git branch -d x` later'''\nprint(s)",
+            "s = \"\"\"run `git branch -d x` later\nThis is documentation.\"\"\"\nprint(s)",
+            "s = r'run `git branch -d x` later'\nprint(s)",
+            "s = b'run `git branch -d x` later'\nprint(s)",
+            "s = u'run `git branch -d x` later'\nprint(s)",
+            "s = f'run `git branch -d x` later'\nprint(s)",
+            "s = \"He said \\\"run `git branch -d x` later\\\"\"\nprint(s)",
+            "s = 'run ' '`git branch -d x`' ' later'\nprint(s)",
+            "\"\"\"run `git branch -d x` later\"\"\"\nprint('documented')",
+            "p = 'README.md'\ns = open(p).read()\ns = s.replace('After merging.', '''After merging, run `git checkout main && git pull --ff-only && git branch -d fix/x`.''')\nopen(p, 'w').write(s)",
+        ] {
+            let command = format!("python3 - <<'PY'\n{body}\nPY");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(
+                decision, "allow",
+                "inert Python literal must be allowed: {command:?}: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_544_javascript_string_literal_forms_remain_inert() {
+        for body in [
+            r#"const s = 'run `git branch -d x` later'; console.log(s);"#,
+            r#"const s = "He said \"run `git branch -d x` later\""; console.log(s);"#,
+            r#"const s = `run \`git branch -d x\` later`; console.log(s);"#,
+            "const s = `run \\`git branch -d x\\` later\nThis is documentation.`;\nconsole.log(s);",
+            r#""run `git branch -d x` later"; console.log('documented');"#,
+            r#"const fs = require('fs'); const source = fs.readFileSync('README.md', 'utf8'); const edited = source.replace('After merging.', 'After merging, run `git branch -d x`.'); fs.writeFileSync('README.md', edited);"#,
+        ] {
+            let command = format!("node - <<'JS'\n{body}\nJS");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(
+                decision, "allow",
+                "inert JavaScript literal must be allowed: {command:?}: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_544_quoted_delimiters_and_written_programs_keep_language_context() {
+        for (program, body) in [
+            ("python3", "s = \"run `git branch -d x` later\"\nprint(s)"),
+            (
+                "node",
+                "const s = \"run `git branch -d x` later\";\nconsole.log(s);",
+            ),
+        ] {
+            for delimiter in ["'DOC'", "\"DOC\"", "D\\OC"] {
+                let direct = format!("{program} - <<{delimiter}\n{body}\nDOC");
+                let written = format!(
+                    "cat > /tmp/documentation-program <<{delimiter}\n{body}\nDOC\n{program} /tmp/documentation-program"
+                );
+                for command in [direct, written] {
+                    let (decision, rule) = hook_decision(&command);
+                    assert_eq!(
+                        decision, "allow",
+                        "the proven interpreter must govern its source: {command:?}: {rule}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn issue_544_dangerous_subprocesses_and_executable_interpolation_stay_denied() {
+        for (program, body) in [
+            ("python3", "import os\nos.system('git branch -d x')"),
+            (
+                "python3",
+                "import subprocess\nsubprocess.run(['git', 'branch', '-d', 'x'])",
+            ),
+            (
+                "python3",
+                "import subprocess\nsubprocess.run('git branch -d x', shell=True)",
+            ),
+            (
+                "python3",
+                "import subprocess\nsubprocess.run(['rm', '-rf', '/home/user/project'])",
+            ),
+            (
+                "python3",
+                "import os\ns = 'echo `git branch -d x`'\nos.system(s)",
+            ),
+            (
+                "python3",
+                "s = f\"run `git branch -d x` later {__import__('os').system('git reset --hard')}\"\nprint(s)",
+            ),
+            (
+                "node",
+                "require('child_process').execSync('git branch -d x');",
+            ),
+            (
+                "node",
+                "require('child_process').spawnSync('rm', ['-rf', '/home/user/project']);",
+            ),
+            (
+                "node",
+                "const s = 'echo `git branch -d x`';\nrequire('child_process').execSync(s);",
+            ),
+            (
+                "node",
+                r#"const s = `run \`git branch -d x\` later ${require('child_process').execSync('git reset --hard')}`; console.log(s);"#,
+            ),
+        ] {
+            for command in [
+                format!("{program} - <<'DOC'\n{body}\nDOC"),
+                format!(
+                    "cat > /tmp/executed-program <<'DOC'\n{body}\nDOC\n{program} /tmp/executed-program"
+                ),
+            ] {
+                let (decision, rule) = hook_decision(&command);
+                assert_eq!(
+                    decision, "deny",
+                    "executed code must remain protected: {command:?}: {rule}"
+                );
+                assert!(
+                    !rule.is_empty(),
+                    "denial must identify its rule: {command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue_544_opaque_calls_and_rebound_data_sinks_are_not_exempted() {
+        for (program, body) in [
+            ("python3", "from helper import run\nrun('git branch -d x')"),
+            (
+                "python3",
+                "from helper import run\ns = 'echo `git branch -d x`'\nrun(s)",
+            ),
+            (
+                "python3",
+                "print = __import__('os').system\nprint('git branch -d x')",
+            ),
+            (
+                "python3",
+                "import os\ns = 'git branch -d x'\nexec('os.system(s)')",
+            ),
+            ("node", "require('./helper')('git branch -d x');"),
+            (
+                "node",
+                "const run = require('./helper');\nconst s = 'echo `git branch -d x`';\nrun(s);",
+            ),
+            (
+                "node",
+                "console.log = require('child_process').execSync;\nconsole.log('git branch -d x');",
+            ),
+            (
+                "node",
+                "const s = 'git branch -d x';\neval(\"require('child_process').execSync(s)\");",
+            ),
+        ] {
+            let command = format!("{program} - <<'DOC'\n{body}\nDOC");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(
+                decision, "deny",
+                "an unproven call can execute its string: {command:?}: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_544_outer_shell_expansion_and_later_commands_remain_protected() {
+        for command in [
+            "python3 - <<PY\ns = \"run `git branch -d x` later\"\nprint(s)\nPY",
+            "node - <<JS\nconst s = 'run `git branch -d x` later';\nJS",
+            "python3 - <<PY\ns = r'$(git reset --hard)'\nprint(s)\nPY",
+            "python3 - <<'PY'\ns = \"run `git branch -d x` later\"\nprint(s)\nPY\ngit branch -d x",
+            "node - <<'JS'\nconst s = \"run `git branch -d x` later\";\nJS\ngit reset --hard",
+            "sh <<'PY'\ns = \"run `git branch -d x` later\"\nPY",
+            "cat <<'PY' | sh\ns = \"run `git branch -d x` later\"\nPY",
+            "python3 - <<'PY' | sh\nprint('git branch -d x')\nPY",
+            "node - <<'JS' | sh\nconsole.log('git branch -d x');\nJS",
+            "unknown-interpreter - <<'PY'\ns = \"run `git branch -d x` later\"\nPY",
+            "python3() { sh -s; }; python3 - <<'PY'\ns = \"run `git branch -d x` later\"\nPY",
+            "node() { sh -s; }; node - <<'JS'\nconst s = \"run `git branch -d x` later\";\nJS",
+            "python3 - <<'PY'\nopen('m.sh', 'w').write('git branch -d x')\nPY\nsh m.sh",
+            "node - <<'JS'\nrequire('fs').writeFileSync('m.sh', 'git branch -d x');\nJS\nsh m.sh",
+            "python3 - <<'PY'\nopen('m.sh', 'w').write('echo `git branch -d x`')\nPY\nsh m.sh",
+            "node - <<'JS'\nrequire('fs').writeFileSync('m.sh', 'echo `git branch -d x`');\nJS\nsh m.sh",
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(
+                decision, "deny",
+                "shell or unknown execution must remain visible: {command:?}: {rule}"
             );
         }
     }

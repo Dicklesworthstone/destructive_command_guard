@@ -14563,17 +14563,142 @@ fn preserve_source_heredoc_data_mask<'a>(
         return Cow::Borrowed(command_for_match);
     }
     let data_view = crate::heredoc::mask_non_expanding_data_heredocs(source);
-    if data_view == source || data_view.len() != source.len() {
+    let documentation_view = mask_proven_interpreter_documentation(source);
+    if (data_view == source && documentation_view == source)
+        || data_view.len() != source.len()
+        || documentation_view.len() != source.len()
+    {
         return Cow::Borrowed(command_for_match);
     }
     let mut result = command_for_match.as_bytes().to_vec();
-    for ((original, masked), output) in source.bytes().zip(data_view.bytes()).zip(result.iter_mut())
+    for (((original, masked), documented), output) in source
+        .bytes()
+        .zip(data_view.bytes())
+        .zip(documentation_view.bytes())
+        .zip(result.iter_mut())
     {
-        if original != masked {
+        if original != documented {
+            *output = documented;
+        } else if original != masked {
             *output = masked;
         }
     }
     String::from_utf8(result).map_or(Cow::Borrowed(command_for_match), Cow::Owned)
+}
+
+/// Withdraw shell syntax invented from proven Python/JavaScript documentation
+/// literals (#544). Only the final shell matching view uses this mask. The
+/// complete original body remains input to interpreter, execution, pipeline,
+/// and protected-write checks; an opaque program never receives a mask.
+fn mask_proven_interpreter_documentation(command: &str) -> Cow<'_, str> {
+    if !command.contains("<<")
+        || (!command.contains('`') && !command.contains("$("))
+        || command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
+    {
+        return Cow::Borrowed(command);
+    }
+    // The deadline covers extraction and both the Bash receiver proof and
+    // the Python/JavaScript parse. Node/byte limits alone do not bound the
+    // parser's wall time (git_safety_guard-bl1c).
+    static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let source = command.to_string();
+    run_documentation_mask_worker(
+        &ACTIVE,
+        crate::ast_matcher::protected_scan_budget(),
+        move || match mask_proven_interpreter_documentation_inner(&source) {
+            Cow::Owned(masked) => Some(masked),
+            Cow::Borrowed(_) => None,
+        },
+    )
+    .map_or(Cow::Borrowed(command), Cow::Owned)
+}
+
+/// At most one parser may outlive its optional documentation proof. The
+/// permit remains owned through timeout or panic until analysis finishes; a
+/// busy slot keeps the conservative source view instead of spawning more work.
+fn run_documentation_mask_worker(
+    active: &'static std::sync::atomic::AtomicBool,
+    budget: std::time::Duration,
+    analyze: impl FnOnce() -> Option<String> + Send + 'static,
+) -> Option<String> {
+    use std::sync::atomic::Ordering;
+    let started = std::time::Instant::now();
+    if budget.is_zero()
+        || active
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+    {
+        return None;
+    }
+    struct Permit(&'static std::sync::atomic::AtomicBool);
+    impl Drop for Permit {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let permit = Permit(active);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let _worker = std::thread::Builder::new()
+        .name("dcg-documentation-proof".into())
+        .spawn(move || {
+            let result = analyze();
+            // The closure and all parser/source state are gone before the
+            // permit is released. The buffered send cannot block a worker.
+            drop(permit);
+            let _ = sender.send(result);
+        })
+        .ok()?;
+    let remaining = budget.checked_sub(started.elapsed())?;
+    let result = receiver.recv_timeout(remaining).ok()?;
+    (started.elapsed() < budget).then_some(result).flatten()
+}
+
+fn mask_proven_interpreter_documentation_inner(command: &str) -> Cow<'_, str> {
+    let ExtractionResult::Extracted(contents) = extract_content(
+        command,
+        &crate::heredoc::ExtractionLimits::structural_scan(),
+    ) else {
+        return Cow::Borrowed(command);
+    };
+    let mut output: Option<Vec<u8>> = None;
+    for content in contents {
+        if !matches!(
+            content.language,
+            crate::heredoc::ScriptLanguage::Python | crate::heredoc::ScriptLanguage::JavaScript
+        ) {
+            continue;
+        }
+        let Some(body_range) = content.content_range.as_ref() else {
+            continue;
+        };
+        if !crate::heredoc::range_is_quoted_interpreter_source(
+            command,
+            body_range,
+            content.language,
+        ) {
+            continue;
+        }
+        let Some(body) = command.get(body_range.clone()) else {
+            continue;
+        };
+        for literal in
+            crate::ast_matcher::inert_documentation_literal_ranges(body, content.language)
+        {
+            if body.get(literal.clone()).is_none() {
+                return Cow::Borrowed(command);
+            }
+            let bytes = output.get_or_insert_with(|| command.as_bytes().to_vec());
+            for byte in &mut bytes[body_range.start + literal.start..body_range.start + literal.end]
+            {
+                if !matches!(*byte, b'\r' | b'\n') {
+                    *byte = b' ';
+                }
+            }
+        }
+    }
+    output.map_or(Cow::Borrowed(command), |bytes| {
+        Cow::Owned(String::from_utf8(bytes).expect("complete literal masks preserve UTF-8"))
+    })
 }
 
 /// Shell reserved words that may precede the command word inside a compound
@@ -29137,11 +29262,24 @@ fn evaluate_pack_destructive_patterns(
     // slice: rebuilding that view from `original_command` would reintroduce
     // inert argv data such as `git commit -m "Fix git push --force"` and turn
     // the commit message into a false positive.
+    // A caller-proven shell dialect may restore quoting that the generic
+    // sanitizer erased, but must not restore documentation literals whose
+    // interpreter/data-flow proof deliberately removed shell syntax (#544).
+    let documentation_source = if pack_id == "core.git"
+        && normalized_offset == Some(0)
+        && original_command
+            .get(slice_offset..slice_offset.saturating_add(command_slice.len()))
+            .is_some_and(|slice| slice.contains('`') || slice.contains("$("))
+    {
+        mask_proven_interpreter_documentation(original_command)
+    } else {
+        Cow::Borrowed(original_command)
+    };
     let git_semantic_command = if pack_id == "core.git"
         && shell_dialect != crate::normalize::ShellDialect::Unknown
         && normalized_offset == Some(0)
     {
-        original_command
+        documentation_source
             .get(slice_offset..slice_offset.saturating_add(command_slice.len()))
             .unwrap_or(command_slice)
     } else {
@@ -32058,6 +32196,56 @@ pub fn apply_branch_strictness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn documentation_mask_timeout_keeps_live_worker_permit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        static ACTIVE: AtomicBool = AtomicBool::new(false);
+        let (release, wait) = std::sync::mpsc::channel();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let result = run_documentation_mask_worker(&ACTIVE, Duration::from_millis(10), move || {
+            // Simulate a parser that cannot observe cooperative checks.
+            // The safety timeout also releases this test worker on panic.
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+            let _ = finished.send(());
+            Some("late mask".to_string())
+        });
+        assert!(result.is_none(), "expired analysis must not produce a mask");
+        assert!(matches!(
+            completion.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(ACTIVE.load(Ordering::Acquire));
+        assert!(
+            run_documentation_mask_worker(&ACTIVE, Duration::from_secs(1), || {
+                panic!("a live parser must retain the only worker permit")
+            })
+            .is_none()
+        );
+        release.send(()).unwrap();
+        completion.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn documentation_mask_completed_worker_releases_permit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        static ACTIVE: AtomicBool = AtomicBool::new(false);
+        assert_eq!(
+            run_documentation_mask_worker(&ACTIVE, Duration::from_secs(5), || {
+                Some("completed mask".to_string())
+            }),
+            Some("completed mask".to_string())
+        );
+        assert!(!ACTIVE.load(Ordering::Acquire));
+        assert!(
+            run_documentation_mask_worker(&ACTIVE, Duration::ZERO, || {
+                panic!("an expired budget must not start a worker")
+            })
+            .is_none()
+        );
+    }
 
     #[test]
     fn heredoc_pipeline_language_is_bound_to_its_own_source() {

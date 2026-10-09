@@ -7922,6 +7922,106 @@ pub(crate) fn range_is_written_bash_source(command: &str, range: &Range<usize>) 
         .is_some_and(|source| source.language == ScriptLanguage::Bash && source.body == *range)
 }
 
+/// Whether this exact body is handed verbatim to the named non-shell
+/// interpreter as its program. This supplies source identity for a
+/// language-specific literal proof; it never masks or approves the program.
+/// Other stdin consumers, unquoted bodies, and ambiguous file handoffs retain
+/// the conservative raw-source analysis.
+pub(crate) fn range_is_quoted_interpreter_source(
+    command: &str,
+    range: &Range<usize>,
+    language: ScriptLanguage,
+) -> bool {
+    if range.start >= range.end
+        || !matches!(
+            language,
+            ScriptLanguage::Python | ScriptLanguage::JavaScript
+        )
+        || !command.contains("<<")
+        || command.len() > MAX_SUBSTITUTION_SOURCE_BYTES
+    {
+        return false;
+    }
+    if written_heredoc_interpreter(command)
+        .is_some_and(|source| source.language == language && source.body == *range)
+    {
+        return true;
+    }
+    // A direct source proof belongs to the complete invocation, not merely
+    // one receiver inside a larger workflow. A later shell could execute a
+    // file the interpreter writes, and a preceding environment assignment
+    // could preload code that changes its builtins. Neither supplies the
+    // isolated program assumed by the language-specific literal analysis.
+    let Ok(ast) = AstGrep::try_new(command, SupportLang::Bash) else {
+        return false;
+    };
+    let root = ast.root();
+    if root.get_inner_node().has_error()
+        || root.children().any(|child| child.kind().as_ref() == "&")
+    {
+        return false;
+    }
+    let mut statements = root
+        .children()
+        .filter(|child| child.is_named() && child.kind().as_ref() != "comment");
+    let Some(statement) = statements.next() else {
+        return false;
+    };
+    if statements.next().is_some()
+        || statement.kind().as_ref() != "redirected_statement"
+        || !statement
+            .field("body")
+            .is_some_and(|body| body.kind().as_ref() == "command")
+        || statement
+            .children()
+            .filter(ast_grep_core::Node::is_named)
+            .any(|child| !matches!(child.kind().as_ref(), "command" | "heredoc_redirect"))
+        || statement
+            .children()
+            .filter(|child| child.kind().as_ref() == "heredoc_redirect")
+            .count()
+            != 1
+    {
+        return false;
+    }
+    let Some(heredocs) = active_heredocs(command) else {
+        return false;
+    };
+    if heredocs.len() > ExtractionLimits::structural_scan().max_heredocs {
+        return false;
+    }
+    heredocs.iter().any(|heredoc| {
+        let Some(mut body) = inert_interpreter_stdin_body(command, heredoc) else {
+            return false;
+        };
+        let Some(text) = command.get(body.clone()) else {
+            return false;
+        };
+        // Extraction excludes the newline immediately before the delimiter;
+        // tree-sitter includes it. Reconcile that one syntax boundary only.
+        if text.ends_with('\n') {
+            body.end -= 1;
+            if text.ends_with("\r\n") {
+                body.end -= 1;
+            }
+        }
+        if body != *range {
+            return false;
+        }
+        let Some(owner) = plain_heredoc_command_at(command, heredoc.operator_start) else {
+            return false;
+        };
+        let Ok(words) = shell_words::split(&owner) else {
+            return false;
+        };
+        let Some((program, arguments)) = words.split_first() else {
+            return false;
+        };
+        ScriptLanguage::from_command(program.rsplit('/').next().unwrap_or(program)) == language
+            && (arguments.is_empty() || matches!(arguments, [argument] if argument == "-"))
+    })
+}
+
 /// The `>` bytes that JavaScript itself parses as arrow operators in a
 /// proven written script (#519). Do not exempt the whole body from redirect
 /// or launcher rules: strings passed through opaque sinks can still hold
@@ -13246,6 +13346,103 @@ mod tests {
         ] {
             let arguments = shell_words::split(command).expect("literal argv");
             assert!(literal_scp_file_transfer(&arguments).is_none(), "{command}");
+        }
+    }
+
+    #[test]
+    fn quoted_interpreter_source_proof_requires_the_complete_handoff_544() {
+        let body = "text = 'run `git branch -d x` later'";
+        for (header, tail, language, expected) in [
+            ("python3 - <<'EOF'", "", ScriptLanguage::Python, true),
+            ("node <<'EOF'", "", ScriptLanguage::JavaScript, true),
+            ("python3 - <<EOF", "", ScriptLanguage::Python, false),
+            (
+                "python3 script.py <<'EOF'",
+                "",
+                ScriptLanguage::Python,
+                false,
+            ),
+            (
+                "python3 -c other <<'EOF'",
+                "",
+                ScriptLanguage::Python,
+                false,
+            ),
+            ("python3 - <<'EOF' | sh", "", ScriptLanguage::Python, false),
+            (
+                "python3 - <<'EOF' > x.sh",
+                "sh x.sh",
+                ScriptLanguage::Python,
+                false,
+            ),
+            (
+                "python3 - <<'EOF'",
+                "sh x.sh",
+                ScriptLanguage::Python,
+                false,
+            ),
+            (
+                "NODE_OPTIONS=bootstrap node <<'EOF'",
+                "",
+                ScriptLanguage::JavaScript,
+                false,
+            ),
+            (
+                "export NODE_OPTIONS=bootstrap; node <<'EOF'",
+                "",
+                ScriptLanguage::JavaScript,
+                false,
+            ),
+            (
+                "cat > x.py <<'EOF'",
+                "python3 x.py",
+                ScriptLanguage::Python,
+                true,
+            ),
+            (
+                "cat > x.py <<'EOF'",
+                "python3 x.py; sh x.py",
+                ScriptLanguage::Python,
+                false,
+            ),
+            (
+                "cat > x.js <<'EOF'",
+                "node --require bootstrap x.js",
+                ScriptLanguage::JavaScript,
+                false,
+            ),
+            (
+                "cat >> x.py <<'EOF'",
+                "python3 x.py",
+                ScriptLanguage::Python,
+                false,
+            ),
+            (
+                "cat > x.py <<'EOF'",
+                "sh x.py",
+                ScriptLanguage::Python,
+                false,
+            ),
+            (
+                "(python3 - <<'EOF'",
+                "sh x.sh) > result",
+                ScriptLanguage::Python,
+                false,
+            ),
+        ] {
+            let command = format!("{header}\n{body}\nEOF\n{tail}");
+            let start = command.find(body).expect("body");
+            let range = start..start + body.len();
+            assert_eq!(
+                range_is_quoted_interpreter_source(&command, &range, language),
+                expected,
+                "{command:?}"
+            );
+            assert!(!range_is_quoted_interpreter_source(
+                &command,
+                &(range.start..range.end - 1),
+                language
+            ));
         }
     }
 
