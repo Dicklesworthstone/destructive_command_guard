@@ -46,7 +46,8 @@ use memchr::memchr;
 use regex::RegexSet;
 use std::borrow::Cow;
 use std::ops::Range;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, mpsc};
 use std::time::{Duration, Instant};
 use tracing::{debug, instrument, trace, warn};
 
@@ -9107,6 +9108,7 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
     let mut written: Vec<(String, usize)> = Vec::new();
     let mut write_targets = vec![false; tokens.len()];
     let mut process_substitution_words = vec![false; tokens.len()];
+    let mut executable_tokens = vec![false; tokens.len()];
     let mut segment_command: Vec<Option<String>> = vec![None; tokens.len()];
     let mut piped = vec![false; tokens.len()];
     // (first token, end token, program, pipes on) of each segment.
@@ -9167,6 +9169,7 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
                     )
                 {
                     command_word = Some(name_of(text));
+                    executable_tokens[index] = true;
                 }
             }
             Some("tee") if !text.starts_with('-') => {
@@ -9177,16 +9180,20 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
         }
     }
     segments.push((segment_start, tokens.len(), command_word, false));
-    for (at, (start, end, program, pipes_on)) in segments.iter().enumerate() {
-        let feeds_interpreter = *pipes_on
-            && segments
-                .get(at + 1)
-                .and_then(|next| next.2.as_deref())
-                .is_some_and(runs_its_input_as_code);
+    let mut downstream_runs = false;
+    for (start, end, program, pipes_on) in segments.iter().rev() {
+        // A reader can hand a file through several filters before the shell
+        // receives it. Propagate that reachability backwards in one pass;
+        // checking only the immediate next stage misses `cat f | grep . | sh`.
+        let feeds_interpreter = *pipes_on && downstream_runs;
         for index in *start..*end {
             segment_command[index].clone_from(program);
             piped[index] = feeds_interpreter;
         }
+        downstream_runs = feeds_interpreter
+            || program
+                .as_deref()
+                .is_some_and(|program| runs_its_input_as_code(program) || program == "ssh");
     }
     written.retain(|(name, _)| !name.is_empty() && name != "-");
     written.sort_unstable();
@@ -9200,9 +9207,62 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
     if written.len() > 32 {
         return true;
     }
+    let data_consumers = literal_file_data_consumers(command, &outside);
+    // A copy consumes bytes as data, but does not make them permanently
+    // inert. Follow literal destination aliases before judging all consumers,
+    // including copies under a different basename and repeated copies. Keep
+    // the original name too: a destination may name an existing directory.
+    // The fixed point is bounded by the same 32-file limit as the scan.
+    for round in 0..32 {
+        let mut changed = false;
+        for consumer in &data_consumers {
+            let Some(transfer) = &consumer.transfer else {
+                continue;
+            };
+            let Some(first_write) = written
+                .iter()
+                .filter(|(name, _)| transfer.sources.contains(name))
+                .map(|(_, first_write)| *first_write)
+                .min()
+            else {
+                continue;
+            };
+            let Some(destination) = &transfer.destination else {
+                continue;
+            };
+            if let Some((_, existing_write)) =
+                written.iter_mut().find(|(name, _)| name == destination)
+            {
+                if first_write < *existing_write {
+                    *existing_write = first_write;
+                    changed = true;
+                }
+            } else {
+                if written.len() >= 32 {
+                    return true;
+                }
+                written.push((destination.clone(), first_write));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+        if round == 31 {
+            return true;
+        }
+    }
     let boundary = |byte: Option<&u8>| {
         byte.is_none_or(|byte| {
             !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+' | b'@'))
+        })
+    };
+    let mentions_name = |text: &str, name: &str| {
+        text.match_indices(name).any(|(at, _)| {
+            boundary(
+                at.checked_sub(1)
+                    .and_then(|before| text.as_bytes().get(before)),
+            ) && boundary(text.as_bytes().get(at + name.len()))
         })
     };
     tokens.iter().enumerate().any(|(index, token)| {
@@ -9225,7 +9285,8 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
         let computed = text.contains(['$', '`', '*', '?', '[']);
         let program = segment_command[index].as_deref();
         let command_word = program.is_some_and(|word| word == name_of(text));
-        let interpreted = program.is_some_and(runs_its_input_as_code);
+        let interpreted =
+            program.is_some_and(|program| runs_its_input_as_code(program) || program == "ssh");
         if computed
             && (has_process_substitution
                 || (!is_shell_env_assignment(text) && (command_word || interpreted)))
@@ -9239,20 +9300,631 @@ fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
             if synchronous_reader && index < *first_write {
                 return false;
             }
-            text.match_indices(name.as_str()).any(|(at, _)| {
-                boundary(
-                    at.checked_sub(1)
-                        .and_then(|before| text.as_bytes().get(before)),
-                ) && boundary(text.as_bytes().get(at + name.len()))
-            })
+            if data_consumers.iter().any(|consumer| {
+                consumer.range.start <= token.byte_range.start
+                    && token.byte_range.end <= consumer.range.end
+                    && !consumer.command_names.contains(&name.as_str())
+            }) {
+                return false;
+            }
+            mentions_name(text, name)
         });
         mentions
-            && (has_process_substitution
+            && ((!data_consumers.is_empty() && executable_tokens[index])
+                || has_process_substitution
                 || piped[index]
                 || !segment_command[index]
                     .as_deref()
                     .is_some_and(|word| READERS.contains(&word)))
     })
+}
+
+/// A file transfer proves only that this command copies its source bytes.
+/// Destination aliases must continue through the ordinary execution scan.
+struct LiteralFileTransfer {
+    sources: Vec<String>,
+    destination: Option<String>,
+}
+
+struct ProvenFileDataConsumer {
+    range: Range<usize>,
+    // A transferred file named `git`/`scp` must not borrow a data-argument
+    // exemption when those names themselves are subsequently executed.
+    command_names: &'static [&'static str],
+    transfer: Option<LiteralFileTransfer>,
+}
+
+/// A timed-out optional proof must not leave room for another live parser.
+/// Releasing this permit after analysis also covers unwind and spawn failure.
+struct FileDataProofPermit(&'static AtomicBool);
+
+impl Drop for FileDataProofPermit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// The parser and every nested remote-command proof run off the hook thread.
+/// All failure paths discard the exemption and keep the existing raw scan.
+fn run_file_data_proof(
+    busy: &'static AtomicBool,
+    started: Instant,
+    budget: Duration,
+    analyze: impl FnOnce() -> Vec<ProvenFileDataConsumer> + Send + 'static,
+) -> Vec<ProvenFileDataConsumer> {
+    if started.elapsed() >= budget
+        || busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+    {
+        return Vec::new();
+    }
+    let permit = FileDataProofPermit(busy);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("dcg-file-data-proof".into())
+        .spawn(move || {
+            let result = if started.elapsed() < budget {
+                analyze()
+            } else {
+                Vec::new()
+            };
+            // No parser remains after analysis returns. Release before send
+            // so the next sequential proof does not spuriously observe busy.
+            // A buffered send cannot strand a timed-out worker, and joining
+            // here would put the hook back under the worker's wall clock.
+            drop(permit);
+            let _ = sender.send(result);
+        })
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(remaining) = budget.checked_sub(started.elapsed()) else {
+        return Vec::new();
+    };
+    receiver
+        .recv_timeout(remaining)
+        .ok()
+        .filter(|_| started.elapsed() < budget)
+        .unwrap_or_default()
+}
+
+/// Narrow per-command data contracts for #543. A bare program-name exemption
+/// for ssh would hide remote shell execution; one for scp would lose renamed
+/// copies, custom transport programs, and configuration-driven execution.
+/// Prove the literal argv and command ancestry instead. Pipelines, substituted
+/// output, redirections, functions, wrappers and mutable shell bindings retain
+/// the old conservative treatment.
+fn literal_file_data_consumers(command: &str, outside: &str) -> Vec<ProvenFileDataConsumer> {
+    if (!outside.contains("scp") && !outside.contains("ssh"))
+        || command.len() > MAX_SUBSTITUTION_SOURCE_BYTES
+    {
+        return Vec::new();
+    }
+    // Match the existing AST timeout's only-raise convention. Keep the cheap
+    // trigger and byte cap outside the worker, and include input ownership and
+    // thread startup in the same deadline. One process-wide slot applies in
+    // tests too; a busy or expired optional proof simply supplies no waiver.
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    let budget = crate::ast_matcher::protected_scan_budget();
+    let started = Instant::now();
+    let command = command.to_owned();
+    let outside = outside.to_owned();
+    run_file_data_proof(&BUSY, started, budget, move || {
+        literal_file_data_consumers_inner(&command, &outside, started, budget)
+    })
+}
+
+fn literal_file_data_consumers_inner(
+    command: &str,
+    outside: &str,
+    started: Instant,
+    budget: Duration,
+) -> Vec<ProvenFileDataConsumer> {
+    if started.elapsed() >= budget {
+        return Vec::new();
+    }
+    let Ok(ast) = AstGrep::try_new(outside, SupportLang::Bash) else {
+        return Vec::new();
+    };
+    if started.elapsed() >= budget || ast.root().get_inner_node().has_error() {
+        return Vec::new();
+    }
+    let mut consumers = Vec::new();
+    let mut candidates = 0usize;
+    'commands: for node in ast.root().dfs() {
+        if started.elapsed() >= budget {
+            return Vec::new();
+        }
+        if node.kind().as_ref() != "command" {
+            continue;
+        }
+        let Some(name) = node
+            .children()
+            .find(|child| child.kind().as_ref() == "command_name")
+        else {
+            continue;
+        };
+        let name_text = name.text();
+        let name = dequoted_executable_word(name_text.as_ref());
+        let basename = name.rsplit('/').next().unwrap_or(&name);
+        if !matches!(basename, "scp" | "ssh" | "git") {
+            continue;
+        }
+        candidates += 1;
+        if candidates > 32 {
+            return Vec::new();
+        }
+        let mut ancestor = node.parent();
+        while let Some(parent) = ancestor {
+            if !matches!(parent.kind().as_ref(), "program" | "list")
+                || parent.children().any(|child| child.kind().as_ref() == "&")
+            {
+                continue 'commands;
+            }
+            ancestor = parent.parent();
+        }
+        if node
+            .children()
+            .filter(ast_grep_core::Node::is_named)
+            .any(|child| {
+                !matches!(
+                    child.kind().as_ref(),
+                    "command_name" | "word" | "raw_string" | "string"
+                )
+            })
+        {
+            continue;
+        }
+        let Some(words) = literal_script_words(&node) else {
+            continue;
+        };
+        let Some((program, arguments)) = words.split_first() else {
+            continue;
+        };
+        if !trusted_literal_script_program(program)
+            || stdin_data_sink_may_be_overridden(command, node.range().end, program)
+        {
+            continue;
+        }
+        let (command_names, transfer): (&'static [&'static str], _) = match basename {
+            "scp" => {
+                let Some(transfer) = literal_scp_file_transfer(arguments) else {
+                    continue;
+                };
+                // OpenSSH invokes ssh for remote copies and cp for local
+                // copies. Those executable identities belong to the proof
+                // even when neither appears as an explicit shell command.
+                (&["scp", "ssh", "cp"], Some(transfer))
+            }
+            "ssh" if literal_ssh_git_message_reader(arguments) => (&["ssh", "git", "cd"], None),
+            "git" if literal_git_commit_message_reader(&words) => (&["git"], None),
+            _ => continue,
+        };
+        consumers.push(ProvenFileDataConsumer {
+            range: node.range(),
+            command_names,
+            transfer,
+        });
+    }
+    // Do not let a new transfer exemption inherit the legacy READERS list's
+    // name-only contract. Other commands can execute files through options
+    // (`rg --pre sh`, `vim -S`), transform them into a differently named file,
+    // or consume them implicitly without a filename in argv. For this new
+    // allowance, the complete workflow must have concrete data contracts.
+    let mut pending = vec![ast.root()];
+    while let Some(node) = pending.pop() {
+        if started.elapsed() >= budget {
+            return Vec::new();
+        }
+        match node.kind().as_ref() {
+            "program" | "list" => {
+                if node
+                    .children()
+                    .any(|child| !child.is_named() && !matches!(child.kind().as_ref(), "&&" | ";"))
+                {
+                    return Vec::new();
+                }
+                pending.extend(node.children().filter(ast_grep_core::Node::is_named));
+            }
+            "redirected_statement" if literal_cat_file_write(&node).is_some() => {}
+            "command"
+                if consumers
+                    .iter()
+                    .any(|consumer| consumer.range == node.range())
+                    || literal_mkdir_setup(&node) => {}
+            "comment" => {}
+            _ => return Vec::new(),
+        }
+    }
+    // Every recognized command relies on a specific executable still having
+    // its normal data contract. A copy from an external (untracked) source
+    // can overwrite one just as a copy from this heredoc can. Check both a
+    // literal target basename and each source basename, since the target may
+    // be an existing directory. This proof does not model changed executables.
+    let names_workflow_program = |name: &str| {
+        matches!(name, "cat" | "mkdir" | "sftp-server")
+            || SHELL_PROGRAMS.contains(&name)
+            || consumers
+                .iter()
+                .any(|consumer| consumer.command_names.contains(&name))
+    };
+    if consumers
+        .iter()
+        .filter_map(|consumer| consumer.transfer.as_ref())
+        .any(|transfer| {
+            transfer
+                .destination
+                .as_deref()
+                .is_some_and(names_workflow_program)
+                || transfer
+                    .sources
+                    .iter()
+                    .any(|source| names_workflow_program(source))
+        })
+    {
+        return Vec::new();
+    }
+    consumers
+}
+
+/// Parse only transport options whose values cannot select commands or load
+/// executable configuration. In particular scp -S/-D, either program's -F/-o,
+/// jump-host options, and scp's legacy/recursive modes are deliberately absent.
+/// The boolean records `--`, since ssh may otherwise parse options again after
+/// the destination. Bundled flags and attached values follow getopt ordering.
+fn literal_transport_options_end(
+    arguments: &[String],
+    mut index: usize,
+    scp: bool,
+) -> Option<(usize, bool)> {
+    let flags = if scp { "46BCpqv" } else { "46CnqTtv" };
+    let values = if scp { "Plic" } else { "plic" };
+    while let Some(argument) = arguments.get(index) {
+        if argument == "--" {
+            return Some((index + 1, true));
+        }
+        let Some(options) = argument.strip_prefix('-') else {
+            break;
+        };
+        if options.is_empty() || options.starts_with('-') {
+            return None;
+        }
+        for (offset, option) in options.char_indices() {
+            if flags.contains(option) {
+                continue;
+            }
+            if !values.contains(option) {
+                return None;
+            }
+            let attached = &options[offset + option.len_utf8()..];
+            let value = if attached.is_empty() {
+                index += 1;
+                arguments.get(index)?.as_str()
+            } else {
+                attached
+            };
+            let valid = match (scp, option) {
+                (true, 'P' | 'l') | (false, 'p') => {
+                    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                }
+                (_, 'i') => literal_transport_file_path(value),
+                (false, 'l') => literal_transport_host(value),
+                (_, 'c') => {
+                    !value.is_empty()
+                        && value.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'_' | b'-' | b'.' | b'+' | b'@' | b',')
+                        })
+                }
+                _ => false,
+            };
+            if !valid {
+                return None;
+            }
+            break;
+        }
+        index += 1;
+    }
+    Some((index, false))
+}
+
+fn literal_transport_host(host: &str) -> bool {
+    !host.is_empty()
+        && !host.starts_with('-')
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'@'))
+}
+
+fn literal_transport_file_path(path: &str) -> bool {
+    is_plain_file_path(path)
+        && !path.contains([
+            ';', '&', '|', '(', ')', '<', '>', '\n', '\r', '\'', '"', ':',
+        ])
+        && !path.split('/').any(|component| component == "..")
+}
+
+fn literal_scp_file_transfer(arguments: &[String]) -> Option<LiteralFileTransfer> {
+    use crate::packs::remote::scp::{ScpSemanticDecision, scp_semantic_decision};
+
+    let (index, _) = literal_transport_options_end(arguments, 0, true)?;
+    let files = arguments.get(index..)?;
+    let (destination, sources) = files.split_last()?;
+    if sources.is_empty()
+        || sources.len() > 32
+        || !sources
+            .iter()
+            .all(|source| literal_transport_file_path(source) && !source.ends_with('/'))
+    {
+        return None;
+    }
+    // The existing SCP policy already distinguishes staging directories
+    // from system executables, libraries, and configuration trees. Reuse it
+    // here even when that optional pack is disabled: such a copy cannot
+    // establish the executable identities required by this data waiver.
+    let mut invocation = String::from("scp");
+    for argument in arguments {
+        invocation.push(' ');
+        invocation.push_str(&shell_words::quote(argument));
+    }
+    if !matches!(
+        scp_semantic_decision(&invocation),
+        ScpSemanticDecision::Safe | ScpSemanticDecision::NonDestructive
+    ) {
+        return None;
+    }
+    let destination = if let Some((host, path)) = destination.split_once(':') {
+        if !literal_transport_host(host) {
+            return None;
+        }
+        path
+    } else {
+        destination.as_str()
+    };
+    if !destination.is_empty() && !literal_transport_file_path(destination) {
+        return None;
+    }
+    // A transfer to a shell startup file or Git hook can execute without any
+    // later argv mentioning that file. Reuse the protected-path policy and
+    // check both interpretations of a target that may be a directory. An
+    // omitted remote path names the remote home, not an arbitrary safe file.
+    let protected = |path: &str| {
+        crate::packs::core::credential_files::names_protected_file(&shell_words::quote(path))
+            // core.hooksPath can locate hooks outside any `.git` directory.
+            // These program basenames therefore remain ambiguous wherever
+            // copied, including a directory target plus source basename.
+            || matches!(
+                path.rsplit('/').next().unwrap_or(path),
+                "applypatch-msg"
+                    | "pre-applypatch"
+                    | "post-applypatch"
+                    | "pre-commit"
+                    | "pre-merge-commit"
+                    | "prepare-commit-msg"
+                    | "commit-msg"
+                    | "post-commit"
+                    | "pre-rebase"
+                    | "post-checkout"
+                    | "post-merge"
+                    | "pre-push"
+                    | "pre-receive"
+                    | "update"
+                    | "proc-receive"
+                    | "post-receive"
+                    | "post-update"
+                    | "reference-transaction"
+                    | "push-to-checkout"
+                    | "pre-auto-gc"
+                    | "post-rewrite"
+                    | "sendemail-validate"
+                    | "fsmonitor-watchman"
+                    | "p4-changelist"
+                    | "p4-prepare-changelist"
+                    | "p4-post-changelist"
+                    | "p4-pre-submit"
+                    | "post-index-change"
+            )
+    };
+    if protected(destination)
+        || sources.iter().any(|source| {
+            let basename = source.rsplit('/').next().unwrap_or(source);
+            let in_directory = if destination.is_empty() {
+                basename.to_string()
+            } else {
+                format!("{destination}/{basename}")
+            };
+            protected(&in_directory)
+        })
+    {
+        return None;
+    }
+    let destination = destination
+        .rsplit('/')
+        .next()
+        .filter(|name| !matches!(*name, "" | "." | ".."))
+        .map(str::to_string);
+    Some(LiteralFileTransfer {
+        sources: sources
+            .iter()
+            .map(|source| source.rsplit('/').next().unwrap_or(source).to_string())
+            .collect(),
+        destination,
+    })
+}
+
+fn literal_ssh_git_message_reader(arguments: &[String]) -> bool {
+    let Some((destination, options_ended)) = literal_transport_options_end(arguments, 0, false)
+    else {
+        return false;
+    };
+    if !arguments
+        .get(destination)
+        .is_some_and(|host| literal_transport_host(host))
+    {
+        return false;
+    }
+    let mut payload = destination + 1;
+    if !options_ended {
+        let Some((index, _)) = literal_transport_options_end(arguments, payload, false) else {
+            return false;
+        };
+        payload = index;
+    }
+    // OpenSSH joins the actual local argv with spaces before the remote shell
+    // parses it. Judge that line, including quotes retained for the remote
+    // shell, rather than a substring of the original quoted local operand.
+    let remote = arguments.get(payload..).unwrap_or_default().join(" ");
+    let Ok(ast) = AstGrep::try_new(remote.as_str(), SupportLang::Bash) else {
+        return false;
+    };
+    if ast.root().get_inner_node().has_error() {
+        return false;
+    }
+    let mut pending = vec![ast.root()];
+    let mut commands = Vec::new();
+    while let Some(node) = pending.pop() {
+        match node.kind().as_ref() {
+            "program" | "list" => {
+                if node
+                    .children()
+                    .any(|child| !child.is_named() && child.kind().as_ref() != "&&")
+                {
+                    return false;
+                }
+                let start = pending.len();
+                pending.extend(node.children().filter(ast_grep_core::Node::is_named));
+                pending[start..].reverse();
+            }
+            "command" => {
+                if node
+                    .children()
+                    .filter(ast_grep_core::Node::is_named)
+                    .any(|child| {
+                        !matches!(
+                            child.kind().as_ref(),
+                            "command_name" | "word" | "raw_string" | "string"
+                        )
+                    })
+                {
+                    return false;
+                }
+                let Some(words) = literal_script_words(&node) else {
+                    return false;
+                };
+                commands.push(words);
+                if commands.len() > 2 {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    let reader = match commands.as_slice() {
+        [reader] => reader,
+        [setup, reader]
+            if matches!(setup.as_slice(), [program, path]
+                if program == "cd" && literal_transport_file_path(path)) =>
+        {
+            reader
+        }
+        _ => return false,
+    };
+    literal_git_commit_message_reader(reader)
+}
+
+fn literal_git_commit_message_reader(words: &[String]) -> bool {
+    let Some((program, arguments)) = words.split_first() else {
+        return false;
+    };
+    if !matches!(program.as_str(), "git" | "/bin/git" | "/usr/bin/git") {
+        return false;
+    }
+    let Some(("commit", commit_arguments)) = git_builtin_subcommand_and_args(arguments) else {
+        return false;
+    };
+    // This new file-flow waiver needs the usual repository layout. An
+    // alternate administrative directory can put executable hooks outside
+    // the protected `.git` anchor; custom helper paths likewise change the
+    // programs involved. Keep ordinary `git -C repo commit -F file` intact
+    // without widening the shared parser's other stdin-data contracts.
+    let global_end = arguments.len() - commit_arguments.len() - 1;
+    if arguments[..global_end].iter().any(|argument| {
+        let option = argument
+            .split_once('=')
+            .map_or(argument.as_str(), |(option, _)| option);
+        matches!(
+            option,
+            "--git-dir"
+                | "--work-tree"
+                | "--bare"
+                | "--namespace"
+                | "--super-prefix"
+                | "--exec-path"
+        )
+    }) {
+        return false;
+    }
+    let arguments = commit_arguments;
+    let mut index = 0usize;
+    let mut found_file = false;
+    while let Some(argument) = arguments.get(index) {
+        if argument == "--" {
+            return found_file
+                && arguments[index + 1..]
+                    .iter()
+                    .all(|path| literal_transport_file_path(path));
+        }
+        let file = if matches!(argument.as_str(), "-F" | "--file") {
+            index += 1;
+            arguments.get(index).map(String::as_str)
+        } else if let Some(path) = argument.strip_prefix("--file=") {
+            Some(path)
+        } else if let Some(short) = argument.strip_prefix('-') {
+            if let Some(at) = short.find('F')
+                && short[..at].chars().all(|flag| "ainopqsv".contains(flag))
+            {
+                let path = &short[at + 1..];
+                if path.is_empty() {
+                    index += 1;
+                    arguments.get(index).map(String::as_str)
+                } else {
+                    Some(path)
+                }
+            } else if !short.is_empty() && short.chars().all(|flag| "ainopqsv".contains(flag))
+                || matches!(
+                    argument.as_str(),
+                    "--all"
+                        | "--amend"
+                        | "--quiet"
+                        | "--no-verify"
+                        | "--no-edit"
+                        | "--allow-empty"
+                        | "--allow-empty-message"
+                        | "--no-gpg-sign"
+                        | "--signoff"
+                        | "--verbose"
+                )
+            {
+                index += 1;
+                continue;
+            } else {
+                return false;
+            }
+        } else if literal_transport_file_path(argument) {
+            index += 1;
+            continue;
+        } else {
+            return false;
+        };
+        if !file.is_some_and(literal_transport_file_path) {
+            return false;
+        }
+        found_file = true;
+        index += 1;
+    }
+    found_file
 }
 
 /// Readers whose file access follows lexical command order. This proof is
@@ -12329,6 +13001,251 @@ mod tests {
                 !mask_non_executing_heredocs(command).contains("rm -rf ~/a"),
                 "{command:?}"
             );
+        }
+    }
+
+    #[test]
+    fn literal_transfers_and_remote_commit_messages_stay_data_543() {
+        let body = "eval ran 16 sequences (5.7 GB) where training ran 4.";
+        for tail in [
+            "scp m.txt host:/tmp/m.txt",
+            "scp -q -P 2222 m.txt host:/tmp/",
+            "scp -qP2222 m.txt host:/tmp/renamed.txt",
+            "scp m.txt /tmp/renamed.txt",
+            "ssh host 'git commit -q -F /tmp/m.txt'",
+            "ssh -T -p 2222 host git commit -q -F /tmp/m.txt",
+            "ssh host -T 'git commit --file=/tmp/m.txt'",
+            "ssh -- host 'git commit -qF/tmp/m.txt'",
+            "ssh host 'cd repo && git commit -F /tmp/m.txt'",
+            "scp m.txt host:/tmp/ && ssh host 'git commit -F /tmp/m.txt'",
+            "scp m.txt host:/tmp/renamed.txt && ssh host 'git commit -F /tmp/renamed.txt'",
+            "scp m.txt /tmp/renamed.txt && scp /tmp/renamed.txt host:/tmp/last.txt && ssh host 'git commit -F /tmp/last.txt'",
+            "scp m.txt host:/tmp/m.txt && git commit -q -F m.txt",
+        ] {
+            let command = format!("cat > m.txt <<'EOF'\n{body}\nEOF\n{tail}");
+            for view in [
+                mask_non_executing_heredocs(&command),
+                mask_non_expanding_data_heredocs(&command),
+            ] {
+                assert!(
+                    !view.contains(body),
+                    "literal file data: {command:?} -> {view:?}"
+                );
+                assert!(view.contains(tail), "executable command text stays visible");
+                assert_eq!(view.len(), command.len(), "byte offsets are preserved");
+            }
+        }
+        let command = format!(
+            "cat > 'message file.txt' <<'EOF'\n{body}\nEOF\nscp 'message file.txt' 'host:/tmp/message file.txt'\nssh host \"git commit -F '/tmp/message file.txt'\""
+        );
+        assert!(!mask_non_expanding_data_heredocs(&command).contains(body));
+    }
+
+    #[test]
+    fn transferred_files_keep_execution_and_ambiguous_consumers_visible_543() {
+        let body = "eval $COMMAND";
+        for tail in [
+            "scp m.txt host:/tmp/m.txt; sh m.txt",
+            "scp m.txt host:/tmp/renamed.txt; ssh host 'sh /tmp/renamed.txt'",
+            "scp m.txt host:/tmp/renamed.txt; ssh host 'cat /tmp/renamed.txt | sh'",
+            "scp m.txt /tmp/renamed.txt; cat /tmp/renamed.txt | grep . | sh",
+            "scp m.txt /tmp/renamed.txt; cat /tmp/renamed.txt | ssh host",
+            "scp m.txt /tmp/renamed.txt; scp /tmp/renamed.txt /tmp/last.txt; sh /tmp/last.txt",
+            "scp m.txt /tmp/renamed.txt; consumer /tmp/renamed.txt",
+            "scp m.txt /tmp/renamed.txt; sh \"$script\"",
+            "scp m.txt host:/tmp/renamed.txt; ssh host \"$script\"",
+            "scp -S m.txt m.txt host:/tmp/",
+            "scp -D m.txt m.txt host:/tmp/",
+            "scp -F m.txt m.txt host:/tmp/",
+            "scp -o 'ProxyCommand=sh m.txt' m.txt host:/tmp/",
+            "scp -J host m.txt host:/tmp/",
+            "scp -O m.txt host:/tmp/",
+            "scp -r m.txt host:/tmp/",
+            "scp m.txt \"$destination\"",
+            "/tmp/scp m.txt host:/tmp/",
+            "scp() { sh \"$1\"; }; scp m.txt host:/tmp/",
+            "ssh host 'git -c alias.send=sh send m.txt'",
+            "ssh host 'git commit -F m.txt; sh m.txt'",
+            "ssh host 'git commit -F m.txt' | cat | sh",
+            "ssh host 'sh m.txt'",
+            "ssh host 'consumer m.txt'",
+            "ssh -o 'ProxyCommand=sh m.txt' host 'git commit -F m.txt'",
+            "scp m.txt /tmp/git; ssh host 'git commit -F other.txt'",
+            "scp m.txt /tmp/cat; chmod +x /tmp/cat; /tmp/cat",
+            "scp m.txt /tmp/git; chmod +x /tmp/git; /tmp/git status",
+            "scp m.txt /tmp/echo; chmod +x /tmp/echo; /tmp/echo",
+            "scp m.txt /usr/bin/git; git commit -F other.txt",
+            "scp m.txt /usr/bin/cat; /usr/bin/cat > other.txt <<'OTHER'\nbenign\nOTHER",
+            "scp m.txt /tmp/renamed.txt; rg --pre sh pattern /tmp/renamed.txt",
+            "scp m.txt /tmp/renamed.txt; vim -S /tmp/renamed.txt",
+            "scp m.txt /tmp/renamed.txt; echo \"$(sh /tmp/renamed.txt)\"",
+            "scp m.txt /tmp/renamed.txt; sort /tmp/renamed.txt -o /tmp/last.txt; sh /tmp/last.txt",
+            "scp m.txt host:/tmp/renamed.txt; consume_implicitly",
+            "consume_later & scp m.txt host:/tmp/renamed.txt",
+            "scp m.txt host:/repo/.git/hooks/post-commit; ssh host 'git commit -F /tmp/other.txt'",
+            "scp m.txt host:/home/user/.bashrc; ssh host 'git commit -F /tmp/other.txt'",
+            "f() { scp m.txt host:/tmp/; }; f",
+        ] {
+            let command = format!("cat > m.txt <<'EOF'\n{body}\nEOF\n{tail}");
+            for view in [
+                mask_non_executing_heredocs(&command),
+                mask_non_expanding_data_heredocs(&command),
+            ] {
+                assert!(
+                    view.contains(body),
+                    "unproven file flow: {command:?} -> {view:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transfers_cannot_replace_executables_used_by_the_data_proof_543() {
+        let body = "eval $COMMAND";
+        for setup in [
+            "scp external.txt /usr/bin/cat",
+            "scp /tmp/cat /usr/bin/",
+            "scp external.txt /usr/bin/scp",
+            "scp external.txt host:/usr/bin/git",
+            "scp /tmp/git host:/usr/bin/",
+        ] {
+            let command = format!(
+                "{setup}\ncat > m.txt <<'EOF'\n{body}\nEOF\nscp m.txt host:/tmp/m.txt\nssh host 'git commit -F /tmp/m.txt'"
+            );
+            for view in [
+                mask_non_executing_heredocs(&command),
+                mask_non_expanding_data_heredocs(&command),
+            ] {
+                assert!(
+                    view.contains(body),
+                    "the proven executables changed: {command:?}"
+                );
+            }
+        }
+        let data_only = format!(
+            "scp external.txt host:/tmp/data.bin\ncat > m.txt <<'EOF'\n{body}\nEOF\nscp m.txt host:/tmp/m.txt"
+        );
+        assert!(!mask_non_expanding_data_heredocs(&data_only).contains(body));
+    }
+
+    #[test]
+    fn expired_and_busy_transfer_proofs_supply_no_exemption_543() {
+        // Exercise the same runner with an isolated slot; public helpers
+        // always use the process-wide slot, including in test builds.
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        assert!(
+            run_file_data_proof(&BUSY, Instant::now(), Duration::ZERO, || {
+                panic!("an expired proof must not begin parsing")
+            })
+            .is_empty()
+        );
+        assert!(!BUSY.load(Ordering::Acquire));
+        BUSY.store(true, Ordering::Release);
+        assert!(
+            run_file_data_proof(&BUSY, Instant::now(), Duration::from_secs(5), || panic!(
+                "a busy worker must not launch another parser"
+            ))
+            .is_empty()
+        );
+        assert!(BUSY.load(Ordering::Acquire));
+        BUSY.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn git_file_message_proof_rejects_custom_repository_context_543() {
+        for globals in [
+            "--git-dir=/srv/gitdata --work-tree=/srv/repo",
+            "--git-dir /srv/gitdata",
+            "--work-tree=/srv/repo",
+            "--bare",
+            "--namespace=other",
+            "--super-prefix=other",
+            "--exec-path=/srv/helpers",
+            "-c core.hooksPath=/srv/hooks",
+            "--config-env=core.hooksPath=HOOKS",
+        ] {
+            let command = format!("git {globals} commit -F /tmp/message.txt");
+            let words = shell_words::split(&command).expect("literal git argv");
+            assert!(!literal_git_commit_message_reader(&words), "{command}");
+            assert!(
+                !literal_ssh_git_message_reader(&["host".into(), command.clone()]),
+                "{command}"
+            );
+        }
+        for command in [
+            "git -C /srv/repo commit -q -F m.txt",
+            "git -C/srv/repo commit -F m.txt",
+            "git --no-pager -C /srv/repo commit -F m.txt",
+        ] {
+            let words = shell_words::split(command).expect("literal git argv");
+            assert!(literal_git_commit_message_reader(&words), "{command}");
+            assert!(literal_ssh_git_message_reader(&[
+                "host".into(),
+                command.into()
+            ]));
+        }
+    }
+
+    #[test]
+    fn transfers_keep_implicit_transport_and_hook_execution_visible_543() {
+        let body = "eval $COMMAND";
+        for setup in [
+            "scp external.txt /usr/bin/cp",
+            "scp external.txt /usr/bin/ssh",
+            "scp /tmp/cp /usr/bin/",
+            "scp /tmp/ssh /usr/bin/",
+            "scp external.txt host:/bin/bash",
+            "scp external.txt host:/usr/lib/openssh/sftp-server",
+            "scp external.txt host:/lib/libc.so.6",
+            "scp /tmp/bash host:/opt/shells/",
+            "scp /tmp/sftp-server host:/opt/openssh/",
+        ] {
+            let command = format!(
+                "{setup}\ncat > m.txt <<'EOF'\n{body}\nEOF\nscp m.txt /tmp/copied.txt\nscp m.txt host:/tmp/m.txt"
+            );
+            assert!(
+                mask_non_expanding_data_heredocs(&command).contains(body),
+                "{command}"
+            );
+        }
+        for arguments in [
+            "m.txt host:/srv/hooks/post-commit",
+            "post-commit host:/srv/hooks/",
+            "post-commit host:/srv/hooks",
+            "m.txt /srv/hooks/reference-transaction",
+            "post-index-change /srv/hooks/",
+        ] {
+            let words = shell_words::split(arguments).expect("literal scp argv");
+            assert!(literal_scp_file_transfer(&words).is_none(), "{arguments}");
+        }
+    }
+
+    #[test]
+    fn transferred_file_alias_proof_is_bounded_543() {
+        use std::fmt::Write as _;
+
+        let body = "eval $COMMAND";
+        let mut command = format!("cat > file0.txt <<'EOF'\n{body}\nEOF\n");
+        for index in 0..33 {
+            writeln!(&mut command, "scp file{index}.txt file{}.txt", index + 1)
+                .expect("append transfer");
+        }
+        command.push_str("sh file33.txt");
+        assert!(mask_non_expanding_data_heredocs(&command).contains(body));
+    }
+
+    #[test]
+    fn transfers_to_implicitly_executed_destinations_remain_unproven_543() {
+        for command in [
+            "m.txt host:/repo/.git/hooks/post-commit",
+            "post-commit host:/repo/.git/hooks/",
+            "m.txt host:/home/user/.bashrc",
+            "m.txt host:.bashrc",
+            ".bashrc host:",
+            "m.txt host:/home/user/../user/.bashrc",
+        ] {
+            let arguments = shell_words::split(command).expect("literal argv");
+            assert!(literal_scp_file_transfer(&arguments).is_none(), "{command}");
         }
     }
 

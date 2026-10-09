@@ -112,7 +112,7 @@ pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Ve
     matches
 }
 
-fn protected_scan_budget() -> Duration {
+pub(crate) fn protected_scan_budget() -> Duration {
     // Match the pattern engine's only-raise timeout convention. No new knob,
     // no smaller production deadline, and no dependence on the working path.
     #[cfg(test)]
