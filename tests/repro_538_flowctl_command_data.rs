@@ -58,9 +58,23 @@ fn assert_decision(command: &str, allowed: bool, expected_rule: Option<&str>) {
         );
     }
     if let Some(rule) = expected_rule {
-        assert!(
-            stdout.contains(rule) || stderr.contains(rule),
-            "{command}: expected {rule}\n{stdout}\n{stderr}"
+        let field = |prefix: &str| {
+            stdout
+                .lines()
+                .chain(stderr.lines())
+                .find_map(|line| line.trim().strip_prefix(prefix))
+                .map(str::trim)
+        };
+        let (pack, pattern) = rule.split_once(':').expect("pack:pattern rule ID");
+        assert_eq!(
+            field("Pack:"),
+            Some(pack),
+            "{command}: expected pack {pack}\n{stdout}\n{stderr}"
+        );
+        assert_eq!(
+            field("Pattern:"),
+            Some(pattern),
+            "{command}: expected pattern {pattern}\n{stdout}\n{stderr}"
         );
     }
 
@@ -101,8 +115,8 @@ fn assert_decision(command: &str, allowed: bool, expected_rule: Option<&str>) {
             "{command}: {stdout}\n{stderr}"
         );
         if let Some(rule) = expected_rule {
-            assert!(
-                stdout.contains(rule) || stderr.contains(rule),
+            assert_eq!(
+                response["hookSpecificOutput"]["ruleId"], rule,
                 "{command}: expected {rule}: {stdout}\n{stderr}"
             );
         }
@@ -146,7 +160,11 @@ fn unknown_and_dynamic_near_misses_keep_launcher_denial() {
         r#""$FLOWCTL" gate check --command "$ARGS""#,
         r#""$FLOWCTL" gate check --command *.sh"#,
     ] {
-        assert_decision(command, false, Some("inline-launcher-unverified"));
+        assert_decision(
+            command,
+            false,
+            Some("heredoc.posix:inline-launcher-unverified"),
+        );
     }
 }
 
@@ -165,6 +183,38 @@ fn genuine_inline_execution_stays_fail_closed() {
         r#"powershell -Command "$SCRIPT""#,
     ] {
         assert_decision(command, false, None);
+    }
+}
+
+#[test]
+fn python_inline_source_keeps_outer_expansion_and_argv_ownership() {
+    for command in [
+        r#"python3 -c "$SCRIPT""#,
+        r"python3 -c $SCRIPT",
+        r#"python3.11 -I -c "${SCRIPT}""#,
+        r#"python3 -W ignore -c "$SCRIPT""#,
+        r#"python3 -X utf8 -c "$SCRIPT""#,
+        r#"python3 -c "$(cat script.py)""#,
+        r#"python3 -c "`cat script.py`""#,
+    ] {
+        assert_decision(
+            command,
+            false,
+            Some("heredoc.posix:inline-launcher-unverified"),
+        );
+    }
+
+    for command in [
+        r"python3 -c '$SCRIPT'",
+        r#"python3 -c "\$SCRIPT""#,
+        r#"python3 -c 'print("$SCRIPT")'"#,
+        r#"python3 script.py -c "$SCRIPT""#,
+        r#"python3 -m example -c "$SCRIPT""#,
+        r#"python3 -c 'print(1)' -c "$SCRIPT""#,
+        r#"python3 -V -c "$SCRIPT""#,
+        r#"python3 -c "$(printf pass)""#,
+    ] {
+        assert_decision(command, true, None);
     }
 }
 
@@ -204,7 +254,7 @@ fn literal_command_variables_expand_into_real_git_arguments_540() {
     assert_decision(
         r"X='git branch -D'; $X obsolete",
         false,
-        Some("core.git:branch-delete"),
+        Some("core.git:branch-force-delete"),
     );
     assert_decision(
         r"X='git push'; ${X} --force",

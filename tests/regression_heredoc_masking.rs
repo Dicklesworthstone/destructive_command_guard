@@ -553,6 +553,10 @@ EOF";
             ),
             (
                 "python3",
+                "import subprocess\nsubprocess.run(['printf', '-c', '$(git reset --hard)'], executable='/bin/sh')",
+            ),
+            (
+                "python3",
                 "import os\ns = 'echo `git branch -d x`'\nos.system(s)",
             ),
             (
@@ -596,6 +600,60 @@ EOF";
     }
 
     #[test]
+    fn issue_544_child_process_options_keep_executable_source_visible() {
+        for (program, body) in [
+            (
+                "python3",
+                "import subprocess\nsubprocess.run(['sh'], input='$(git reset --hard)', text=True)",
+            ),
+            (
+                "python3",
+                "import subprocess\nsubprocess.run(['/bin/bash', '-c', 'true'], env={'BASH_ENV': '$(git reset --hard)'})",
+            ),
+            (
+                "python3",
+                "import subprocess\nsubprocess.run(['printf', '-c', '$(git reset --hard)'], ｅxecutable='/bin/sh')",
+            ),
+            (
+                "python3",
+                "import subprocess\nsubprocess.run(['echo $(git reset --hard)'], ｓｈｅｌｌ=True)",
+            ),
+            (
+                "node",
+                "const cp = require('child_process'); cp.spawnSync('sh', [], {input: '$(git reset --hard)'});",
+            ),
+            (
+                "node",
+                "const cp = require('child_process'); cp.execFileSync('sh', [], {input: '$(git reset --hard)'});",
+            ),
+            (
+                "node",
+                "const cp = require('child_process'); cp.execSync('sh', {input: '$(git reset --hard)'});",
+            ),
+            (
+                "node",
+                "const cp = require('child_process'); cp.spawnSync('bash', ['-c', 'true'], {env: {BASH_ENV: '$(git reset --hard)'}});",
+            ),
+            (
+                "node",
+                r#"const cp = require('child_process'); cp.spawnSync('node', ['-e', ''], {env: {NODE_OPTIONS: "--import=\"data:text/javascript,import cp from 'node:child_process';cp.execSync('echo $(git reset --hard)')\""}});"#,
+            ),
+            (
+                "node",
+                r"const cp = require('child_process'); cp.spawnSync('printf', ['%s', '$(git reset --hard)'], {sh\u0065ll: true});",
+            ),
+        ] {
+            let command = format!("{program} - <<'DOC'\n{body}\nDOC");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(
+                decision, "deny",
+                "child options can supply executable code: {command:?}: {rule}"
+            );
+            assert!(!rule.is_empty(), "{command:?}");
+        }
+    }
+
+    #[test]
     fn issue_544_opaque_calls_and_rebound_data_sinks_are_not_exempted() {
         for (program, body) in [
             ("python3", "from helper import run\nrun('git branch -d x')"),
@@ -631,6 +689,69 @@ EOF";
                 decision, "deny",
                 "an unproven call can execute its string: {command:?}: {rule}"
             );
+        }
+    }
+
+    #[test]
+    fn issue_544_hoisted_require_cannot_grant_an_argv_data_mask() {
+        let body = concat!(
+            "const cp = require('child_process');\n",
+            "cp.spawnSync('printf', ['%s', '$(git reset --hard)']);\n",
+            "function require() { return {spawnSync(_file, argv) { module.require('child_process').execSync(argv[1]); }}; }",
+        );
+        let command = format!("node - <<'DOC'\n{body}\nDOC");
+        let (decision, rule) = hook_decision(&command);
+        assert_eq!(
+            decision, "deny",
+            "a hoisted require can supply an executing API: {command:?}: {rule}"
+        );
+        assert_eq!(rule, "core.git:reset-hard", "{command:?}");
+    }
+
+    #[test]
+    fn issue_544_literal_eval_dependencies_keep_rule_ownership() {
+        for (program, flag, body, outer_rule) in [
+            (
+                "python3",
+                "-c",
+                r#"import os; s = "git reset --hard"; exec("os.system(s)")"#,
+                "heredoc.python:exec_sink.git_reset_hard",
+            ),
+            (
+                "node",
+                "-e",
+                r#"const cp = require("child_process"); const s = "git reset --hard"; eval("cp.execSync(s)");"#,
+                "heredoc.javascript:exec_sink.git_reset_hard",
+            ),
+        ] {
+            for command in [
+                format!("{program} - <<'DOC'\n{body}\nDOC"),
+                format!("{program} {flag} '{body}' && true"),
+            ] {
+                for grant in [None, Some(outer_rule)] {
+                    let (decision, rule) = hook_decision_with_allowlist(&command, grant);
+                    assert_eq!(decision, "deny", "{command:?}: {grant:?}: {rule}");
+                    assert_eq!(rule, "core.git:reset-hard", "{command:?}: {grant:?}");
+                }
+                let (decision, rule) =
+                    hook_decision_with_allowlist(&command, Some("core.git:reset-hard"));
+                assert_eq!(decision, "allow", "{command:?}: {rule}");
+            }
+        }
+    }
+
+    #[test]
+    fn issue_544_literal_eval_does_not_execute_unreferenced_command_text() {
+        for (program, body) in [
+            ("python3", "s = 'git reset --hard'\nexec('print(s)')"),
+            (
+                "node",
+                "const s = 'git reset --hard'; eval('console.log(s)');",
+            ),
+        ] {
+            let command = format!("{program} - <<'DOC'\n{body}\nDOC");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(decision, "allow", "{command:?}: {rule}");
         }
     }
 
@@ -976,6 +1097,160 @@ EOF";
                 decision, "allow",
                 "recovered commands honor their own reported pack rule: {command:?}: {rule}"
             );
+        }
+    }
+
+    #[test]
+    fn issue_544_inline_literal_commands_survive_other_shell_consumers() {
+        for (launcher, body) in [
+            (
+                "python3 -c",
+                r#"import os; s = "echo $(git reset --hard)"; os.system(s)"#,
+            ),
+            (
+                "node -e",
+                r#"const cp = require("child_process"); const s = "echo $(git reset --hard)"; cp.execSync(s);"#,
+            ),
+            (
+                "python3 -c",
+                r#"import os; s = "echo \x60git reset --hard\x60"; os.system(s)"#,
+            ),
+            (
+                "node -e",
+                r#"const cp = require("child_process"); const s = "echo \u0060git reset --hard\u0060"; cp.execSync(s);"#,
+            ),
+        ] {
+            let invocation = format!("{launcher} '{body}'");
+            for command in [
+                format!("{invocation} && true"),
+                format!("true; {invocation}"),
+                format!("{invocation} > /dev/null"),
+                format!("{invocation} | cat"),
+                format!("MODE=review {invocation}"),
+                format!("{invocation} extra"),
+            ] {
+                let (decision, rule) = hook_decision(&command);
+                assert_eq!(
+                    decision, "deny",
+                    "another shell consumer must not hide the complete inline source: {command:?}: {rule}"
+                );
+                assert_eq!(rule, "core.git:reset-hard", "{command:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn issue_544_compound_inline_commands_keep_allowlist_ownership() {
+        for (launcher, direct, indirect, named_rule) in [
+            (
+                "python3 -c",
+                r#"from os import system as run; run("git reset --hard; echo $(printf done)")"#,
+                r#"import os; s = "echo $(git reset --hard)"; os.system(s)"#,
+                "heredoc.python:exec_sink.git_reset_hard",
+            ),
+            (
+                "node -e",
+                r#"const cp = require("child_process"); cp.execSync("git reset --hard; echo $(printf done)");"#,
+                r#"const cp = require("child_process"); const s = "echo $(git reset --hard)"; cp.execSync(s);"#,
+                "heredoc.javascript:exec_sink.git_reset_hard",
+            ),
+        ] {
+            let command = format!("{launcher} '{direct}' && true");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(decision, "deny", "{command:?}");
+            assert_eq!(rule, named_rule, "{command:?}");
+            let (decision, rule) = hook_decision_with_allowlist(&command, Some(named_rule));
+            assert_eq!(
+                decision, "allow",
+                "literal recovery must honor the established named-sink grant: {command:?}: {rule}"
+            );
+
+            let command = format!("{launcher} '{indirect}' && true");
+            let (decision, rule) = hook_decision_with_allowlist(&command, Some(named_rule));
+            assert_eq!(decision, "deny", "{command:?}");
+            assert_eq!(
+                rule, "core.git:reset-hard",
+                "an outer grant must not suppress another command's rule: {command:?}"
+            );
+            let (decision, rule) =
+                hook_decision_with_allowlist(&command, Some("core.git:reset-hard"));
+            assert_eq!(
+                decision, "allow",
+                "the recovered command retains its own grant: {command:?}: {rule}"
+            );
+        }
+
+        let canonical =
+            r#"python3 -c 'import os; os.system("git reset --hard; echo $(printf done)")' && true"#;
+        for (granted_rule, remaining_rule) in [
+            (
+                "heredoc.python:exec_sink.git_reset_hard",
+                "heredoc.python:os_system.git_reset_hard",
+            ),
+            (
+                "heredoc.python:os_system.git_reset_hard",
+                "heredoc.python:exec_sink.git_reset_hard",
+            ),
+        ] {
+            let (decision, rule) = hook_decision_with_allowlist(canonical, Some(granted_rule));
+            assert_eq!(decision, "deny", "granting {granted_rule}: {canonical:?}");
+            assert_eq!(
+                rule, remaining_rule,
+                "distinct named-sink rules retain separate grants: {canonical:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_544_node_later_options_cannot_prove_the_first_source_executes() {
+        let body = r#"const cp = require("child_process"); const s = "echo $(git reset --hard)"; cp.execSync(s);"#;
+        for tail in [
+            r#"-e 'console.log("ready")'"#,
+            r#"--eval='console.log("ready")'"#,
+            "-p '1 + 1'",
+        ] {
+            let command = format!("node -e '{body}' {tail}");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(
+                decision, "allow",
+                "a replaced first program is not executable source: {command:?}: {rule}"
+            );
+        }
+        for operand in ["extra", "--", "-", "''"] {
+            let command = format!("node -e '{body}' {operand} -e 'console.log(\"ready\")'");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(
+                decision, "deny",
+                "an option-stop operand keeps the first program active: {command:?}: {rule}"
+            );
+            assert_eq!(rule, "core.git:reset-hard", "{command:?}");
+        }
+    }
+
+    #[test]
+    fn issue_544_compound_inline_commands_keep_static_argv_as_data() {
+        for (launcher, body) in [
+            (
+                "python3 -c",
+                r#"import subprocess; subprocess.run(["printf", "%s", "$(git reset --hard)"])"#,
+            ),
+            (
+                "node -e",
+                r#"const cp = require("child_process"); cp.spawnSync("printf", ["%s", "$(git reset --hard)"]);"#,
+            ),
+        ] {
+            let invocation = format!("{launcher} '{body}'");
+            for command in [
+                format!("{invocation} && true"),
+                format!("true; {invocation}"),
+                format!("{invocation} > /dev/null"),
+            ] {
+                let (decision, rule) = hook_decision(&command);
+                assert_eq!(
+                    decision, "allow",
+                    "complete argument arrays do not acquire shell expansion: {command:?}: {rule}"
+                );
+            }
         }
     }
 }

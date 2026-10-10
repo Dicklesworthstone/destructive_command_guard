@@ -5989,6 +5989,127 @@ fn posix_inline_flag_position(name: Option<&str>, words: &[&str]) -> Option<usiz
     })
 }
 
+/// The first source operand Python actually takes from `-c`. Interface
+/// options terminate interpreter option parsing; later `-c` words belong to
+/// the script or module. Unknown option syntax cannot establish ownership.
+fn python_inline_source_word<'a>(words: &[&'a str]) -> Option<&'a str> {
+    const NO_VALUE_OPTIONS: &[u8] = b"bBdEiIOPqRsStuvx";
+    if words.len() > MAX_STATIC_SHELL_SOURCE_TERMS {
+        return None;
+    }
+    let static_option = |raw: &str| {
+        if posix_eval_word_has_dynamic_source(raw) || contains_dynamic_posix_substitution(raw) {
+            None
+        } else {
+            literal_posix_executable_value(raw)
+        }
+    };
+    let mut index = 1usize;
+    'options: while let Some(raw) = words.get(index).copied() {
+        // A plain short-option prefix retains the exact quoting of an
+        // attached source (`-Ic"$SCRIPT"`), even though that whole argv word
+        // cannot be statically decoded. Stop before value-taking options.
+        if let Some(letters) = raw.strip_prefix('-') {
+            for (offset, byte) in letters.bytes().enumerate() {
+                if byte == b'c' {
+                    let source = letters.get(offset + 1..)?;
+                    return if source.is_empty() {
+                        words.get(index + 1).copied()
+                    } else {
+                        Some(source)
+                    };
+                }
+                if !NO_VALUE_OPTIONS.contains(&byte) {
+                    break;
+                }
+            }
+        }
+
+        let option = static_option(raw)?;
+        if option == "--check-hash-based-pycs" {
+            let value = static_option(words.get(index + 1)?)?;
+            if !matches!(value.as_str(), "default" | "always" | "never") {
+                return None;
+            }
+            index += 2;
+            continue;
+        }
+        let letters = option.strip_prefix('-')?;
+        if letters.is_empty() || letters.starts_with('-') {
+            return None;
+        }
+        for (offset, byte) in letters.bytes().enumerate() {
+            match byte {
+                b'c' => {
+                    // A complete, quoted option word can spell -c too. An
+                    // attached literal source is already static; do not lose
+                    // its raw quoting by treating decoded dollars as live.
+                    return (offset + 1 == letters.len())
+                        .then(|| words.get(index + 1).copied())
+                        .flatten();
+                }
+                b'W' | b'X' => {
+                    if offset + 1 == letters.len() {
+                        static_option(words.get(index + 1)?)?;
+                        index += 1;
+                    }
+                    index += 1;
+                    continue 'options;
+                }
+                byte if NO_VALUE_OPTIONS.contains(&byte) => {}
+                // Includes -m, help/version options and unsupported flags.
+                _ => return None,
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// A whole live shell expansion supplied as Python source, with the original
+/// word's quotes intact. Literal dollars and partly dynamic programs retain
+/// their existing language-aware analysis. Arithmetic yields a numeric value,
+/// not arbitrary program source, and is outside this narrow guard.
+fn posix_word_is_wholly_dynamic_python_source(raw: &str) -> bool {
+    if literal_posix_executable_value(raw).is_some() {
+        return false;
+    }
+    let expansion = raw
+        .strip_prefix('"')
+        .and_then(|word| word.strip_suffix('"'))
+        .unwrap_or(raw);
+    !expansion.starts_with("$((")
+        && expansion.starts_with(['$', '`'])
+        && inline_shell_script_is_wholly_dynamic(expansion)
+}
+
+fn python_inline_source_is_wholly_dynamic(
+    words: &[&str],
+    original_words: &[&str],
+    has_dynamic_substitution: bool,
+) -> bool {
+    let Some(source) = python_inline_source_word(words) else {
+        return false;
+    };
+    if posix_word_is_wholly_dynamic_python_source(source) {
+        return true;
+    }
+    // The shared substitution view resolves supported literal producers and
+    // marks unknown output. Consult the original operand only for a whole
+    // marker, so resolved producers and partially dynamic source stay on
+    // their existing path, and arithmetic is not mistaken for a command.
+    has_dynamic_substitution
+        && literal_posix_executable_value(source).is_some_and(|value| {
+            matches!(
+                value.as_str(),
+                crate::packs::core::git::POSIX_DYNAMIC_QUOTED
+                    | crate::packs::core::git::POSIX_DYNAMIC_UNQUOTED
+            )
+        })
+        && python_inline_source_word(original_words)
+            .is_some_and(posix_word_is_wholly_dynamic_python_source)
+}
+
 fn parse_obfuscated_posix_inline_launcher_segment(
     segment: &str,
     max_payload_bytes: usize,
@@ -6082,6 +6203,24 @@ fn parse_obfuscated_posix_inline_launcher_segment(
 
     let name = decoded_name.expect("dynamic executable returned above");
     let recognized = posix_inline_shell_name(&name) || non_shell_inline_interpreter_name(&name);
+    if recognized && name.starts_with("python") {
+        let original_exec_index = original_words
+            .iter()
+            .position(|word| !posix_word_is_assignment_prefix(word))
+            .unwrap_or(0);
+        if python_inline_source_is_wholly_dynamic(
+            words,
+            &original_words[original_exec_index..],
+            substitution_view
+                .as_ref()
+                .is_some_and(|view| view.has_dynamic),
+        ) {
+            return PosixInlineLauncherParse::Unverified(
+                "Python inline source is a whole shell expansion or unresolved command substitution"
+                    .to_string(),
+            );
+        }
+    }
     if !recognized
         || (posix_executable_word_is_plain(raw_executable) && !executable_was_statically_resolved)
     {
@@ -12075,16 +12214,17 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
         // source" — `cat <<'EOF' | bash` executes the body, so they must see it,
         // and masking them turned that into an allow (#440, first attempt). The
         // eval collector asks "is there an eval here whose source I cannot
-        // resolve", and an eval sitting INSIDE a body that nothing executes is
-        // not one: `cat > script.rb <<'OUTER' … eval <<~'SCRIPT' … OUTER` writes a
-        // Ruby file, and Ruby's `eval` is not POSIX `eval`. Masking blanks exactly
-        // those bodies — quoted delimiter, target proven not to execute stdin —
-        // so the eval disappears with the text it was never part of.
+        // resolve". A quoted data body or a proven non-shell interpreter body
+        // cannot contain an outer shell eval: writing a Ruby file or running
+        // JavaScript's `eval` does not invoke POSIX `eval`. The two existing
+        // ownership masks remove only those bodies from this syntax view;
+        // interpreter source still reaches its language and raw-pattern scans.
         //
         // An eval that is real stays visible either way: outside any heredoc it is
         // untouched, and inside a body a pipeline hands to a shell the pipeline
         // collector recursively evaluates that body, where the eval is seen again.
-        let eval_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+        let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+        let eval_view = crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
         collect_posix_eval_sinks(eval_view.as_ref(), &mut sinks);
         let mut interpreter_heredocs = Vec::new();
         collect_posix_pipeline_executable_sinks(command, &mut sinks, &mut interpreter_heredocs);
@@ -31579,19 +31719,13 @@ fn exec_sink_pack_verdict(
         return Some(result);
     }
 
-    // A variable can carry a shell substitution to an indirect or opaque
-    // execution call (#544). The outer shell never expands a quoted heredoc,
-    // and its role-aware Git parser cannot interpret a Python/JS assignment
+    // A variable can carry a shell substitution to an indirect call, or supply
+    // a proven exec/eval dependency (#544). The outer shell never expands a
+    // quoted heredoc, and its role-aware Git parser cannot interpret a Python/JS assignment
     // as a Git invocation. Recover actual host-language literal values for
     // the existing pack evaluator without pretending their quotes are shell
     // syntax. Named calls retain their original ownership in the helper.
-    if !matches!(
-        content.language,
-        crate::heredoc::ScriptLanguage::Python | crate::heredoc::ScriptLanguage::JavaScript
-    ) || (!content.content.contains('`')
-        && !content.content.contains("$(")
-        && !content.content.contains('\\'))
-    {
+    if !crate::ast_matcher::has_interpreter_literal_candidates(&content.content, content.language) {
         return None;
     }
     // The outer Bash parse belongs under the same wall-clock bound as the
@@ -31619,12 +31753,10 @@ fn exec_sink_pack_verdict(
             if inline {
                 // The existing inline extractor can return a partial raw
                 // fragment when shell quotes are escaped. Only extend it
-                // when the extracted bytes are exactly the complete program;
-                // other forms retain their existing named/raw analysis.
-                crate::heredoc::range_is_literal_inline_interpreter_source(
-                    &source, &range, language,
-                )
-                .then_some(true)
+                // when the extracted bytes are exactly the complete program.
+                // Other consumers revoke the documentation exemption without
+                // suppressing additive checks of that complete source.
+                crate::heredoc::inline_interpreter_source_proof(&source, &range, language)
             } else {
                 Some(crate::heredoc::range_is_quoted_interpreter_source(
                     &source, &range, language,
@@ -33005,6 +33137,104 @@ mod tests {
                     if source.trim() == "print(\"```\")"
             )),
             "the independent shell source must retain its dialect: {sinks:?}"
+        );
+    }
+
+    #[test]
+    fn posix_eval_keeps_quoted_interpreter_source_in_its_language_544() {
+        for command in [
+            "node - <<'DOC'\nconst cp = require(\"child_process\"); const s = \"git reset --hard\"; eval(\"cp.execSync(s)\");\nDOC",
+            "node - <<'DOC'\nconst s = 'git reset --hard'; eval('console.log(s)');\nDOC",
+            "python3 - <<'DOC'\ns = 'git reset --hard'; eval('print(s)')\nDOC",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let sinks = collect_executable_text_sinks(command, dialect);
+                assert!(
+                    sinks.is_empty(),
+                    "the interpreter owns this eval: {command:?}, {dialect:?}: {sinks:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn posix_eval_retains_outer_and_unproven_source_544() {
+        for command in [
+            "node - <<'DOC'\nconsole.log('safe')\nDOC\neval \"$COMMAND\"",
+            "node - <<DOC\nconst s = 'safe'; eval(s);\nDOC",
+            "sh <<'DOC'\neval \"$COMMAND\"\nDOC",
+            "runner <<'DOC'\neval \"$COMMAND\"\nDOC",
+            "PATH=./tools:$PATH node - <<'DOC'\nconst s = 'safe'; eval(s);\nDOC",
+            "node() { sh; }; node - <<'DOC'\neval \"$COMMAND\"\nDOC",
+            "node - <<'DOC' | sh\nconst s = 'safe'; eval(s);\nDOC",
+        ] {
+            let sinks = collect_executable_text_sinks(command, ShellDialect::Posix);
+            assert!(
+                sinks.iter().any(|sink| matches!(
+                    sink,
+                    ExecutableTextSink::Unverified {
+                        rule: EVAL_DYNAMIC_RULE,
+                        ..
+                    }
+                )),
+                "unproven or outer shell eval must remain visible: {command:?}: {sinks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_eval_keeps_raw_pipeline_and_static_outer_source_544() {
+        let command = "cat <<'DOC' | sh\neval \"$COMMAND\"\nDOC";
+        let sinks = collect_executable_text_sinks(command, ShellDialect::Posix);
+        assert!(
+            sinks.iter().any(|sink| matches!(
+                sink,
+                ExecutableTextSink::Payload {
+                    source,
+                    dialect: ShellDialect::Posix,
+                    ..
+                } if source.trim() == "eval \"$COMMAND\""
+            )),
+            "the shell consumer must receive the raw body: {command:?}: {sinks:?}"
+        );
+
+        // This process-substitution layout has no static producer proof. Both
+        // existing denial paths must remain visible in the original source.
+        let command = "tee >(sh) <<'DOC'\neval \"$COMMAND\"\nDOC";
+        let sinks = collect_executable_text_sinks(command, ShellDialect::Posix);
+        assert!(
+            sinks.iter().any(|sink| matches!(
+                sink,
+                ExecutableTextSink::Unverified {
+                    rule: EVAL_DYNAMIC_RULE,
+                    ..
+                }
+            )),
+            "the shell eval must remain unverified: {sinks:?}"
+        );
+        assert!(
+            sinks.iter().any(|sink| matches!(
+                sink,
+                ExecutableTextSink::UnverifiedSource {
+                    rule: PIPELINE_CONSUMER_RULE,
+                    ..
+                }
+            )),
+            "the shell consumer must remain unverified: {sinks:?}"
+        );
+
+        let command = "node - <<'DOC'\neval('console.log(1)');\nDOC\neval 'git reset --hard'";
+        let sinks = collect_executable_text_sinks(command, ShellDialect::Posix);
+        assert!(
+            sinks.iter().any(|sink| matches!(
+                sink,
+                ExecutableTextSink::Payload {
+                    source,
+                    dialect: ShellDialect::Posix,
+                    ..
+                } if source == "git reset --hard"
+            )),
+            "the independent shell eval must retain its source: {sinks:?}"
         );
     }
 
@@ -45696,6 +45926,137 @@ mod tests {
                 result.pattern_info
             );
         }
+    }
+
+    #[test]
+    fn python_inline_source_guard_respects_option_ownership() {
+        for command in [
+            r#"python3 -c "$SCRIPT""#,
+            "python3 -c $SCRIPT",
+            r#"/usr/bin/python3.11 -Iu -c "${SCRIPT}""#,
+            r#"python3 -Iuc "$SCRIPT""#,
+            r#"python3 -Ic"$SCRIPT""#,
+            r#"python3 '-I' '-c' "$SCRIPT""#,
+            r#"python3 -W ignore -c "$SCRIPT""#,
+            r#"python3 -Wignore -c "$SCRIPT""#,
+            r#"python3 -bW '-c' -c "$SCRIPT""#,
+            r#"python3 -X utf8 -c "$SCRIPT""#,
+            r#"python3 -Xutf8 -c "$SCRIPT""#,
+            r#"python3 --check-hash-based-pycs default -c "$SCRIPT""#,
+            r#"python3 -c "$(cat script.py)""#,
+            r#"python3 -c "`cat script.py`""#,
+        ] {
+            let parsed = parse_obfuscated_posix_inline_launcher_segment(
+                command,
+                MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES,
+            );
+            assert!(
+                matches!(parsed, PosixInlineLauncherParse::Unverified(ref reason)
+                    if reason.starts_with("Python inline source")),
+                "a real Python source operand must reach its dynamic guard: {command}: {parsed:?}"
+            );
+        }
+
+        for command in [
+            r"python3 -c '$SCRIPT'",
+            r#"python3 -c "\$SCRIPT""#,
+            r"python3 -c \$SCRIPT",
+            r#"python3 -c 'print("$SCRIPT")'"#,
+            r#"python3 -c "print('$SCRIPT')""#,
+            r#"python3 script.py -c "$SCRIPT""#,
+            r#"python3 -m example -c "$SCRIPT""#,
+            r#"python3 -mexample -c "$SCRIPT""#,
+            r#"python3 -c pass -c "$SCRIPT""#,
+            r#"python3 -cpass -c "$SCRIPT""#,
+            r#"python3 - -c "$SCRIPT""#,
+            r#"python3 -- -c "$SCRIPT""#,
+            r#"python3 -V -c "$SCRIPT""#,
+            r#"python3 -h -c "$SCRIPT""#,
+            r#"python3 --help-all -c "$SCRIPT""#,
+            r#"python3 -e "$SCRIPT""#,
+            r#"python3 --unknown -c "$SCRIPT""#,
+            r#"python3 -W '-c' "$SCRIPT""#,
+            r#"python3 -X '-c' "$SCRIPT""#,
+            r#"python3 -Wignorec "$SCRIPT""#,
+            r#"python3 -W $FILTER -c "$SCRIPT""#,
+            r#"python3 -W* -c "$SCRIPT""#,
+            r#"python3 -c "$(printf pass)""#,
+            r#"python3 -c "`printf pass`""#,
+            r#"python3 -c "$((1 + 2))""#,
+            r#"node -e "$SCRIPT""#,
+            r#"perl -e "$SCRIPT""#,
+        ] {
+            assert_eq!(
+                parse_obfuscated_posix_inline_launcher_segment(
+                    command,
+                    MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES,
+                ),
+                PosixInlineLauncherParse::NotLauncher,
+                "literal source, script argv or unsupported ownership must retain its prior route: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_inline_source_guard_preserves_literal_marker_data() {
+        let marker = crate::packs::core::git::POSIX_DYNAMIC_QUOTED;
+        let quoted_marker = format!("'{marker}'");
+        let words = ["python3", "-c", quoted_marker.as_str()];
+        assert!(!python_inline_source_is_wholly_dynamic(
+            &words, &words, false
+        ));
+        assert!(!posix_word_is_wholly_dynamic_python_source(
+            r#""'$SCRIPT'""#
+        ));
+        assert!(!posix_word_is_wholly_dynamic_python_source(
+            r"$'\x24SCRIPT'"
+        ));
+    }
+
+    #[test]
+    fn wholly_dynamic_python_inline_source_keeps_allowlist_ownership() {
+        let command = r#"python3 -c "$SCRIPT""#;
+        let denied = evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+        assert!(denied.is_denied(), "{:?}", denied.pattern_info);
+        let info = denied
+            .pattern_info
+            .expect("dynamic source has an owning rule");
+        assert_eq!(info.pack_id.as_deref(), Some("heredoc.posix"));
+        assert_eq!(
+            info.pattern_name.as_deref(),
+            Some("inline-launcher-unverified")
+        );
+
+        let allowlists = project_allowlists_for_rule(
+            "heredoc.posix:inline-launcher-unverified",
+            "reviewed Python source provider",
+        );
+        let allowed = evaluate_with_pack_ids_and_allowlists_at_path(
+            command,
+            &["core.git"],
+            &allowlists,
+            None,
+        );
+        assert!(allowed.is_allowed(), "{:?}", allowed.pattern_info);
+        let grant = allowed
+            .allowlist_override
+            .expect("owning grant is reported");
+        assert_eq!(grant.matched.pack_id.as_deref(), Some("heredoc.posix"));
+        assert_eq!(
+            grant.matched.pattern_name.as_deref(),
+            Some("inline-launcher-unverified")
+        );
+
+        let sibling = evaluate_with_pack_ids_and_allowlists_at_path(
+            &format!("{command}; git reset --hard"),
+            &["core.git"],
+            &allowlists,
+            None,
+        );
+        assert!(sibling.is_denied(), "{:?}", sibling.pattern_info);
+        let info = sibling.pattern_info.expect("independent Git denial");
+        assert_eq!(info.pack_id.as_deref(), Some("core.git"));
+        assert_eq!(info.pattern_name.as_deref(), Some("reset-hard"));
     }
 
     /// A shell `-c` script that is wholly an expansion or substitution runs

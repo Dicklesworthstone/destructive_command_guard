@@ -5592,6 +5592,20 @@ fn command_string_runner_payloads(
     let mut payloads = Vec::new();
     match name {
         DYNAMIC_RUNNER => {
+            // The documented flowctl handle has the same complete, static
+            // receipt grammar here as in the launcher verifier and pattern
+            // sanitizer. Its receipt values must not become shell programs
+            // merely because the executable is a variable (#538). Local
+            // redirects remain outside this argv view and are still checked
+            // by the shell evaluator; live substitutions revoke the proof.
+            if let Some(executable) = tokens[start].text(command) {
+                let receipt_words: Vec<_> = std::iter::once(executable)
+                    .chain(words.iter().map(|(word, _)| *word))
+                    .collect();
+                if crate::context::flowctl_gate_data_values(&receipt_words).is_some() {
+                    return payloads;
+                }
+            }
             // A program the shell names at run time may be any runner, so
             // every quoted operand may be its command string, and so may the
             // operands joined (`w${x}atch 'git reset' --hard`). Words shown
@@ -8105,22 +8119,217 @@ pub(crate) fn range_is_literal_inline_interpreter_source(
     let ([program], [flag]) = (program_words.as_slice(), flag_words.as_slice()) else {
         return false;
     };
-    if !trusted_literal_script_program(program)
-        || ScriptLanguage::from_command(program.rsplit('/').next().unwrap_or(program)) != language
-        || !match language {
-            ScriptLanguage::Python => flag == "-c",
-            ScriptLanguage::JavaScript => {
-                matches!(flag.as_str(), "-e" | "-p" | "--eval" | "--print")
-            }
-            _ => false,
-        }
-    {
+    if !literal_inline_interpreter_command_matches(program, flag, language) {
         return false;
     }
     let Ok(words) = shell_words::split(statement.text().as_ref()) else {
         return false;
     };
     matches!(words.as_slice(), [_, _, source] if command.get(range.clone()) == Some(source.as_str()))
+}
+
+fn literal_inline_interpreter_command_matches(
+    program: &str,
+    flag: &str,
+    language: ScriptLanguage,
+) -> bool {
+    trusted_literal_script_program(program)
+        && ScriptLanguage::from_command(program.rsplit('/').next().unwrap_or(program)) == language
+        && match language {
+            ScriptLanguage::Python => flag == "-c",
+            ScriptLanguage::JavaScript => matches!(flag, "-e" | "-p" | "--eval" | "--print"),
+            _ => false,
+        }
+}
+
+fn literal_inline_interpreter_payload_is_static<'tree>(
+    payload: &impl ast_grep_core::source::SgNode<'tree>,
+) -> bool {
+    const MAX_PAYLOAD_NODES: usize = 4096;
+    payload.dfs().enumerate().all(|(index, node)| {
+        index < MAX_PAYLOAD_NODES
+            && !matches!(
+                node.kind().as_ref(),
+                "command_substitution"
+                    | "process_substitution"
+                    | "expansion"
+                    | "simple_expansion"
+                    | "arithmetic_expansion"
+            )
+    })
+}
+
+fn literal_node_option_stop<'tree>(
+    command: &str,
+    argument: &impl ast_grep_core::source::SgNode<'tree>,
+) -> bool {
+    if !matches!(argument.kind().as_ref(), "word" | "raw_string" | "string") {
+        return false;
+    }
+    let Some(text) = command.get(argument.range()) else {
+        return false;
+    };
+    if text.contains(['$', '`', '\\', '*', '?', '[', '{', '~']) {
+        return false;
+    }
+    let Ok(words) = shell_words::split(text) else {
+        return false;
+    };
+    matches!(words.as_slice(), [word] if !word.starts_with('-') || matches!(word.as_str(), "-" | "--"))
+}
+
+/// Bash's file_redirect node stores later argv as additional destination
+/// fields. Only its first destination belongs to the redirect. Recover the
+/// first three operands of one simple command without consuming target data
+/// or borrowing words from another statement.
+fn literal_inline_interpreter_arguments<'tree, N: ast_grep_core::source::SgNode<'tree>>(
+    payload: &N,
+    argument_field: u16,
+    destination_field: u16,
+) -> Option<(N, Vec<N>)> {
+    const MAX_ARGUMENT_NODES: usize = 4096;
+    let mut owner = payload.parent()?;
+    if owner.kind().as_ref() == "file_redirect" {
+        owner = owner.parent()?;
+    }
+    let statement = owner
+        .parent()
+        .filter(|parent| {
+            parent.kind().as_ref() == "redirected_statement"
+                && parent
+                    .field("body")
+                    .is_some_and(|body| body.node_id() == owner.node_id())
+        })
+        .unwrap_or(owner);
+    let body = match statement.kind().as_ref() {
+        "command" => statement.clone(),
+        "redirected_statement" => statement.field("body")?,
+        _ => return None,
+    };
+    if body.kind().as_ref() != "command"
+        || statement
+            .parent()
+            .is_some_and(|parent| parent.kind().as_ref() == "redirected_statement")
+        || body.named_children().enumerate().any(|(index, child)| {
+            index >= MAX_ARGUMENT_NODES || child.kind().as_ref() == "file_redirect"
+        })
+    {
+        return None;
+    }
+    let program = body.field("name")?;
+    let mut arguments: Vec<_> = body.field_children(Some(argument_field)).take(3).collect();
+    if statement.node_id() != body.node_id() {
+        for (index, redirect) in statement.named_children().enumerate() {
+            if index >= MAX_ARGUMENT_NODES {
+                return None;
+            }
+            if redirect.node_id() == body.node_id() || redirect.kind().as_ref() == "comment" {
+                continue;
+            }
+            if redirect.kind().as_ref() != "file_redirect"
+                || !redirect.children().any(|child| {
+                    matches!(
+                        child.kind().as_ref(),
+                        "<" | ">" | ">>" | "&>" | "&>>" | "<&" | ">&" | ">|"
+                    )
+                })
+            {
+                return None;
+            }
+            let mut destinations = redirect.field_children(Some(destination_field));
+            destinations.next()?;
+            arguments.extend(destinations.take(3 - arguments.len()));
+        }
+    }
+    Some((program, arguments))
+}
+
+/// Prove a complete inline program independently of the documentation exemption.
+///
+/// `Some(true)` retains the isolated-invocation proof above. `Some(false)`
+/// means the same literal program belongs to an executing interpreter command,
+/// but other shell statements, arguments or consumers prevent that exemption.
+/// `None` leaves partial extracts, dynamic words and uncertain option ownership
+/// to the existing named and raw analysis; it is neither a denial nor a proof
+/// of safety. A suffix such as `&& true` must not turn a complete program into
+/// an unsupported fragment and thereby skip its additive literal checks.
+///
+/// The caller runs both Bash parses under the interpreter worker's deadline.
+/// Source size, command operands and the payload's AST walk are bounded too.
+pub(crate) fn inline_interpreter_source_proof(
+    command: &str,
+    range: &Range<usize>,
+    language: ScriptLanguage,
+) -> Option<bool> {
+    if range.start >= range.end
+        || command.get(range.clone()).is_none()
+        || !matches!(
+            language,
+            ScriptLanguage::Python | ScriptLanguage::JavaScript
+        )
+        || command.len() > MAX_SUBSTITUTION_SOURCE_BYTES
+    {
+        return None;
+    }
+    if range_is_literal_inline_interpreter_source(command, range, language) {
+        return Some(true);
+    }
+
+    let quoted_range = range.start.checked_sub(1)?..range.end.checked_add(1)?;
+    let ast = AstGrep::try_new(command, SupportLang::Bash).ok()?;
+    let root = ast.root();
+    let root = root.get_inner_node();
+    if root.has_error() {
+        return None;
+    }
+    // Locate the precise shell word by its range, without scanning every
+    // statement preceding it or borrowing a quote inside another data word.
+    let payload = root.named_descendant_for_byte_range(quoted_range.start, quoted_range.end)?;
+    if payload.byte_range() != quoted_range || !matches!(payload.kind(), "raw_string" | "string") {
+        return None;
+    }
+    let grammar = root.language();
+    let (program, arguments) = literal_inline_interpreter_arguments(
+        &payload,
+        grammar.field_id_for_name("argument")?.get(),
+        grammar.field_id_for_name("destination")?.get(),
+    )?;
+    // Python stops parsing options after -c's source. Node may replace its
+    // program until an operand or -- ends option parsing, even after a redirect.
+    let flag = arguments.first()?;
+    let source = arguments.get(1)?;
+    if program.kind() != "command_name" || source.byte_range() != quoted_range {
+        return None;
+    }
+    if language == ScriptLanguage::JavaScript
+        && arguments
+            .get(2)
+            .is_some_and(|argument| !literal_node_option_stop(command, argument))
+    {
+        return None;
+    }
+    let program_text = command.get(program.byte_range())?;
+    let flag_text = command.get(flag.byte_range())?;
+    if [program_text, flag_text]
+        .iter()
+        .any(|text| text.contains(['$', '`', '\\', '*', '?', '[', '{', '~']))
+    {
+        return None;
+    }
+    let program_words = shell_words::split(program_text).ok()?;
+    let flag_words = shell_words::split(flag_text).ok()?;
+    let ([program], [flag]) = (program_words.as_slice(), flag_words.as_slice()) else {
+        return None;
+    };
+    if !literal_inline_interpreter_command_matches(program, flag, language) {
+        return None;
+    }
+    let words = shell_words::split(command.get(quoted_range)?).ok()?;
+    if !matches!(words.as_slice(), [source] if command.get(range.clone()) == Some(source.as_str()))
+    {
+        return None;
+    }
+    literal_inline_interpreter_payload_is_static(&payload).then_some(false)
 }
 
 /// The `>` bytes that JavaScript itself parses as arrow operators in a
@@ -9738,11 +9947,16 @@ fn literal_file_data_consumers_inner(
         if node
             .children()
             .filter(ast_grep_core::Node::is_named)
-            .any(|child| {
-                !matches!(
-                    child.kind().as_ref(),
-                    "command_name" | "word" | "raw_string" | "string"
-                )
+            .any(|child| match child.kind().as_ref() {
+                "command_name" | "word" | "raw_string" | "string" => false,
+                // Bash gives an unquoted port its own number node. Other
+                // number forms can contain expansions, so prove decimal
+                // text before the transport parser checks its option role.
+                "number" => {
+                    let text = child.text();
+                    text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit())
+                }
+                _ => true,
             })
         {
             continue;
@@ -12935,8 +13149,15 @@ mod tests {
             ("f() { cat <<EOF\nx\nEOF\n}; f | sh", None),
             ("cat <<A; sh <<B\nhi\nA\nx\nB", None),
         ] {
-            let outputs = heredoc_outputs(command);
-            assert_eq!(outputs.first().copied().flatten(), expected, "{command:?}");
+            // Unsupported layouts may have no recoverable parse. Their
+            // output remains unknown, and masking must preserve every byte.
+            let heredocs = active_heredocs(command);
+            if heredocs.is_none() {
+                assert_eq!(mask_non_expanding_data_heredocs(command), command);
+            }
+            let output =
+                heredocs.and_then(|heredocs| heredocs.first().and_then(|heredoc| heredoc.output));
+            assert_eq!(output, expected, "{command:?}");
         }
     }
 
@@ -13329,6 +13550,9 @@ mod tests {
             "scp -J host m.txt host:/tmp/",
             "scp -O m.txt host:/tmp/",
             "scp -r m.txt host:/tmp/",
+            "scp -q -P \"$PORT\" m.txt host:/tmp/",
+            "scp -q -P \"$(printf 2222)\" m.txt host:/tmp/",
+            "scp -q -P 2#$(printf 2222) m.txt host:/tmp/",
             "scp m.txt \"$destination\"",
             "/tmp/scp m.txt host:/tmp/",
             "scp() { sh \"$1\"; }; scp m.txt host:/tmp/",
@@ -13338,6 +13562,7 @@ mod tests {
             "ssh host 'sh m.txt'",
             "ssh host 'consumer m.txt'",
             "ssh -o 'ProxyCommand=sh m.txt' host 'git commit -F m.txt'",
+            "ssh -T -p \"$PORT\" host 'git commit -F /tmp/m.txt'",
             "scp m.txt /tmp/git; ssh host 'git commit -F other.txt'",
             "scp m.txt /tmp/cat; chmod +x /tmp/cat; /tmp/cat",
             "scp m.txt /tmp/git; chmod +x /tmp/git; /tmp/git status",
@@ -13642,6 +13867,45 @@ mod tests {
             "tool$X",
         ] {
             assert!(!dynamic_word_may_name_runner(word), "{word:?}");
+        }
+    }
+
+    #[test]
+    fn dynamic_runner_preserves_static_flowctl_receipt_values_538() {
+        for command in [
+            r#""$FLOWCTL" gate check --command 'npm test; git reset --hard'"#,
+            r#""$FLOWCTL" gate receipt --command "git reset --hard""#,
+            r#""$FLOWCTL" gate check --gate=test --command='-c echo example'"#,
+            r#""$FLOWCTL" gate receipt --command '$(git reset --hard)' --json"#,
+            r#""$FLOWCTL" gate check --command npm\ test\;\ git\ reset\ --hard"#,
+            r#""$FLOWCTL" 2>/dev/null gate check --command 'git reset --hard'"#,
+            r#""$FLOWCTL" gate check --command 'npm test' > /etc/profile"#,
+        ] {
+            let tokens = crate::normalize::tokenize_for_normalization(command);
+            assert!(
+                command_string_runner_payloads(command, &tokens, 0, DYNAMIC_RUNNER).is_empty(),
+                "receipt data was reinterpreted as a program: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_runner_keeps_non_receipt_payloads_538() {
+        for command in [
+            r#""$OTHER" gate check --command 'git reset --hard'"#,
+            r"$FLOWCTL gate check --command 'git reset --hard'",
+            r#""${FLOWCTL:-sh}" gate check --command 'git reset --hard'"#,
+            r#""$FLOWCTL" gate run --command 'git reset --hard'"#,
+            r#""$FLOWCTL" gate check --unknown value --command 'git reset --hard'"#,
+            r#""$FLOWCTL" gate check --command 'npm test' -c 'git reset --hard'"#,
+            r#""$FLOWCTL" gate receipt --command "$(git reset --hard)""#,
+            r#""$FLOWCTL" gate check --command "`git reset --hard`""#,
+        ] {
+            let tokens = crate::normalize::tokenize_for_normalization(command);
+            assert!(
+                !command_string_runner_payloads(command, &tokens, 0, DYNAMIC_RUNNER).is_empty(),
+                "unknown or executing operands lost their analysis: {command:?}"
+            );
         }
     }
 
@@ -15833,6 +16097,315 @@ mod tests {
                 &(start..start + body.len()),
                 ScriptLanguage::Python
             ));
+        }
+
+        #[test]
+        fn complete_inline_source_survives_other_shell_consumers_544() {
+            for (program, flag, language, body) in [
+                (
+                    "python3",
+                    "-c",
+                    ScriptLanguage::Python,
+                    r#"import os; s="echo $(git reset --hard)"; os.system(s)"#,
+                ),
+                (
+                    "node",
+                    "-e",
+                    ScriptLanguage::JavaScript,
+                    r#"const s="echo $(git reset --hard)"; require("child_process").execSync(s);"#,
+                ),
+            ] {
+                let invocation = format!("{program} {flag} '{body}'");
+                let start = invocation.find(body).unwrap();
+                assert_eq!(
+                    inline_interpreter_source_proof(
+                        &invocation,
+                        &(start..start + body.len()),
+                        language,
+                    ),
+                    Some(true),
+                    "the existing isolated proof remains available"
+                );
+                for command in [
+                    format!("{invocation} && true"),
+                    format!("true; {invocation}"),
+                    format!("printf 'élève\\n'; {invocation}"),
+                    format!("{invocation}\nprintf done"),
+                    format!("({invocation})"),
+                    format!("{{ {invocation}; }}"),
+                    format!("if true; then {invocation}; fi"),
+                    format!("{invocation} | cat"),
+                    format!("{invocation} > /dev/null"),
+                    format!("{program} 2>/dev/null {flag} '{body}'"),
+                    format!("{invocation} extra_argument"),
+                    format!("PYTHONPATH=/tmp/plugins {invocation}"),
+                ] {
+                    let start = command.find(body).unwrap();
+                    let range = start..start + body.len();
+                    assert_eq!(
+                        inline_interpreter_source_proof(&command, &range, language),
+                        Some(false),
+                        "complete source must retain additive checks: {command:?}"
+                    );
+                    assert!(
+                        !range_is_literal_inline_interpreter_source(&command, &range, language),
+                        "another consumer must not acquire the documentation exemption: {command:?}"
+                    );
+                    let ExtractionResult::Extracted(contents) =
+                        extract_content(&command, &ExtractionLimits::structural_scan())
+                    else {
+                        panic!("expected complete inline extraction: {command:?}");
+                    };
+                    assert!(contents.iter().any(|content| {
+                        content.language == language
+                            && content.content_range.as_ref() == Some(&range)
+                            && content.content == body
+                    }));
+                }
+            }
+        }
+
+        #[test]
+        fn inline_source_proof_preserves_redirect_argument_roles_544() {
+            for (command, body, language, expected) in [
+                (
+                    "python3 -c 2>/dev/null 'print(1)'",
+                    "print(1)",
+                    ScriptLanguage::Python,
+                    Some(false),
+                ),
+                (
+                    "python3 2>/dev/null -c 3>/dev/null 'print(1)'",
+                    "print(1)",
+                    ScriptLanguage::Python,
+                    Some(false),
+                ),
+                (
+                    "python3 >'-c' 'print(1)'",
+                    "print(1)",
+                    ScriptLanguage::Python,
+                    None,
+                ),
+                (
+                    "python3 -c >'print(1)' ignored",
+                    "print(1)",
+                    ScriptLanguage::Python,
+                    None,
+                ),
+                (
+                    "node -e 'console.log(1)' 2>/dev/null -e 'console.log(2)'",
+                    "console.log(1)",
+                    ScriptLanguage::JavaScript,
+                    None,
+                ),
+                (
+                    "node 2>/dev/null -e 'console.log(1)' 3>'--' -e 'console.log(2)'",
+                    "console.log(1)",
+                    ScriptLanguage::JavaScript,
+                    None,
+                ),
+                (
+                    "node -e 'console.log(1)' 2>/dev/null -- -e 'console.log(2)'",
+                    "console.log(1)",
+                    ScriptLanguage::JavaScript,
+                    Some(false),
+                ),
+            ] {
+                let start = command.find(body).unwrap();
+                assert_eq!(
+                    inline_interpreter_source_proof(
+                        command,
+                        &(start..start + body.len()),
+                        language,
+                    ),
+                    expected,
+                    "redirect targets and actual interpreter argv retain separate roles: {command}"
+                );
+            }
+        }
+
+        #[test]
+        fn inline_source_proof_rejects_uncertain_node_options_544() {
+            let body = r#"const s="echo $(git reset --hard)";"#;
+            for flag in ["-e", "-p", "--eval", "--print"] {
+                for trailing in [
+                    "-e 'console.log(2)'",
+                    "'-e' 'console.log(2)'",
+                    "--eval 'console.log(2)'",
+                    "--eval='console.log(2)'",
+                    "-p '2'",
+                    "--print '2'",
+                    "--print='2'",
+                    "--help",
+                    "--version",
+                    "--check",
+                    "--title operand -e 'console.log(2)'",
+                    "--no-warnings operand -e 'console.log(2)'",
+                    "$ARGS -e 'console.log(2)'",
+                    "\"$ARGS\" -e 'console.log(2)'",
+                    "* -e 'console.log(2)'",
+                    "{one,two} -e 'console.log(2)'",
+                    "~ -e 'console.log(2)'",
+                    "$(printf -- --help)",
+                    "<(printf operand)",
+                ] {
+                    let command = format!("node {flag} '{body}' {trailing} && true");
+                    let start = command.find(body).unwrap();
+                    assert_eq!(
+                        inline_interpreter_source_proof(
+                            &command,
+                            &(start..start + body.len()),
+                            ScriptLanguage::JavaScript,
+                        ),
+                        None,
+                        "unproved Node option ownership retains existing analysis: {command:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn inline_source_proof_preserves_node_option_stops_544() {
+            let body = r#"const s="echo $(git reset --hard)";"#;
+            for flag in ["-e", "-p", "--eval", "--print"] {
+                for stop in ["--", "-", "''", "\"\"", "operand", "'operand'", "\"élève\""] {
+                    let command =
+                        format!("node {flag} '{body}' {stop} -e 'console.log(2)' && true");
+                    let start = command.find(body).unwrap();
+                    let range = start..start + body.len();
+                    assert_eq!(
+                        inline_interpreter_source_proof(
+                            &command,
+                            &range,
+                            ScriptLanguage::JavaScript,
+                        ),
+                        Some(false),
+                        "later -e is argv data after a literal option stop: {command:?}"
+                    );
+                    assert!(!range_is_literal_inline_interpreter_source(
+                        &command,
+                        &range,
+                        ScriptLanguage::JavaScript,
+                    ));
+                }
+            }
+            for trailing in ["--help", "-c 'print(2)'", "$ARGS"] {
+                let command = format!("python3 -c 'print(1)' {trailing} && true");
+                let start = command.find("print(1)").unwrap();
+                assert_eq!(
+                    inline_interpreter_source_proof(
+                        &command,
+                        &(start..start + "print(1)".len()),
+                        ScriptLanguage::Python,
+                    ),
+                    Some(false),
+                    "Python -c has already stopped option parsing: {command:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn inline_source_proof_rejects_fragments_and_unowned_words_544() {
+            let body = r#"s="echo $(git reset --hard)"; print(s)"#;
+            for command in [
+                format!("python3 -c '{body}'extra && true"),
+                format!("python3 -c '{body}'\"suffix\" && true"),
+                format!("python3 -c '{body}'$SUFFIX && true"),
+                format!("python3 -c '{body}' && ("),
+                format!("python3 script.py '{body}' && true"),
+                format!("node -e '{body}' && true"),
+                format!("echo python3 -c '{body}' && true"),
+                format!("/tmp/python3 -c '{body}' && true"),
+                format!("$PYTHON -c '{body}' && true"),
+            ] {
+                let start = command.find(body).unwrap();
+                assert_eq!(
+                    inline_interpreter_source_proof(
+                        &command,
+                        &(start..start + body.len()),
+                        ScriptLanguage::Python,
+                    ),
+                    None,
+                    "only a complete program owned by the exact interpreter qualifies: {command:?}"
+                );
+            }
+            for (command, raw_capture) in [
+                (r#"python3 -c "print(\"hello\")" && true"#, r"print(\"),
+                (
+                    r#"python3 -c "print('$(git reset --hard)')" && true"#,
+                    "print('$(git reset --hard)')",
+                ),
+                (r#"python3 -c "print('$VALUE')" && true"#, "print('$VALUE')"),
+                (r#"echo 'Example: python3 -c "print(1)"'"#, "print(1)"),
+            ] {
+                let start = command.find(raw_capture).unwrap();
+                assert_eq!(
+                    inline_interpreter_source_proof(
+                        command,
+                        &(start..start + raw_capture.len()),
+                        ScriptLanguage::Python,
+                    ),
+                    None,
+                    "raw extraction cannot stand in for expanded or partial source: {command:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn inline_source_proof_preserves_byte_identity_and_bounds_544() {
+            let body = "print('élève')";
+            let command = format!("python3 -c \"{body}\" && true");
+            let start = command.find(body).unwrap();
+            let range = start..start + body.len();
+            assert_eq!(
+                inline_interpreter_source_proof(&command, &range, ScriptLanguage::Python),
+                Some(false)
+            );
+            for range in [
+                0..body.len(),
+                start..start,
+                start + 1..start + body.len(),
+                start..start + body.len() + 1,
+                command.len()..command.len() + 1,
+                usize::MAX - 1..usize::MAX,
+            ] {
+                assert_eq!(
+                    inline_interpreter_source_proof(&command, &range, ScriptLanguage::Python),
+                    None,
+                    "a source proof must own the complete quoted word: {range:?}"
+                );
+            }
+            let split_utf8 = command.find('é').unwrap() + 1;
+            assert_eq!(
+                inline_interpreter_source_proof(
+                    &command,
+                    &(split_utf8..start + body.len()),
+                    ScriptLanguage::Python,
+                ),
+                None
+            );
+            let extra_arguments = format!("python3 -c \"{body}\"{}", " argument".repeat(128));
+            let start = extra_arguments.find(body).unwrap();
+            assert_eq!(
+                inline_interpreter_source_proof(
+                    &extra_arguments,
+                    &(start..start + body.len()),
+                    ScriptLanguage::Python,
+                ),
+                Some(false),
+                "unrelated later argv must not suppress an already identified program"
+            );
+            let excessive = format!("{command} # {}", "x".repeat(MAX_SUBSTITUTION_SOURCE_BYTES));
+            let start = excessive.find(body).unwrap();
+            assert_eq!(
+                inline_interpreter_source_proof(
+                    &excessive,
+                    &(start..start + body.len()),
+                    ScriptLanguage::Python,
+                ),
+                None,
+                "the outer-source byte bound remains enforced"
+            );
         }
 
         #[test]

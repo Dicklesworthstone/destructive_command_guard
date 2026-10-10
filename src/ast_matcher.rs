@@ -29,12 +29,14 @@ enum DocumentationValue {
     NodeFs,
 }
 
-/// Literal ranges whose shell-looking bytes are only documentation (#544).
+/// Literal ranges whose shell-looking bytes retain a proven data role (#544).
 ///
 /// This small proof covers straight-line Python/JavaScript text edits. Every
 /// expression must use concrete text/scalar values, known string methods, or
 /// the standard print/file APIs below. One opaque call, escaped value, rebound
-/// API, or unsupported statement withdraws the proof for the entire program.
+/// API, or unsupported statement withdraws that whole-program proof. A separate
+/// bounded proof preserves static argv/option data owned by a named scanner,
+/// after verifying its standard module binding and argument roles.
 /// The caller must independently prove the interpreter and absence of outer
 /// consumers, and keep the ORIGINAL source in execution/protected-write scans.
 /// Parsing must run inside the caller's bounded optional-proof worker.
@@ -73,7 +75,7 @@ pub(crate) fn inert_documentation_literal_ranges(
     if proof.expression(&root, 0).is_some() {
         proof.literals
     } else {
-        Vec::new()
+        inert_named_exec_literal_ranges(&root, code, language)
     }
 }
 
@@ -296,7 +298,603 @@ const MAX_INTERPRETER_LITERAL_NODES: usize = 4096;
 const MAX_INTERPRETER_LITERAL_CANDIDATES: usize = 128;
 const MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES: usize = 64 * 1024;
 
-/// Recover shell substitutions carried by literal interpreter values (#544).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiteralModule {
+    PythonOs,
+    PythonSubprocess,
+    NodeChildProcess,
+}
+
+enum LiteralBinding {
+    Text {
+        value: String,
+        range: std::ops::Range<usize>,
+    },
+    Module(LiteralModule),
+}
+
+type LiteralBindings = std::collections::BTreeMap<String, LiteralBinding>;
+
+/// A later JavaScript function declaration can replace require/eval before
+/// the verified prefix runs. Decline these optional prefix proofs without
+/// attempting scope analysis; the original execution scans still run.
+fn literal_prefix_has_no_function_hoisting<D: ast_grep_core::Doc>(
+    root: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+) -> bool {
+    language != ScriptLanguage::JavaScript
+        || root.dfs().enumerate().all(|(index, node)| {
+            index < MAX_INTERPRETER_LITERAL_NODES
+                && !matches!(
+                    node.kind().as_ref(),
+                    "function_declaration" | "generator_function_declaration"
+                )
+        })
+}
+
+fn literal_statement<D: ast_grep_core::Doc>(
+    mut node: ast_grep_core::Node<'_, D>,
+) -> Option<ast_grep_core::Node<'_, D>> {
+    for _ in 0..4 {
+        if !matches!(
+            node.kind().as_ref(),
+            "expression_statement" | "lexical_declaration" | "variable_declaration"
+        ) {
+            return Some(node);
+        }
+        node = {
+            let mut children = node
+                .children()
+                .filter(|child| child.is_named() && child.kind().as_ref() != "comment");
+            let child = children.next()?;
+            if children.next().is_some() {
+                return None;
+            }
+            child
+        };
+    }
+    None
+}
+
+fn literal_required_module<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+) -> Option<LiteralModule> {
+    if language != ScriptLanguage::JavaScript || node.kind().as_ref() != "call_expression" {
+        return None;
+    }
+    let function = node.field("function")?;
+    if function.kind().as_ref() != "identifier" || function.text() != "require" {
+        return None;
+    }
+    let arguments = node.field("arguments")?;
+    let mut args = arguments
+        .children()
+        .filter(|child| child.is_named() && child.kind().as_ref() != "comment");
+    let module = static_interpreter_literal(&args.next()?, language, 0)?;
+    (args.next().is_none() && matches!(module.as_str(), "child_process" | "node:child_process"))
+        .then_some(LiteralModule::NodeChildProcess)
+}
+
+/// Only straight-line literal assignments and standard module bindings may
+/// establish a value for a later execution call. An unknown statement ends
+/// this optional proof instead of guessing about rebinding or side effects.
+fn record_literal_binding<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+    bindings: &mut LiteralBindings,
+) -> bool {
+    if bindings.len() >= MAX_INTERPRETER_LITERAL_CANDIDATES {
+        return false;
+    }
+    if language == ScriptLanguage::Python && node.kind().as_ref() == "import_statement" {
+        let (name, module) = match node.text().as_ref() {
+            "import os" => ("os", LiteralModule::PythonOs),
+            "import posix" => ("posix", LiteralModule::PythonOs),
+            "import subprocess" => ("subprocess", LiteralModule::PythonSubprocess),
+            _ => return false,
+        };
+        bindings.insert(name.to_owned(), LiteralBinding::Module(module));
+        return true;
+    }
+    if !matches!(node.kind().as_ref(), "assignment" | "variable_declarator")
+        || node
+            .children()
+            .filter(ast_grep_core::Node::is_named)
+            .count()
+            != 2
+    {
+        return false;
+    }
+    let Some(name) = node.field("left").or_else(|| node.field("name")) else {
+        return false;
+    };
+    let name_text = name.text();
+    if name.kind().as_ref() != "identifier"
+        // Python normalizes identifiers; JavaScript permits identifier
+        // escapes. Raw spellings cannot establish a distinct binding then.
+        || !name_text.is_ascii()
+        || name_text.contains('\\')
+        || matches!(name_text.as_ref(), "exec" | "eval" | "require")
+    {
+        return false;
+    }
+    let Some(value) = node.field("right").or_else(|| node.field("value")) else {
+        return false;
+    };
+    let binding = if let Some(module) = literal_required_module(&value, language) {
+        LiteralBinding::Module(module)
+    } else if let Some(text) = static_interpreter_literal(&value, language, 0) {
+        if text.len() > MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES {
+            return false;
+        }
+        LiteralBinding::Text {
+            value: text,
+            range: value.range(),
+        }
+    } else {
+        return false;
+    };
+    bindings.insert(name_text.into_owned(), binding);
+    true
+}
+
+fn bound_literal_callee<D: ast_grep_core::Doc>(
+    call: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+    bindings: &LiteralBindings,
+) -> Option<(LiteralModule, String, usize)> {
+    let function = call.field("function")?;
+    if !matches!(function.kind().as_ref(), "attribute" | "member_expression") {
+        return None;
+    }
+    let object = function.field("object")?;
+    let name = function
+        .field("attribute")
+        .or_else(|| function.field("property"))?;
+    if !matches!(name.kind().as_ref(), "identifier" | "property_identifier") {
+        return None;
+    }
+    let module = if object.kind().as_ref() == "identifier" {
+        let LiteralBinding::Module(module) = bindings.get(object.text().as_ref())? else {
+            return None;
+        };
+        *module
+    } else {
+        literal_required_module(&object, language)?
+    };
+    Some((module, name.text().into_owned(), name.range().start))
+}
+
+fn literal_mapping_key<D: ast_grep_core::Doc>(
+    key: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+) -> Option<String> {
+    if language == ScriptLanguage::JavaScript && key.kind().as_ref() == "property_identifier" {
+        let text = key.text();
+        // JavaScript permits escapes inside an identifier. Its source spelling
+        // cannot prove that the resulting key is not shell, input, or env.
+        return (text.is_ascii() && !text.contains('\\')).then(|| text.into_owned());
+    }
+    static_interpreter_literal(key, language, 0).filter(|key| key.is_ascii())
+}
+
+fn literal_node_options_disable_shell<D: ast_grep_core::Doc>(
+    options: &ast_grep_core::Node<'_, D>,
+) -> bool {
+    if options.kind().as_ref() != "object"
+        || options
+            .dfs()
+            .filter(ast_grep_core::Node::is_named)
+            .any(|node| {
+                !matches!(
+                    node.kind().as_ref(),
+                    "object"
+                        | "pair"
+                        | "property_identifier"
+                        | "string"
+                        | "string_fragment"
+                        | "escape_sequence"
+                        | "number"
+                        | "true"
+                        | "false"
+                        | "null"
+                        | "array"
+                )
+            })
+    {
+        return false;
+    }
+    options
+        .children()
+        .filter(|child| child.is_named() && child.kind().as_ref() != "comment")
+        .all(|pair| {
+            let Some(key) = pair.field("key") else {
+                return false;
+            };
+            let name = literal_mapping_key(&key, ScriptLanguage::JavaScript);
+            name.is_some_and(|name| {
+                name != "shell"
+                    || pair
+                        .field("value")
+                        .is_some_and(|value| value.text() == "false")
+            })
+        })
+}
+
+fn literal_argv_has_no_shell<D: ast_grep_core::Doc>(
+    args: &[ast_grep_core::Node<'_, D>],
+    module: LiteralModule,
+    sink: &str,
+) -> bool {
+    match module {
+        LiteralModule::PythonSubprocess
+            if matches!(
+                sink,
+                "run" | "call" | "Popen" | "check_call" | "check_output"
+            ) =>
+        {
+            args.iter().enumerate().all(|(index, argument)| {
+                if argument.kind().as_ref() != "keyword_argument" {
+                    return index == 0;
+                }
+                argument.field("name").is_some_and(|name| {
+                    let name = name.text();
+                    // CPython normalizes identifiers with NFKC; raw Unicode
+                    // spelling cannot exclude an executable/shell override.
+                    name.is_ascii()
+                        && match name.as_ref() {
+                            // The argv scanner models args[0], so an executable
+                            // override can select an unmodeled shell or interpreter.
+                            "executable" => false,
+                            "shell" => argument
+                                .field("value")
+                                .is_some_and(|value| value.text() == "False"),
+                            _ => true,
+                        }
+                })
+            })
+        }
+        LiteralModule::NodeChildProcess
+            if matches!(sink, "spawn" | "spawnSync" | "execFile" | "execFileSync") =>
+        {
+            match args {
+                [_] => true,
+                [_, argv] if argv.kind().as_ref() == "array" => true,
+                [_, options] => literal_node_options_disable_shell(options),
+                [_, argv, options] if argv.kind().as_ref() == "array" => {
+                    literal_node_options_disable_shell(options)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn literal_argument_is_data<D: ast_grep_core::Doc>(
+    argument: &ast_grep_core::Node<'_, D>,
+    index: usize,
+    module: LiteralModule,
+    sink: &str,
+    no_shell: bool,
+) -> bool {
+    match module {
+        LiteralModule::PythonOs | LiteralModule::PythonSubprocess => {
+            if argument.kind().as_ref() == "keyword_argument" {
+                return argument.field("name").is_some_and(|name| {
+                    let name = name.text();
+                    name.is_ascii()
+                        && match name.as_ref() {
+                            "input" => false,
+                            "args" => no_shell,
+                            _ => true,
+                        }
+                });
+            }
+            index > 0 || no_shell
+        }
+        LiteralModule::NodeChildProcess if matches!(sink, "exec" | "execSync") => index > 0,
+        LiteralModule::NodeChildProcess
+            if matches!(sink, "spawn" | "spawnSync" | "execFile" | "execFileSync") =>
+        {
+            no_shell || index >= 2 || index == 1 && argument.kind().as_ref() == "object"
+        }
+        _ => false,
+    }
+}
+
+fn literal_environment_data<'a, D: ast_grep_core::Doc>(
+    environment: &ast_grep_core::Node<'a, D>,
+    language: ScriptLanguage,
+) -> Option<Vec<ast_grep_core::Node<'a, D>>> {
+    if !matches!(environment.kind().as_ref(), "dictionary" | "object") {
+        return None;
+    }
+    let mut values = Vec::new();
+    for pair in environment
+        .children()
+        .filter(|node| node.is_named() && node.kind().as_ref() != "comment")
+    {
+        let key = literal_mapping_key(&pair.field("key")?, language)?;
+        let value = pair.field("value")?;
+        // Shell startup variables and Node's import options can execute
+        // source before the child's ordinary argv. Unknown keys or container
+        // spreads likewise cannot establish a data role.
+        if !matches!(key.as_str(), "BASH_ENV" | "ENV" | "NODE_OPTIONS") {
+            values.push(value);
+        }
+    }
+    Some(values)
+}
+
+fn literal_argument_data_roots<'a, D: ast_grep_core::Doc>(
+    argument: &ast_grep_core::Node<'a, D>,
+    language: ScriptLanguage,
+) -> Vec<ast_grep_core::Node<'a, D>> {
+    if language == ScriptLanguage::Python
+        && argument.kind().as_ref() == "keyword_argument"
+        && argument
+            .field("name")
+            .is_some_and(|name| name.text() == "env")
+    {
+        return argument
+            .field("value")
+            .and_then(|value| literal_environment_data(&value, language))
+            .unwrap_or_default();
+    }
+    if language != ScriptLanguage::JavaScript || argument.kind().as_ref() != "object" {
+        return vec![argument.clone()];
+    }
+    let mut roots = Vec::new();
+    for pair in argument
+        .children()
+        .filter(|node| node.is_named() && node.kind().as_ref() != "comment")
+    {
+        let Some(key) = pair
+            .field("key")
+            .and_then(|key| literal_mapping_key(&key, language))
+        else {
+            return Vec::new();
+        };
+        match key.as_str() {
+            // A shell/interpreter child can execute this stdin directly.
+            "input" => {}
+            "env" => {
+                let Some(values) = pair
+                    .field("value")
+                    .and_then(|value| literal_environment_data(&value, language))
+                else {
+                    return Vec::new();
+                };
+                roots.extend(values);
+            }
+            _ => roots.push(pair),
+        }
+    }
+    roots
+}
+
+/// A named scanner owns complete static argv independently of whether the
+/// surrounding program is a documentation edit. Only literal data positions
+/// get this raw-view mask; shell programs and executable argument expressions
+/// keep their original bytes in every execution scanner.
+fn inert_named_exec_literal_ranges<D: ast_grep_core::Doc>(
+    root: &ast_grep_core::Node<'_, D>,
+    code: &str,
+    language: ScriptLanguage,
+) -> Vec<std::ops::Range<usize>> {
+    if !literal_prefix_has_no_function_hoisting(root, language) {
+        return Vec::new();
+    }
+    let Some(owned) =
+        engine::literal_exec_sink_starts(code, language, MAX_INTERPRETER_LITERAL_CANDIDATES)
+    else {
+        return Vec::new();
+    };
+    let mut bindings = LiteralBindings::new();
+    for statement in root
+        .children()
+        .filter(|node| node.is_named() && node.kind().as_ref() != "comment")
+    {
+        let Some(node) = literal_statement(statement) else {
+            break;
+        };
+        if !matches!(node.kind().as_ref(), "call" | "call_expression") {
+            if record_literal_binding(&node, language, &mut bindings) {
+                continue;
+            }
+            break;
+        }
+        let Some((module, sink, start)) = bound_literal_callee(&node, language, &bindings) else {
+            break;
+        };
+        if owned.binary_search(&start).is_err() {
+            break;
+        }
+        let Some(arguments) = node.field("arguments") else {
+            break;
+        };
+        let args: Vec<_> = arguments
+            .children()
+            .filter(|arg| arg.is_named() && arg.kind().as_ref() != "comment")
+            .collect();
+        let no_shell = literal_argv_has_no_shell(&args, module, &sink);
+        let mut ranges = Vec::new();
+        for (index, argument) in args.iter().enumerate() {
+            if !literal_argument_is_data(argument, index, module, &sink, no_shell) {
+                continue;
+            }
+            for literal in literal_argument_data_roots(argument, language)
+                .iter()
+                .flat_map(ast_grep_core::Node::dfs)
+            {
+                if matches!(
+                    literal.kind().as_ref(),
+                    "string" | "template_string" | "concatenated_string"
+                ) && interpreter_literal_has_owned_sink(&literal, &[start])
+                    && static_interpreter_literal(&literal, language, 0)
+                        .is_some_and(|value| value.contains('`') || value.contains("$("))
+                {
+                    ranges.push(literal.range());
+                }
+            }
+        }
+        // Later calls may rebind modules or run callbacks. This small proof
+        // owns only the first call after its verified literal/module prefix.
+        return ranges;
+    }
+    Vec::new()
+}
+
+/// This cheap gate is shared with the evaluator so direct exec/eval dependency
+/// recovery is not accidentally disabled before its bounded AST proof runs.
+pub(crate) fn has_interpreter_literal_candidates(code: &str, language: ScriptLanguage) -> bool {
+    matches!(
+        language,
+        ScriptLanguage::Python | ScriptLanguage::JavaScript
+    ) && (code.contains('`')
+        || code.contains("$(")
+        || code.contains('\\')
+        || code.contains("eval")
+        || language == ScriptLanguage::Python && code.contains("exec"))
+}
+
+fn evaluated_shell_dependency(
+    code: &str,
+    language: ScriptLanguage,
+    bindings: &LiteralBindings,
+) -> Result<Option<String>, MatchError> {
+    use ast_grep_core::AstGrep;
+    use ast_grep_language::SupportLang;
+
+    if code.len() > MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES {
+        return Err(interpreter_literal_parse_error(
+            language,
+            "evaluated source byte limit",
+        ));
+    }
+    let grammar = match language {
+        ScriptLanguage::Python => SupportLang::Python,
+        ScriptLanguage::JavaScript => SupportLang::JavaScript,
+        _ => return Ok(None),
+    };
+    let Ok(ast) = AstGrep::try_new(code, grammar) else {
+        return Ok(None);
+    };
+    let root = ast.root();
+    for (index, node) in root.dfs().enumerate() {
+        if index >= MAX_INTERPRETER_LITERAL_NODES {
+            return Err(interpreter_literal_parse_error(
+                language,
+                "evaluated AST node limit",
+            ));
+        }
+        if node.is_error() || node.is_missing() {
+            return Ok(None);
+        }
+    }
+    let mut statements = root
+        .children()
+        .filter(|node| node.is_named() && node.kind().as_ref() != "comment");
+    let Some(call) = statements.next().and_then(literal_statement) else {
+        return Ok(None);
+    };
+    if statements.next().is_some() || !matches!(call.kind().as_ref(), "call" | "call_expression") {
+        return Ok(None);
+    }
+    let Some((module, sink, _)) = bound_literal_callee(&call, language, bindings) else {
+        return Ok(None);
+    };
+    if !match module {
+        LiteralModule::PythonOs => matches!(sink.as_str(), "system" | "popen"),
+        LiteralModule::PythonSubprocess => matches!(sink.as_str(), "getoutput" | "getstatusoutput"),
+        LiteralModule::NodeChildProcess => matches!(sink.as_str(), "exec" | "execSync"),
+    } {
+        return Ok(None);
+    }
+    let Some(arguments) = call.field("arguments") else {
+        return Ok(None);
+    };
+    let mut args = arguments
+        .children()
+        .filter(|node| node.is_named() && node.kind().as_ref() != "comment");
+    let Some(value) = args.next() else {
+        return Ok(None);
+    };
+    Ok(
+        (args.next().is_none() && value.kind().as_ref() == "identifier")
+            .then(|| value.text().into_owned()),
+    )
+}
+
+/// Recover a bound value only when a direct exec/eval's complete literal
+/// program passes that identifier to a known shell sink. Ordinary literals,
+/// unknown prefixes, custom globals, and safe evaluated print calls do not
+/// become shell programs merely because an exec/eval spelling is present.
+fn evaluated_literal_commands<D: ast_grep_core::Doc>(
+    root: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+) -> Result<Vec<ReconstructedCommand>, MatchError> {
+    if !literal_prefix_has_no_function_hoisting(root, language) {
+        return Ok(Vec::new());
+    }
+    let mut bindings = LiteralBindings::new();
+    for statement in root
+        .children()
+        .filter(|node| node.is_named() && node.kind().as_ref() != "comment")
+    {
+        let Some(node) = literal_statement(statement) else {
+            break;
+        };
+        if !matches!(node.kind().as_ref(), "call" | "call_expression") {
+            if record_literal_binding(&node, language, &mut bindings) {
+                continue;
+            }
+            break;
+        }
+        let Some(function) = node.field("function") else {
+            break;
+        };
+        if function.kind().as_ref() != "identifier"
+            || !matches!(
+                (language, function.text().as_ref()),
+                (ScriptLanguage::Python, "exec" | "eval") | (ScriptLanguage::JavaScript, "eval")
+            )
+        {
+            break;
+        }
+        let Some(arguments) = node.field("arguments") else {
+            break;
+        };
+        let mut args = arguments
+            .children()
+            .filter(|arg| arg.is_named() && arg.kind().as_ref() != "comment");
+        let Some(program) = args.next() else {
+            break;
+        };
+        if args.next().is_some() {
+            break;
+        }
+        let Some(source) = static_interpreter_literal(&program, language, 0) else {
+            break;
+        };
+        let Some(dependency) = evaluated_shell_dependency(&source, language, &bindings)? else {
+            break;
+        };
+        let Some(LiteralBinding::Text { value, range }) = bindings.get(&dependency) else {
+            break;
+        };
+        return Ok(vec![ReconstructedCommand {
+            command: value.clone(),
+            start: range.start,
+            end: range.end,
+        }]);
+    }
+    Ok(Vec::new())
+}
+
+/// Recover shell commands carried by literal interpreter values (#544).
 ///
 /// A Python assignment can hold ``echo `git branch -d x``` and later hand that
 /// value to `os.system` or an opaque imported function. The assignment itself
@@ -304,6 +902,9 @@ const MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES: usize = 64 * 1024;
 /// substitution after Git's executable-position check. Preserve that existing
 /// conservative evidence by examining the actual string value independently.
 /// This is not a claim that the outer heredoc performs shell expansion.
+/// A plain literal also qualifies when a direct exec/eval's complete source
+/// passes its recorded binding to a known shell sink. This dependency proof
+/// never promotes unrelated plain strings into executable commands.
 ///
 /// The caller proves the executable source and may permit the complete
 /// documentation proof only when there are no unaccounted-for outer consumers.
@@ -320,11 +921,7 @@ pub(crate) fn interpreter_literal_shell_commands(
 ) -> Result<Vec<ReconstructedCommand>, MatchError> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    if !matches!(
-        language,
-        ScriptLanguage::Python | ScriptLanguage::JavaScript
-    ) || (!code.contains('`') && !code.contains("$(") && !code.contains('\\'))
-    {
+    if !has_interpreter_literal_candidates(code, language) {
         return Ok(Vec::new());
     }
     if code.len() > MAX_INTERPRETER_LITERAL_SOURCE_BYTES {
@@ -461,10 +1058,13 @@ fn interpreter_literal_shell_commands_inner(
     );
     owned_call_starts.sort_unstable();
     owned_call_starts.dedup();
+    let mut commands = evaluated_literal_commands(&root, language)?;
     let mut pending = vec![root];
-    let mut candidates = 0usize;
-    let mut payload_bytes = 0usize;
-    let mut commands = Vec::new();
+    let mut candidates = commands.len();
+    let mut payload_bytes = commands
+        .iter()
+        .map(|command| command.command.len())
+        .sum::<usize>();
     while let Some(node) = pending.pop() {
         if node.kind().as_ref() == "comment" {
             continue;
@@ -473,6 +1073,13 @@ fn interpreter_literal_shell_commands_inner(
             node.kind().as_ref(),
             "string" | "template_string" | "concatenated_string"
         ) {
+            let range = node.range();
+            if commands
+                .iter()
+                .any(|command| command.start == range.start && command.end == range.end)
+            {
+                continue;
+            }
             if interpreter_literal_has_owned_sink(&node, &owned_call_starts) {
                 continue;
             }
@@ -964,6 +1571,368 @@ fn protected_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_exec_data_literals_keep_their_roles_544() {
+        for (language, source) in [
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.spawnSync('printf', ['%s', '$(git reset --hard)']);",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.execSync('printf ready', {env: {NOTICE: '$(git reset --hard)'}});",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['printf', '%s', '$(git reset --hard)'])",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['printf', 'ready'], env={'NOTICE': '$(git reset --hard)'})",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('node:child_process'); cp.spawnSync('printf', ['%s', '$(git reset --hard)'], {shell: false});",
+            ),
+        ] {
+            let ranges = inert_documentation_literal_ranges(source, language);
+            assert_eq!(ranges.len(), 1, "named data must retain its role: {source}");
+            assert_eq!(
+                source.get(ranges[0].clone()),
+                Some("'$(git reset --hard)'"),
+                "mask only the complete static data literal: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_exec_data_literals_do_not_hide_executable_source_544() {
+        for (language, source) in [
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.execSync('echo $(git reset --hard)');",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.spawnSync('printf', ['%s', '$(git reset --hard)'], {shell: true});",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r"const cp = require('child_process'); cp.spawnSync('printf', ['%s', '$(git reset --hard)'], {'sh\u0065ll': true});",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.spawnSync('printf', ['%s', '$(git reset --hard)'], {shell: mode});",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.spawnSync('printf', ['%s', '$(git reset --hard)'], {...options});",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.spawnSync = run; cp.spawnSync('printf', ['%s', '$(git reset --hard)']);",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('./helper'); cp.spawnSync('printf', ['%s', '$(git reset --hard)']);",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.exec('printf ready', () => { const s = 'echo $(git reset --hard)'; cp.execSync(s); });",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.spawnSync('printf', ['%s', run('$(git reset --hard)')]);",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os\nos.system('echo $(git reset --hard)')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['printf', '%s', '$(git reset --hard)'], shell=True)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['printf', '-c', '$(git reset --hard)'], executable='/bin/sh')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['printf', '%s', '$(git reset --hard)'], **options)",
+            ),
+        ] {
+            assert!(
+                inert_documentation_literal_ranges(source, language).is_empty(),
+                "execution and unknown ownership retain their source evidence: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_exec_data_proof_rejects_hoisted_javascript_functions_544() {
+        for declaration in [
+            "function require() { return {spawnSync(_file, argv) { module.require('child_process').execSync(argv[1]); }}; }",
+            "function* require() { yield 'unused'; }",
+            "async function require() { return {}; }",
+        ] {
+            let source = format!(
+                "const cp = require('child_process'); cp.spawnSync('printf', ['%s', '$(git reset --hard)']); {declaration}"
+            );
+            assert!(
+                inert_documentation_literal_ranges(&source, ScriptLanguage::JavaScript).is_empty(),
+                "a hoisted declaration can replace the standard module binding: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_exec_input_and_environment_sources_remain_visible_544() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['sh'], input='$(git reset --hard)', text=True)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.spawnSync('sh', [], {input: '$(git reset --hard)'});",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.execFileSync('sh', [], {input: '$(git reset --hard)'});",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.execSync('sh', {input: '$(git reset --hard)'});",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['/bin/bash', '-c', 'true'], env={'BASH_ENV': '$(git reset --hard)'})",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.spawnSync('/bin/bash', ['-c', 'true'], {env: {BASH_ENV: '$(git reset --hard)'}});",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r#"const cp = require('child_process'); cp.spawnSync('node', ['-e', ''], {env: {NODE_OPTIONS: "--import=\"data:text/javascript,import cp from 'node:child_process';cp.execSync('echo $(git reset --hard)')\""}});"#,
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['sh', '-i'], env={'ENV': '$(git reset --hard)'})",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.spawnSync('sh', ['-i'], {env: {ENV: '$(git reset --hard)'}});",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['sh'], env={key: '$(git reset --hard)'})",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.spawnSync('sh', [], {env: {[key]: '$(git reset --hard)'}});",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.spawnSync('sh', [], {env: {NOTICE: '$(git reset --hard)', ...environment}});",
+            ),
+        ] {
+            assert!(
+                inert_documentation_literal_ranges(source, language).is_empty(),
+                "stdin/startup source and unproved environments retain their bytes: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_exec_option_keys_require_exact_semantics_544() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['printf', '-c', '$(git reset --hard)'], ｅxecutable='/bin/sh')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['printf', '$(git reset --hard)'], ｓｈｅｌｌ=True)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['sh'], ｉｎｐｕｔ='$(git reset --hard)', text=True)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r"const cp = require('child_process'); cp.spawnSync('printf', ['%s', '$(git reset --hard)'], {sh\u0065ll:true});",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r"const cp = require('child_process'); cp.spawnSync('sh', [], {in\u0070ut: '$(git reset --hard)'});",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r"const cp = require('child_process'); cp.spawnSync('sh', [], {'in\u0070ut': '$(git reset --hard)'});",
+            ),
+        ] {
+            assert!(
+                inert_documentation_literal_ranges(source, language).is_empty(),
+                "encoded option names cannot acquire a different argument role: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpreter_literals_recover_proven_exec_eval_dependencies_544() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import os\ns = 'git branch -d x'\nexec('os.system(s)')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os\ns = 'git branch -d x'\neval('os.system(s)')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\ns = 'git branch -d x'\nexec('subprocess.getoutput(s)')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const s = 'git branch -d x'; eval(\"require('child_process').execSync(s)\");",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); const s = 'git branch -d x'; eval('cp.execSync(s)');",
+            ),
+        ] {
+            assert!(has_interpreter_literal_candidates(source, language));
+            let commands = interpreter_literal_shell_commands_inner(source, language, true)
+                .expect("bounded direct evaluation dependency");
+            assert_eq!(commands.len(), 1, "missing executed dependency: {source}");
+            assert_eq!(commands[0].command, "git branch -d x");
+            assert_eq!(
+                source.get(commands[0].start..commands[0].end),
+                Some("'git branch -d x'"),
+                "report the bound value's original source span: {source}"
+            );
+        }
+        let source = "import os\ns = 'git branch -d x'\ns = 'printf ready'\nexec('os.system(s)')";
+        let commands =
+            interpreter_literal_shell_commands_inner(source, ScriptLanguage::Python, true)
+                .expect("the latest literal assignment owns the value");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command, "printf ready");
+
+        let payload = format!("echo $(git reset --hard){}", " ".repeat(40 * 1024));
+        let source = format!("import os\ns = '{payload}'\nexec('os.system(s)')");
+        let commands =
+            interpreter_literal_shell_commands_inner(&source, ScriptLanguage::Python, true)
+                .expect("one literal must count once even when two recovery routes identify it");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command, payload);
+    }
+
+    #[test]
+    fn interpreter_literals_do_not_invent_exec_eval_dependencies_544() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "s = 'git branch -d x'\nexec('print(s)')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os\ns = 'git branch -d x'\nexec('os.system(other)')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os\ns = 'git branch -d x'\nexec('os.system(s)', {'s': 'printf ready'})",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os\nexec = print\ns = 'git branch -d x'\nexec('os.system(s)')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os\ns = 'git branch -d x'\nmutate()\nexec('os.system(s)')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os\ns = 'git branch -d x'\nexec(source)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const s = 'git branch -d x'; eval('console.log(s)');",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('./helper'); const s = 'git branch -d x'; eval('cp.execSync(s)');",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const s = 'git branch -d x'; const example = \"eval('cp.execSync(s)')\";",
+            ),
+        ] {
+            assert!(
+                interpreter_literal_shell_commands_inner(source, language, true)
+                    .expect("unsupported dependencies retain existing analysis")
+                    .is_empty(),
+                "an unrelated literal must not become executed shell source: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpreter_literals_decline_hoisted_javascript_eval_544() {
+        for declaration in [
+            "function eval() {}",
+            "function* eval() {}",
+            "async function eval() {}",
+        ] {
+            let source = format!(
+                "const s = 'git branch -d x'; eval(\"require('child_process').execSync(s)\"); {declaration}"
+            );
+            assert!(
+                interpreter_literal_shell_commands_inner(
+                    &source,
+                    ScriptLanguage::JavaScript,
+                    true,
+                )
+                .expect("unproved hoisted bindings retain the original analysis")
+                .is_empty(),
+                "a hoisted eval declaration must not invent an execution dependency: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpreter_literals_reject_encoded_binding_identities_544() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import os\ns = 'git branch -d x'\nｅxec = 'data'\nexec('os.system(s)')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os\ns = 'git branch -d x'\nｅval = 'data'\neval('os.system(s)')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r"const cp = require('child_process'); const s = 'git branch -d x'; const e\u0076al = 'data'; eval('cp.execSync(s)');",
+            ),
+        ] {
+            assert!(
+                interpreter_literal_shell_commands_inner(source, language, true)
+                    .expect("uncertain binding identities retain the original analysis")
+                    .is_empty(),
+                "an encoded rebinding must not be mistaken for the builtin API: {source}"
+            );
+        }
+        let source = "import os\ns = 'printf élève'\nexec('os.system(s)')";
+        let commands =
+            interpreter_literal_shell_commands_inner(source, ScriptLanguage::Python, true)
+                .expect("Unicode literal payloads retain their established value");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command, "printf élève");
+    }
 
     #[test]
     fn interpreter_literal_shell_commands_recover_indirect_payloads_544() {
