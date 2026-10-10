@@ -41703,6 +41703,8 @@ mod tests {
 
     #[test]
     fn executable_assignment_limits_are_findings_only_at_executable_uses_540() {
+        use std::fmt::Write as _;
+
         let large = "x".repeat(MAX_POSIX_EXECUTABLE_VALUE_BYTES + 1);
         let data = format!("X='{large}'; printf '%s' \"$X\"");
         let model = model_literal_posix_executable_assignments(&data, ShellDialect::Posix);
@@ -41722,9 +41724,10 @@ mod tests {
             assert!(model.inert_ranges.is_empty());
         }
 
-        let assignments = (0..=MAX_POSIX_EXECUTABLE_BINDINGS)
-            .map(|index| format!("X{index}=git; "))
-            .collect::<String>();
+        let mut assignments = String::new();
+        for index in 0..=MAX_POSIX_EXECUTABLE_BINDINGS {
+            write!(assignments, "X{index}=git; ").expect("append assignment");
+        }
         let data = format!("{assignments}printf '%s' \"$X0\"");
         assert!(
             model_literal_posix_executable_assignments(&data, ShellDialect::Posix)

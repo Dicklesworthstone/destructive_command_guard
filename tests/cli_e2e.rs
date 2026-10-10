@@ -3753,7 +3753,12 @@ mod config_tests {
             "",
             "paths = []",
             "paths = [\"*\"]",
+            "paths = [\"**/\"]",
+            "paths = [\"**/*\"]",
+            "paths = [\"**/**\"]",
+            "paths = [\"**/**/**\"]",
             "paths = [\"/reviewed/workspace/**\", \"*\"]",
+            "paths = [\"/reviewed/workspace/**\", \"**/*\"]",
             "session = false",
             "conditions = { AUDIT_REVIEWED = \"yes\" }",
             "environments = [\"not-the-current-environment\"]",
@@ -3883,6 +3888,9 @@ destructive_patterns:
     fn doctor_does_not_call_scoped_expiring_or_inactive_exceptions_unrestricted() {
         for extra in [
             "paths = [\"/reviewed/workspace/**\"]",
+            "paths = [\"**/reviewed/**\"]",
+            "paths = [\"**/*.rs\"]",
+            "paths = [\"*/reviewed\"]",
             "expires_at = \"2099-12-31T23:59:59Z\"",
             "expires_at = \"2099-12-31\"",
             "expires_at = \"2000-01-01T00:00:00Z\"",
@@ -4046,6 +4054,96 @@ destructive_patterns:
                 assert!(message.contains(&expected), "missing {expected:?}: {check}");
             }
             assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn doctor_warns_for_universal_globs_in_every_layer_without_changing_grants_545() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_, xdg_config, _) = setup_doctor_env(&temp);
+        let project_config = temp.path().join(".dcg.toml");
+        std::fs::write(&project_config, "").expect("trusted project config");
+        let nested = temp.path().join("src/nested");
+        std::fs::create_dir_all(&nested).expect("nested directory");
+        let fixtures = [
+            (
+                "project",
+                temp.path().join(".dcg/allowlist.toml"),
+                "core.git:reset-hard",
+                "**/",
+                "git reset --hard",
+            ),
+            (
+                "user",
+                xdg_config.join("dcg/allowlist.toml"),
+                "core.git:clean-force",
+                "**/*",
+                "git clean -fd",
+            ),
+            (
+                "system",
+                temp.path().join("system-allowlist.toml"),
+                "core.git:stash-clear",
+                "**/**",
+                "git stash clear",
+            ),
+        ];
+        let mut originals = Vec::new();
+        for (layer, path, rule, pattern, _) in &fixtures {
+            let contents = format!(
+                "[[allow]]\nrule = \"{rule}\"\nreason = \"{layer} wildcard maintenance\"\npaths = [\"{pattern}\"]\nadded_by = \"{layer}-reviewer\"\n"
+            );
+            write_doctor_allowlist(path, &contents);
+            originals.push(contents);
+        }
+        for after_audit in [false, true] {
+            if after_audit {
+                let output = allowlist_doctor_command(&temp)
+                    .env("DCG_CONFIG", &project_config)
+                    .current_dir(&nested)
+                    .args(["doctor", "--fix", "--strict", "--format", "json"])
+                    .output()
+                    .expect("audit universal globs across all layers");
+                let report = parse_allowlist_doctor_report(&output);
+                assert!(output.status.success(), "{report}");
+                let check = allowlist_doctor_check(&report);
+                assert_eq!(check["status"], "warning", "{check}");
+                assert_ne!(check["fixed"], true, "doctor must preserve grants: {check}");
+                let message = check["message"].as_str().expect("audit message");
+                assert_eq!(
+                    message
+                        .matches("active globally scoped, indefinite allowlist exception")
+                        .count(),
+                    fixtures.len(),
+                    "universal scope must be diagnosed in every layer: {check}"
+                );
+                for ((layer, path, rule, _, _), original) in fixtures.iter().zip(&originals) {
+                    for expected in [
+                        format!("{layer}:"),
+                        (*rule).to_string(),
+                        format!("{layer}-reviewer"),
+                    ] {
+                        assert!(message.contains(&expected), "missing {expected:?}: {check}");
+                    }
+                    assert_eq!(std::fs::read_to_string(path).unwrap(), *original);
+                }
+            }
+            for (_, _, _, _, command) in &fixtures {
+                for cwd in [temp.path(), nested.as_path()] {
+                    let output = allowlist_doctor_command(&temp)
+                        .env("DCG_CONFIG", &project_config)
+                        .current_dir(cwd)
+                        .args(["test", "--format", "json", command])
+                        .output()
+                        .expect("evaluate granted command as inert data");
+                    let evaluation: serde_json::Value =
+                        serde_json::from_slice(&output.stdout).expect("evaluation JSON");
+                    assert_eq!(
+                        evaluation["decision"], "allow",
+                        "the audit must not change matching: after_audit={after_audit}, {command:?}: {evaluation}"
+                    );
+                }
+            }
         }
     }
 

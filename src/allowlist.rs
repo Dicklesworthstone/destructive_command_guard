@@ -1300,6 +1300,90 @@ pub fn entry_is_path_scoped(entry: &AllowEntry) -> bool {
         .is_some_and(|patterns| !patterns.is_empty() && !patterns.iter().any(|p| p == "*"))
 }
 
+/// Recognize path scopes that cover every absolute working directory.
+///
+/// This is an audit-only property. Recursive universal globs still require a
+/// known cwd when matching, so this must not replace [`entry_is_path_scoped`]
+/// in the evaluator. Normalize and resolve literal prefixes exactly as the
+/// runtime matcher does; a spelling such as `/./**/*` has no real restriction.
+pub(crate) fn entry_has_unrestricted_path_scope(entry: &AllowEntry) -> bool {
+    if !entry_is_path_scoped(entry) {
+        return true;
+    }
+
+    entry.paths.as_ref().is_some_and(|patterns| {
+        patterns.iter().any(|pattern| {
+            glob_has_unrestricted_path_scope(&normalize_scope_text(pattern))
+                || cached_pattern_prefix(pattern)
+                    .is_some_and(|resolved| glob_has_unrestricted_path_scope(&resolved))
+        })
+    })
+}
+
+/// Prove universality for the star/separator subset of the runtime glob syntax.
+///
+/// In `glob::Pattern`, `**/` is one recursive token: its following separator is
+/// consumed by the parser. With no remaining literal separator, recursive
+/// tokens and an optional final `*` cover every path. With one separator, a `*`
+/// immediately before it covers the first or penultimate component while a
+/// recursive token on either side covers any depth. Without that component
+/// wildcard, the separator can only be the Unix root and the suffix must cover
+/// any depth: a recursive prefix cannot stop midway through a component. A
+/// final literal `/` would exclude ordinary cwd paths.
+/// More restrictive syntax and unions of individually bounded patterns are
+/// intentionally not classified from a handful of sample directories.
+fn glob_has_unrestricted_path_scope(pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if glob::Pattern::new(pattern).is_err() {
+        return false;
+    }
+
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    let mut has_recursive = false;
+    let mut recursive_after_separator = false;
+    let mut component_before_separator = false;
+    let mut literal_separators = 0;
+    let mut ends_with_separator = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'*' => {
+                index += 1;
+                if bytes.get(index) == Some(&b'*') {
+                    has_recursive = true;
+                    recursive_after_separator |= literal_separators == 1;
+                    index += 1;
+                    // Pattern validation above guarantees a whole-component
+                    // `**`; its optional trailing slash is part of the token.
+                    if bytes.get(index) == Some(&b'/') {
+                        index += 1;
+                    }
+                }
+                ends_with_separator = false;
+            }
+            b'/' => {
+                literal_separators += 1;
+                if literal_separators > 1 {
+                    return false;
+                }
+                component_before_separator =
+                    bytes[..index].ends_with(b"*") && !bytes[..index].ends_with(b"**");
+                index += 1;
+                ends_with_separator = true;
+            }
+            _ => return false,
+        }
+    }
+
+    has_recursive
+        && !ends_with_separator
+        && (literal_separators == 0
+            || component_before_separator
+            || (cfg!(unix) && recursive_after_separator))
+}
+
 /// The string form of a working directory used for path-scope glob matching.
 ///
 /// Symlinks are resolved first. A scope is a claim about a real directory, and
@@ -3643,6 +3727,122 @@ mod tests {
 
         entry.paths = Some(vec!["/srv/scratch/**".to_string()]);
         assert!(entry_is_path_scoped(&entry));
+    }
+
+    #[test]
+    fn unrestricted_scope_audit_recognizes_equivalent_recursive_globs() {
+        for pattern in [
+            "**", "**/", "**/*", "**/**", "**/**/*", "**/*/**", "**/*/*", "*/**", "*/**/*",
+            r"\\?/**", r"\\?/*",
+        ] {
+            let mut entry = make_test_entry();
+            entry.paths = Some(vec![pattern.to_string()]);
+            assert!(validate_glob_pattern(pattern).is_ok(), "{pattern}");
+            assert!(entry_has_unrestricted_path_scope(&entry), "{pattern}");
+
+            // These are regression witnesses against the actual matcher, not
+            // the basis for the diagnostic's structural universality proof.
+            for cwd in [
+                "/",
+                "/etc",
+                "/home/review/.private/deep",
+                "/workspace/日本語",
+                "C:/",
+                "C:/Users/reviewer/project",
+                "//server/share/.private/deep",
+            ] {
+                assert!(path_matches_glob(pattern, cwd), "{pattern} vs {cwd}");
+            }
+
+            assert!(entry_is_path_scoped(&entry), "{pattern}");
+            assert!(
+                !is_entry_valid_at_path(&entry, None),
+                "auditing {pattern} must preserve unknown-cwd matching behavior"
+            );
+        }
+    }
+
+    #[test]
+    fn unrestricted_scope_audit_preserves_bounded_globs() {
+        for pattern in [
+            "/tmp/**",
+            "/reviewed/workspace/**",
+            "**/workspace/**",
+            "**/*.rs",
+            "projects/**",
+            "*/*",
+            "/*/**",
+            "**/*/",
+            "**/*/*/*",
+            "**//",
+            "**//*",
+            "[abc]/**",
+            "?/**",
+            "***",
+            "[",
+        ] {
+            let mut entry = make_test_entry();
+            entry.paths = Some(vec![pattern.to_string()]);
+            assert!(!entry_has_unrestricted_path_scope(&entry), "{pattern}");
+        }
+
+        // Root coverage alone does not establish universality: a required
+        // trailing slash still excludes normal canonical working directories.
+        assert!(path_matches_glob("**/*/", "/"));
+        assert!(!path_matches_glob("**/*/", "/etc"));
+        assert!(!path_matches_glob("/*/**", "/"));
+        assert!(path_matches_glob("**//*", "/etc"));
+        assert!(!path_matches_glob("**//*", "/etc/deep"));
+
+        let mut entry = make_test_entry();
+        entry.paths = Some(vec!["/tmp/**".to_string(), "**/*".to_string()]);
+        assert!(entry_has_unrestricted_path_scope(&entry));
+    }
+
+    #[test]
+    fn unrestricted_scope_audit_respects_platform_roots() {
+        for pattern in ["/**", "/**/", "/**/*", "/**/**", "/**/**/*", "**//**"] {
+            let mut entry = make_test_entry();
+            entry.paths = Some(vec![pattern.to_string()]);
+            assert_eq!(
+                entry_has_unrestricted_path_scope(&entry),
+                cfg!(unix),
+                "{pattern}"
+            );
+            for cwd in ["/", "/etc", "/home/review/.private/deep"] {
+                assert!(path_matches_glob(pattern, cwd), "{pattern} vs {cwd}");
+            }
+            assert!(!path_matches_glob(pattern, "C:/Users/reviewer"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrestricted_scope_audit_uses_runtime_canonical_prefixes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root_link = temp.path().join("root-link");
+        let scoped_link = temp.path().join("scoped-link");
+        std::os::unix::fs::symlink("/", &root_link).expect("root symlink");
+        std::os::unix::fs::symlink(temp.path(), &scoped_link).expect("scoped symlink");
+
+        let mut entry = make_test_entry();
+        for pattern in [
+            "/./**/*".to_string(),
+            format!("{}/**/*", root_link.display()),
+        ] {
+            entry.paths = Some(vec![pattern.clone()]);
+            assert!(entry_has_unrestricted_path_scope(&entry), "{pattern}");
+            for cwd in ["/", "/etc", "/var/tmp"] {
+                assert!(
+                    entry_path_matches_cwd(&entry, Path::new(cwd)),
+                    "{pattern} vs {cwd}"
+                );
+            }
+        }
+
+        entry.paths = Some(vec![format!("{}/**/*", scoped_link.display())]);
+        assert!(!entry_has_unrestricted_path_scope(&entry));
+        assert!(!entry_path_matches_cwd(&entry, Path::new("/")));
     }
 
     #[test]

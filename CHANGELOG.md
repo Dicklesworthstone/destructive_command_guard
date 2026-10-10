@@ -15,6 +15,13 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Fixed
 
+- **Audit universal allowlist globs as unrestricted (#545).** Doctor now
+  recognizes composite patterns such as `**/`, `**/*`, and `**/**` that match
+  every working directory, including equivalent normalized root paths.
+  Permanent grants using these patterns receive the existing actionable
+  rule and provenance warnings in project, user, and system layers. Bounded
+  patterns and temporary or inactive entries retain their classifications;
+  the audit does not change matching or rewrite grants in `--fix` mode.
 - **Inspect the arguments produced by executable variables (#540).** Literal
   assignments such as `X='git reset --hard'; $X` now reach the Git rule for
   the expanded command instead of being mistaken for one quoted executable

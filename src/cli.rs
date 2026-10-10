@@ -19003,18 +19003,9 @@ fn unrestricted_allowlist_warning(
                 || names.contains(rule_id.pattern_name.as_str())
         })
     });
-    // A recursive universal glob still needs a known cwd at runtime, but it
-    // does not restrict that cwd to any particular directory. This audit-only
-    // classification must not change the matcher's unknown-cwd fail-closed rule.
-    let globally_scoped = !crate::allowlist::entry_is_path_scoped(entry)
-        || entry.paths.as_ref().is_some_and(|patterns| {
-            patterns
-                .iter()
-                .any(|pattern| pattern == "**" || (cfg!(unix) && pattern == "/**"))
-        });
     if rule_id.pack_id == "*"
         || !rule_is_active
-        || !globally_scoped
+        || !crate::allowlist::entry_has_unrestricted_path_scope(entry)
         || entry.expires_at.is_some()
         || entry.ttl.is_some()
         || entry.session == Some(true)
@@ -30332,8 +30323,16 @@ exclude = ["target/**"]
             ("paths = [\"*\"]", true),
             ("paths = [\"/reviewed/**\", \"*\"]", true),
             ("paths = [\"**\"]", true),
+            ("paths = [\"**/\"]", true),
+            ("paths = [\"**/*\"]", true),
+            ("paths = [\"**/**\"]", true),
+            (r"paths = ['\\?/**']", true),
             ("paths = [\"/reviewed/**\"]", false),
+            ("paths = [\"/tmp/**\"]", false),
+            ("paths = [\"**/reviewed/**\"]", false),
+            ("paths = [\"**/*/\"]", false),
             ("paths = [\"/**\"]", cfg!(unix)),
+            ("paths = [\"/**/*\"]", cfg!(unix)),
             ("session = false", true),
             ("session = true\nsession_id = \"bounded-session\"", false),
             ("expires_at = \"2099-12-31\"", false),
@@ -30346,6 +30345,13 @@ exclude = ["target/**"]
             ("expires_at = 123", true),
             ("ttl = 123", true),
             ("session = \"true\"", true),
+            ("paths = [\"**/*\"]\nexpires_at = \"2099-12-31\"", false),
+            ("paths = [\"**/*\"]\nexpires_at = \"2000-01-01\"", false),
+            ("paths = [\"**/*\"]\nttl = \"1h\"", false),
+            (
+                "paths = [\"**/*\"]\nsession = true\nsession_id = \"bounded-session\"",
+                false,
+            ),
         ] {
             let path = std::path::PathBuf::from("doctor-allowlist.toml");
             let file = parse_allowlist_toml(
