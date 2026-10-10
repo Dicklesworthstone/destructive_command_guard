@@ -11825,23 +11825,26 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
 
     // Check 8: Allowlist discovery + validation
     print!("Checking allowlist entries... ");
-    let allowlist_diag = diagnose_allowlists();
+    let allowlist_diag = diagnose_allowlists(config);
     if allowlist_diag.total_errors > 0 {
         println!("{}", "INVALID".red());
         issues += allowlist_diag.total_errors;
         for msg in &allowlist_diag.error_messages {
             println!("  {msg}");
         }
-        println!("  → Run 'dcg allowlist validate' for details");
+        for msg in &allowlist_diag.warning_messages {
+            println!("  {msg}");
+        }
+        println!("  → {ALLOWLIST_DOCTOR_REMEDIATION}");
     } else if allowlist_diag.total_warnings > 0 {
         println!("{}", "WARNING".yellow());
         for msg in &allowlist_diag.warning_messages {
             println!("  {msg}");
         }
-        println!("  → Run 'dcg allowlist validate' for details");
+        println!("  → {ALLOWLIST_DOCTOR_REMEDIATION}");
     } else if allowlist_diag.layers_found == 0 {
         println!("{}", "NONE".yellow().dimmed());
-        println!("  No allowlist files found (project or user)");
+        println!("  No allowlist files found (project, user, or system)");
         println!("  → Use 'dcg allow <rule-id> -r \"reason\"' to create one");
     } else {
         println!(
@@ -12495,16 +12498,22 @@ fn collect_doctor_report(
     });
 
     // Check 8: Allowlist discovery + validation
-    let allowlist_diag = diagnose_allowlists();
+    let allowlist_diag = diagnose_allowlists(config);
     let (status, message, remediation) = if allowlist_diag.total_errors > 0 {
         issues += allowlist_diag.total_errors;
         (
             DoctorCheckStatus::Error,
             format!(
                 "Allowlist errors: {}",
-                allowlist_diag.error_messages.join("; ")
+                allowlist_diag
+                    .error_messages
+                    .iter()
+                    .chain(&allowlist_diag.warning_messages)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ),
-            Some("Run 'dcg allowlist validate' for details".to_string()),
+            Some(ALLOWLIST_DOCTOR_REMEDIATION.to_string()),
         )
     } else if allowlist_diag.total_warnings > 0 {
         (
@@ -12513,12 +12522,12 @@ fn collect_doctor_report(
                 "Allowlist warnings: {}",
                 allowlist_diag.warning_messages.join("; ")
             ),
-            Some("Run 'dcg allowlist validate' for details".to_string()),
+            Some(ALLOWLIST_DOCTOR_REMEDIATION.to_string()),
         )
     } else if allowlist_diag.layers_found == 0 {
         (
             DoctorCheckStatus::Warning,
-            "No allowlist files found (project or user)".to_string(),
+            "No allowlist files found (project, user, or system)".to_string(),
             Some("Use 'dcg allow <rule-id> -r \"reason\"' to create one".to_string()),
         )
     } else {
@@ -18808,7 +18817,7 @@ fn run_smoke_test(config: &Config) -> bool {
 /// Allowlist validation diagnostics for doctor command.
 #[derive(Debug, Default)]
 struct AllowlistDiagnostics {
-    /// Number of allowlist layers found (project/user)
+    /// Number of allowlist layers found (project/user/system)
     layers_found: usize,
     /// Total error count
     total_errors: usize,
@@ -18820,10 +18829,17 @@ struct AllowlistDiagnostics {
     warning_messages: Vec<String>,
 }
 
-/// Diagnose allowlist health across project and user layers.
-fn diagnose_allowlists() -> AllowlistDiagnostics {
-    use crate::allowlist::{AllowSelector, AllowlistLayer};
+const ALLOWLIST_DOCTOR_REMEDIATION: &str = "Review the named allowlist file. Restrict working directories with paths (--path), \
+     set expires_at (--expires), or remove obsolete entries; use 'dcg allow-once' for \
+     one-off exceptions. Run 'dcg allowlist validate' for project/user validation; \
+     inspect system entries in their source file.";
 
+/// None denotes a synthetic namespace with dynamically generated rule names.
+type DoctorAllowlistRules =
+    std::collections::HashMap<String, Option<std::collections::HashSet<&'static str>>>;
+
+/// Diagnose the same persistent allowlist layers the evaluator loads.
+fn diagnose_allowlists(config: &Config) -> AllowlistDiagnostics {
     let mut diag = AllowlistDiagnostics::default();
 
     // An inactive repository allowlist is intentionally absent from the
@@ -18839,80 +18855,195 @@ fn diagnose_allowlists() -> AllowlistDiagnostics {
         ));
     }
 
-    // Load all allowlists
+    let active_rules = doctor_allowlist_active_rules(config);
     let allowlist = crate::allowlist::load_default_allowlists();
-
-    // Check each layer
     for loaded in &allowlist.layers {
-        // Skip system layer in doctor (less common)
-        if loaded.layer == AllowlistLayer::System {
-            continue;
-        }
-
-        // Count as found if path exists
-        let path = match loaded.layer {
-            AllowlistLayer::Agent => continue,
-            AllowlistLayer::Project => allowlist_path_for_layer(AllowlistLayer::Project),
-            AllowlistLayer::User => crate::allowlist::user_allowlist_path(),
-            AllowlistLayer::System => continue,
-        };
-
-        if !path.exists() {
-            continue;
-        }
-
-        diag.layers_found += 1;
-        let layer_label = loaded.layer.label();
-
-        // Report parse errors
-        for err in &loaded.file.errors {
-            diag.total_errors += 1;
-            diag.error_messages
-                .push(format!("{layer_label}: {}", err.message));
-        }
-
-        // Check entries
-        for (idx, entry) in loaded.file.entries.iter().enumerate() {
-            let entry_num = idx + 1;
-
-            // Check for expired entries
-            if let Some(expires_at) = &entry.expires_at {
-                if is_expired(expires_at) {
-                    diag.total_warnings += 1;
-                    diag.warning_messages.push(format!(
-                        "{layer_label}: entry {entry_num} expired ({expires_at})"
-                    ));
-                }
-            }
-
-            // Check for risky regex patterns without acknowledgement
-            if matches!(entry.selector, AllowSelector::RegexPattern(_)) && !entry.risk_acknowledged
-            {
-                diag.total_warnings += 1;
-                diag.warning_messages.push(format!(
-                    "{layer_label}: entry {entry_num} uses regex without risk_acknowledged"
-                ));
-            }
-
-            // Check for overly broad wildcards
-            if let AllowSelector::Rule(rule_id) = &entry.selector {
-                if rule_id.pack_id == "*" {
-                    diag.total_errors += 1;
-                    diag.error_messages.push(format!(
-                        "{layer_label}: entry {entry_num} uses dangerous global wildcard (*:*)"
-                    ));
-                } else if rule_id.pattern_name == "*" {
-                    diag.total_warnings += 1;
-                    diag.warning_messages.push(format!(
-                        "{layer_label}: entry {entry_num} uses pack wildcard ({}:*)",
-                        rule_id.pack_id
-                    ));
-                }
-            }
+        if loaded.layer != AllowlistLayer::Agent && loaded.path.exists() {
+            diagnose_allowlist_layer(loaded, &active_rules, &mut diag);
         }
     }
 
     diag
+}
+
+/// Resolve enabled rule inventories once. Guidance includes semantic filesystem
+/// rules as well as regex rules; heredoc refinements have dynamic identities.
+fn doctor_allowlist_active_rules(config: &Config) -> DoctorAllowlistRules {
+    use crate::heredoc::ScriptLanguage;
+
+    let mut active = DoctorAllowlistRules::new();
+    // Windows payloads enable their default packs on Unix too. Doctor audits
+    // persistent grants that can affect either supported shell dialect.
+    for pack_id in REGISTRY.expand_enabled_ordered(&config.enabled_pack_ids_for_payload(true)) {
+        if let Some(pack) = REGISTRY.get(&pack_id) {
+            active.insert(pack_id, Some(pack.guidance_rule_names().collect()));
+        }
+    }
+    let external = load_external_packs(&config.packs.expand_custom_paths());
+    for (pack_id, pack) in external.iter_packs() {
+        active.insert(pack_id.clone(), Some(pack.guidance_rule_names().collect()));
+    }
+
+    // Executable-text sinks are checked even when optional heredoc scanning
+    // is disabled. Do not mistake these synthetic namespaces for inert rules.
+    for pack_id in ["heredoc.posix", "heredoc.shell", "heredoc.powershell"] {
+        active.insert(pack_id.to_string(), None);
+    }
+
+    let settings = config.heredoc_settings();
+    if settings.enabled {
+        for (pack_id, language) in [
+            ("heredoc.bash", ScriptLanguage::Bash),
+            ("heredoc.go", ScriptLanguage::Go),
+            ("heredoc.php", ScriptLanguage::Php),
+            ("heredoc.python", ScriptLanguage::Python),
+            ("heredoc.ruby", ScriptLanguage::Ruby),
+            ("heredoc.perl", ScriptLanguage::Perl),
+            ("heredoc.javascript", ScriptLanguage::JavaScript),
+            ("heredoc.typescript", ScriptLanguage::TypeScript),
+        ] {
+            if settings
+                .allowed_languages
+                .as_ref()
+                .is_none_or(|languages| languages.contains(&language))
+            {
+                active.insert(pack_id.to_string(), None);
+            }
+        }
+    }
+
+    active
+}
+
+fn diagnose_allowlist_layer(
+    loaded: &crate::allowlist::LoadedAllowlistLayer,
+    active_rules: &DoctorAllowlistRules,
+    diag: &mut AllowlistDiagnostics,
+) {
+    diag.layers_found += 1;
+    let source = format!("{}: {}", loaded.layer.label(), loaded.path.display());
+
+    for err in &loaded.file.errors {
+        diag.total_errors += 1;
+        let entry = err
+            .entry_index
+            .map_or_else(String::new, |idx| format!("entry {}: ", idx + 1));
+        diag.error_messages
+            .push(format!("{source}: {entry}{}", err.message));
+    }
+
+    // Parsing drops invalid entries. Keep the original [[allow]] ordinal so a
+    // malformed earlier row cannot make remediation point at the wrong entry.
+    let rejected: std::collections::HashSet<_> = loaded
+        .file
+        .errors
+        .iter()
+        .filter_map(|err| err.entry_index)
+        .collect();
+    let mut source_index = 0;
+    for entry in &loaded.file.entries {
+        while rejected.contains(&source_index) {
+            source_index += 1;
+        }
+        let entry_num = source_index + 1;
+        source_index += 1;
+        let location = format!("{source}: entry {entry_num}");
+
+        // Share timestamp/date-only/TTL semantics with matching, including its
+        // fail-closed treatment of an uncomputable TTL.
+        if crate::allowlist::is_expired(entry) {
+            diag.total_warnings += 1;
+            diag.warning_messages.push(format!(
+                "{location} expired or has unusable expiration metadata \
+                 (expires_at={:?}, ttl={:?}, added_at={:?})",
+                entry.expires_at, entry.ttl, entry.added_at
+            ));
+        }
+
+        if matches!(entry.selector, AllowSelector::RegexPattern(_)) && !entry.risk_acknowledged {
+            diag.total_warnings += 1;
+            diag.warning_messages
+                .push(format!("{location} uses regex without risk_acknowledged"));
+        }
+
+        if let Some(warning) = unrestricted_allowlist_warning(entry, active_rules) {
+            diag.total_warnings += 1;
+            diag.warning_messages.push(format!("{location}: {warning}"));
+        } else if let AllowSelector::Rule(rule_id) = &entry.selector {
+            if rule_id.pack_id == "*" {
+                diag.total_errors += 1;
+                diag.error_messages
+                    .push(format!("{location} uses dangerous global wildcard (*:*)"));
+            } else if rule_id.pattern_name == "*" {
+                diag.total_warnings += 1;
+                diag.warning_messages.push(format!(
+                    "{location} uses pack wildcard ({}:*)",
+                    rule_id.pack_id
+                ));
+            }
+        }
+    }
+}
+
+/// Audit whole-rule grants, not exact commands or regex selectors. Eligibility
+/// deliberately follows parsed runtime semantics: e.g. environments/context
+/// metadata does not enforce a restriction, and session=false is indefinite.
+fn unrestricted_allowlist_warning(
+    entry: &AllowEntry,
+    active_rules: &DoctorAllowlistRules,
+) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let AllowSelector::Rule(rule_id) = &entry.selector else {
+        return None;
+    };
+    let rule_is_active = active_rules.get(&rule_id.pack_id).is_some_and(|names| {
+        names.as_ref().is_none_or(|names| {
+            (rule_id.pattern_name == "*" && !names.is_empty())
+                || names.contains(rule_id.pattern_name.as_str())
+        })
+    });
+    // A recursive universal glob still needs a known cwd at runtime, but it
+    // does not restrict that cwd to any particular directory. This audit-only
+    // classification must not change the matcher's unknown-cwd fail-closed rule.
+    let globally_scoped = !crate::allowlist::entry_is_path_scoped(entry)
+        || entry.paths.as_ref().is_some_and(|patterns| {
+            patterns
+                .iter()
+                .any(|pattern| pattern == "**" || (cfg!(unix) && pattern == "/**"))
+        });
+    if rule_id.pack_id == "*"
+        || !rule_is_active
+        || !globally_scoped
+        || entry.expires_at.is_some()
+        || entry.ttl.is_some()
+        || entry.session == Some(true)
+        || !crate::allowlist::is_entry_valid(entry)
+    {
+        return None;
+    }
+
+    let risk = match rule_id.pack_id.as_str() {
+        "core.filesystem" | "windows.filesystem" => {
+            "HIGH RISK: bypasses destructive filesystem protection"
+        }
+        "core.git" => "HIGH RISK: bypasses destructive Git protection",
+        _ => "bypasses this rule's protection",
+    };
+    let mut warning = format!(
+        "active globally scoped, indefinite allowlist exception for rule {rule_id}: \
+         {risk}; all working directories, no expiration; reason={:?}",
+        entry.reason
+    );
+    // Debug quoting preserves malformed provenance without allowing control
+    // characters to forge extra diagnostic lines or terminal escape sequences.
+    if let Some(added_by) = &entry.added_by {
+        let _ = write!(warning, "; added_by={added_by:?}");
+    }
+    if let Some(added_at) = &entry.added_at {
+        let _ = write!(warning, "; added_at={added_at:?}");
+    }
+    Some(warning)
 }
 // Allowlist CLI implementation
 // ============================================================================
@@ -30188,6 +30319,154 @@ exclude = ["target/**"]
         };
         assert!(!diag.is_healthy());
         assert!(diag.has_issues());
+    }
+
+    #[test]
+    fn doctor_allowlist_audit_respects_runtime_scope_and_lifetime() {
+        use crate::allowlist::{LoadedAllowlistLayer, parse_allowlist_toml};
+
+        let active_rules = doctor_allowlist_active_rules(&Config::default());
+        for (metadata, expect_warning) in [
+            ("", true),
+            ("paths = []", true),
+            ("paths = [\"*\"]", true),
+            ("paths = [\"/reviewed/**\", \"*\"]", true),
+            ("paths = [\"**\"]", true),
+            ("paths = [\"/reviewed/**\"]", false),
+            ("paths = [\"/**\"]", cfg!(unix)),
+            ("session = false", true),
+            ("session = true\nsession_id = \"bounded-session\"", false),
+            ("expires_at = \"2099-12-31\"", false),
+            ("expires_at = \"2000-01-01\"", false),
+            ("ttl = \"1h\"\nadded_at = \"2099-01-01\"", false),
+            ("ttl = \"1h\"\nadded_at = \"2000-01-01\"", false),
+            ("ttl = \"1h\"", false),
+            ("ttl = \"1h\"\nadded_at = \"bad-timestamp\"", false),
+            ("added_at = \"bad-timestamp\"", true),
+            ("expires_at = 123", true),
+            ("ttl = 123", true),
+            ("session = \"true\"", true),
+        ] {
+            let path = std::path::PathBuf::from("doctor-allowlist.toml");
+            let file = parse_allowlist_toml(
+                AllowlistLayer::User,
+                &path,
+                &format!(
+                    "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"review\"\n{metadata}\n"
+                ),
+            );
+            assert!(file.errors.is_empty(), "{metadata}: {:?}", file.errors);
+            assert_eq!(file.entries.len(), 1, "{metadata}");
+            let mut diag = AllowlistDiagnostics::default();
+            diagnose_allowlist_layer(
+                &LoadedAllowlistLayer {
+                    layer: AllowlistLayer::User,
+                    path,
+                    file,
+                },
+                &active_rules,
+                &mut diag,
+            );
+            let warnings = diag.warning_messages.join("; ");
+            assert_eq!(
+                warnings.contains("active globally scoped, indefinite"),
+                expect_warning,
+                "{metadata}: {warnings}"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_allowlist_audit_uses_concrete_enabled_rules_and_synthetic_namespaces() {
+        let mut config = Config::default();
+        config.packs.enabled = vec![
+            "core".to_string(),
+            "containers.docker".to_string(),
+            "made.up".to_string(),
+        ];
+        config.packs.disabled = vec!["containers.docker".to_string()];
+        config.heredoc.enabled = Some(false);
+        let rules = doctor_allowlist_active_rules(&config);
+        assert!(!rules.contains_key("core"));
+        assert!(!rules.contains_key("made.up"));
+        assert!(!rules.contains_key("containers.docker"));
+        assert!(rules.contains_key("windows.filesystem"));
+        let filesystem = rules["core.filesystem"].as_ref().unwrap();
+        assert!(filesystem.contains("rm-rf-root-home"));
+        assert!(filesystem.contains("tar-exec-unverified"));
+        assert!(!filesystem.contains("rm-rf-root"));
+        assert!(rules.contains_key("heredoc.posix"));
+        assert!(rules.contains_key("heredoc.shell"));
+        assert!(rules.contains_key("heredoc.powershell"));
+        assert!(!rules.contains_key("heredoc.python"));
+        assert!(!rules.contains_key("heredoc.madeup"));
+
+        config.heredoc.enabled = Some(true);
+        config.heredoc.languages = Some(vec!["python".to_string()]);
+        let rules = doctor_allowlist_active_rules(&config);
+        assert!(rules.contains_key("heredoc.python"));
+        assert!(!rules.contains_key("heredoc.ruby"));
+        assert!(rules.contains_key("heredoc.posix"));
+
+        config.packs.disabled.push("windows.filesystem".to_string());
+        assert!(!doctor_allowlist_active_rules(&config).contains_key("windows.filesystem"));
+    }
+
+    #[test]
+    fn doctor_allowlist_audit_keeps_source_ordinals_and_escapes_provenance() {
+        use crate::allowlist::{LoadedAllowlistLayer, parse_allowlist_toml};
+
+        let path = std::path::PathBuf::from("system-allowlist.toml");
+        let file = parse_allowlist_toml(
+            AllowlistLayer::System,
+            &path,
+            r#"
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "rejected expiry"
+expires_at = "bad-expiry"
+
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "review\nforged diagnostic"
+added_by = "reviewer\u001b[31m"
+added_at = "not-a-timestamp"
+
+[[allow]]
+rule = "core.git:reset-hard"
+
+[[allow]]
+rule = "core.filesystem:rm-rf-general"
+reason = "filesystem exception"
+added_at = 2026-08-01T12:00:00Z
+"#,
+        );
+        let mut diag = AllowlistDiagnostics::default();
+        diagnose_allowlist_layer(
+            &LoadedAllowlistLayer {
+                layer: AllowlistLayer::System,
+                path,
+                file,
+            },
+            &doctor_allowlist_active_rules(&Config::default()),
+            &mut diag,
+        );
+        assert_eq!(diag.layers_found, 1);
+        assert_eq!(diag.total_errors, 2);
+        assert_eq!(diag.total_warnings, 2);
+        assert!(diag.error_messages[0].contains("entry 1"));
+        assert!(diag.error_messages[1].contains("entry 3"));
+        let git = &diag.warning_messages[0];
+        assert!(git.contains("system: system-allowlist.toml: entry 2"));
+        assert!(git.contains("HIGH RISK: bypasses destructive Git protection"));
+        assert!(git.contains(r"review\nforged diagnostic"));
+        assert!(git.contains(r"reviewer\u{1b}[31m"));
+        assert!(git.contains("not-a-timestamp"));
+        assert!(!git.contains(['\n', '\r', '\u{1b}']));
+        let filesystem = &diag.warning_messages[1];
+        assert!(filesystem.contains("entry 4"));
+        assert!(filesystem.contains("destructive filesystem protection"));
+        assert!(filesystem.contains("2026-08-01T12:00:00Z"));
     }
 
     #[test]

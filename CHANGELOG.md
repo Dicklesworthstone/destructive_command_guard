@@ -11,6 +11,20 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- **Doctor audits unrestricted allowlist exceptions (#545).** Active whole-rule
+  grants with no working-directory restriction or expiration now produce
+  actionable warnings naming the rule, source layer/file, reason, and available
+  author/timestamp metadata. Destructive filesystem and Git exceptions are
+  marked high risk. The audit covers trusted project, user, and system layers,
+  preserves warnings alongside parse errors, and distinguishes scoped,
+  temporary, expired, and inactive entries using runtime semantics. Doctor
+  leaves allowlist files and matching behavior unchanged, including in `--fix`
+  mode; its JSON v1 schema and warning-only exit behavior are preserved.
+
 ## [v0.15.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.3) -- 2026-10-08 [Release]
 
 This release closes commands that ran unguarded (Claude Code's `Monitor`
