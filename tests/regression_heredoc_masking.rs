@@ -494,12 +494,12 @@ EOF";
     #[test]
     fn issue_544_javascript_string_literal_forms_remain_inert() {
         for body in [
-            r#"const s = 'run `git branch -d x` later'; console.log(s);"#,
+            r"const s = 'run `git branch -d x` later'; console.log(s);",
             r#"const s = "He said \"run `git branch -d x` later\""; console.log(s);"#,
-            r#"const s = `run \`git branch -d x\` later`; console.log(s);"#,
+            r"const s = `run \`git branch -d x\` later`; console.log(s);",
             "const s = `run \\`git branch -d x\\` later\nThis is documentation.`;\nconsole.log(s);",
             r#""run `git branch -d x` later"; console.log('documented');"#,
-            r#"const fs = require('fs'); const source = fs.readFileSync('README.md', 'utf8'); const edited = source.replace('After merging.', 'After merging, run `git branch -d x`.'); fs.writeFileSync('README.md', edited);"#,
+            r"const fs = require('fs'); const source = fs.readFileSync('README.md', 'utf8'); const edited = source.replace('After merging.', 'After merging, run `git branch -d x`.'); fs.writeFileSync('README.md', edited);",
         ] {
             let command = format!("node - <<'JS'\n{body}\nJS");
             let (decision, rule) = hook_decision(&command);
@@ -573,7 +573,7 @@ EOF";
             ),
             (
                 "node",
-                r#"const s = `run \`git branch -d x\` later ${require('child_process').execSync('git reset --hard')}`; console.log(s);"#,
+                r"const s = `run \`git branch -d x\` later ${require('child_process').execSync('git reset --hard')}`; console.log(s);",
             ),
         ] {
             for command in [
@@ -735,6 +735,83 @@ EOF";
                 );
                 assert!(!rule.is_empty(), "denial must name its rule: {command:?}");
             }
+        }
+    }
+
+    #[test]
+    fn issue_544_callbacks_and_argument_side_effects_keep_independent_evidence() {
+        for (program, body, named_rule) in [
+            (
+                "node",
+                r#"const cp = require('child_process'); cp.exec('printf ready', function () { const s = "echo $(git reset --hard)"; cp.execSync(s); });"#,
+                "heredoc.javascript:exec_sink.git_reset_hard",
+            ),
+            (
+                "node",
+                r#"const cp = require('child_process'); cp.exec('printf ready', () => { const s = "echo $(git reset --hard)"; cp.execSync(s); });"#,
+                "heredoc.javascript:exec_sink.git_reset_hard",
+            ),
+            (
+                "node",
+                r#"const cp = require('child_process'); let s; cp.exec('printf ready', (s = "echo $(git reset --hard)", cp.execSync(s)));"#,
+                "heredoc.javascript:exec_sink.git_reset_hard",
+            ),
+            (
+                "node",
+                r#"const cp = require('child_process'); cp.exec('git reset --hard', () => { const s = "echo $(git reset --hard)"; cp.execSync(s); });"#,
+                "heredoc.javascript:exec_sink.git_reset_hard",
+            ),
+            (
+                "python3",
+                "import os, subprocess\nsubprocess.run(['printf', 'ready'], preexec_fn=lambda s='echo $(git reset --hard)': os.system(s))",
+                "heredoc.python:exec_sink.git_reset_hard",
+            ),
+        ] {
+            for command in [
+                format!("{program} - <<'DOC'\n{body}\nDOC"),
+                format!(
+                    "tee /tmp/callback-program <<'DOC' >/dev/null\n{body}\nDOC\n{program} /tmp/callback-program"
+                ),
+            ] {
+                let (decision, rule) = hook_decision_with_allowlist(&command, Some(named_rule));
+                assert_eq!(
+                    decision, "deny",
+                    "an outer call grant cannot cover independently executed callback source: {command:?}: {rule}"
+                );
+                assert_eq!(
+                    rule, "core.git:reset-hard",
+                    "the recovered inner command owns its finding: {command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue_544_named_argv_and_option_literals_keep_their_data_roles() {
+        for (program, body) in [
+            (
+                "node",
+                "const cp = require('child_process'); cp.spawnSync('printf', ['%s', '$(git reset --hard)']);",
+            ),
+            (
+                "node",
+                "const cp = require('child_process'); cp.execSync('printf ready', {env: {NOTICE: '$(git reset --hard)'}});",
+            ),
+            (
+                "python3",
+                "import subprocess\nsubprocess.run(['printf', '%s', '$(git reset --hard)'])",
+            ),
+            (
+                "python3",
+                "import subprocess\nsubprocess.run(['printf', 'ready'], env={'NOTICE': '$(git reset --hard)'})",
+            ),
+        ] {
+            let command = format!("{program} - <<'DOC'\n{body}\nDOC");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(
+                decision, "allow",
+                "static argv and option values must not be reparsed as shell code: {command:?}: {rule}"
+            );
         }
     }
 

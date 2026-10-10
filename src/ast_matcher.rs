@@ -526,12 +526,18 @@ fn interpreter_literal_has_owned_sink<D: ast_grep_core::Doc>(
         let Some(node) = ancestor else {
             break;
         };
-        if matches!(node.kind().as_ref(), "call" | "call_expression")
-            && let Some(arguments) = node.field("arguments")
-            && arguments.range().start <= literal_range.start
-            && arguments.range().end >= literal_range.end
-            && let Some(function) = node.field("function")
-        {
+        if matches!(node.kind().as_ref(), "call" | "call_expression") {
+            let Some(arguments) = node.field("arguments") else {
+                return false;
+            };
+            if arguments.range().start > literal_range.start
+                || arguments.range().end < literal_range.end
+            {
+                return false;
+            }
+            let Some(function) = node.field("function") else {
+                return false;
+            };
             // Inspect the terminal callee name, not a receiver expression
             // whose own arguments can contain fake `exec(...)` source text.
             let name = match function.kind().as_ref() {
@@ -552,6 +558,28 @@ fn interpreter_literal_has_owned_sink<D: ast_grep_core::Doc>(
             // An unknown nested call can execute this value before passing
             // its result to an enclosing spawn. It cannot borrow that outer
             // call's argv proof or an allowlist grant for the outer rule.
+            return false;
+        }
+        // A named sink owns values assembled into its argv or options, not
+        // code that runs while evaluating another argument or a callback.
+        // Walking through assignments, sequences or function bodies would
+        // let a harmless outer exec hide an indirect shell command inside it.
+        if !matches!(
+            node.kind().as_ref(),
+            "parenthesized_expression"
+                | "argument_list"
+                | "arguments"
+                | "array"
+                | "list"
+                | "tuple"
+                | "object"
+                | "dictionary"
+                | "pair"
+                | "keyword_argument"
+                | "concatenated_string"
+                | "binary_operator"
+                | "binary_expression"
+        ) {
             return false;
         }
         ancestor = node.parent();
@@ -1144,6 +1172,38 @@ mod tests {
                 ScriptLanguage::JavaScript,
                 "require('child_process').execSync('echo `git branch -d x`');",
             ),
+            (
+                ScriptLanguage::Python,
+                "subprocess.run(['printf', 'ready'], preexec_fn=lambda: os.system('git reset --hard; echo $(printf done)'))",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "cp.exec('printf ready', () => { cp.execSync('git reset --hard; echo $(printf done)'); });",
+            ),
+            (
+                ScriptLanguage::Python,
+                "subprocess.run(['printf', 'ready'], preexec_fn=lambda: subprocess.run(('echo', '$(git reset --hard)')))",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "cp.exec('printf ready', () => { cp.spawnSync('echo', ['$(git reset --hard)']); });",
+            ),
+            (
+                ScriptLanguage::Python,
+                "subprocess.run(args=['printf', 'ready'], env={'NOTE': 'echo $(git reset --hard)'})",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "cp.exec('printf ready', {env: {NOTE: 'echo $(git reset --hard)'}});",
+            ),
+            (
+                ScriptLanguage::Python,
+                "os.system(('git reset --hard; ' + 'echo $(printf done)'))",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "cp.execSync('git reset --hard; ' + 'echo $(printf done)');",
+            ),
         ] {
             assert!(
                 interpreter_literal_shell_commands_inner(source, language, false)
@@ -1169,11 +1229,59 @@ mod tests {
                 ScriptLanguage::Python,
                 "subprocess.run(['echo', transform('echo `git branch -d x`'), 'git reset --hard'])",
             ),
+            (
+                ScriptLanguage::JavaScript,
+                "cp.execSync(('echo `git branch -d x`'));",
+            ),
         ] {
             let commands = interpreter_literal_shell_commands_inner(source, language, false)
                 .expect("unowned literal retains its conservative evidence");
             assert_eq!(commands.len(), 1, "a false callee claim hid {source}");
             assert!(commands[0].command.contains("`git branch -d x`"));
+        }
+    }
+
+    #[test]
+    fn interpreter_literal_shell_commands_do_not_borrow_outer_sink_ownership_544() {
+        for (language, source, literal, expected) in [
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); cp.exec('printf ready', function () { const s = 'echo $(git reset --hard)'; cp.execSync(s); });",
+                "'echo $(git reset --hard)'",
+                "echo $(git reset --hard)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r"const cp = require('child_process'); cp.exec('printf ready', () => { const s = 'echo \u0060git reset --hard\u0060'; cp.execSync(s); });",
+                r"'echo \u0060git reset --hard\u0060'",
+                "echo `git reset --hard`",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "let s; const cp = require('child_process'); cp.exec('printf ready', (s = 'echo $(git reset --hard)', cp.execSync(s)));",
+                "'echo $(git reset --hard)'",
+                "echo $(git reset --hard)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os, subprocess\nsubprocess.run(['printf', 'ready'], preexec_fn=lambda: ((s := 'echo $(git reset --hard)'), os.system(s)))",
+                "'echo $(git reset --hard)'",
+                "echo $(git reset --hard)",
+            ),
+        ] {
+            let commands = interpreter_literal_shell_commands_inner(source, language, false)
+                .expect("bounded callback and argument-expression source");
+            assert_eq!(
+                commands.len(),
+                1,
+                "an outer sink's harmless argv must not hide executable source: {source}"
+            );
+            assert_eq!(commands[0].command, expected, "source: {source}");
+            assert_eq!(
+                source.get(commands[0].start..commands[0].end),
+                Some(literal),
+                "recovery must identify the inner literal, not the outer sink: {source}"
+            );
         }
     }
 

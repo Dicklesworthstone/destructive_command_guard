@@ -1135,23 +1135,47 @@ pub fn is_argument_data(command: &str, preceding_flag: Option<&str>) -> bool {
 
 /// Decode one static POSIX word for the scoped flowctl data contract.
 fn flowctl_static_word(raw: &str) -> Option<String> {
-    use crate::normalize::{ShellDialect, ShellTokenDecoder, ShellTokenRole};
-    // Reject shell expansion and control metacharacters. Numeric byte values
-    // keep this boundary explicit and independent of quote-removal behavior.
-    if raw.is_empty()
-        || raw.bytes().any(|byte| {
-            matches!(
-                byte,
-                36 | 96 | 42 | 63 | 91 | 123 | 126 | 59 | 124 | 38 | 40 | 41 | 60 | 62
-            )
-        })
-    {
+    if raw.is_empty() {
         return None;
     }
-    let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
-    decoder
-        .decode(raw, ShellTokenRole::Syntax)
-        .map(Cow::into_owned)
+    // Validate the raw word before quote removal. Separators, globs, and
+    // expansion spellings are data inside single quotes; double quotes keep
+    // separators literal but still execute dollar/backtick substitutions.
+    // Applying a byte blacklist after losing these roles rejected receipt
+    // text such as 'npm test; git reset --hard' (#540).
+    let bytes = raw.as_bytes();
+    let mut quote = None;
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        match (quote, byte) {
+            (Some(b'\''), b'\'') | (Some(b'"'), b'"') => quote = None,
+            (Some(b'\''), _) => {}
+            (_, b'\\') => {
+                let &escaped = bytes.get(index + 1)?;
+                if quote.is_none() || matches!(escaped, b'$' | b'`' | b'"' | b'\\' | b'\n') {
+                    index += 1;
+                }
+            }
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (_, b'$' | b'`') => return None,
+            (
+                None,
+                b'*' | b'?' | b'[' | b'{' | b'~' | b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>'
+                | b'#',
+            ) => {
+                return None;
+            }
+            (None, byte) if byte.is_ascii_whitespace() => return None,
+            _ => {}
+        }
+        index += 1;
+    }
+    if quote.is_some() {
+        return None;
+    }
+    let mut words = shell_words::split(raw).ok()?.into_iter();
+    let value = words.next()?;
+    words.next().is_none().then_some(value)
 }
 
 /// Return static data operand indices for flowctl gate check/receipt (#538).
@@ -3900,6 +3924,92 @@ mod tests {
         assert!(!sanitized.as_ref().contains("rm -rf"));
         assert!(sanitized.as_ref().contains("bd create"));
         assert!(sanitized.as_ref().contains("--description="));
+    }
+
+    #[test]
+    fn flowctl_static_words_preserve_quoted_and_escaped_data_540() {
+        for (raw, expected) in [
+            ("'npm test; git reset --hard'", "npm test; git reset --hard"),
+            (
+                "\"printf '(literal)' > result\"",
+                "printf '(literal)' > result",
+            ),
+            ("'grep $HOME *.rs | cat'", "grep $HOME *.rs | cat"),
+            ("'literal `git reset --hard`'", "literal `git reset --hard`"),
+            (
+                r"npm\ test\;\ git\ reset\ --hard",
+                "npm test; git reset --hard",
+            ),
+            (r#""\$(git reset --hard)""#, "$(git reset --hard)"),
+            ("'multiline\ndata; Ω'", "multiline\ndata; Ω"),
+            ("'npm 'test", "npm test"),
+            ("''", ""),
+        ] {
+            assert_eq!(
+                flowctl_static_word(raw).as_deref(),
+                Some(expected),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flowctl_static_words_reject_live_or_incomplete_syntax_540() {
+        for raw in [
+            "",
+            "$ARGS",
+            "\"$ARGS\"",
+            "$(git reset --hard)",
+            "\"$(git reset --hard)\"",
+            "`git reset --hard`",
+            r#""\\$(git reset --hard)""#,
+            "*.sh",
+            "a?b",
+            "[ab]",
+            "{a,b}",
+            "~/script",
+            "a;b",
+            "a|b",
+            "a&b",
+            "(a)",
+            "a>b",
+            "a<b",
+            "#comment",
+            "two words",
+            "'unterminated",
+            "\"unterminated",
+            "trailing\\",
+        ] {
+            assert!(flowctl_static_word(raw).is_none(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_flowctl_data_preserves_executable_boundaries_540() {
+        for source in [
+            r#""$FLOWCTL" gate check --command 'npm test; git reset --hard'"#,
+            r#"flowctl gate receipt --command="echo (git reset --hard)""#,
+            r#"flowctl gate check --command 'grep "$HOME" *.rs; git reset --hard'"#,
+            r"flowctl gate check --command npm\ test\;\ git\ reset\ --hard",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(source);
+            assert_eq!(sanitized.len(), source.len(), "{source:?}");
+            assert!(!sanitized.contains("git"), "{source:?}: {sanitized}");
+            assert!(sanitized.contains("gate"), "{source:?}: {sanitized}");
+        }
+        for source in [
+            r#""$FLOWCTL" gate check --command "$(git reset --hard)""#,
+            r#""$FLOWCTL" gate check --command 'npm test'; git reset --hard"#,
+            r#""$FLOWCTL" gate check --command 'npm test' > /etc/profile"#,
+            r#""$FLOWCTL" gate run --command 'git reset --hard'"#,
+            r#""$FLOWCTL" gate check --unknown --command 'git reset --hard'"#,
+        ] {
+            let sanitized = sanitize_for_pattern_matching(source);
+            assert!(
+                sanitized.contains("git reset --hard") || sanitized.contains("> /etc/profile"),
+                "live or unsupported syntax was hidden: {source:?}: {sanitized}"
+            );
+        }
     }
 
     #[test]

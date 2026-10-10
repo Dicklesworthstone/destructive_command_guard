@@ -15,6 +15,26 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Fixed
 
+- **Inspect the arguments produced by executable variables (#540).** Literal
+  assignments such as `X='git reset --hard'; $X` now reach the Git rule for
+  the expanded command instead of being mistaken for one quoted executable
+  name. Quoted variable references preserve one argument, while supported
+  unquoted expansion splits fields without reinterpreting their contents as
+  shell syntax. Unknown splitting, globbing, and interpreter flags introduced
+  by expansion require review. Rule-specific grants and original source spans
+  remain attached to the command that actually needs them.
+- **Keep quoted flowctl receipt text as data (#538, #540).** Complete static
+  `gate check` and `gate receipt` command operands can contain quoted shell
+  punctuation without triggering destructive-command rules. Live expansions,
+  incomplete words, unknown options, redirects, and later commands retain
+  their execution checks. Regression cases exercise both `dcg test` and the
+  actual hook protocol.
+- **Keep interpreter callbacks independent of outer execution grants (#544).**
+  Literal command evidence inside callbacks, assignments, and argument side
+  effects can no longer inherit an enclosing call's already-checked status.
+  Destructive commands carried through variables retain their own rule and
+  cannot be hidden by an allowlist entry for the outer execution sink. Static
+  argument arrays and option values preserve their existing data treatment.
 - **Check substitutions carried by interpreter variables (#544).** Python and
   JavaScript literal values passed through variables or opaque calls now reach
   the existing command evaluator, including encoded substitution markers.

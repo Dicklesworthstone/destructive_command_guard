@@ -12814,20 +12814,46 @@ struct ResolvedPosixExecutableInvocation {
     argv0_range: std::ops::Range<usize>,
     replacement_len: usize,
     command: String,
+    split_inline_launcher: bool,
+}
+
+#[derive(Debug)]
+enum ModeledPosixExecutableInvocation {
+    Resolved(ResolvedPosixExecutableInvocation),
+    Unverified {
+        range: std::ops::Range<usize>,
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug, Default)]
 struct PosixExecutableAssignmentModel {
     inert_ranges: Vec<std::ops::Range<usize>>,
-    invocations: Vec<ResolvedPosixExecutableInvocation>,
+    invocations: Vec<ModeledPosixExecutableInvocation>,
 }
 
-/// Parse one assignment-only POSIX segment whose value is entirely literal.
-///
-/// The returned value keeps its original shell spelling so quoted executable
-/// paths remain one word when substituted into the later invocation. Dynamic
-/// values deliberately refuse the proof.
-fn literal_posix_executable_assignment(segment: &str) -> Option<(String, String)> {
+const MAX_POSIX_EXECUTABLE_BINDINGS: usize = 64;
+const MAX_POSIX_EXECUTABLE_SEGMENTS: usize = 128;
+const MAX_POSIX_EXECUTABLE_FIELDS: usize = 128;
+const MAX_POSIX_EXECUTABLE_VALUE_BYTES: usize = 16 * 1024;
+const POSIX_EXECUTABLE_UNVERIFIED_RULE: &str = "heredoc.posix.executable-unverified";
+
+#[derive(Clone, Copy)]
+enum ModeledPosixIfs {
+    Default,
+    Empty,
+    Unverified,
+}
+
+#[derive(Debug)]
+enum ModeledPosixBinding {
+    Literal(String),
+    Unverified(&'static str),
+}
+
+/// Return the two parts of one assignment-only POSIX segment. The value is
+/// still shell source; callers must decode it before modeling an expansion.
+fn posix_executable_assignment_parts(segment: &str) -> Option<(&str, &str)> {
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
     let mut words = tokens
         .iter()
@@ -12845,35 +12871,49 @@ fn literal_posix_executable_assignment(segment: &str) -> Option<(String, String)
     let name = raw.get(..equals)?;
     let raw_value = raw.get(equals + 1..)?;
     if name.is_empty()
-        || raw_value.is_empty()
         || !name.bytes().enumerate().all(|(index, byte)| {
             byte.is_ascii_alphabetic() || byte == b'_' || index > 0 && byte.is_ascii_digit()
         })
-        || contains_dynamic_shell_output(raw_value)
     {
         return None;
     }
-    let decoded = shell_word_value(raw, ShellDialect::Posix)?;
-    let (decoded_name, decoded_value) = decoded.split_once('=')?;
-    if decoded_name != name || decoded_value.is_empty() {
+    Some((name, raw_value))
+}
+
+/// Decode assignment-time quotes exactly once. In particular, those quotes
+/// cannot protect whitespace when the later variable expansion is unquoted.
+fn literal_posix_executable_value(raw: &str) -> Option<String> {
+    // Assignment words suppress field splitting and pathname expansion, so
+    // unquoted `X=g*` binds the same literal pattern as `X='g*'`. The shared
+    // syntax decoder returns an owned value only when every quote and escape
+    // was decoded without encountering a runtime expansion. Locale-quoted
+    // text still depends on translation and cannot establish a literal value.
+    if raw.contains("$\"") {
         return None;
     }
-    Some((name.to_string(), raw_value.to_string()))
+    match crate::normalize::decode_posix_syntax_token(raw) {
+        Cow::Owned(value) => Some(value),
+        Cow::Borrowed(value) if !value.contains(['$', '`', '\'', '"', '\\', '~', '<', '>']) => {
+            Some(value.to_string())
+        }
+        Cow::Borrowed(_) => None,
+    }
 }
 
 /// Return an exact executable-position variable reference.
-fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>)> {
+fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>, bool)> {
     let token = tokenize_for_shell_dialect(segment, ShellDialect::Posix)
         .into_iter()
         .find(|token| token.kind == NormalizeTokenKind::Word)?;
     let raw = token.text(segment)?;
-    let expansion = if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        inner
-    } else if raw.starts_with('\'') {
-        return None;
-    } else {
-        raw
-    };
+    let (expansion, quoted) =
+        if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            (inner, true)
+        } else if raw.starts_with('\'') {
+            return None;
+        } else {
+            (raw, false)
+        };
     let name = expansion
         .strip_prefix('$')
         .and_then(|value| value.strip_prefix('{'))
@@ -12886,7 +12926,126 @@ fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>
     {
         return None;
     }
-    Some((name.to_string(), token.byte_range))
+    Some((name.to_string(), token.byte_range, quoted))
+}
+
+/// Render the argv fields produced by one variable expansion. Quotes and
+/// operators in the value are data: parameter expansion never reparses them
+/// as shell source. Only an unquoted expansion performs IFS splitting and
+/// pathname expansion, and the latter has no static filesystem proof here.
+fn render_posix_executable_expansion(
+    value: &str,
+    quoted: bool,
+    ifs: ModeledPosixIfs,
+) -> Result<(String, bool), &'static str> {
+    if value.len() > MAX_POSIX_EXECUTABLE_VALUE_BYTES {
+        return Err("the executable variable exceeds the bounded literal-value limit");
+    }
+    let fields: Vec<&str> = if quoted {
+        vec![value]
+    } else {
+        if matches!(ifs, ModeledPosixIfs::Unverified) {
+            return Err("an unquoted executable variable uses a custom or dynamic IFS value");
+        }
+        if value.contains(['*', '?', '[']) {
+            return Err("an unquoted executable variable can expand pathname patterns");
+        }
+        if value.is_empty() {
+            Vec::new()
+        } else if matches!(ifs, ModeledPosixIfs::Empty) {
+            vec![value]
+        } else {
+            // POSIX's default IFS is exactly space, tab and LF. CR, vertical
+            // tab and Unicode whitespace remain literal argument bytes.
+            value
+                .split([' ', '\t', '\n'])
+                .filter(|field| !field.is_empty())
+                .take(MAX_POSIX_EXECUTABLE_FIELDS + 1)
+                .collect()
+        }
+    };
+    if fields.len() > MAX_POSIX_EXECUTABLE_FIELDS {
+        return Err("the executable variable expands into too many argument fields");
+    }
+    let rendered_fields: Vec<String> = fields
+        .iter()
+        .map(|field| posix_single_quote_argument(field))
+        .collect();
+    // A split value that introduces interpreter options remains a bounded
+    // launcher proof, not flowctl receipt data (#540). Evaluate its concrete
+    // command first so a known destructive payload keeps its owning rule.
+    let split_inline_launcher = !quoted
+        && fields.len() > 1
+        && fields.first().is_some_and(|executable| {
+            let name = executable.rsplit('/').next().unwrap_or(executable);
+            (posix_inline_shell_name(name) || non_shell_inline_interpreter_name(name))
+                && posix_inline_flag_position(
+                    Some(name),
+                    &rendered_fields
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                )
+                .is_some()
+        });
+    Ok((rendered_fields.join(" "), split_inline_launcher))
+}
+
+/// Apply the same parent-shell mutation boundary as variable/path proofs.
+/// A concrete external Git invocation leaves a scalar intact, while eval,
+/// read, declarations and printf -v can invalidate every retained binding.
+fn modeled_posix_invocation_may_mutate_bindings(command: &str) -> bool {
+    let first = hazard_first_word(command);
+    first.contains(['$', '`'])
+        || first.starts_with('-')
+        || matches!(first.as_ref(), "command" | "builtin" | "time")
+        || match first.as_ref() {
+            // The reconstruction quotes every literal field, so quoting the
+            // command name is not itself uncertainty here. Inspect its exact
+            // argv instead of borrowing the raw-source printf heuristic.
+            "printf" => static_posix_command_without_redirects(command)
+                .and_then(|source| command_tokens(&source))
+                .is_none_or(|(_, arguments)| {
+                    arguments
+                        .first()
+                        .is_some_and(|argument| argument.starts_with("-v"))
+                }),
+            other => matches!(
+                other,
+                "read"
+                    | "readonly"
+                    | "declare"
+                    | "typeset"
+                    | "local"
+                    | "export"
+                    | "let"
+                    | "eval"
+                    | "source"
+                    | "."
+                    | "mapfile"
+                    | "readarray"
+                    | "unset"
+                    | "getopts"
+                    | "select"
+                    | "trap"
+                    | "alias"
+            ),
+        }
+        // Arithmetic and parameter expansions can also assign in the parent
+        // shell even when the receiving command itself is an external tool.
+        || contains_dynamic_shell_output(command)
+}
+
+fn invalidate_modeled_posix_bindings(
+    bindings: &mut HashMap<String, ModeledPosixBinding>,
+    ifs: &mut ModeledPosixIfs,
+) {
+    for binding in bindings.values_mut() {
+        *binding = ModeledPosixBinding::Unverified(
+            "an earlier executable-variable invocation can change this shell binding",
+        );
+    }
+    *ifs = ModeledPosixIfs::Unverified;
 }
 
 /// Build the bounded literal-assignment portion of #289's command model.
@@ -12897,11 +13056,21 @@ fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>
 /// state. Each resolved invocation is evaluated independently, then its source
 /// bytes and the assignment-only segments are masked from the ordinary
 /// whole-command pass so another pack cannot misattribute their tokens.
+#[allow(clippy::too_many_lines)] // One bounded state machine keeps assignments, taint and source masks in order.
 fn model_literal_posix_executable_assignments(
     command: &str,
     dialect: ShellDialect,
 ) -> PosixExecutableAssignmentModel {
     if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return PosixExecutableAssignmentModel::default();
+    }
+    if !command.contains('$') || !command.contains('=') {
+        return PosixExecutableAssignmentModel::default();
+    }
+    if command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
+        // Without a bounded parse there is no established executable use.
+        // Leave all source visible to the existing evaluation paths rather
+        // than converting a large data assignment into a launcher finding.
         return PosixExecutableAssignmentModel::default();
     }
     let ranges = top_level_segment_ranges(command);
@@ -12916,36 +13085,147 @@ fn model_literal_posix_executable_assignments(
         return PosixExecutableAssignmentModel::default();
     }
 
-    let mut bindings = HashMap::<String, String>::new();
+    // Tainted bindings remain known: forgetting one would let its later use
+    // silently fall back to an unresolved executable after eval changed it.
+    let mut bindings = HashMap::<String, ModeledPosixBinding>::new();
+    let mut binding_limit_exceeded = false;
+    let mut ifs = ModeledPosixIfs::Default;
+    let mut assignment_ranges = Vec::new();
+    let mut reconstructed_bytes = 0usize;
     let mut model = PosixExecutableAssignmentModel::default();
-    for &(start, end) in &ranges {
+    for (segment_index, &(start, end)) in ranges.iter().enumerate() {
         let Some(segment) = command.get(start..end) else {
-            return PosixExecutableAssignmentModel::default();
+            return model;
         };
-        if let Some((name, value)) = literal_posix_executable_assignment(segment) {
-            bindings.insert(name, value);
-            model.inert_ranges.push(start..end);
+        if segment_index >= MAX_POSIX_EXECUTABLE_SEGMENTS {
+            if posix_variable_argv0(segment).is_some() && !bindings.is_empty() {
+                model
+                    .invocations
+                    .push(ModeledPosixExecutableInvocation::Unverified {
+                        range: start..end,
+                        reason: "the executable-assignment model exceeds the bounded statement limit",
+                    });
+            }
+            // An inert tail past the limit must not erase an earlier proven
+            // destructive invocation, nor replace its rule with a waiver for
+            // the analysis limit.
+            return model;
+        }
+        if let Some((name, raw_value)) = posix_executable_assignment_parts(segment) {
+            let value = literal_posix_executable_value(raw_value);
+            if name == "IFS" {
+                ifs = match value.as_deref() {
+                    Some("") => ModeledPosixIfs::Empty,
+                    Some(" \t\n") => ModeledPosixIfs::Default,
+                    _ => ModeledPosixIfs::Unverified,
+                };
+            }
+            let Some(value) = value else {
+                if name == "IFS" {
+                    // `${X:=git}` and arithmetic assignment can update an
+                    // earlier binding while computing IFS. Quoting `$X`
+                    // later suppresses splitting, not that parent mutation.
+                    invalidate_modeled_posix_bindings(&mut bindings, &mut ifs);
+                    continue;
+                }
+                break;
+            };
+            if !bindings.contains_key(name) && bindings.len() >= MAX_POSIX_EXECUTABLE_BINDINGS {
+                binding_limit_exceeded = true;
+                continue;
+            }
+            let binding = if value.len() > MAX_POSIX_EXECUTABLE_VALUE_BYTES {
+                ModeledPosixBinding::Unverified(
+                    "the executable variable exceeds the bounded literal-value limit",
+                )
+            } else if name != "IFS" && shell_maintained_posix_variable(name) {
+                ModeledPosixBinding::Unverified(
+                    "the executable variable is maintained by the shell rather than a stable scalar",
+                )
+            } else {
+                ModeledPosixBinding::Literal(value)
+            };
+            bindings.insert(name.to_string(), binding);
+            assignment_ranges.push(start..end);
             continue;
         }
-        let Some((name, argv0_range)) = posix_variable_argv0(segment) else {
+        let Some((name, argv0_range, quoted)) = posix_variable_argv0(segment) else {
             break;
         };
-        let Some(replacement) = bindings.get(&name) else {
+        if binding_limit_exceeded {
+            model
+                .invocations
+                .push(ModeledPosixExecutableInvocation::Unverified {
+                    range: start + argv0_range.start..start + argv0_range.end,
+                    reason: "the executable-assignment model exceeds the bounded binding limit",
+                });
+            invalidate_modeled_posix_bindings(&mut bindings, &mut ifs);
+            continue;
+        }
+        let Some(binding) = bindings.get(&name) else {
             break;
         };
+        let value = match binding {
+            ModeledPosixBinding::Literal(value) => value,
+            ModeledPosixBinding::Unverified(reason) => {
+                model
+                    .invocations
+                    .push(ModeledPosixExecutableInvocation::Unverified {
+                        range: start + argv0_range.start..start + argv0_range.end,
+                        reason,
+                    });
+                invalidate_modeled_posix_bindings(&mut bindings, &mut ifs);
+                continue;
+            }
+        };
+        let (replacement, split_inline_launcher) =
+            match render_posix_executable_expansion(value, quoted, ifs) {
+                Ok(expansion) => expansion,
+                Err(reason) => {
+                    model
+                        .invocations
+                        .push(ModeledPosixExecutableInvocation::Unverified {
+                            range: start + argv0_range.start..start + argv0_range.end,
+                            reason,
+                        });
+                    invalidate_modeled_posix_bindings(&mut bindings, &mut ifs);
+                    continue;
+                }
+            };
+        let resolved_bytes = segment.len() - argv0_range.len() + replacement.len();
+        reconstructed_bytes = reconstructed_bytes.saturating_add(resolved_bytes);
+        if reconstructed_bytes > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
+            model
+                .invocations
+                .push(ModeledPosixExecutableInvocation::Unverified {
+                    range: start..end,
+                    reason: "the executable assignments exceed the bounded reconstructed-command limit",
+                });
+            return model;
+        }
         let mut resolved = String::with_capacity(
             segment.len() + replacement.len().saturating_sub(argv0_range.len()),
         );
         resolved.push_str(&segment[..argv0_range.start]);
-        resolved.push_str(replacement);
+        resolved.push_str(&replacement);
         resolved.push_str(&segment[argv0_range.end..]);
+        let may_mutate_bindings = modeled_posix_invocation_may_mutate_bindings(&resolved);
+        model.inert_ranges.append(&mut assignment_ranges);
         model.inert_ranges.push(start..end);
-        model.invocations.push(ResolvedPosixExecutableInvocation {
-            segment_range: start..end,
-            argv0_range,
-            replacement_len: replacement.len(),
-            command: resolved,
-        });
+        model
+            .invocations
+            .push(ModeledPosixExecutableInvocation::Resolved(
+                ResolvedPosixExecutableInvocation {
+                    segment_range: start..end,
+                    argv0_range,
+                    replacement_len: replacement.len(),
+                    command: resolved,
+                    split_inline_launcher,
+                },
+            ));
+        if may_mutate_bindings {
+            invalidate_modeled_posix_bindings(&mut bindings, &mut ifs);
+        }
     }
     if model.invocations.is_empty() {
         return PosixExecutableAssignmentModel::default();
@@ -13859,6 +14139,29 @@ fn evaluate_command_in_single_dialect_view(
     // their tokens (issue #289). A dynamic assignment keeps the established
     // fail-closed path.
     for invocation in &posix_executable_model.invocations {
+        let invocation = match invocation {
+            ModeledPosixExecutableInvocation::Resolved(invocation) => invocation,
+            ModeledPosixExecutableInvocation::Unverified { range, reason } => {
+                if let Some(mut denial) = launcher_unverified_denial(
+                    POSIX_EXECUTABLE_UNVERIFIED_RULE,
+                    reason,
+                    allowlists,
+                    project_path,
+                    &mut heredoc_allowlist_hit,
+                ) {
+                    if let Some(info) = denial.pattern_info.as_mut() {
+                        let span = MatchSpan {
+                            start: range.start,
+                            end: range.end,
+                        };
+                        info.matched_span = Some(span);
+                        info.matched_text_preview = Some(extract_match_preview(command, &span));
+                    }
+                    return denial;
+                }
+                continue;
+            }
+        };
         let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
             &invocation.command,
             enabled_keywords,
@@ -13879,6 +14182,17 @@ fn evaluate_command_in_single_dialect_view(
             return result;
         }
         record_nested_allowlist_hit(&mut heredoc_allowlist_hit, &mut result);
+        if invocation.split_inline_launcher
+            && let Some(denial) = launcher_unverified_denial(
+                POSIX_INLINE_LAUNCHER_UNVERIFIED_RULE,
+                "Field splitting introduces an interpreter's inline-code options from an executable variable; this launcher form requires explicit review",
+                allowlists,
+                project_path,
+                &mut heredoc_allowlist_hit,
+            )
+        {
+            return denial;
+        }
     }
     // `$IFS`/`${IFS}` word-splits to whitespace by default, so
     // `rm${IFS}-rf${IFS}~` runs `rm -rf ~` while presenting no whitespace the
@@ -41131,6 +41445,42 @@ mod tests {
                 "core.git",
                 "reset-hard",
             ),
+            (
+                "g='git reset --hard'; $g",
+                &["core.git"][..],
+                "core.git",
+                "reset-hard",
+            ),
+            (
+                "g=git\\ reset; ${g} --hard",
+                &["core.git"][..],
+                "core.git",
+                "reset-hard",
+            ),
+            (
+                "g='git clean -fd'; $g",
+                &["core.git"][..],
+                "core.git",
+                "clean-force",
+            ),
+            (
+                "g='git push'; $g --force",
+                &["core.git"][..],
+                "core.git",
+                "push-force-long",
+            ),
+            (
+                "g=''; $g git reset --hard",
+                &["core.git"][..],
+                "core.git",
+                "reset-hard",
+            ),
+            (
+                "g=; ${g} git reset --hard",
+                &["core.git"][..],
+                "core.git",
+                "reset-hard",
+            ),
         ];
         for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
             for (command, packs, expected_pack, expected_rule) in cases {
@@ -41192,6 +41542,263 @@ mod tests {
                 "dynamic assignment must retain fail-closed behavior ({dialect:?})"
             );
         }
+    }
+
+    #[test]
+    fn executable_assignment_expansion_preserves_shell_argument_boundaries_540() {
+        for (command, expected) in [
+            ("X='git reset --hard'; $X", "'git' 'reset' '--hard'"),
+            ("X=git\\ reset\\ --hard; $X", "'git' 'reset' '--hard'"),
+            ("X='git reset'; ${X} --hard", "'git' 'reset' --hard"),
+            ("X='git reset --hard'; \"$X\"", "'git reset --hard'"),
+            ("X=''; $X git reset --hard", " git reset --hard"),
+            ("X=; \"$X\" git reset --hard", "'' git reset --hard"),
+            (
+                "X='echo ; git reset --hard'; $X",
+                "'echo' ';' 'git' 'reset' '--hard'",
+            ),
+            (
+                "X='echo $(git reset --hard)'; $X",
+                "'echo' '$(git' 'reset' '--hard)'",
+            ),
+            ("X='git\treset\n--hard'; $X", "'git' 'reset' '--hard'"),
+            ("X='git\rreset\u{b}--hard'; $X", "'git\rreset\u{b}--hard'"),
+            ("X='git\u{a0}reset'; $X", "'git\u{a0}reset'"),
+            ("IFS=''; X='git reset'; $X", "'git reset'"),
+            ("IFS=:; X='git reset'; \"$X\"", "'git reset'"),
+        ] {
+            let model = model_literal_posix_executable_assignments(command, ShellDialect::Posix);
+            let [ModeledPosixExecutableInvocation::Resolved(invocation)] =
+                model.invocations.as_slice()
+            else {
+                panic!("expected one proven invocation: {command}: {model:?}");
+            };
+            assert_eq!(invocation.command, expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn executable_assignment_expansion_keeps_inert_values_inert_540() {
+        for command in [
+            "X='git reset --hard'; \"$X\"",
+            "X='/opt/tools/git reset --hard'; \"${X}\"",
+            "X=''; \"$X\" git reset --hard",
+            "X='git reset --hard'; printf '%s' \"$X\"",
+            "X='echo ; git reset --hard'; $X",
+            "X='echo $(git reset --hard)'; $X",
+            "X='echo `git reset --hard`'; $X",
+            "X='echo > /etc/profile'; $X",
+            "IFS=''; X='git reset --hard'; $X",
+            "X=git; $X status; $X diff",
+            "X=printf; $X '%s' safe; $X '%s' done",
+            "X=echo; Y=printf; $Y '>/dev/null' -v X git; $X 'git reset --hard'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(result.is_allowed(), "{command}: {:?}", result.pattern_info);
+        }
+    }
+
+    #[test]
+    fn executable_assignment_ifs_and_pathname_uncertainty_never_supply_masks_540() {
+        for command in [
+            "IFS=:; X='git:reset:--hard'; $X",
+            "IFS=$CUSTOM; X='git reset --hard'; $X",
+            "IFS=''; IFS=:; X='git:reset:--hard'; $X",
+            "X='g*'; $X reset --hard",
+            "X=g*; $X reset --hard",
+            "X='gi?'; $X reset --hard",
+            "X='gi[t]'; $X reset --hard",
+            "IFS=''; X='g*'; $X reset --hard",
+        ] {
+            let model = model_literal_posix_executable_assignments(command, ShellDialect::Posix);
+            assert!(
+                matches!(
+                    model.invocations.as_slice(),
+                    [ModeledPosixExecutableInvocation::Unverified { .. }]
+                ),
+                "{command}: {model:?}"
+            );
+            assert!(
+                model.inert_ranges.is_empty(),
+                "unproven source remains visible: {command}"
+            );
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            let info = result
+                .pattern_info
+                .expect("uncertain executable carries a rule");
+            assert!(result.decision == EvaluationDecision::Deny, "{command}");
+            assert_eq!(info.pack_id.as_deref(), Some("heredoc.posix"), "{command}");
+            assert_eq!(
+                info.pattern_name.as_deref(),
+                Some("executable-unverified"),
+                "{command}"
+            );
+        }
+
+        for command in [
+            "IFS=:; IFS=' \t\n'; X='git reset --hard'; $X",
+            "IFS=$CUSTOM; IFS=$' \\t\\n'; X='git reset --hard'; $X",
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "restored default IFS exposes Git: {command}"
+            );
+            assert_eq!(
+                result.pattern_info.and_then(|info| info.pattern_name),
+                Some("reset-hard".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn executable_assignment_state_cannot_survive_parent_shell_mutators_540() {
+        for command in [
+            "X=echo; Y=eval; $Y 'X=git'; $X reset --hard",
+            "X=echo; Y=printf; $Y -v X git; $X reset --hard",
+            "X=echo; Y=printf; $Y >/dev/null -v X git; $X reset --hard",
+            "X=echo; Y=printf; $Y > /dev/null -v X git; $X reset --hard",
+            "X=echo; Y=printf; $Y -v 2>/dev/null X git; $X reset --hard",
+            "X=echo; Y=read; $Y X; $X reset --hard",
+            "X='git:reset:--hard'; Y=eval; $Y 'IFS=:'; $X",
+            "X=; IFS=${X:=git}; \"$X\" reset --hard",
+        ] {
+            let model = model_literal_posix_executable_assignments(command, ShellDialect::Posix);
+            assert!(
+                matches!(
+                    model.invocations.last(),
+                    Some(ModeledPosixExecutableInvocation::Unverified { .. })
+                ),
+                "{command}: {model:?}"
+            );
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "a stale executable binding must not grant an allow: {command}"
+            );
+        }
+        let command = "X=echo; Y=eval; $Y 'X=git'; IFS=' \t\n'; X=git; $X status";
+        let model = model_literal_posix_executable_assignments(command, ShellDialect::Posix);
+        assert!(
+            model.invocations.iter().all(|invocation| matches!(
+                invocation,
+                ModeledPosixExecutableInvocation::Resolved(_)
+            )),
+            "fresh literal assignments restore proof: {model:?}"
+        );
+        let result = evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+        assert!(
+            result.is_allowed(),
+            "fresh safe binding: {:?}",
+            result.pattern_info
+        );
+    }
+
+    #[test]
+    fn executable_assignment_limits_are_findings_only_at_executable_uses_540() {
+        let large = "x".repeat(MAX_POSIX_EXECUTABLE_VALUE_BYTES + 1);
+        let data = format!("X='{large}'; printf '%s' \"$X\"");
+        let model = model_literal_posix_executable_assignments(&data, ShellDialect::Posix);
+        assert!(model.invocations.is_empty());
+        assert!(model.inert_ranges.is_empty());
+
+        let many_fields = "field ".repeat(MAX_POSIX_EXECUTABLE_FIELDS + 1);
+        for command in [format!("X='{large}'; $X"), format!("X='{many_fields}'; $X")] {
+            let model = model_literal_posix_executable_assignments(&command, ShellDialect::Posix);
+            assert!(
+                matches!(
+                    model.invocations.as_slice(),
+                    [ModeledPosixExecutableInvocation::Unverified { .. }]
+                ),
+                "{model:?}"
+            );
+            assert!(model.inert_ranges.is_empty());
+        }
+
+        let assignments = (0..=MAX_POSIX_EXECUTABLE_BINDINGS)
+            .map(|index| format!("X{index}=git; "))
+            .collect::<String>();
+        let data = format!("{assignments}printf '%s' \"$X0\"");
+        assert!(
+            model_literal_posix_executable_assignments(&data, ShellDialect::Posix)
+                .invocations
+                .is_empty()
+        );
+        let command = format!("{assignments}$X0 reset --hard");
+        assert!(matches!(
+            model_literal_posix_executable_assignments(&command, ShellDialect::Posix)
+                .invocations
+                .as_slice(),
+            [ModeledPosixExecutableInvocation::Unverified { .. }]
+        ));
+
+        let padding = "Y=0; ".repeat(MAX_POSIX_EXECUTABLE_SEGMENTS);
+        let command = format!("X='git reset --hard'; $X; {padding}printf done");
+        let model = model_literal_posix_executable_assignments(&command, ShellDialect::Posix);
+        assert!(
+            matches!(
+                model.invocations.first(),
+                Some(ModeledPosixExecutableInvocation::Resolved(_))
+            ),
+            "a bounded tail cannot erase earlier evidence: {model:?}"
+        );
+        let allowed = project_allowlists_for_rule(
+            "heredoc.posix:executable-unverified",
+            "reviewed analysis boundary",
+        );
+        let result =
+            evaluate_with_pack_ids_and_allowlists_at_path(&command, &["core.git"], &allowed, None);
+        assert!(result.is_denied());
+        assert_eq!(
+            result.pattern_info.and_then(|info| info.pattern_name),
+            Some("reset-hard".to_string())
+        );
+    }
+
+    #[test]
+    fn executable_assignment_rules_and_grants_keep_their_scope_540() {
+        let command = "X='git reset --hard'; $X";
+        let allowed = project_allowlists_for_rule("core.git:reset-hard", "reviewed Git reset");
+        assert!(
+            evaluate_with_pack_ids_and_allowlists_at_path(command, &["core.git"], &allowed, None)
+                .is_allowed()
+        );
+        let unrelated = project_allowlists_for_rule("core.git:clean-force", "different operation");
+        assert!(
+            evaluate_with_pack_ids_and_allowlists_at_path(command, &["core.git"], &unrelated, None)
+                .is_denied()
+        );
+
+        let uncertain = project_allowlists_for_rule(
+            "heredoc.posix:executable-unverified",
+            "reviewed executable assembly",
+        );
+        let result = evaluate_with_pack_ids_and_allowlists_at_path(
+            "IFS=:; X='git:status'; $X; git reset --hard",
+            &["core.git"],
+            &uncertain,
+            None,
+        );
+        assert!(result.is_denied());
+        assert_eq!(
+            result.pattern_info.and_then(|info| info.pattern_name),
+            Some("reset-hard".to_string())
+        );
+
+        let command = "FLOWCTL='bash -c'; $FLOWCTL gate check --command 'npm test'";
+        let result = evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+        assert!(result.is_denied());
+        assert_eq!(
+            result.pattern_info.and_then(|info| info.pattern_name),
+            Some("inline-launcher-unverified".to_string())
+        );
     }
 
     /// `core.filesystem:credential-file-write` runs ahead of the redirect
