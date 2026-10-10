@@ -15,6 +15,21 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Fixed
 
+- **Inspect GNU tar helpers inside shell groups (#540).** Helper discovery now
+  reaches actual tar invocations inside parentheses and brace groups, preserving
+  their original command context. Enclosing file writes or earlier state changes
+  prevent a helper from relying on stale local-file evidence, including a
+  PostgreSQL checkpoint helper whose input is overwritten by the caller's
+  redirect. Read-only groups retain the existing helper checks.
+- **Analyze scripts written by tee before execution (#540).** A quoted heredoc
+  written to literal files by `tee` and immediately run by a supported
+  interpreter now receives the same language-aware safety checks as a script
+  written by `cat`. This catches destructive Python and JavaScript filesystem
+  calls while recognizing genuine language literals and arrow operators.
+  Source identity requires an unambiguous overwrite and interpreter handoff;
+  append mode, dynamic paths, extra consumers, and outputs that replace an
+  interpreter retain conservative analysis. Ordinary data writes and the
+  existing cat-based transfer-data checks keep their behavior.
 - **Doctor audits unrestricted allowlist exceptions (#545).** Active whole-rule
   grants with no working-directory restriction or expiration now produce
   actionable warnings naming the rule, source layer/file, reason, and available

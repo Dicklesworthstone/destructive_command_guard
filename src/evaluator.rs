@@ -18779,6 +18779,206 @@ fn tar_callsite_may_write_files(command: &str) -> bool {
     false
 }
 
+/// Recover local commands inside shell groups without treating the grouping
+/// punctuation as argv. Keep source offsets and the full caller separately:
+/// extracting `(tar ...) >file` must not discard its redirect or stdin scope.
+/// Earlier setup and concurrent pipeline/background siblings make caller-local
+/// file evidence untrustworthy; this is not a general shell-state proof.
+fn tar_invocation_ranges(
+    command: &str,
+    sources: &mut Vec<TarHelperSource>,
+) -> Vec<(usize, usize, bool, bool)> {
+    let mut ranges: Vec<_> = command_segment_ranges(command)
+        .into_iter()
+        .map(|(start, end)| (start, end, false, false))
+        .collect();
+    if !command.contains(['(', '{']) || command.len() as u64 > MAX_INDIRECT_INPUT_BYTES {
+        // Cheap text hints can come entirely from quoted data. Until a real
+        // invocation owns the source, retain the existing bounded fallback.
+        return ranges;
+    }
+    let Ok(ast) = AstGrep::try_new(command, SupportLang::Bash) else {
+        return ranges;
+    };
+    if ast.root().get_inner_node().has_error() {
+        return ranges;
+    }
+    let mut grouped = Vec::new();
+    let mut owns_grouped_tar = false;
+    let mut prior_statement = false;
+    let mut pending = vec![(ast.root(), false, false, false, false)];
+    let mut visited = 0usize;
+    const MAX_TAR_GROUP_NODES: usize = 4096;
+    while let Some((node, inside_group, concurrent, inherited_stdin, inherited_nonlocal)) =
+        pending.pop()
+    {
+        visited += 1;
+        if visited > MAX_TAR_GROUP_NODES {
+            if owns_grouped_tar {
+                push_tar_helper(
+                    sources,
+                    TarHelperSource::AnalysisLimit("too many grouped tar source nodes"),
+                );
+            }
+            return ranges;
+        }
+        let kind = node.kind();
+        let inherited_nonlocal =
+            inherited_nonlocal || node.children().any(tar_redirect_has_executable_expansion);
+        let inherited_stdin = inherited_stdin
+            || node.children().any(|child| {
+                tar_redirect_targets_stdin(&child)
+                    || (child.kind().as_ref() == "heredoc_redirect"
+                        && child
+                            .children()
+                            .any(|nested| tar_redirect_targets_stdin(&nested)))
+            });
+        match kind.as_ref() {
+            "command" => {
+                if inside_group {
+                    let range = node.range();
+                    owns_grouped_tar |=
+                        command_tokens(node.text().as_ref()).is_some_and(|(executable, _)| {
+                            matches!(executable.as_str(), "tar" | "gtar")
+                        });
+                    grouped.push((
+                        range.start,
+                        range.end,
+                        prior_statement || concurrent || inherited_nonlocal,
+                        inherited_stdin,
+                    ));
+                }
+                prior_statement = true;
+                // Substitutions in argv are separate execution domains and
+                // already have their own recursive evaluation. Never discover
+                // a quoted helper's text as another local command here.
+                continue;
+            }
+            "variable_assignment"
+            | "variable_assignments"
+            | "declaration_command"
+            | "unset_command"
+            | "test_command"
+            | "function_definition" => {
+                prior_statement = true;
+                continue;
+            }
+            "compound_statement" if node.text().trim_start().starts_with("((") => {
+                // Bash also uses this node kind for arithmetic statements,
+                // whose expansions can run code or change shell variables.
+                prior_statement = true;
+                continue;
+            }
+            "redirected_statement" if node.field("body").is_none() => {
+                // A standalone redirect can execute expansions before a
+                // later group even though there is no command body to visit.
+                prior_statement = true;
+                continue;
+            }
+            "if_statement"
+            | "elif_clause"
+            | "else_clause"
+            | "while_statement"
+            | "for_statement"
+            | "c_style_for_statement"
+            | "do_group"
+            | "case_statement"
+            | "case_item" => prior_statement = true,
+            "program"
+            | "list"
+            | "subshell"
+            | "compound_statement"
+            | "redirected_statement"
+            | "pipeline"
+            | "negated_command" => {}
+            // In particular, skip function bodies, heredoc/string data,
+            // command substitutions and process substitutions.
+            _ => continue,
+        }
+        let inside_group =
+            inside_group || matches!(kind.as_ref(), "subshell" | "compound_statement");
+        let concurrent = concurrent
+            || kind.as_ref() == "pipeline"
+            || node.children().any(|child| child.kind().as_ref() == "&");
+        let start = pending.len();
+        pending.extend(
+            node.children()
+                .filter(ast_grep_core::Node::is_named)
+                .map(|child| {
+                    (
+                        child,
+                        inside_group,
+                        concurrent,
+                        inherited_stdin,
+                        inherited_nonlocal,
+                    )
+                }),
+        );
+        pending[start..].reverse();
+    }
+    // Replace the enclosing legacy segments, whose leading '(' or '{' and
+    // trailing ')' are not command arguments. Retain strictly nested ranges
+    // such as command substitutions, which have independent execution scope.
+    grouped.sort_unstable_by_key(|(start, end, _, _)| (*start, *end));
+    ranges.retain(|(start, end, _, _)| {
+        let first = grouped.partition_point(|(inner_start, _, _, _)| inner_start < start);
+        grouped
+            .get(first)
+            .is_none_or(|(_, inner_end, _, _)| inner_end > end)
+    });
+    ranges.extend(grouped);
+    ranges.sort_unstable_by_key(|(start, end, _, _)| (*start, *end));
+    ranges
+}
+
+/// Expansions in a group's redirects run before its commands and may change a
+/// callback's input files. Inspect syntax nodes so quoted path text stays data.
+fn tar_redirect_has_executable_expansion<D: Doc>(redirect: ast_grep_core::Node<'_, D>) -> bool {
+    if !matches!(
+        redirect.kind().as_ref(),
+        "file_redirect" | "heredoc_redirect" | "herestring_redirect"
+    ) {
+        return false;
+    }
+    let mut pending = vec![redirect];
+    let mut visited = 0usize;
+    while let Some(node) = pending.pop() {
+        visited += 1;
+        if visited > 4096
+            || matches!(
+                node.kind().as_ref(),
+                "command_substitution" | "process_substitution"
+            )
+        {
+            return true;
+        }
+        pending.extend(node.children());
+    }
+    false
+}
+
+/// Only actual redirect syntax can replace a group's descriptor zero. This
+/// deliberately does not read the input: callbacks may consume those bytes as
+/// code, so inheriting them is automated input even when the outer tar lists.
+fn tar_redirect_targets_stdin<D: Doc>(redirect: &ast_grep_core::Node<'_, D>) -> bool {
+    if !matches!(
+        redirect.kind().as_ref(),
+        "file_redirect" | "heredoc_redirect" | "herestring_redirect"
+    ) {
+        return false;
+    }
+    if let Some(descriptor) = redirect.field("descriptor") {
+        let descriptor = descriptor.text();
+        return !descriptor.is_empty() && descriptor.bytes().all(|byte| byte == b'0');
+    }
+    redirect.children().any(|child| {
+        matches!(
+            child.kind().as_ref(),
+            "<" | "<&" | "<&-" | "<>" | "<<" | "<<-" | "<<<"
+        )
+    })
+}
+
 fn collect_tar_helper_sources(command: &str, dialect: ShellDialect) -> Vec<TarHelperSource> {
     if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
         || (!command
@@ -18792,7 +18992,8 @@ fn collect_tar_helper_sources(command: &str, dialect: ShellDialect) -> Vec<TarHe
     let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
     let mut sources = Vec::new();
     let mut caller_writes_files = None;
-    for (start, end) in command_segment_ranges(data_view.as_ref()) {
+    let invocation_ranges = tar_invocation_ranges(data_view.as_ref(), &mut sources);
+    for (start, end, inherited_nonlocal, inherited_stdin) in invocation_ranges {
         let segment = &data_view[start..end];
         let Ok(masked) = mask_command_substitutions(segment) else {
             continue;
@@ -18902,13 +19103,15 @@ fn collect_tar_helper_sources(command: &str, dialect: ShellDialect) -> Vec<TarHe
         // Creation/update can overwrite the archive before a callback reads
         // it as code; extraction can replace arbitrary callback input files.
         // Native tar -C is virtual and does not change a helper's process cwd.
-        let nonlocal_filesystem = script_segment_is_nonlocal(segment)
+        let nonlocal_filesystem = inherited_nonlocal
+            || script_segment_is_nonlocal(segment)
             || options.uncertain
             || options.writes_local_files
             || *caller_writes_files
                 .get_or_insert_with(|| tar_callsite_may_write_files(data_view.as_ref()))
             || !matches!(options.mode, Some('t' | 'd'));
-        let automated_stdin = source_position_receives_automated_stdin(command, start, dialect);
+        let automated_stdin =
+            inherited_stdin || source_position_receives_automated_stdin(command, start, dialect);
         let mut push_command = |value: &str,
                                 archive_stdin: bool,
                                 remote: bool,
@@ -19375,6 +19578,7 @@ mod tar_helper_tests {
     fn tar_callsite_writes_require_actual_file_redirects() {
         for command in [
             "tar -tf archive > safe.sql",
+            "(tar -tf archive) > safe.sql",
             "{ tar -tf archive; } > safe.sql",
             "tar -tf archive $(printf SELECT > safe.sql)",
             "tar -tf archive <> safe.sql",
@@ -19423,6 +19627,153 @@ mod tar_helper_tests {
                     if command == "psql -X -f safe.sql" && *nonlocal_filesystem == expected_nonlocal
             )), "{command}");
         }
+    }
+
+    #[test]
+    fn grouped_tar_helpers_preserve_caller_context_540() {
+        for (command, expected_nonlocal) in [
+            (
+                "(tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql')",
+                false,
+            ),
+            (
+                "{ tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql'; } >/dev/null",
+                false,
+            ),
+            (
+                "( (tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql') ) >safe.sql",
+                true,
+            ),
+            (
+                "(cd other; tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql')",
+                true,
+            ),
+            (
+                "cd other; (tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql')",
+                true,
+            ),
+            (
+                "TAR_OPTIONS='--checkpoint=1'; (tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql')",
+                true,
+            ),
+            (
+                "[[ $(cp attacker.sql safe.sql) ]]; (tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql')",
+                true,
+            ),
+            (
+                "((setup = $(cp attacker.sql safe.sql; printf 1))); (tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql')",
+                true,
+            ),
+            (
+                "(env -C other tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql')",
+                true,
+            ),
+            (
+                "(tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql' | cp attacker.sql safe.sql)",
+                true,
+            ),
+            (
+                "(tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql' & cp attacker.sql safe.sql)",
+                true,
+            ),
+            (
+                "(tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql') <\"$(cp attacker.sql safe.sql; printf /dev/null)\"",
+                true,
+            ),
+            (
+                "(tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql') < <(cp attacker.sql safe.sql; printf 'SELECT 1;')",
+                true,
+            ),
+            (
+                "<\"$(cp attacker.sql safe.sql; printf /dev/null)\"; (tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql')",
+                true,
+            ),
+            (
+                "(tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql') <'$(cp attacker.sql safe.sql)'",
+                false,
+            ),
+        ] {
+            let sources = collect_tar_helper_sources(command, ShellDialect::Posix);
+            assert!(sources.iter().any(|source| matches!(
+                source,
+                TarHelperSource::Command { command, nonlocal_filesystem, .. }
+                    if command == "psql -X -f safe.sql" && *nonlocal_filesystem == expected_nonlocal
+            )), "{command}: {sources:?}");
+        }
+        for (command, expected_stdin) in [
+            (
+                "printf 'SELECT 1;' | (tar -tf archive --checkpoint-action='exec=psql -X')",
+                true,
+            ),
+            (
+                "(tar -tf archive --checkpoint-action='exec=psql -X') <unsafe.sql",
+                true,
+            ),
+            (
+                "(tar -tf archive --checkpoint-action='exec=psql -X') 00<unsafe.sql",
+                true,
+            ),
+            (
+                "{ tar -tf archive --checkpoint-action='exec=psql -X'; } 0<&3",
+                true,
+            ),
+            (
+                "(tar -tf archive --checkpoint-action='exec=psql -X') <<'SQL'\nSELECT 1;\nSQL",
+                true,
+            ),
+            (
+                "(tar -tf archive --checkpoint-action='exec=psql -X') <<<'SELECT 1;'",
+                true,
+            ),
+            (
+                "(tar -tf archive --checkpoint-action='exec=psql -X') 3<unsafe.sql",
+                false,
+            ),
+            (
+                "(tar -tf archive --checkpoint-action='exec=psql -X') 3<<'SQL'\nSELECT 1;\nSQL",
+                false,
+            ),
+        ] {
+            let sources = collect_tar_helper_sources(command, ShellDialect::Posix);
+            assert!(
+                sources.iter().any(|source| matches!(
+                    source,
+                    TarHelperSource::Command { command, automated_stdin, .. }
+                        if command == "psql -X" && *automated_stdin == expected_stdin
+                )),
+                "the original stdin scope must survive discovery: {command}: {sources:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_tar_discovery_preserves_data_and_function_boundaries_540() {
+        for command in [
+            "(printf '%s' \"tar -tf archive --checkpoint-action='exec=git reset --hard'\")",
+            "unused() { (tar -tf archive --checkpoint-action='exec=git reset --hard'); }; printf ready",
+            "cat <<'EOF'\n(tar -tf archive --checkpoint-action='exec=git reset --hard')\nEOF",
+            "printf '%s' '(tar'; )",
+        ] {
+            assert!(
+                collect_tar_helper_sources(command, ShellDialect::Posix).is_empty(),
+                "group discovery must not promote data or a function body: {command}"
+            );
+        }
+        let large_data = format!(
+            "printf '%s' '{} (tar)'",
+            "x".repeat(super::MAX_INDIRECT_INPUT_BYTES as usize)
+        );
+        assert!(collect_tar_helper_sources(&large_data, ShellDialect::Posix).is_empty());
+        let many_statements = format!(
+            "(tar -tf archive --checkpoint-action='exec=git reset --hard'; {})",
+            "true;".repeat(4096)
+        );
+        assert!(
+            collect_tar_helper_sources(&many_statements, ShellDialect::Posix)
+                .iter()
+                .any(|source| matches!(source, TarHelperSource::AnalysisLimit(_))),
+            "an owned grouped tar source must fail closed at the traversal bound"
+        );
     }
 }
 

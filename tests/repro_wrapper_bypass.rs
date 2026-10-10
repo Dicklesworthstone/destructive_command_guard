@@ -495,6 +495,68 @@ fn tar_helpers_cannot_treat_archive_input_as_interactive_stdin() {
 }
 
 #[test]
+fn grouped_tar_helpers_keep_the_callers_file_evidence_scope_540() {
+    for command in [
+        "(tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql')",
+        "{ tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql'; }",
+        "( (tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql') )",
+        "(tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql') >/dev/null",
+        "{ tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql'; } 2>&1",
+        "(tar -tf input.tar -C other --checkpoint-action='exec=psql -X -f safe.sql')",
+        "(tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql') <'$(cp attacker.sql safe.sql)'",
+    ] {
+        assert_tar_allowed(command);
+    }
+    for command in [
+        "{ tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql'; } >safe.sql",
+        "( (tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql') ) >safe.sql",
+        "(tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql') 2>safe.sql",
+        "(env -C other tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql')",
+        "(cd other; tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql')",
+        "cd other; (tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql')",
+        "TAR_OPTIONS='--checkpoint=1'; (tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql')",
+        "(tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql' | cp attacker.sql safe.sql)",
+        "(tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql' & cp attacker.sql safe.sql)",
+        "(tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql') <\"$(cp attacker.sql safe.sql; printf /dev/null)\"",
+        "(tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql') < <(cp attacker.sql safe.sql; printf 'SELECT 1;')",
+        "<\"$(cp attacker.sql safe.sql; printf /dev/null)\"; (tar -tf input.tar --checkpoint-action='exec=psql -X -f safe.sql')",
+    ] {
+        assert_tar_denied(command, "database.postgresql:stdin-unverified");
+    }
+}
+
+#[test]
+fn grouped_tar_helpers_keep_destructive_and_dynamic_code_visible_540() {
+    assert_tar_denied(
+        "(tar -tf input.tar --checkpoint-action='exec=git reset --hard')",
+        "core.git:reset-hard",
+    );
+    assert_tar_denied(
+        "{ tar -tf input.tar --checkpoint-action='exec=psql -X -c \"DROP TABLE important_data;\"'; }",
+        "database.postgresql:drop-table",
+    );
+    assert_tar_denied(
+        "(tar -tf input.tar --checkpoint-action=\"$ACTION\")",
+        "core.filesystem:tar-exec-unverified",
+    );
+}
+
+#[test]
+fn grouped_tar_helper_stdin_is_not_assumed_interactive_540() {
+    for command in [
+        "(tar -tf input.tar --checkpoint-action='exec=psql -X') <unsafe.sql",
+        "(tar -tf input.tar --checkpoint-action='exec=psql -X') 0<unsafe.sql",
+        "(tar -tf input.tar --checkpoint-action='exec=psql -X') 00<unsafe.sql",
+        "{ tar -tf input.tar --checkpoint-action='exec=psql -X'; } 0<&3",
+        "(tar -tf input.tar --checkpoint-action='exec=psql -X') <<'SQL'\nSELECT 1;\nSQL",
+        "(tar -tf input.tar --checkpoint-action='exec=psql -X') <<<'SELECT 1;'",
+    ] {
+        assert_tar_denied(command, "core.filesystem:tar-exec-unverified");
+    }
+    assert_tar_allowed("(tar -tf input.tar --checkpoint-action='exec=psql -X') 3<unsafe.sql");
+}
+
+#[test]
 fn tar_remote_archive_helpers_keep_remote_scope_and_activation() {
     assert_tar_denied(
         "TAPE=host:archive tar -c --rmt-command='git reset --hard' file",

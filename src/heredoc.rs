@@ -7904,7 +7904,7 @@ pub(crate) fn mask_inert_interpreter_stdin(command: &str) -> Cow<'_, str> {
     }
 }
 
-/// A quoted cat body written verbatim and immediately read by a concrete
+/// A quoted cat or tee body written verbatim and immediately read by a concrete
 /// interpreter. This proof supplies a language, never an allow:
 /// both the language-aware checks and conservative raw-pattern scan remain.
 struct WrittenHeredocInterpreter {
@@ -7969,9 +7969,9 @@ pub(crate) fn range_is_quoted_interpreter_source(
     };
     if statements.next().is_some()
         || statement.kind().as_ref() != "redirected_statement"
-        || !statement
+        || statement
             .field("body")
-            .is_some_and(|body| body.kind().as_ref() == "command")
+            .is_none_or(|body| body.kind().as_ref() != "command")
         || statement
             .children()
             .filter(ast_grep_core::Node::is_named)
@@ -8096,7 +8096,9 @@ fn written_heredoc_interpreter(command: &str) -> Option<WrittenHeredocInterprete
         [setup, writer, consumer] if literal_mkdir_setup(setup) => (writer, consumer),
         _ => return None,
     };
-    let (operator_start, body, destination) = literal_cat_file_write(writer)?;
+    let (operator_start, body, destinations) = literal_cat_file_write(writer)
+        .map(|(operator_start, body, destination)| (operator_start, body, vec![destination]))
+        .or_else(|| literal_tee_file_write(writer))?;
     if consumer.kind().as_ref() != "command"
         || consumer
             .children()
@@ -8117,7 +8119,16 @@ fn written_heredoc_interpreter(command: &str) -> Option<WrittenHeredocInterprete
     let interpreter = program.rsplit('/').next()?;
     let language = ScriptLanguage::from_command(interpreter);
     let supported_shell = matches!(interpreter, "bash" | "sh" | "dash" | "ksh" | "zsh");
-    if destination != *path
+    if !destinations.contains(path)
+        // Every output must leave the interpreter's normal contract intact,
+        // including tee outputs that the consumer does not read. Comparing
+        // basenames also covers an absolute output followed by a PATH lookup.
+        || destinations.iter().any(|destination| {
+            let name = destination.rsplit('/').next().unwrap_or(destination);
+            matches!(name, "cat" | "tee" | "mkdir")
+                || SHELL_PROGRAMS.contains(&name)
+                || ScriptLanguage::from_command(name) != ScriptLanguage::Unknown
+        })
         || !(supported_shell
             || matches!(
                 language,
@@ -8145,7 +8156,7 @@ fn literal_cat_file_write<D: ast_grep_core::Doc>(
     if writer.kind().as_ref() != "redirected_statement" {
         return None;
     }
-    let owner = literal_cat_write_owner(writer)?;
+    let owner = literal_heredoc_write_owner(writer)?;
     let words = literal_script_words(&owner)?;
     let [program] = words.as_slice() else {
         return None;
@@ -8160,6 +8171,63 @@ fn literal_cat_file_write<D: ast_grep_core::Doc>(
     {
         return None;
     }
+    let (operator_start, body, destination) = literal_quoted_write_input(writer)?;
+    let destination = destination.filter(|path| path != "/dev/null")?;
+    Some((operator_start, body, destination))
+}
+
+/// Tee writes the same quoted stdin bytes to each literal output in overwrite
+/// mode. Stdout may remain unchanged or be discarded; a stdout file,
+/// descriptor duplication, or input redirect needs a different provenance proof.
+/// Keep this separate from the cat-only transfer-data proof (#543).
+fn literal_tee_file_write<D: ast_grep_core::Doc>(
+    writer: &ast_grep_core::Node<'_, D>,
+) -> Option<(usize, Range<usize>, Vec<String>)> {
+    if writer.kind().as_ref() != "redirected_statement" {
+        return None;
+    }
+    let owner = literal_heredoc_write_owner(writer)?;
+    let words = literal_script_words(&owner)?;
+    let (program, arguments) = words.split_first()?;
+    if owner.kind().as_ref() != "command"
+        || owner
+            .children()
+            .filter(ast_grep_core::Node::is_named)
+            .any(|child| {
+                !matches!(
+                    child.kind().as_ref(),
+                    "command_name" | "word" | "raw_string" | "string"
+                )
+            })
+        || !matches!(program.as_str(), "tee" | "/bin/tee" | "/usr/bin/tee")
+        || !trusted_literal_script_program(program)
+    {
+        return None;
+    }
+    let destinations = match arguments {
+        [separator, destinations @ ..] if separator == "--" => destinations,
+        destinations => destinations,
+    };
+    if destinations.is_empty()
+        || destinations
+            .iter()
+            .any(|path| !is_plain_file_path(path) || path == "/dev/null")
+    {
+        return None;
+    }
+    let (operator_start, body, stdout) = literal_quoted_write_input(writer)?;
+    if stdout.is_some_and(|path| path != "/dev/null") {
+        return None;
+    }
+    Some((operator_start, body, destinations.to_vec()))
+}
+
+/// Recover one quoted stdin heredoc and at most one plain stdout overwrite.
+/// Bash may attach a trailing redirect to the heredoc instead of the writer;
+/// inspect both locations before claiming that the body reaches the writer.
+fn literal_quoted_write_input<D: ast_grep_core::Doc>(
+    writer: &ast_grep_core::Node<'_, D>,
+) -> Option<(usize, Range<usize>, Option<String>)> {
     let mut redirects = Vec::new();
     let mut heredoc = None;
     for child in writer.children().filter(ast_grep_core::Node::is_named) {
@@ -8204,17 +8272,18 @@ fn literal_cat_file_write<D: ast_grep_core::Doc>(
             _ => return None,
         }
     }
-    if !quoted || redirects.len() != 1 {
+    if !quoted {
         return None;
     }
-    Some((
-        heredoc.range().start + operator_offset,
-        body?,
-        literal_overwrite_destination(&redirects[0])?,
-    ))
+    let destination = match redirects.as_slice() {
+        [] => None,
+        [redirect] => Some(literal_stdout_overwrite_destination(redirect)?),
+        _ => return None,
+    };
+    Some((heredoc.range().start + operator_offset, body?, destination))
 }
 
-fn literal_cat_write_owner<'a, D: ast_grep_core::Doc>(
+fn literal_heredoc_write_owner<'a, D: ast_grep_core::Doc>(
     writer: &ast_grep_core::Node<'a, D>,
 ) -> Option<ast_grep_core::Node<'a, D>> {
     let body = writer.field("body")?;
@@ -8222,7 +8291,7 @@ fn literal_cat_write_owner<'a, D: ast_grep_core::Doc>(
         return Some(body);
     }
     // Bash's grammar attaches `mkdir ... && cat >file <<EOF` redirects
-    // to the list. Only its final cat consumes the heredoc. Admit this exact
+    // to the list. Only its final command consumes the heredoc. Admit this exact
     // setup shape; a grouped, branching or longer command is not a proof.
     if body.kind().as_ref() != "list" {
         return None;
@@ -8237,7 +8306,7 @@ fn literal_cat_write_owner<'a, D: ast_grep_core::Doc>(
         .then(|| owner.clone())
 }
 
-fn literal_overwrite_destination<D: ast_grep_core::Doc>(
+fn literal_stdout_overwrite_destination<D: ast_grep_core::Doc>(
     redirect: &ast_grep_core::Node<'_, D>,
 ) -> Option<String> {
     let mut destination = None;
@@ -8251,7 +8320,7 @@ fn literal_overwrite_destination<D: ast_grep_core::Doc>(
                 let [path] = words.as_slice() else {
                     return None;
                 };
-                if !is_plain_file_path(path) || path == "/dev/null" {
+                if !is_plain_file_path(path) {
                     return None;
                 }
                 destination = Some(path.clone());
@@ -17016,6 +17085,124 @@ fi"#;
                 written_javascript_arrow_offsets(command).is_empty(),
                 "unproven source cannot exempt an arrow: {command}"
             );
+        }
+    }
+
+    #[test]
+    fn tee_written_heredoc_keeps_exact_source_identity_540() {
+        let body = "const text = 'π => !string';\nf(u => !x);";
+        for (writer, consumer) in [
+            ("tee /tmp/a.js <<'EOF'", "node /tmp/a.js"),
+            ("tee -- /tmp/a.js <<'EOF' >/dev/null", "node /tmp/a.js"),
+            ("tee /tmp/a.js >/dev/null <<'EOF'", "node /tmp/a.js"),
+            (
+                "/bin/tee '/tmp/a b.js' 0<<'EOF' 1>|'/dev/null'",
+                "/usr/bin/node '/tmp/a b.js'",
+            ),
+            (
+                "tee /tmp/a.js /tmp/b.js <<'EOF' >/dev/null",
+                "node /tmp/b.js",
+            ),
+            (
+                "mkdir -p /tmp/x && /usr/bin/tee /tmp/x/a.js <<'EOF' >/dev/null",
+                "node /tmp/x/a.js",
+            ),
+        ] {
+            let command = format!("{writer}\n{body}\nEOF\n{consumer}");
+            let proof = written_heredoc_interpreter(&command).expect("literal tee script handoff");
+            assert_eq!(&command[proof.body.clone()], body, "exact original bytes");
+            assert_eq!(proof.language, ScriptLanguage::JavaScript);
+            assert_eq!(proof.interpreter, "node");
+            let ExtractionResult::Extracted(contents) =
+                extract_content(&command, &ExtractionLimits::structural_scan())
+            else {
+                panic!("complete extraction required: {command}");
+            };
+            let content = contents
+                .iter()
+                .find(|source| source.byte_range.start == proof.operator_start)
+                .expect("the exact tee body must reach typed analysis");
+            assert_eq!(content.content, body, "{command}");
+            assert_eq!(content.language, ScriptLanguage::JavaScript);
+            assert_eq!(content.target_command.as_deref(), Some("node"));
+            assert!(range_is_quoted_interpreter_source(
+                &command,
+                &proof.body,
+                ScriptLanguage::JavaScript
+            ));
+            assert_eq!(
+                written_javascript_arrow_offsets(&command),
+                vec![command.find("u =>").expect("real arrow") + 3],
+                "only a real language operator earns an exemption"
+            );
+            assert!(
+                mask_non_executing_heredocs(&command).contains(body),
+                "executed source must retain its raw safety evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn tee_written_script_proof_rejects_ambiguous_inputs_and_outputs_540() {
+        for writer in [
+            "tee <<'EOF'",
+            "tee -a /tmp/a.js <<'EOF'",
+            "tee --append /tmp/a.js <<'EOF'",
+            "tee -i /tmp/a.js <<'EOF'",
+            "tee - /tmp/a.js <<'EOF'",
+            "tee /tmp/a.js /dev/stdout <<'EOF'",
+            "tee /tmp/a.js /proc/self/fd/1 <<'EOF'",
+            "tee /tmp/a.js /dev/null <<'EOF'",
+            "tee /tmp/a.js '$OUTPUT' <<'EOF'",
+            "tee /tmp/a.js >(bash) <<'EOF'",
+            "tee /tmp/a.js 3<<'EOF'",
+            "tee /tmp/a.js < other <<'EOF'",
+            "tee /tmp/a.js <<'EOF' < other",
+            "tee /tmp/a.js <<EOF >'/dev/null'",
+            "tee /tmp/a.js <<'EOF' 2>/dev/null",
+            "tee /tmp/a.js <<'EOF' >&2",
+            "tee /tmp/a.js <<'EOF' >>/dev/null",
+            "tee /tmp/a.js >/tmp/b.js <<'EOF'",
+            "tee /tmp/a.js >/dev/null <<'EOF' >/dev/null",
+            "tee /tmp/a.js <<'EOF' >/tmp/b.js",
+            "tee /tmp/a.js /usr/bin/node <<'EOF'",
+            "tee /tmp/a.js /usr/bin/../bin/node <<'EOF'",
+            "tee /tmp/a.js /usr/bin/python3 <<'EOF'",
+            "/tmp/tee /tmp/a.js <<'EOF'",
+            "env tee /tmp/a.js <<'EOF'",
+            "PATH=/tmp tee /tmp/a.js <<'EOF'",
+            "mkdir -p /tmp/x || tee /tmp/a.js <<'EOF'",
+        ] {
+            let command = format!("{writer}\nf(u => !x);\nEOF\nnode /tmp/a.js");
+            assert!(
+                written_heredoc_interpreter(&command).is_none(),
+                "an ambiguous writer cannot establish source identity: {command}"
+            );
+            assert!(written_javascript_arrow_offsets(&command).is_empty());
+        }
+        for consumer in [
+            "node /tmp/b.js",
+            "node --check /tmp/a.js",
+            "python3 -c /tmp/a.js",
+            "python3 -m /tmp/a.js",
+            "env node /tmp/a.js",
+            "LD_PRELOAD=/tmp/hook.so node /tmp/a.js",
+            "node /tmp/a.js\nbash /tmp/a.js",
+            "printf changed > /tmp/a.js\nnode /tmp/a.js",
+        ] {
+            let command = format!("tee /tmp/a.js <<'EOF' >/dev/null\nf(u => !x);\nEOF\n{consumer}");
+            assert!(
+                written_heredoc_interpreter(&command).is_none(),
+                "the entire consumer workflow must be proven: {command}"
+            );
+        }
+        for command in [
+            "tee /tmp/a.js <<'FIRST' <<'EOF'\nfirst body\nFIRST\nf(u => !x);\nEOF\nnode /tmp/a.js",
+            "tee /usr/bin/node <<'EOF'\nf(u => !x);\nEOF\n/usr/bin/node /usr/bin/node",
+            "cat >/usr/bin/node <<'EOF'\nf(u => !x);\nEOF\n/usr/bin/node /usr/bin/node",
+        ] {
+            assert!(written_heredoc_interpreter(command).is_none(), "{command}");
+            assert!(written_javascript_arrow_offsets(command).is_empty());
         }
     }
 

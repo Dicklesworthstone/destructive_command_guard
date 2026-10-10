@@ -251,6 +251,174 @@ EOF";
     }
 
     #[test]
+    fn issue_540_tee_written_programs_receive_language_safety_checks() {
+        // The Python and JavaScript filesystem APIs require their actual
+        // language checks; retaining the body as raw shell text is insufficient.
+        for (program, body, expected_rule) in [
+            (
+                "python3",
+                "import shutil\nshutil.rmtree('/home/user')",
+                "heredoc.python:shutil_rmtree",
+            ),
+            (
+                "node",
+                "require('fs').rmSync('/home/user', {recursive: true});",
+                "heredoc.javascript:fs_rmsync.catastrophic",
+            ),
+        ] {
+            let command =
+                format!("tee /tmp/program <<'EOF' >/dev/null\n{body}\nEOF\n{program} /tmp/program");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(decision, "deny", "{command:?}");
+            assert_eq!(
+                rule, expected_rule,
+                "typed safety check required: {command:?}"
+            );
+        }
+        for (program, body) in [
+            (
+                "python3",
+                "import subprocess\nsubprocess.run(['rm', '-rf', '/home/user'])",
+            ),
+            (
+                "python3",
+                "open('/home/user/.ssh/authorized_keys', 'w').write('key')",
+            ),
+            (
+                "node",
+                "require('child_process').spawnSync('rm', ['-rf', '/home/user']);",
+            ),
+            (
+                "node",
+                "require('fs').writeFileSync('/home/user/.ssh/authorized_keys', 'key');",
+            ),
+            ("bash", "rm -rf /home/user"),
+            ("sh", "git reset --hard"),
+            ("ruby", "system('rm', '-rf', '/home/user')"),
+            ("perl", "system('rm', '-rf', '/home/user');"),
+            ("php", "<?php system('git reset --hard'); ?>"),
+        ] {
+            let command =
+                format!("tee /tmp/program <<'EOF' >/dev/null\n{body}\nEOF\n{program} /tmp/program");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(
+                decision, "deny",
+                "must inspect the program written by tee: {command:?}: {rule}"
+            );
+            assert!(!rule.is_empty(), "denial must name its rule: {command:?}");
+        }
+    }
+
+    #[test]
+    fn issue_540_literal_tee_output_paths_keep_their_interpreter_identity() {
+        for (writer, consumer) in [
+            ("tee /tmp/program.py <<'PY'", "python3 /tmp/program.py"),
+            (
+                "tee /tmp/program.py >/dev/null <<'PY'",
+                "python3 /tmp/program.py",
+            ),
+            (
+                "/usr/bin/tee /tmp/program.py <<'PY' >/dev/null",
+                "/usr/bin/python3 /tmp/program.py",
+            ),
+            (
+                "/bin/tee '/tmp/program file.py' 0<<'PY' 1>/dev/null",
+                "python3 '/tmp/program file.py'",
+            ),
+            (
+                "tee /tmp/first.py /tmp/second.py <<'PY' >/dev/null",
+                "python3 /tmp/first.py",
+            ),
+            (
+                "tee /tmp/first.py /tmp/second.py <<'PY' >/dev/null",
+                "python3 /tmp/second.py",
+            ),
+            (
+                "mkdir -p /tmp/scripts && tee /tmp/scripts/program.py <<'PY' >/dev/null",
+                "python3 /tmp/scripts/program.py",
+            ),
+            (
+                "mkdir -p /tmp/scripts\ntee /tmp/scripts/program.py <<'PY' >/dev/null",
+                "python3 /tmp/scripts/program.py",
+            ),
+        ] {
+            let command =
+                format!("{writer}\nimport shutil\nshutil.rmtree('/home/user')\nPY\n{consumer}");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(
+                decision, "deny",
+                "every literal tee output can become interpreter source: {command:?}: {rule}"
+            );
+            assert!(!rule.is_empty(), "denial must name its rule: {command:?}");
+        }
+    }
+
+    #[test]
+    fn issue_540_tee_source_identity_preserves_real_execution_evidence() {
+        for command in [
+            "tee /tmp/a.js <<'EOF' >/dev/null\nf(u => !x);\nrequire('child_process').execSync('echo bad > /etc/passwd');\nEOF\nnode /tmp/a.js",
+            "tee /tmp/a.js <<'EOF' >/dev/null\nf(u=>require('child_process').execSync('>$TARGET'));\nEOF\nnode /tmp/a.js",
+            "tee /tmp/a.js <<'EOF' >/dev/null\nconst run = require('child_process').execSync;\nrun('git reset --hard');\nEOF\nnode /tmp/a.js",
+            "tee /tmp/program.sh <<EOF >/dev/null\n$(rm -rf /home/user)\nEOF\nbash /tmp/program.sh",
+            "tee -a /tmp/program.sh <<'EOF' >/dev/null\nrm -rf /home/user\nEOF\nbash /tmp/program.sh",
+            "tee --append /tmp/program.sh <<'EOF' >/dev/null\ngit reset --hard\nEOF\nbash /tmp/program.sh",
+            "tee /tmp/program.sh <<'EOF' >/dev/null\nrm -rf /home/user\nEOF\nprintf '\\n' >> /tmp/program.sh\nbash /tmp/program.sh",
+            "tee /tmp/program.sh <<'EOF' >/dev/null\nrm -rf /home/user\nEOF\nsed -i 's/unused/other/' /tmp/program.sh\nbash /tmp/program.sh",
+            "tee /tmp/program.js <<'EOF' >/dev/null\nx=`git reset --hard`\nEOF\nnode /tmp/program.js\nbash /tmp/program.js",
+            "tee /tmp/program.sh <<'EOF' >/dev/null\nrm -rf /home/user\nEOF\ntimeout 5 bash /tmp/program.sh",
+            "tee /tmp/program.sh <<'EOF' >/dev/null\nrm -rf /home/user\nEOF\ncat /tmp/program.sh | bash",
+            "tee /tmp/program.sh <<'EOF' >/dev/null\nrm -rf /home/user\nEOF\nscp /tmp/program.sh /tmp/renamed.sh\nbash /tmp/renamed.sh",
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(
+                decision, "deny",
+                "source classification cannot hide destructive execution: {command:?}: {rule}"
+            );
+            assert!(!rule.is_empty(), "denial must name its rule: {command:?}");
+        }
+    }
+
+    #[test]
+    fn issue_540_safe_tee_programs_use_their_actual_language() {
+        for command in [
+            "tee /tmp/program.py <<'PY' >/dev/null\nprint('hello')\nPY\npython3 /tmp/program.py",
+            "tee /tmp/program.py <<'PY' >/dev/null\ns = \"run `git branch -d x` later\"\nprint(s)\nPY\npython3 /tmp/program.py",
+            "tee /tmp/program.js <<'JS' >/dev/null\nconst s = \"run `git branch -d x` later\";\nconsole.log(s);\nJS\nnode /tmp/program.js",
+            "tee /tmp/program.js <<'JS' >/dev/null\nconsole.log([1, 2].map(value => value + 1));\nJS\nnode /tmp/program.js",
+            "tee /tmp/first.js /tmp/second.js <<'JS' >/dev/null\nconsole.log([1, 2].map(value => value + 1));\nJS\nnode /tmp/second.js",
+            "tee /tmp/program.sh <<'SH' >/dev/null\nprintf hello\nSH\nbash /tmp/program.sh",
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(
+                decision, "allow",
+                "verified tee-written language source must avoid shell false positives: {command:?}: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_540_document_writes_and_data_consumers_remain_allowed() {
+        for command in [
+            "tee /tmp/example.py <<'EOF' >/dev/null\nimport shutil\nshutil.rmtree('/home/user')\nEOF",
+            "tee /tmp/example.js <<'EOF' >/dev/null\nrequire('fs').rmSync('/home/user', {recursive: true});\nEOF",
+            "tee notes.md <<'EOF' >/dev/null\nrm -rf /; git reset --hard\nEOF\ncat notes.md",
+            "tee notes.md backup.md <<'EOF' >/dev/null\nrm -rf /; git reset --hard\nEOF\nwc -l backup.md",
+            "tee -a notes.md <<'EOF' >/dev/null\nrm -rf /; git reset --hard\nEOF\ngit add notes.md && git commit -m docs",
+            "tee m.txt <<'EOF' >/dev/null\neval ran 16 sequences (5.7 GB) where training ran 4.\nEOF\ngit commit -F m.txt",
+            // The existing cat-only transfer proof remains a separate data
+            // contract; adding tee interpreter provenance must preserve it.
+            "cat > m.txt <<'EOF'\neval ran 16 sequences (5.7 GB) where training ran 4.\nEOF\nscp m.txt host:/tmp/renamed.txt\nssh host 'git commit -F /tmp/renamed.txt'",
+            "cat > notes.md <<'EOF'\n$(rm -rf /)\nEOF\nscp notes.md /tmp/copy.md",
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(
+                decision, "allow",
+                "output consumed only as literal data must remain allowed: {command:?}: {rule}"
+            );
+        }
+    }
+
+    #[test]
     fn issue_519_arrow_exemption_preserves_real_shell_evidence() {
         for command in [
             "cat >/tmp/a.js <<'EOF'\nf(u => !x);\nrequire('child_process').execSync('echo bad > /etc/passwd');\nEOF\nnode /tmp/a.js",
