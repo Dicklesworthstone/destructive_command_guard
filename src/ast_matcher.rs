@@ -291,6 +291,467 @@ impl DocumentationProof {
     }
 }
 
+const MAX_INTERPRETER_LITERAL_SOURCE_BYTES: usize = 256 * 1024;
+const MAX_INTERPRETER_LITERAL_NODES: usize = 4096;
+const MAX_INTERPRETER_LITERAL_CANDIDATES: usize = 128;
+const MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES: usize = 64 * 1024;
+
+/// Recover shell substitutions carried by literal interpreter values (#544).
+///
+/// A Python assignment can hold ``echo `git branch -d x``` and later hand that
+/// value to `os.system` or an opaque imported function. The assignment itself
+/// is not a Git invocation, so scanning the whole program as shell loses the
+/// substitution after Git's executable-position check. Preserve that existing
+/// conservative evidence by examining the actual string value independently.
+/// This is not a claim that the outer heredoc performs shell expansion.
+///
+/// The caller proves the executable source and may permit the complete
+/// documentation proof only when there are no unaccounted-for outer consumers.
+/// Returning `None` leaves unsupported inline extracts to the existing paths.
+/// AST-confirmed named sink arguments remain owned by their existing scanner,
+/// so an existing allowlist grant is not denied under a new rule.
+/// Original source, including interpolation and unsupported values, still runs
+/// through the normal interpreter and raw-pattern analysis.
+pub(crate) fn interpreter_literal_shell_commands(
+    code: &str,
+    language: ScriptLanguage,
+    allow_documentation_literals: impl FnOnce() -> Option<bool> + Send + 'static,
+    budget: Duration,
+) -> Result<Vec<ReconstructedCommand>, MatchError> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    if !matches!(
+        language,
+        ScriptLanguage::Python | ScriptLanguage::JavaScript
+    ) || (!code.contains('`') && !code.contains("$(") && !code.contains('\\'))
+    {
+        return Ok(Vec::new());
+    }
+    if code.len() > MAX_INTERPRETER_LITERAL_SOURCE_BYTES {
+        return Err(interpreter_literal_parse_error(
+            language,
+            "source byte limit",
+        ));
+    }
+    let started = Instant::now();
+    if budget.is_zero() {
+        return Err(interpreter_literal_timeout(started, budget));
+    }
+    // A timed-out parser retains its permit until its source and AST are gone;
+    // subsequent requests cannot leave an unbounded number of workers running.
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    if ACTIVE
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(MatchError::Unavailable {
+            language,
+            detail: "interpreter literal analysis is still busy".into(),
+        });
+    }
+    struct Permit(&'static AtomicBool);
+    impl Drop for Permit {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let permit = Permit(&ACTIVE);
+    let source = code.to_string();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let _worker = thread::Builder::new()
+        .name("dcg-interpreter-literals".into())
+        .spawn(move || {
+            // The outer Bash source proof can parse too. Keep it under this
+            // worker's deadline and permit along with the interpreter parse.
+            // An unsupported inline extraction is not a complete program;
+            // leave it to the existing analysis instead of parsing a fragment.
+            let result = match allow_documentation_literals() {
+                Some(allow_documentation_literals) => interpreter_literal_shell_commands_inner(
+                    &source,
+                    language,
+                    allow_documentation_literals,
+                ),
+                None => Ok(Vec::new()),
+            };
+            drop(source);
+            drop(permit);
+            let _ = sender.send(result);
+        })
+        .map_err(|error| MatchError::Unavailable {
+            language,
+            detail: format!("could not start interpreter literal analysis: {error}"),
+        })?;
+    let remaining = budget
+        .checked_sub(started.elapsed())
+        .ok_or_else(|| interpreter_literal_timeout(started, budget))?;
+    match receiver.recv_timeout(remaining) {
+        Ok(result) if started.elapsed() < budget => result,
+        Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(interpreter_literal_timeout(started, budget))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(MatchError::Unavailable {
+            language,
+            detail: "interpreter literal analysis did not complete".into(),
+        }),
+    }
+}
+
+fn interpreter_literal_timeout(started: Instant, budget: Duration) -> MatchError {
+    MatchError::Timeout {
+        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+    }
+}
+
+fn interpreter_literal_parse_error(language: ScriptLanguage, detail: &str) -> MatchError {
+    MatchError::ParseError {
+        language,
+        detail: format!("interpreter literal analysis exceeded or could not verify {detail}"),
+    }
+}
+
+fn interpreter_literal_shell_commands_inner(
+    code: &str,
+    language: ScriptLanguage,
+    allow_documentation_literals: bool,
+) -> Result<Vec<ReconstructedCommand>, MatchError> {
+    use ast_grep_core::{AstGrep, Node};
+    use ast_grep_language::SupportLang;
+
+    let grammar = match language {
+        ScriptLanguage::Python => SupportLang::Python,
+        ScriptLanguage::JavaScript => SupportLang::JavaScript,
+        _ => return Ok(Vec::new()),
+    };
+    if code.len() > MAX_INTERPRETER_LITERAL_SOURCE_BYTES {
+        return Err(interpreter_literal_parse_error(
+            language,
+            "source byte limit",
+        ));
+    }
+    let ast = AstGrep::try_new(code, grammar)
+        .map_err(|_| interpreter_literal_parse_error(language, "source grammar"))?;
+    let root = ast.root();
+    for (index, node) in root.dfs().enumerate() {
+        if index >= MAX_INTERPRETER_LITERAL_NODES {
+            return Err(interpreter_literal_parse_error(language, "AST node limit"));
+        }
+        if node.is_error() || node.is_missing() {
+            return Err(interpreter_literal_parse_error(language, "source grammar"));
+        }
+    }
+    if allow_documentation_literals {
+        let mut proof = DocumentationProof {
+            language,
+            values: std::collections::BTreeMap::new(),
+            literals: Vec::new(),
+            remaining_steps: 16_384,
+        };
+        if proof.expression(&root, 0).is_some() {
+            return Ok(Vec::new());
+        }
+    }
+    let mut owned_call_starts =
+        engine::literal_exec_sink_starts(code, language, MAX_INTERPRETER_LITERAL_CANDIDATES)
+            .ok_or_else(|| interpreter_literal_parse_error(language, "named sink count limit"))?;
+    owned_call_starts.extend(
+        engine::scan_executing_sink_matches(code, language)
+            .into_iter()
+            .map(|matched| matched.start),
+    );
+    owned_call_starts.sort_unstable();
+    owned_call_starts.dedup();
+    let mut pending = vec![root];
+    let mut candidates = 0usize;
+    let mut payload_bytes = 0usize;
+    let mut commands = Vec::new();
+    while let Some(node) = pending.pop() {
+        if node.kind().as_ref() == "comment" {
+            continue;
+        }
+        if matches!(
+            node.kind().as_ref(),
+            "string" | "template_string" | "concatenated_string"
+        ) {
+            if interpreter_literal_has_owned_sink(&node, &owned_call_starts) {
+                continue;
+            }
+            candidates += 1;
+            if candidates > MAX_INTERPRETER_LITERAL_CANDIDATES {
+                return Err(interpreter_literal_parse_error(
+                    language,
+                    "literal count limit",
+                ));
+            }
+            if node.range().len() > MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES {
+                return Err(interpreter_literal_parse_error(
+                    language,
+                    "literal byte limit",
+                ));
+            }
+            if let Some(command) = static_interpreter_literal(&node, language, 0) {
+                if command.contains('`') || command.contains("$(") {
+                    payload_bytes = payload_bytes.saturating_add(command.len());
+                    if payload_bytes > MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES {
+                        return Err(interpreter_literal_parse_error(
+                            language,
+                            "aggregate literal byte limit",
+                        ));
+                    }
+                    let range = node.range();
+                    commands.push(ReconstructedCommand {
+                        command,
+                        start: range.start,
+                        end: range.end,
+                    });
+                }
+                // An adjacent Python literal sequence is one value. Do not
+                // evaluate its individual fragments again as different scripts.
+                continue;
+            }
+        }
+        pending.extend(node.children().filter(Node::is_named));
+    }
+    commands.sort_by_key(|command| command.start);
+    Ok(commands)
+}
+
+fn interpreter_literal_has_owned_sink<D: ast_grep_core::Doc>(
+    literal: &ast_grep_core::Node<'_, D>,
+    owned_call_starts: &[usize],
+) -> bool {
+    let literal_range = literal.range();
+    let mut ancestor = literal.parent();
+    for _ in 0..64 {
+        let Some(node) = ancestor else {
+            break;
+        };
+        if matches!(node.kind().as_ref(), "call" | "call_expression")
+            && let Some(arguments) = node.field("arguments")
+            && arguments.range().start <= literal_range.start
+            && arguments.range().end >= literal_range.end
+            && let Some(function) = node.field("function")
+        {
+            // Inspect the terminal callee name, not a receiver expression
+            // whose own arguments can contain fake `exec(...)` source text.
+            let name = match function.kind().as_ref() {
+                "identifier" => Some(function),
+                "attribute" => function.field("attribute"),
+                "member_expression" => function.field("property"),
+                _ => None,
+            };
+            if let Some(name) = name
+                && matches!(name.kind().as_ref(), "identifier" | "property_identifier")
+            {
+                let range = name.range();
+                let at = owned_call_starts.partition_point(|start| *start < range.start);
+                return owned_call_starts
+                    .get(at)
+                    .is_some_and(|start| *start < range.end);
+            }
+            // An unknown nested call can execute this value before passing
+            // its result to an enclosing spawn. It cannot borrow that outer
+            // call's argv proof or an allowlist grant for the outer rule.
+            return false;
+        }
+        ancestor = node.parent();
+    }
+    false
+}
+
+/// Decode complete AST string values, retaining unknown expressions as unknown.
+/// Python's raw/bytes/triple strings and JavaScript's static templates have
+/// different escape contracts; shell quoting cannot decode either language.
+fn static_interpreter_literal<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+    depth: usize,
+) -> Option<String> {
+    if depth >= 64 {
+        return None;
+    }
+    if node.kind().as_ref() == "concatenated_string" {
+        let mut joined = String::new();
+        for child in node
+            .children()
+            .filter(|child| child.is_named() && child.kind().as_ref() != "comment")
+        {
+            joined.push_str(&static_interpreter_literal(&child, language, depth + 1)?);
+        }
+        return Some(joined);
+    }
+    if !matches!(node.kind().as_ref(), "string" | "template_string")
+        || node.dfs().any(|child| {
+            matches!(
+                child.kind().as_ref(),
+                "interpolation" | "format_expression" | "template_substitution"
+            )
+        })
+    {
+        return None;
+    }
+    if language == ScriptLanguage::JavaScript
+        && node.kind().as_ref() == "template_string"
+        && node.parent().is_some_and(|parent| {
+            parent.kind().as_ref() == "call_expression"
+                && parent
+                    .field("arguments")
+                    .is_some_and(|arguments| arguments.range() == node.range())
+        })
+    {
+        // A tag receives raw and cooked pieces and chooses the result itself.
+        // In particular String.raw retains escaped backticks; cooking its
+        // template here would invent shell substitutions that never execute.
+        return None;
+    }
+    let raw = node.text();
+    let first = raw.find(['\'', '"', '`'])?;
+    let prefix = raw[..first].to_ascii_lowercase();
+    let python = language == ScriptLanguage::Python;
+    if (python
+        && !matches!(
+            prefix.as_str(),
+            "" | "r" | "u" | "b" | "f" | "br" | "rb" | "fr" | "rf"
+        ))
+        || (!python && !prefix.is_empty())
+    {
+        return None;
+    }
+    let quote = raw.as_bytes()[first];
+    if python && quote == b'`' {
+        return None;
+    }
+    let width = if python
+        && raw
+            .as_bytes()
+            .get(first..first + 3)
+            .is_some_and(|bytes| bytes == [quote; 3])
+    {
+        3
+    } else {
+        1
+    };
+    if raw.len() < first + 2 * width
+        || !raw.as_bytes()[raw.len() - width..]
+            .iter()
+            .all(|byte| *byte == quote)
+    {
+        return None;
+    }
+    let body = &raw[first + width..raw.len() - width];
+    let bytes_literal = python && prefix.contains('b');
+    if bytes_literal && !body.is_ascii() {
+        return None;
+    }
+    let raw_mode = python && prefix.contains('r');
+    let formatted = python && prefix.contains('f');
+    let mut result = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            result.push('\n');
+        } else if formatted && matches!(ch, '{' | '}') && chars.peek() == Some(&ch) {
+            chars.next();
+            result.push(ch);
+        } else if ch != '\\' || raw_mode {
+            result.push(ch);
+        } else {
+            let escaped = chars.next()?;
+            match escaped {
+                '\\' | '\'' | '"' => result.push(escaped),
+                'n' => result.push('\n'),
+                'r' => result.push('\r'),
+                't' => result.push('\t'),
+                'b' => result.push('\u{0008}'),
+                'f' => result.push('\u{000c}'),
+                'v' => result.push('\u{000b}'),
+                'a' if python => result.push('\u{0007}'),
+                '\n' => {}
+                '\u{2028}' | '\u{2029}' if !python => {}
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                }
+                '0'..='7' if python => {
+                    let mut value = escaped.to_digit(8)?;
+                    for _ in 0..2 {
+                        let Some(digit) = chars.peek().and_then(|ch| ch.to_digit(8)) else {
+                            break;
+                        };
+                        chars.next();
+                        value = value * 8 + digit;
+                    }
+                    result.push(char::from_u32(value)?);
+                }
+                'x' => result.push(interpreter_hex_escape(&mut chars, 2)?),
+                'u' | 'U' if python && !bytes_literal => {
+                    result.push(interpreter_hex_escape(
+                        &mut chars,
+                        if escaped == 'u' { 4 } else { 8 },
+                    )?);
+                }
+                'u' if !python => {
+                    if chars.peek() == Some(&'{') {
+                        chars.next();
+                        let mut value = 0u32;
+                        let mut digits = 0usize;
+                        loop {
+                            let next = chars.next()?;
+                            if next == '}' {
+                                break;
+                            }
+                            digits += 1;
+                            if digits > 6 {
+                                return None;
+                            }
+                            value = value * 16 + next.to_digit(16)?;
+                        }
+                        if digits == 0 {
+                            return None;
+                        }
+                        result.push(char::from_u32(value)?);
+                    } else {
+                        result.push(interpreter_hex_escape(&mut chars, 4)?);
+                    }
+                }
+                'N' if python && !bytes_literal => return None,
+                '0' if !python && !chars.peek().is_some_and(char::is_ascii_digit) => {
+                    result.push('\0');
+                }
+                '0'..='9' if !python => return None,
+                _ if python => {
+                    // Python retains an unrecognized escape's backslash.
+                    // Removing it would turn literal shell syntax into a live
+                    // substitution, unlike JavaScript's identity escapes.
+                    result.push('\\');
+                    result.push(escaped);
+                }
+                _ => result.push(escaped),
+            }
+        }
+    }
+    // A Python bytes value is a byte sequence, not UTF-8 encoded Unicode.
+    // Non-ASCII bytes cannot be represented faithfully as a shell String.
+    (!bytes_literal || result.is_ascii()).then_some(result)
+}
+
+fn interpreter_hex_escape(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    count: usize,
+) -> Option<char> {
+    let mut value = 0u32;
+    for _ in 0..count {
+        value = value
+            .checked_mul(16)?
+            .checked_add(chars.next()?.to_digit(16)?)?;
+    }
+    char::from_u32(value)
+}
+
 /// The default executable-source matcher, including the shared core policy.
 /// Custom `AstMatcher::with_patterns` instances retain their explicit corpus.
 #[derive(Debug, Default)]
@@ -475,6 +936,356 @@ fn protected_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interpreter_literal_shell_commands_recover_indirect_payloads_544() {
+        for (language, source, literal, expected) in [
+            (
+                ScriptLanguage::Python,
+                "import os\ns = 'echo `git branch -d x`'\nos.system(s)",
+                "'echo `git branch -d x`'",
+                "echo `git branch -d x`",
+            ),
+            (
+                ScriptLanguage::Python,
+                "from helper import run\ns = 'echo $(git reset --hard)'\nrun(s)",
+                "'echo $(git reset --hard)'",
+                "echo $(git reset --hard)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const s = 'echo `git branch -d x`'; require('child_process').execSync(s);",
+                "'echo `git branch -d x`'",
+                "echo `git branch -d x`",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const run = require('./helper'); const s = 'echo $(git reset --hard)'; run(s);",
+                "'echo $(git reset --hard)'",
+                "echo $(git reset --hard)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "# Unicode source: élève\ns = 'echo ' '`git branch -d x`'\nrun(s)",
+                "'echo ' '`git branch -d x`'",
+                "echo `git branch -d x`",
+            ),
+        ] {
+            let commands = interpreter_literal_shell_commands_inner(source, language, true)
+                .expect("bounded, valid interpreter source");
+            assert_eq!(commands.len(), 1, "missing literal evidence in {source}");
+            assert_eq!(commands[0].command, expected, "source: {source}");
+            assert_eq!(
+                source.get(commands[0].start..commands[0].end),
+                Some(literal),
+                "decoded values must retain the original byte span: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpreter_literal_shell_commands_require_the_outer_documentation_proof_544() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "s = 'echo `git branch -d x`'\nprint(s)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "s = 'echo $(git reset --hard)'\nopen('README.md', 'w').write(s)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const s = 'echo `git branch -d x`'; console.log(s);",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const fs = require('fs'); const s = 'echo $(git reset --hard)'; fs.writeFileSync('README.md', s);",
+            ),
+        ] {
+            assert!(
+                interpreter_literal_shell_commands_inner(source, language, true)
+                    .expect("complete documentation proof")
+                    .is_empty(),
+                "proven documentation must not become shell: {source}"
+            );
+            assert_eq!(
+                interpreter_literal_shell_commands_inner(source, language, false)
+                    .expect("literal source without an outer consumer proof")
+                    .len(),
+                1,
+                "a later shell consumer must retain the literal evidence: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpreter_literal_shell_commands_decode_encoded_markers_before_gating_544() {
+        for (language, execution, documentation) in [
+            (
+                ScriptLanguage::Python,
+                r"s = 'echo \x60git branch -d x\x60'; os.system(s)",
+                r"s = 'echo \x60git branch -d x\x60'; print(s)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r"const s = 'echo \u0060git branch -d x\u0060'; run(s);",
+                r"const s = 'echo \u0060git branch -d x\u0060'; console.log(s);",
+            ),
+        ] {
+            let commands = interpreter_literal_shell_commands(
+                execution,
+                language,
+                || Some(true),
+                protected_scan_budget(),
+            )
+            .expect("a supported encoded marker must reach literal analysis");
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0].command, "echo `git branch -d x`");
+            assert!(
+                interpreter_literal_shell_commands(
+                    documentation,
+                    language,
+                    || Some(true),
+                    protected_scan_budget(),
+                )
+                .expect("encoded documentation retains the same proof")
+                .is_empty()
+            );
+        }
+        assert!(
+            interpreter_literal_shell_commands(
+                "print(\\",
+                ScriptLanguage::Python,
+                || None,
+                protected_scan_budget(),
+            )
+            .expect("an unverified inline extraction keeps its existing analysis")
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn interpreter_literal_shell_commands_decode_each_language_exactly_544() {
+        for (language, source, expected) in [
+            (
+                ScriptLanguage::Python,
+                r"s = 'echo \`git branch -d x\`'; run(s)",
+                r"echo \`git branch -d x\`",
+            ),
+            (
+                ScriptLanguage::Python,
+                r"s = r'echo \`git branch -d x\`'; run(s)",
+                r"echo \`git branch -d x\`",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r"const s = 'echo \`git branch -d x\`'; run(s);",
+                "echo `git branch -d x`",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r"const s = `echo \`git branch -d x\``; run(s);",
+                "echo `git branch -d x`",
+            ),
+            (
+                ScriptLanguage::Python,
+                "s = '''echo `git branch -d x`\nsecond line'''\nrun(s)",
+                "echo `git branch -d x`\nsecond line",
+            ),
+            (
+                ScriptLanguage::Python,
+                "s = b'echo `git branch -d x`'\nrun(s)",
+                "echo `git branch -d x`",
+            ),
+            (
+                ScriptLanguage::Python,
+                r"s = f'echo {{note}} \x60git branch -d x`'; run(s)",
+                "echo {note} `git branch -d x`",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r"const s = 'echo \u{60}git branch -d x`'; run(s);",
+                "echo `git branch -d x`",
+            ),
+            (
+                ScriptLanguage::Python,
+                "s = 'echo `git branch -d \\\nx`'\nrun(s)",
+                "echo `git branch -d x`",
+            ),
+        ] {
+            let commands = interpreter_literal_shell_commands_inner(source, language, false)
+                .expect("bounded literal source");
+            assert_eq!(commands.len(), 1, "source: {source}");
+            assert_eq!(commands[0].command, expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn interpreter_literal_shell_commands_preserve_named_sink_ownership_544() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['echo', '`git branch -d x`'])",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run('echo `git branch -d x`')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os\nos.system('git reset --hard; echo `git branch -d x`')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('child_process').spawnSync('echo', ['`git branch -d x`']);",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('child_process').execSync('echo `git branch -d x`');",
+            ),
+        ] {
+            assert!(
+                interpreter_literal_shell_commands_inner(source, language, false)
+                    .expect("the named sink already owns its complete literal arguments")
+                    .is_empty(),
+                "literal recovery must not reinterpret argv or duplicate a named sink rule: {source}"
+            );
+        }
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "consume('echo `git branch -d x`; system(\"plain\")')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "consume('echo `git branch -d x`; exec(\"plain\")');",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('exec(\"plain\")').consume('echo `git branch -d x`');",
+            ),
+            (
+                ScriptLanguage::Python,
+                "subprocess.run(['echo', transform('echo `git branch -d x`'), 'git reset --hard'])",
+            ),
+        ] {
+            let commands = interpreter_literal_shell_commands_inner(source, language, false)
+                .expect("unowned literal retains its conservative evidence");
+            assert_eq!(commands.len(), 1, "a false callee claim hid {source}");
+            assert!(commands[0].command.contains("`git branch -d x`"));
+        }
+    }
+
+    #[test]
+    fn interpreter_literal_shell_commands_do_not_invent_fragment_values_544() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "# documentation: `git branch -d x`\nprint('plain text')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "// documentation: $(git reset --hard)\nconsole.log('plain text');",
+            ),
+            (
+                ScriptLanguage::Python,
+                "s = f'echo `git branch -d x` {name}'\nrun(s)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r"const s = `echo \`git branch -d x\` ${name}`; run(s);",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r"const s = String.raw`echo \`git branch -d x\``; require('child_process').execSync(s);",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r"const s = transform`echo \`git branch -d x\``; run(s);",
+            ),
+            (
+                ScriptLanguage::Python,
+                r"s = 'echo `git branch -d x` \N{UNKNOWN CHARACTER}'; run(s)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                r"const s = 'echo `git branch -d x` \uD800'; run(s);",
+            ),
+            (
+                ScriptLanguage::Python,
+                r"s = b'echo `git branch -d x` \xff'; run(s)",
+            ),
+        ] {
+            assert!(
+                interpreter_literal_shell_commands_inner(source, language, false)
+                    .expect("unsupported values retain their original source analysis")
+                    .is_empty(),
+                "an unknown value must not be reconstructed as a complete command: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpreter_literal_shell_commands_report_analysis_limits_544() {
+        let oversized = format!(
+            "s = '`git branch -d x`'\n#{}",
+            "x".repeat(MAX_INTERPRETER_LITERAL_SOURCE_BYTES)
+        );
+        let many_nodes = format!("# `git branch -d x`\n{}", "pass\n".repeat(4096));
+        let many_literals =
+            "consume('`git branch -d x`')\n".repeat(MAX_INTERPRETER_LITERAL_CANDIDATES + 1);
+        let large_literal = format!(
+            "consume('`git branch -d x`{}')",
+            "x".repeat(MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES)
+        );
+        let aggregate = format!(
+            "consume('`git branch -d x`{}')\nconsume('`git branch -d x`{}')",
+            "x".repeat(MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES / 2),
+            "y".repeat(MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES / 2),
+        );
+        for source in [
+            "s = '`git branch -d x`'\nrun(s",
+            &oversized,
+            &many_nodes,
+            &many_literals,
+            &large_literal,
+            &aggregate,
+        ] {
+            assert!(
+                matches!(
+                    interpreter_literal_shell_commands_inner(source, ScriptLanguage::Python, false),
+                    Err(MatchError::ParseError { .. })
+                ),
+                "incomplete analysis must not be an empty successful scan"
+            );
+        }
+        let many_calls =
+            "run('plain')\n".repeat(MAX_INTERPRETER_LITERAL_CANDIDATES + 1) + "# `git`";
+        assert!(matches!(
+            interpreter_literal_shell_commands_inner(&many_calls, ScriptLanguage::Python, false),
+            Err(MatchError::ParseError { .. })
+        ));
+        assert!(matches!(
+            interpreter_literal_shell_commands(
+                "s = '`git branch -d x`'\nrun(s)",
+                ScriptLanguage::Python,
+                || Some(false),
+                Duration::ZERO,
+            ),
+            Err(MatchError::Timeout { .. })
+        ));
+        assert!(
+            interpreter_literal_shell_commands(
+                "print('plain text')",
+                ScriptLanguage::Python,
+                || Some(false),
+                Duration::ZERO,
+            )
+            .expect("no substitution candidate needs no worker")
+            .is_empty()
+        );
+    }
 
     #[test]
     fn documentation_literal_proof_handles_text_edits_and_literal_forms() {

@@ -611,6 +611,47 @@ pub struct ReconstructedCommand {
     pub end: usize,
 }
 
+/// Starts of named calls whose command operands the existing scanner parsed
+/// completely, including single-string APIs that do not invoke a shell.
+///
+/// These offsets are metadata for the interpreter literal recovery pass. They
+/// do not approve source: that pass must establish a real AST callee at each
+/// offset before excluding the call's arguments, because regex-looking text
+/// inside a string or comment is not an executing sink. `None` reports a
+/// bounded scan that did not finish enumerating its candidates.
+pub(crate) fn literal_exec_sink_starts(
+    code: &str,
+    language: ScriptLanguage,
+    max_calls: usize,
+) -> Option<Vec<usize>> {
+    let sink_regex = match language {
+        ScriptLanguage::Python => &PY_EXEC_SINK_LITERAL,
+        ScriptLanguage::JavaScript => &JS_EXEC_SINK_LITERAL,
+        _ => return Some(Vec::new()),
+    };
+    let mut starts = Vec::new();
+    for (index, caps) in sink_regex.captures_iter(code).enumerate() {
+        if index >= max_calls {
+            return None;
+        }
+        let Some(matched) = caps.get(0) else {
+            continue;
+        };
+        let region = exec_sink_arg_region(code, matched.start());
+        let argv = exec_argv_operands(region, language);
+        if !argv.unverified
+            && !argv.values.is_empty()
+            && argv
+                .values
+                .iter()
+                .all(|value| !value.contains(RUNTIME_VALUE))
+        {
+            starts.push(matched.start());
+        }
+    }
+    Some(starts)
+}
+
 /// Each exec-sink argv-split call in `code`, reconstructed as the shell command
 /// line it runs, for evaluation through the full pack pipeline.
 ///

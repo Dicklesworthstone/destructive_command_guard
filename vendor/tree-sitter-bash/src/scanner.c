@@ -155,41 +155,66 @@ static void deserialize(Scanner *scanner, const char *buffer, unsigned length) {
 }
 
 /**
- * Consume a "word" in POSIX parlance, and returns it unquoted.
- *
- * This is an approximate implementation that doesn't deal with any
- * POSIX-mandated substitution, and assumes the default value for
- * IFS.
+ * Consume a complete heredoc delimiter word with quote removal. Quoting any
+ * fragment suppresses expansion in the body, including an empty quoted
+ * fragment. Unsupported substitution spellings must not become a shorter
+ * delimiter, so raw dollar/backtick words and incomplete quoting are rejected.
  */
-static bool advance_word(TSLexer *lexer, String *unquoted_word) {
-    bool empty = true;
-
+static bool advance_word(TSLexer *lexer, String *unquoted_word, bool *is_raw) {
+    bool saw_word = false;
     int32_t quote = 0;
-    if (lexer->lookahead == '\'' || lexer->lookahead == '"') {
-        quote = lexer->lookahead;
-        advance(lexer);
-    }
+    *is_raw = false;
 
-    while (lexer->lookahead &&
-           !(quote ? lexer->lookahead == quote || lexer->lookahead == '\r' || lexer->lookahead == '\n'
-                   : iswspace(lexer->lookahead))) {
-        if (lexer->lookahead == '\\') {
-            advance(lexer);
-            if (!lexer->lookahead) {
+    while (lexer->lookahead) {
+        int32_t character = lexer->lookahead;
+        if (quote) {
+            if (character == '\r' || character == '\n') {
                 return false;
             }
+            if (character == quote) {
+                quote = 0;
+                advance(lexer);
+                continue;
+            }
+        } else {
+            if (iswspace(character) || character == ';' || character == '&' || character == '|' ||
+                character == '(' || character == ')' || character == '<' || character == '>') {
+                break;
+            }
+            if (character == '$' || character == '`') {
+                return false;
+            }
+            if (character == '\'' || character == '"') {
+                saw_word = true;
+                *is_raw = true;
+                quote = character;
+                advance(lexer);
+                continue;
+            }
         }
-        empty = false;
+        saw_word = true;
+        if (character == '\\' && quote != '\'') {
+            advance(lexer);
+            if (!lexer->lookahead || lexer->lookahead == '\r' || lexer->lookahead == '\n') {
+                return false;
+            }
+            *is_raw = true;
+            // Single quotes retain every backslash. Double quotes remove
+            // one only before $, `, ", or another backslash; a plain \O
+            // remains two delimiter characters, exactly as in the shell.
+            if (quote == '"' && lexer->lookahead != '$' && lexer->lookahead != '`' &&
+                lexer->lookahead != '"' && lexer->lookahead != '\\') {
+                array_push(unquoted_word, '\\');
+            }
+        }
         array_push(unquoted_word, lexer->lookahead);
         advance(lexer);
     }
-    array_push(unquoted_word, '\0');
-
-    if (quote && lexer->lookahead == quote) {
-        advance(lexer);
+    if (quote || !saw_word) {
+        return false;
     }
-
-    return !empty;
+    array_push(unquoted_word, '\0');
+    return true;
 }
 
 static inline bool scan_bare_dollar(TSLexer *lexer) {
@@ -213,10 +238,9 @@ static bool scan_heredoc_start(Heredoc *heredoc, TSLexer *lexer) {
     }
 
     lexer->result_symbol = HEREDOC_START;
-    heredoc->is_raw = lexer->lookahead == '\'' || lexer->lookahead == '"' || lexer->lookahead == '\\';
-
-    bool found_delimiter = advance_word(lexer, &heredoc->delimiter);
+    bool found_delimiter = advance_word(lexer, &heredoc->delimiter, &heredoc->is_raw);
     if (!found_delimiter) {
+        heredoc->is_raw = false;
         reset_string(&heredoc->delimiter);
         return false;
     }
@@ -238,15 +262,38 @@ static bool scan_heredoc_end_identifier(Heredoc *heredoc, TSLexer *lexer) {
         }
     }
     array_push(&heredoc->current_leading_word, '\0');
-    return heredoc->delimiter.size == 0
-               ? false
-               : strcmp(heredoc->current_leading_word.contents, heredoc->delimiter.contents) == 0;
+    if (heredoc->delimiter.size == 0 ||
+        strcmp(heredoc->current_leading_word.contents, heredoc->delimiter.contents) != 0) {
+        return false;
+    }
+    // A terminator occupies the complete line. In particular, DOCsuffix is
+    // body text for DOC, and an empty quoted delimiter needs an empty line.
+    if (lexer->lookahead == '\r') {
+        advance(lexer);
+        return lexer->lookahead == '\n';
+    }
+    return lexer->lookahead == '\n' || lexer->eof(lexer);
 }
 
 static bool scan_heredoc_content(Scanner *scanner, TSLexer *lexer, enum TokenType middle_type,
                                  enum TokenType end_type) {
     bool did_advance = false;
     Heredoc *heredoc = array_back(&scanner->heredocs);
+
+    // An immediately empty body starts on its empty terminator line. The
+    // ordinary newline arm first advances to the next line, which would
+    // otherwise absorb the following command before recognizing this end.
+    if (heredoc->delimiter.size == 1 && lexer->get_column(lexer) == 0 &&
+        (lexer->lookahead == '\n' || lexer->lookahead == '\r')) {
+        lexer->result_symbol = heredoc->started ? middle_type : end_type;
+        lexer->mark_end(lexer);
+        if (scan_heredoc_end_identifier(heredoc, lexer)) {
+            if (lexer->result_symbol == HEREDOC_END) {
+                array_pop(&scanner->heredocs);
+            }
+            return true;
+        }
+    }
 
     for (;;) {
         switch (lexer->lookahead) {
@@ -298,7 +345,7 @@ static bool scan_heredoc_content(Scanner *scanner, TSLexer *lexer, enum TokenTyp
                 }
                 did_advance = true;
                 if (heredoc->allows_indent) {
-                    while (iswspace(lexer->lookahead)) {
+                    while (lexer->lookahead == '\t') {
                         advance(lexer);
                     }
                 }
@@ -317,11 +364,13 @@ static bool scan_heredoc_content(Scanner *scanner, TSLexer *lexer, enum TokenTyp
                 if (lexer->get_column(lexer) == 0) {
                     // an alternative is to check the starting column of the
                     // heredoc body and track that statefully
-                    while (iswspace(lexer->lookahead)) {
-                        if (did_advance) {
-                            advance(lexer);
-                        } else {
-                            skip(lexer);
+                    if (heredoc->allows_indent) {
+                        while (lexer->lookahead == '\t') {
+                            if (did_advance) {
+                                advance(lexer);
+                            } else {
+                                skip(lexer);
+                            }
                         }
                     }
                     if (end_type != SIMPLE_HEREDOC_BODY) {
@@ -425,6 +474,22 @@ static bool scan(Scanner *scanner, TSLexer *lexer, const bool *valid_symbols) {
                 return true;
             }
             return false;
+        }
+    }
+
+    // Keep the header newline separate from an empty delimiter's terminator
+    // line. The internal whitespace lexer can otherwise consume both LFs
+    // before the heredoc body scanner gets a chance to recognize the end.
+    if (valid_symbols[NEWLINE] && !in_error_recovery(valid_symbols) && scanner->heredocs.size > 0 &&
+        !array_back(&scanner->heredocs)->started && array_back(&scanner->heredocs)->delimiter.size == 1) {
+        while (lexer->lookahead == ' ' || lexer->lookahead == '\t' || lexer->lookahead == '\r') {
+            skip(lexer);
+        }
+        if (lexer->lookahead == '\n') {
+            advance(lexer);
+            lexer->mark_end(lexer);
+            lexer->result_symbol = NEWLINE;
+            return true;
         }
     }
 

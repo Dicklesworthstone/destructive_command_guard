@@ -1378,13 +1378,14 @@ pub enum ExtractionResult {
 
 /// Regex patterns for heredoc extraction (compiled once).
 static HEREDOC_EXTRACTOR: LazyLock<Regex> = LazyLock::new(|| {
-    // Matches: <<[-~]? followed by:
-    // 1. Single-quoted delimiter: 'delim' (Group 2)
-    // 2. Double-quoted delimiter: "delim" (Group 3)
-    // 3. Unquoted delimiter: delim (Group 4)
+    // Recognize a complete delimiter word, including adjacent quoted
+    // fragments and backslash quoting (#544). Raw dollar/backtick syntax
+    // needs a fuller shell lexer; the boundary check rejects those words
+    // instead of selecting a supported prefix as a shorter delimiter.
     // Group 1 is the operator variant (-/~/empty).
-    // Note: * instead of + allows empty delimiters (valid in bash).
-    Regex::new(r#"<<([-~])?\s*(?:'([^']*)'|"([^"]*)"|([\w.-]+))"#).expect("heredoc regex compiles")
+    // Group 2 is the raw delimiter; '' and "" remain valid empty words.
+    Regex::new(r#"<<([-~])?[ \t]*((?:[^ \t\r\n'"\\`$;&|()<>]+|'[^']*'|"(?:\\[^\r\n]|[^"\\])*"|\\[^\r\n])+)"#)
+        .expect("heredoc regex compiles")
 });
 
 /// Regex for here-string extraction with single quotes (<<<).
@@ -6662,16 +6663,29 @@ fn extract_heredocs(
 
         let operator_variant = cap.get(1).map(|m| m.as_str());
 
-        let (delimiter, quoted) = if let Some(m) = cap.get(2) {
-            (m.as_str(), true)
-        } else if let Some(m) = cap.get(3) {
-            (m.as_str(), true)
-        } else if let Some(m) = cap.get(4) {
-            (m.as_str(), false)
-        } else {
-            // Should be unreachable if regex matched
+        // Never interpret a supported prefix as the whole delimiter. For
+        // example, DOC$SUFFIX is a literal delimiter word, not DOC followed
+        // by a shell expansion; a prefix would select the wrong body end.
+        if command
+            .as_bytes()
+            .get(full_match.end())
+            .is_some_and(|byte| {
+                !byte.is_ascii_whitespace()
+                    && !matches!(byte, b';' | b'&' | b'|' | b')' | b'<' | b'>')
+            })
+        {
+            continue;
+        }
+        let Some(delimiter_word) = cap.get(2).map(|value| value.as_str()) else {
             continue;
         };
+        let Ok(delimiter_words) = shell_words::split(delimiter_word) else {
+            continue;
+        };
+        let [delimiter] = delimiter_words.as_slice() else {
+            continue;
+        };
+        let quoted = delimiter_word.contains(['\'', '"', '\\']);
 
         // Determine heredoc type
         let heredoc_type = match operator_variant {
@@ -6718,7 +6732,7 @@ fn extract_heredocs(
                 extracted.push(ExtractedContent {
                     content,
                     language,
-                    delimiter: Some(delimiter.to_string()),
+                    delimiter: Some(delimiter.clone()),
                     byte_range: full_match.start()..end_pos.min(command.len()),
                     content_range: Some(body_start_abs..body_end_abs),
                     quoted,
@@ -8020,6 +8034,93 @@ pub(crate) fn range_is_quoted_interpreter_source(
         ScriptLanguage::from_command(program.rsplit('/').next().unwrap_or(program)) == language
             && (arguments.is_empty() || matches!(arguments, [argument] if argument == "-"))
     })
+}
+
+/// Whether an isolated inline invocation passes these exact bytes as its
+/// program. Quote removal must preserve the extracted source, and no outer
+/// expansion, environment assignment, redirect, or additional consumer may
+/// change the assumptions of the language-specific documentation proof.
+pub(crate) fn range_is_literal_inline_interpreter_source(
+    command: &str,
+    range: &Range<usize>,
+    language: ScriptLanguage,
+) -> bool {
+    if range.start >= range.end
+        || command.get(range.clone()).is_none()
+        || !matches!(
+            language,
+            ScriptLanguage::Python | ScriptLanguage::JavaScript
+        )
+        || command.len() > MAX_SUBSTITUTION_SOURCE_BYTES
+    {
+        return false;
+    }
+    let Ok(ast) = AstGrep::try_new(command, SupportLang::Bash) else {
+        return false;
+    };
+    let root = ast.root();
+    if root.get_inner_node().has_error()
+        || root.children().any(|child| child.kind().as_ref() == "&")
+    {
+        return false;
+    }
+    let mut statements = root
+        .children()
+        .filter(|child| child.is_named() && child.kind().as_ref() != "comment");
+    let Some(statement) = statements.next() else {
+        return false;
+    };
+    if statements.next().is_some() || statement.kind().as_ref() != "command" {
+        return false;
+    }
+    let arguments: Vec<_> = statement
+        .children()
+        .filter(ast_grep_core::Node::is_named)
+        .collect();
+    let [program, flag, payload] = arguments.as_slice() else {
+        return false;
+    };
+    if program.kind().as_ref() != "command_name"
+        || !matches!(payload.kind().as_ref(), "raw_string" | "string")
+        || payload.range().start + 1 != range.start
+        || payload.range().end.checked_sub(1) != Some(range.end)
+        || payload.dfs().any(|node| {
+            matches!(
+                node.kind().as_ref(),
+                "command_substitution"
+                    | "process_substitution"
+                    | "expansion"
+                    | "simple_expansion"
+                    | "arithmetic_expansion"
+            )
+        })
+    {
+        return false;
+    }
+    let (Some(program_words), Some(flag_words)) =
+        (literal_script_words(program), literal_script_words(flag))
+    else {
+        return false;
+    };
+    let ([program], [flag]) = (program_words.as_slice(), flag_words.as_slice()) else {
+        return false;
+    };
+    if !trusted_literal_script_program(program)
+        || ScriptLanguage::from_command(program.rsplit('/').next().unwrap_or(program)) != language
+        || !match language {
+            ScriptLanguage::Python => flag == "-c",
+            ScriptLanguage::JavaScript => {
+                matches!(flag.as_str(), "-e" | "-p" | "--eval" | "--print")
+            }
+            _ => false,
+        }
+    {
+        return false;
+    }
+    let Ok(words) = shell_words::split(statement.text().as_ref()) else {
+        return false;
+    };
+    matches!(words.as_slice(), [_, _, source] if command.get(range.clone()) == Some(source.as_str()))
 }
 
 /// The `>` bytes that JavaScript itself parses as arrow operators in a
@@ -10379,9 +10480,8 @@ fn active_heredocs(command: &str) -> Option<Vec<ActiveHeredoc>> {
 /// describes (a second one *inside* that body is data, not shell input —
 /// #440), proven active by the quote-aware trigger scanner, not preceded by
 /// a `#` on its own line (the scanner does not model comments), a simple
-/// delimiter token (no `<<'E'OF`-style concatenation, whose quote removal the
-/// tier-2 extractor does not perform), and a terminator the extractor
-/// actually found. Under those conditions the body is exactly the lines
+/// complete delimiter word with supported quote removal, and a terminator
+/// the extractor actually found. Under those conditions the body is exactly the lines
 /// between the operator's line and the terminator line — the same span the
 /// shell itself feeds the command — and the operator line's own commands,
 /// plus everything after the terminator, stay visible. Anything ambiguous
@@ -10402,9 +10502,8 @@ fn active_single_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
         return None;
     }
     // The delimiter token must end where the extractor's regex says it ends:
-    // a following quote, word byte, or escape means shell quote removal would
-    // change the real delimiter, and the extractor's terminator search would
-    // then be wrong.
+    // a following unsupported word byte means the extractor saw only a
+    // prefix, and its terminator search could select the wrong body end.
     let delimiter_match = HEREDOC_EXTRACTOR.find_at(command, operator_start)?;
     if delimiter_match.start() != operator_start {
         return None;
@@ -15648,6 +15747,143 @@ mod tests {
             }
         }
 
+        #[test]
+        fn extracts_complete_quote_removed_delimiters_544() {
+            let body = "s = \"run `git branch -d x` later\"\nprint(s)";
+            for delimiter_word in [
+                "'DOC'",
+                "\"DOC\"",
+                "D\\OC",
+                "\\DOC",
+                "D'OC'",
+                "D\"OC\"",
+                "'D'O\"C\"",
+                "D''OC",
+            ] {
+                let command = format!("python3 - <<{delimiter_word}\n{body}\nDOC");
+                let ExtractionResult::Extracted(contents) =
+                    extract_content(&command, &ExtractionLimits::structural_scan())
+                else {
+                    panic!("expected the complete quoted body: {command:?}");
+                };
+                assert_eq!(contents.len(), 1, "{command:?}");
+                let content = &contents[0];
+                assert_eq!(content.content, body, "{command:?}");
+                assert_eq!(content.delimiter.as_deref(), Some("DOC"));
+                assert!(content.quoted, "{command:?}");
+                let range = content.content_range.as_ref().unwrap();
+                assert_eq!(command.get(range.clone()), Some(body));
+                assert!(
+                    range_is_quoted_interpreter_source(&command, range, ScriptLanguage::Python),
+                    "extraction and source identity must agree: {command:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn inline_interpreter_source_requires_exact_isolated_arguments_544() {
+            for (program, flag, language, body) in [
+                (
+                    "python3",
+                    "-c",
+                    ScriptLanguage::Python,
+                    "print(\"run `git branch -d x` later\")",
+                ),
+                (
+                    "node",
+                    "-e",
+                    ScriptLanguage::JavaScript,
+                    "console.log(\"run `git branch -d x` later\");",
+                ),
+            ] {
+                let command = format!("{program} {flag} '{body}'");
+                let start = command.find(body).unwrap();
+                let range = start..start + body.len();
+                assert!(range_is_literal_inline_interpreter_source(
+                    &command, &range, language
+                ));
+                assert!(!range_is_literal_inline_interpreter_source(
+                    &command,
+                    &(range.start + 1..range.end),
+                    language
+                ));
+                for ambiguous in [
+                    format!("{command} | sh"),
+                    format!("{command}; bash output.py"),
+                    format!("{command} > output.py"),
+                    format!("{command} extra_argument"),
+                    format!("PYTHONPATH=/tmp/plugins {command}"),
+                ] {
+                    let start = ambiguous.find(body).unwrap();
+                    assert!(
+                        !range_is_literal_inline_interpreter_source(
+                            &ambiguous,
+                            &(start..start + body.len()),
+                            language
+                        ),
+                        "ambiguous source or consumer: {ambiguous:?}"
+                    );
+                }
+            }
+            let body = "print('$(git reset --hard)')";
+            let command = format!("python3 -c \"{body}\"");
+            let start = command.find(body).unwrap();
+            assert!(!range_is_literal_inline_interpreter_source(
+                &command,
+                &(start..start + body.len()),
+                ScriptLanguage::Python
+            ));
+        }
+
+        #[test]
+        fn partial_delimiter_words_cannot_select_a_shorter_body_544() {
+            for delimiter_word in ["DOC'X'", "DOC\\X", "DOC$SUFFIX", "DOC\\"] {
+                let command = format!(
+                    "python3 - <<{delimiter_word}\nprint('documentation')\nDOC\ngit reset --hard"
+                );
+                let result = extract_content(&command, &ExtractionLimits::structural_scan());
+                let contents = match result {
+                    ExtractionResult::Extracted(contents)
+                    | ExtractionResult::Partial {
+                        extracted: contents,
+                        ..
+                    } => contents,
+                    _ => Vec::new(),
+                };
+                assert!(
+                    contents
+                        .iter()
+                        .all(|content| { content.byte_range.start != command.find("<<").unwrap() }),
+                    "a prefix must not manufacture a source boundary: {command:?}"
+                );
+            }
+            for (delimiter_word, wrong_terminator) in [
+                ("DOC$(printf suffix)", "DOC$"),
+                ("DOC`printf suffix`", "DOC`printf"),
+                ("$'D\\x4fC'", "$D\\x4fC"),
+                ("DOC$\"suffix\"", "DOC$suffix"),
+            ] {
+                let command = format!(
+                    "python3 - <<{delimiter_word}\nprint('documentation')\n{wrong_terminator}\ngit reset --hard"
+                );
+                let result = extract_content(&command, &ExtractionLimits::structural_scan());
+                let contents = match result {
+                    ExtractionResult::Extracted(contents)
+                    | ExtractionResult::Partial {
+                        extracted: contents,
+                        ..
+                    } => contents,
+                    _ => Vec::new(),
+                };
+                assert!(
+                    contents
+                        .iter()
+                        .all(|content| { content.byte_range.start != command.find("<<").unwrap() }),
+                    "unsupported quoting must not manufacture a body: {command:?}"
+                );
+            }
+        }
+
         // Regression test for issue #109: bash accepts `<<- 'EOF'` (with a
         // space after the `-` tab-strip marker). Before the fix, the
         // delimiter parser fell through to the unquoted branch with a
@@ -15692,10 +15928,7 @@ mod tests {
         // delimiter `EOF`. Pre-fix the parser would mis-classify, the
         // terminator search would look for a line `EOF` rather than `-EOF`,
         // and the heredoc body would either run past the real terminator
-        // or never close. The `~` variant cannot reach this path because
-        // the unquoted-delimiter regex char class is `[\w.-]+` (no tilde),
-        // so `<< ~FOO` is rejected by the regex before parse_heredoc_delimiter
-        // runs — only the dash variant is reachable.
+        // or never close.
         #[test]
         fn parses_dash_after_space_as_part_of_unquoted_delimiter() {
             let cmd = "cat << -EOF\nbody line\n-EOF";

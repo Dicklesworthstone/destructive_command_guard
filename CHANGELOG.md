@@ -15,6 +15,20 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Fixed
 
+- **Check substitutions carried by interpreter variables (#544).** Python and
+  JavaScript literal values passed through variables or opaque calls now reach
+  the existing command evaluator, including encoded substitution markers.
+  Bounded analysis preserves source spans, language escape semantics, named
+  execution rules, and their allowlist ownership. Proven documentation in an
+  isolated inline invocation or quoted heredoc remains data; unverified or
+  incomplete analysis cannot silently approve a command.
+- **Read complete quoted heredoc delimiters (#544).** Backslash quoting and
+  adjacent quoted fragments, such as `<<D\OC` and `<<D'OC'`, now retain the
+  exact interpreter source boundary in both the extractor and bundled Bash
+  parser. Any quoted fragment correctly suppresses outer-shell expansion in
+  the body. This prevents false denials of literal documentation and keeps
+  subsequent commands visible. Unsupported delimiter syntax cannot select a
+  shorter, misleading terminator.
 - **Inspect GNU tar helpers inside shell groups (#540).** Helper discovery now
   reaches actual tar invocations inside parentheses and brace groups, preserving
   their original command context. Enclosing file writes or earlier state changes

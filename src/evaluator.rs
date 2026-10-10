@@ -31257,9 +31257,84 @@ fn exec_sink_pack_verdict(
     content: &crate::heredoc::ExtractedContent,
     context: HeredocEvaluationContext<'_>,
 ) -> Option<EvaluationResult> {
-    for reconstructed in
-        crate::ast_matcher::exec_sink_reconstructed_commands(&content.content, content.language)
+    let named =
+        crate::ast_matcher::exec_sink_reconstructed_commands(&content.content, content.language);
+    if let Some(result) =
+        reconstructed_interpreter_commands_verdict(command, content, context, named)
     {
+        return Some(result);
+    }
+
+    // A variable can carry a shell substitution to an indirect or opaque
+    // execution call (#544). The outer shell never expands a quoted heredoc,
+    // and its role-aware Git parser cannot interpret a Python/JS assignment
+    // as a Git invocation. Recover actual host-language literal values for
+    // the existing pack evaluator without pretending their quotes are shell
+    // syntax. Named calls retain their original ownership in the helper.
+    if !matches!(
+        content.language,
+        crate::heredoc::ScriptLanguage::Python | crate::heredoc::ScriptLanguage::JavaScript
+    ) || (!content.content.contains('`')
+        && !content.content.contains("$(")
+        && !content.content.contains('\\'))
+    {
+        return None;
+    }
+    // The outer Bash parse belongs under the same wall-clock bound as the
+    // language parse. Only copy a source small enough to supply this proof.
+    let inline = content.heredoc_type.is_none();
+    let source_identity = content
+        .content_range
+        .as_ref()
+        .filter(|_| command.len() <= crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES)
+        .map(|range| (command.to_owned(), range.clone(), content.language));
+    let mut budget = crate::ast_matcher::protected_scan_budget();
+    if let Some(deadline) = context.deadline {
+        let Some(remaining) = deadline.remaining() else {
+            return Some(EvaluationResult::indeterminate_due_to_budget());
+        };
+        budget = budget.min(remaining);
+    }
+    let recovered = match crate::ast_matcher::interpreter_literal_shell_commands(
+        &content.content,
+        content.language,
+        move || {
+            let Some((source, range, language)) = source_identity else {
+                return (!inline).then_some(false);
+            };
+            if inline {
+                // The existing inline extractor can return a partial raw
+                // fragment when shell quotes are escaped. Only extend it
+                // when the extracted bytes are exactly the complete program;
+                // other forms retain their existing named/raw analysis.
+                crate::heredoc::range_is_literal_inline_interpreter_source(
+                    &source, &range, language,
+                )
+                .then_some(true)
+            } else {
+                Some(crate::heredoc::range_is_quoted_interpreter_source(
+                    &source, &range, language,
+                ))
+            }
+        },
+        budget,
+    ) {
+        Ok(commands) => commands,
+        Err(error) => {
+            tracing::debug!(%error, "interpreter literal analysis did not complete");
+            return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+    };
+    reconstructed_interpreter_commands_verdict(command, content, context, recovered)
+}
+
+fn reconstructed_interpreter_commands_verdict(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    context: HeredocEvaluationContext<'_>,
+    commands: Vec<crate::ast_matcher::ReconstructedCommand>,
+) -> Option<EvaluationResult> {
+    for reconstructed in commands {
         if deadline_exceeded(context.deadline) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
         }

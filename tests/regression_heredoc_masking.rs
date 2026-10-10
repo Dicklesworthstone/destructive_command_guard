@@ -94,11 +94,26 @@ EOF";
 
     /// Only the guard receives these strings; no test command is executed.
     fn hook_decision(command: &str) -> (String, String) {
+        hook_decision_with_allowlist(command, None)
+    }
+
+    fn hook_decision_with_allowlist(command: &str, allowed_rule: Option<&str>) -> (String, String) {
         let temporary = tempfile::tempdir().expect("isolated hook directory");
         let home = temporary.path().join("home");
         std::fs::create_dir_all(&home).expect("isolated home");
         let config = temporary.path().join("config.toml");
         std::fs::write(&config, "[history]\nenabled = false\n").expect("hook config");
+        if let Some(rule) = allowed_rule {
+            let directory = home.join("config").join("dcg");
+            std::fs::create_dir_all(&directory).expect("isolated user allowlist directory");
+            std::fs::write(
+                directory.join("allowlist.toml"),
+                format!(
+                    "[[allow]]\nrule = \"{rule}\"\nreason = \"reviewed rule ownership fixture\"\n"
+                ),
+            )
+            .expect("isolated user allowlist");
+        }
         let payload = serde_json::json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "Bash",
@@ -643,6 +658,246 @@ EOF";
             assert_eq!(
                 decision, "deny",
                 "shell or unknown execution must remain visible: {command:?}: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_544_mixed_quoted_delimiters_preserve_inert_documentation() {
+        for (program, body) in [
+            (
+                "python3",
+                "s = 'run `git branch -d x` or $(git reset --hard) later'\nprint(s)",
+            ),
+            (
+                "node",
+                "const s = 'run `git branch -d x` or $(git reset --hard) later';\nconsole.log(s);",
+            ),
+        ] {
+            for delimiter in ["D'OC'", "D\\OC"] {
+                for command in [
+                    format!("{program} - <<{delimiter}\n{body}\nDOC"),
+                    format!(
+                        "cat > /tmp/documentation-program <<{delimiter}\n{body}\nDOC\n{program} /tmp/documentation-program"
+                    ),
+                    format!(
+                        "tee /tmp/documentation-program <<{delimiter} >/dev/null\n{body}\nDOC\n{program} /tmp/documentation-program"
+                    ),
+                ] {
+                    let (decision, rule) = hook_decision(&command);
+                    assert_eq!(
+                        decision, "allow",
+                        "quote removal must preserve literal interpreter source: {command:?}: {rule}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn issue_544_indirect_shell_commands_keep_literal_evidence() {
+        for (program, body) in [
+            (
+                "python3",
+                "import os\ns = 'echo $(git reset --hard)'\nos.system(s)",
+            ),
+            (
+                "python3",
+                "import subprocess\ns = 'echo `git branch -d x`'\nsubprocess.run(s, shell=True)",
+            ),
+            (
+                "node",
+                "const s = 'echo $(git reset --hard)';\nrequire('child_process').execSync(s);",
+            ),
+            (
+                "node",
+                "const s = 'echo `git branch -d x`';\nconst run = require('child_process').execSync;\nrun(s);",
+            ),
+            (
+                "python3",
+                "from helper import run\ns = 'echo $(git reset --hard)'\nrun(s)",
+            ),
+            (
+                "node",
+                "const run = require('./helper');\nconst s = 'echo $(git reset --hard)';\nrun(s);",
+            ),
+        ] {
+            for command in [
+                format!("{program} - <<'DOC'\n{body}\nDOC"),
+                format!(
+                    "tee /tmp/executed-program <<'DOC' >/dev/null\n{body}\nDOC\n{program} /tmp/executed-program"
+                ),
+            ] {
+                let (decision, rule) = hook_decision(&command);
+                assert_eq!(
+                    decision, "deny",
+                    "a variable must not hide executable literal evidence: {command:?}: {rule}"
+                );
+                assert!(!rule.is_empty(), "denial must name its rule: {command:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn issue_544_document_edits_keep_the_same_command_text_inert() {
+        for (program, body) in [
+            (
+                "python3",
+                "s = 'echo $(git reset --hard)'\nprint(s)\nopen('notes.md', 'w').write(s)",
+            ),
+            (
+                "python3",
+                "s = 'echo `git branch -d x`'\nopen('notes.md', 'w').write(s.replace('echo', 'Example:'))",
+            ),
+            (
+                "node",
+                "const s = 'echo $(git reset --hard)';\nconsole.log(s);\nrequire('fs').writeFileSync('notes.md', s);",
+            ),
+            (
+                "node",
+                "const s = 'echo `git branch -d x`';\nrequire('node:fs').writeFileSync('notes.md', s.replace('echo', 'Example:'));",
+            ),
+        ] {
+            let command = format!("{program} - <<'DOC'\n{body}\nDOC");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(
+                decision, "allow",
+                "proven documentation output must remain usable: {command:?}: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_544_documentation_literals_do_not_mask_protected_file_writes() {
+        for (program, body) in [
+            (
+                "python3",
+                "s = 'run `git branch -d x` later'\nopen('/home/user/.ssh/authorized_keys', 'w').write(s)",
+            ),
+            (
+                "node",
+                "const s = 'run $(git reset --hard) later';\nrequire('fs').writeFileSync('/home/user/.ssh/authorized_keys', s);",
+            ),
+        ] {
+            for command in [
+                format!("{program} - <<'DOC'\n{body}\nDOC"),
+                format!("tee /tmp/program <<'DOC' >/dev/null\n{body}\nDOC\n{program} /tmp/program"),
+            ] {
+                let (decision, rule) = hook_decision(&command);
+                assert_eq!(decision, "deny", "{command:?}");
+                assert_eq!(
+                    rule, "core.filesystem:credential-file-write",
+                    "the original source must reach protected-write analysis: {command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue_544_documentation_output_piped_to_shell_is_executable() {
+        for command in [
+            "python3 - <<'PY' | bash\ns = 'echo `git branch -d x`'\nprint(s)\nPY",
+            "node - <<'JS' | sh\nconst s = 'echo $(git reset --hard)';\nconsole.log(s);\nJS",
+            "tee /tmp/program.py <<D\\OC >/dev/null\ns = 'echo $(git reset --hard)'\nprint(s)\nDOC\npython3 /tmp/program.py | sh",
+            "tee /tmp/program.js <<D'OC' >/dev/null\nconst s = 'echo `git branch -d x`';\nconsole.log(s);\nDOC\nnode /tmp/program.js | bash",
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(
+                decision, "deny",
+                "a downstream shell executes the printed command text: {command:?}: {rule}"
+            );
+            assert!(!rule.is_empty(), "denial must name its rule: {command:?}");
+        }
+    }
+
+    #[test]
+    fn issue_544_inline_documentation_literals_remain_inert() {
+        for command in [
+            r#"python3 -c 's = "run `git branch -d x` later"; print(s)'"#,
+            r#"python3 -c 's = "run \x60git branch -d x\x60 later"; print(s)'"#,
+            r#"node -e 'const s = "run `git branch -d x` later"; console.log(s);'"#,
+            r#"node -e 'const s = "run \u0060git branch -d x\u0060 later"; console.log(s);'"#,
+            r#"python3 -c "print(\"hello\")""#,
+            r#"node -e "console.log(\"hello\")""#,
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(
+                decision, "allow",
+                "isolated inline documentation has the same literal semantics: {command:?}: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_544_tagged_templates_do_not_invent_cooked_shell_commands() {
+        for (body, expected) in [
+            (
+                r"const s = String.raw`echo \`git branch -d x\``; require('child_process').execSync(s);",
+                "allow",
+            ),
+            (
+                r"const s = `echo \`git branch -d x\``; require('child_process').execSync(s);",
+                "deny",
+            ),
+        ] {
+            let command = format!("node - <<'JS'\n{body}\nJS");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(
+                decision, expected,
+                "raw and ordinary templates produce different shell values: {command:?}: {rule}"
+            );
+            if expected == "deny" {
+                assert_eq!(rule, "core.git:branch-delete", "{command:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn issue_544_named_sink_allowlists_do_not_cover_indirect_commands() {
+        for (launcher, direct, indirect, opaque, named_rule) in [
+            (
+                "python3 -c",
+                r#"from os import system as run; run("git reset --hard; echo $(printf done)")"#,
+                r#"from os import system as run; s = "echo $(git reset --hard)"; run(s)"#,
+                r#"from helper import run; s = "echo $(git reset --hard)"; run(s)"#,
+                "heredoc.python:exec_sink.git_reset_hard",
+            ),
+            (
+                "node -e",
+                r#"const cp = require("child_process"); cp.execSync("git reset --hard; echo $(printf done)");"#,
+                r#"const cp = require("child_process"); const s = "echo $(git reset --hard)"; cp.execSync(s);"#,
+                r#"const run = require("./helper"); const s = "echo $(git reset --hard)"; run(s);"#,
+                "heredoc.javascript:exec_sink.git_reset_hard",
+            ),
+        ] {
+            let direct_command = format!("{launcher} '{direct}'");
+            let (decision, rule) = hook_decision(&direct_command);
+            assert_eq!(decision, "deny", "{direct_command:?}");
+            assert_eq!(
+                rule, named_rule,
+                "the established named sink retains its rule: {direct_command:?}"
+            );
+            let (decision, rule) = hook_decision_with_allowlist(&direct_command, Some(named_rule));
+            assert_eq!(
+                decision, "allow",
+                "a named-sink grant must not be denied again by literal recovery: {direct_command:?}: {rule}"
+            );
+
+            for body in [indirect, opaque] {
+                let command = format!("{launcher} '{body}'");
+                let (decision, rule) = hook_decision_with_allowlist(&command, Some(named_rule));
+                assert_eq!(decision, "deny", "{command:?}");
+                assert_eq!(
+                    rule, "core.git:reset-hard",
+                    "a different call does not inherit the named-sink grant: {command:?}"
+                );
+            }
+            let command = format!("{launcher} '{indirect}'");
+            let (decision, rule) =
+                hook_decision_with_allowlist(&command, Some("core.git:reset-hard"));
+            assert_eq!(
+                decision, "allow",
+                "recovered commands honor their own reported pack rule: {command:?}: {rule}"
             );
         }
     }
