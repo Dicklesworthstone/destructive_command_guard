@@ -65,7 +65,7 @@ tokio = { version = "1.52", features = ["rt-multi-thread"] }
 rayon = { version = "1.11", optional = true }
 
 # AST-based pattern matching for heredoc/inline-script content
-ast-grep-core = "0.45"
+ast-grep-core = "0.50"
 # The Bash grammar carries dcg's #442/#461 fixes (scanner memory safety on glibc;
 # explicit stdin descriptors and mixed file/here-string redirections). It used to
 # arrive through `[patch.crates-io]`, which `cargo publish` drops, so a crates.io
