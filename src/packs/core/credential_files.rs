@@ -33,7 +33,7 @@ pub(crate) fn may_name_protected_path(command: &str) -> bool {
     shell::may_name_protected_path(command) || word_splitting::candidate(command)
 }
 
-/// IFS assignments and expansions belong to the outer shell, not to a quoted
+/// Scalar/IFS assignments and expansions belong to the outer shell, not to a quoted
 /// Python/Node program supplied on stdin (#560). Reuse the existing ownership
 /// proof instead of letting source text establish shell state or exhaust the
 /// shell event budget. It rejects unquoted bodies and ambiguous receivers.
@@ -43,18 +43,24 @@ pub(crate) fn may_name_protected_path(command: &str) -> bool {
 /// `embedded::scan_command` below must always receive the original command.
 /// Do not apply a POSIX-only proof when the caller's dialect is unknown.
 fn scan_outer_writer_arguments(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWrite> {
-    if dialect != ShellDialect::Posix || !word_splitting::candidate(command) {
-        return word_splitting::scan(command, dialect);
-    }
-    let outer = crate::heredoc::mask_inert_interpreter_stdin(command);
-    word_splitting::scan(outer.as_ref(), dialect)
+    let outer = if dialect == ShellDialect::Posix
+        && (word_splitting::candidate(command) || shell::indirection::candidate(command))
+    {
+        crate::heredoc::mask_inert_interpreter_stdin(command)
+    } else {
+        std::borrow::Cow::Borrowed(command)
+    };
+    let mut hits = word_splitting::scan(outer.as_ref(), dialect);
+    hits.extend(shell::indirection::scan(outer.as_ref(), dialect));
+    hits
 }
 
 /// Inspect executable source before shell segmentation or masking removes it.
 /// Shell syntax uses the separate [`classify_credential_file_write`] above;
 /// inline scripts, heredocs, and here-strings use their proven interpreter.
-/// The IFS view retains preceding assignments until each writer's arguments
-/// have been split, then delegates every destination to the same path policy.
+/// The shell views retain preceding scalar assignments and recognized Git
+/// origins, including IFS-dependent argv, and delegate destination evidence
+/// to the same native path policy before source segmentation discards it.
 /// Apply explicit language/content exemptions to each decoded program, not
 /// to another program or shell writer in the same command.
 /// Retain all rule families, including coincident spans from a single rename.

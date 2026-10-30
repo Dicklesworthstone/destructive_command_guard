@@ -90,7 +90,7 @@ impl State {
     }
 }
 
-fn maintained_variable(name: &str) -> bool {
+pub(super) fn maintained_variable(name: &str) -> bool {
     name.starts_with("BASH_")
         || matches!(
             name,
@@ -110,14 +110,14 @@ fn maintained_variable(name: &str) -> bool {
         )
 }
 
-fn identifier(name: &str) -> bool {
+pub(super) fn identifier(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().enumerate().all(|(index, byte)| {
             byte.is_ascii_alphabetic() || byte == b'_' || index > 0 && byte.is_ascii_digit()
         })
 }
 
-fn assignment(raw: &str) -> Option<(&str, bool, &str)> {
+pub(super) fn assignment(raw: &str) -> Option<(&str, bool, &str)> {
     let (left, rhs) = raw.split_once('=')?;
     let name = left.strip_suffix('+').unwrap_or(left);
     identifier(name).then_some((name, left != name, rhs))
@@ -772,7 +772,7 @@ fn classify(argv: &[String], span: Range<usize>) -> Result<Vec<CredentialFileWri
 /// modifiers do not make a count assignment harmless. Backslash escapes do
 /// not protect a source `%`: `\%n` still performs the assignment, whereas
 /// `\045n` only prints percent/n and must not be re-parsed as a conversion.
-fn printf_format_may_assign(format: &str) -> bool {
+pub(super) fn printf_format_may_assign(format: &str) -> bool {
     let bytes = format.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
@@ -845,7 +845,7 @@ fn printf_may_assign(words: &[String], state: &State) -> bool {
     false
 }
 
-fn mutates_shell(name: &str) -> bool {
+pub(super) fn mutates_shell(name: &str) -> bool {
     matches!(
         name,
         "read"
@@ -876,7 +876,7 @@ fn mutates_shell(name: &str) -> bool {
     )
 }
 
-fn special_builtin(name: &str) -> bool {
+pub(super) fn special_builtin(name: &str) -> bool {
     matches!(
         name,
         ":" | "."
@@ -899,7 +899,7 @@ fn special_builtin(name: &str) -> bool {
 /// The async terminator belongs to the whole statement, not to each
 /// assignment inside it. Ask the syntax tree so line continuations before
 /// `&`, and the distinct `&&` and `&>` operators, keep their shell meaning.
-fn has_async_terminator(node: &Node<'_, StrDoc<SupportLang>>) -> bool {
+pub(super) fn has_async_terminator(node: &Node<'_, StrDoc<SupportLang>>) -> bool {
     node.get_inner_node()
         .next_sibling()
         .is_some_and(|sibling| sibling.kind() == "&")
@@ -911,7 +911,7 @@ fn has_async_terminator(node: &Node<'_, StrDoc<SupportLang>>) -> bool {
 /// literal value. Keep quoted/escaped braces and commas as data. This bounded
 /// lexical check never enumerates alternatives (which can grow exponentially)
 /// and deliberately treats malformed range candidates as uncertain too.
-fn declaration_may_expand_braces(raw: &str) -> bool {
+pub(super) fn declaration_may_expand_braces(raw: &str) -> bool {
     let mut quote = None;
     let mut braces = Vec::new();
     let mut previous_dot = false;
@@ -979,7 +979,7 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
 /// it before reading words, and for each byte of that source the offset of the
 /// same byte in `command`, with one more entry for the end. `None` when
 /// nothing was removed.
-fn join_line_continuations(command: &str) -> Option<(String, Vec<usize>)> {
+pub(super) fn join_line_continuations(command: &str) -> Option<(String, Vec<usize>)> {
     if !command.contains("\\\n") {
         return None;
     }

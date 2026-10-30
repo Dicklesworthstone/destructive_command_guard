@@ -28,6 +28,7 @@ use crate::normalize::{ShellDialect, is_env_assignment};
 use crate::packs::PatternSuggestion;
 use std::ops::Range;
 
+pub(super) mod indirection;
 mod windows_shells;
 
 /// Rule name under `core.filesystem`. The pattern entry in
@@ -1274,7 +1275,7 @@ enum WriteMode {
     Append,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Token {
     Word(Word),
     /// An output redirect with a file target.
