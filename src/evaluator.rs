@@ -13987,6 +13987,20 @@ fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>
     Some((name.to_string(), token.byte_range, quoted))
 }
 
+/// A literal non-shell interpreter such as `/usr/bin/python3` is the same word
+/// quoted or bare. Render it bare: the quoted spelling reads as an obfuscated
+/// interpreter whose inline source never reaches the language-aware
+/// extractor, so `PY=/usr/bin/python3; $PY -c "print(1)"` denied while the
+/// literal command is judged by its program (#608). Only bytes that no POSIX
+/// shell treats specially qualify, and none of the names is a reserved word.
+fn posix_literal_interpreter_field_is_plain(field: &str) -> bool {
+    !field.starts_with('-')
+        && field.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+')
+        })
+        && non_shell_inline_interpreter_name(field.rsplit('/').next().unwrap_or(field))
+}
+
 /// Render the argv fields produced by one variable expansion. Quotes and
 /// operators in the value are data: parameter expansion never reparses them
 /// as shell source. Only an unquoted expansion performs IFS splitting and
@@ -14027,7 +14041,14 @@ fn render_posix_executable_expansion(
     }
     let rendered_fields: Vec<String> = fields
         .iter()
-        .map(|field| posix_single_quote_argument(field))
+        .enumerate()
+        .map(|(index, field)| {
+            if index == 0 && posix_literal_interpreter_field_is_plain(field) {
+                (*field).to_string()
+            } else {
+                posix_single_quote_argument(field)
+            }
+        })
         .collect();
     // A split value that introduces interpreter options remains a bounded
     // launcher proof, not flowctl receipt data (#540). Evaluate its concrete
@@ -47891,6 +47912,57 @@ mod tests {
             result.pattern_info.and_then(|info| info.pattern_name),
             Some("inline-launcher-unverified".to_string())
         );
+    }
+
+    /// A straight-line literal binding of a non-shell interpreter resolves to
+    /// the same command as the literal spelling, so its inline program is read
+    /// and judged in its own language instead of refused as obfuscated (#608).
+    #[test]
+    fn literal_interpreter_bindings_are_judged_by_their_program_608() {
+        for command in [
+            "PY=/usr/bin/python3; $PY -c \"print(1)\"",
+            "PY=/usr/bin/python3; \"$PY\" -c \"print(1)\"",
+            "D=/tmp/x; PY=/usr/bin/python3; $PY -c \"print(1)\"",
+            "PY=python3.12; ${PY} -c 'x = 1'",
+            "PL=/usr/bin/perl; $PL -e 'print 1'",
+            "N=/usr/bin/node; $N -e 'console.log(1)'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "literal interpreter binding: {command:?}: {result:?}"
+            );
+        }
+
+        let result = evaluate_with_pack_ids_in_dialect(
+            "PY=/usr/bin/python3; $PY -c \"import shutil; shutil.rmtree('/home/user')\"",
+            &["core.git"],
+            ShellDialect::Posix,
+        );
+        assert!(result.is_denied(), "the bound program is read: {result:?}");
+        let info = result.pattern_info.expect("Python AST denial has a rule");
+        assert_eq!(info.pack_id.as_deref(), Some("heredoc.python"));
+        assert_eq!(info.pattern_name.as_deref(), Some("shutil_rmtree"));
+
+        for command in [
+            "$PY -c \"print(1)\"",
+            "PY='python3 -c'; $PY 'print(1)'",
+            "PY=\"$(command -v python3)\"; $PY -c 'print(1)'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "unproven interpreter launcher: {command:?}: {result:?}"
+            );
+        }
     }
 
     /// `core.filesystem:credential-file-write` runs ahead of the redirect
