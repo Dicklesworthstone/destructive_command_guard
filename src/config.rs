@@ -6007,6 +6007,12 @@ history_window = "24h"
 
 # [projects."/path/to/k8s-infra"]
 # packs.enabled = ["kubernetes", "cloud.aws", "infrastructure.terraform"]
+
+# Factory Droid profile (selected by dcg install --droid).
+# Uses the same agent-profile fields as every other supported agent.
+# [agents.droid]
+# extra_packs = ["database"]
+# disabled_allowlist = true
 "#
         .to_string()
     }
@@ -9428,6 +9434,40 @@ enabled = false
 
         let profile = config.profile_for("claude-code");
         assert_eq!(profile.trust_level, TrustLevel::High);
+    }
+
+    #[test]
+    fn test_droid_profile_and_alias_use_existing_agent_configuration() {
+        use crate::agent::Agent;
+
+        for key in ["droid", "factory-droid", "factory_droid"] {
+            let config: Config = toml::from_str(&format!(
+                r#"
+                [agents.{key}]
+                trust_level = "low"
+                extra_packs = ["database.postgresql"]
+                disabled_packs = ["core"]
+                disabled_allowlist = true
+                additional_allowlist = ["git reset --hard"]
+            "#
+            ))
+            .unwrap();
+            let profile = config.agents.profile_for_agent(&Agent::Droid);
+            assert_eq!(profile.trust_level, TrustLevel::Low);
+            assert!(profile.disabled_allowlist);
+            assert_eq!(profile.additional_allowlist, ["git reset --hard"]);
+            let packs = config.enabled_pack_ids_for_agent(&Agent::Droid);
+            assert!(packs.contains("database.postgresql"));
+            assert!(
+                packs.contains("core"),
+                "profiles must preserve mandatory core protections"
+            );
+            assert!(
+                !config
+                    .enabled_pack_ids_for_agent(&Agent::ClaudeCode)
+                    .contains("database.postgresql")
+            );
+        }
     }
 
     #[test]

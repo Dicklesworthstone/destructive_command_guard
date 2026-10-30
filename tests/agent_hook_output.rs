@@ -978,3 +978,291 @@ fn test_crush_envelope_allows_safe_command_silently() {
         "safe Crush hook output must be silent, got: {stdout}"
     );
 }
+
+// Factory's documented direct Execute hook contract (#617). These tests feed
+// the real dcg binary commands as JSON data; they never execute the commands
+// and do not establish that a live Droid Script invokes Execute hooks.
+fn droid_payload(command: &str) -> String {
+    serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "droid-session-617",
+        "transcript_path": "/home/user/.factory/sessions/session.jsonl",
+        "cwd": test_state_path("-home"),
+        "tool_name": "Execute",
+        "tool_input": {
+            "command": command,
+            "timeout": 90,
+            "riskLevel": "high",
+            "riskLevelReason": "User requested shell operation"
+        },
+        "tool_use_id": "call_execute_617"
+    })
+    .to_string()
+}
+
+fn assert_droid_denial(stdout: &str, stderr: &str, code: i32) -> serde_json::Value {
+    assert_eq!(code, 0, "Factory parses JSON on exit 0: {stderr}");
+    let output: serde_json::Value = serde_json::from_str(stdout).unwrap_or_else(|error| {
+        panic!("Droid must receive JSON denial: {error}; {stdout}; {stderr}")
+    });
+    let hook_output = &output["hookSpecificOutput"];
+    assert_eq!(hook_output["hookEventName"], "PreToolUse");
+    assert_eq!(hook_output["permissionDecision"], "deny");
+    assert!(
+        hook_output["permissionDecisionReason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty())
+    );
+    output
+}
+
+#[test]
+fn test_droid_execute_denials_match_supported_bash_tools() {
+    for command in [
+        "git reset --hard HEAD",
+        "git status; git reset --hard HEAD",
+        "bash -c 'git reset --hard HEAD'",
+        "python3 - <<'PY'\nimport os\nos.system('git reset --hard HEAD')\nPY",
+    ] {
+        let (bash_stdout, bash_stderr, bash_code) = run_hook_mode_raw_with_options(
+            &serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}})
+                .to_string(),
+            &["--agent", "claude-code"],
+            &[],
+        );
+        let bash = assert_droid_denial(&bash_stdout, &bash_stderr, bash_code);
+        for args in [&[][..], &["--agent", "droid"][..]] {
+            let (stdout, stderr, code) =
+                run_hook_mode_raw_with_options(&droid_payload(command), args, &[]);
+            let droid = assert_droid_denial(&stdout, &stderr, code);
+            for field in ["permissionDecision", "ruleId", "packId", "severity"] {
+                assert_eq!(
+                    droid["hookSpecificOutput"][field], bash["hookSpecificOutput"][field],
+                    "{command}: {field}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_droid_execute_allows_safe_commands_without_preapproving_them() {
+    for command in [
+        "git status",
+        "git clean --dry-run",
+        "git diff --stat",
+        "printf '%s\\n' 'ordinary text'",
+    ] {
+        for args in [&[][..], &["--agent", "droid"][..]] {
+            let (stdout, stderr, code) =
+                run_hook_mode_raw_with_options(&droid_payload(command), args, &[]);
+            assert_eq!(code, 0, "{command}: {stderr}");
+            assert!(
+                stdout.is_empty(),
+                "an allowed command must not bypass Factory's own permission prompt: {stdout}"
+            );
+            assert!(stderr.is_empty(), "{command}: {stderr}");
+        }
+    }
+}
+
+#[test]
+fn test_droid_profile_applies_with_explicit_identity_and_native_payload() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("droid-profile.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+        [packs]
+        enabled = ["core.git", "core.filesystem"]
+        [agents.droid]
+        extra_packs = ["database.postgresql"]
+        disabled_packs = ["core"]
+    "#,
+    )
+    .unwrap();
+    let env = [
+        ("DCG_CONFIG", config_path.to_str().unwrap()),
+        // A surrounding Claude terminal must not misattribute Execute.
+        ("CLAUDECODE", "1"),
+    ];
+    let command = "psql -c 'DROP TABLE users'";
+    for args in [
+        &[][..],
+        &["--agent", "droid"][..],
+        &["--agent", "factory-droid"][..],
+    ] {
+        let (stdout, stderr, code) =
+            run_hook_mode_raw_with_options(&droid_payload(command), args, &env);
+        let denial = assert_droid_denial(&stdout, &stderr, code);
+        assert_eq!(
+            denial["hookSpecificOutput"]["packId"],
+            "database.postgresql"
+        );
+        let (stdout, stderr, code) =
+            run_hook_mode_raw_with_options(&droid_payload("git reset --hard"), args, &env);
+        assert_droid_denial(&stdout, &stderr, code);
+    }
+    // Explicit overrides remain authoritative and optional Droid packs do
+    // not leak into another host's policy.
+    let (stdout, stderr, code) =
+        run_hook_mode_raw_with_options(&droid_payload(command), &["--agent", "claude-code"], &env);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+}
+
+#[test]
+fn test_droid_allowlist_profile_preserves_disabled_allowlist_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let command = "git reset --hard HEAD";
+    for disabled in [false, true] {
+        let config_path = temp.path().join(format!("droid-allowlist-{disabled}.toml"));
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+            [agents.droid]
+            additional_allowlist = ["{command}"]
+            disabled_allowlist = {disabled}
+        "#
+            ),
+        )
+        .unwrap();
+        let env = [("DCG_CONFIG", config_path.to_str().unwrap())];
+        let (stdout, stderr, code) =
+            run_hook_mode_raw_with_options(&droid_payload(command), &["--agent", "droid"], &env);
+        if disabled {
+            assert_droid_denial(&stdout, &stderr, code);
+        } else {
+            assert_eq!(code, 0, "{stderr}");
+            assert!(
+                stdout.is_empty(),
+                "configured exact command should be allowed: {stdout}"
+            );
+        }
+        let (stdout, stderr, code) = run_hook_mode_raw_with_options(
+            &serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}})
+                .to_string(),
+            &["--agent", "claude-code"],
+            &env,
+        );
+        assert_droid_denial(&stdout, &stderr, code);
+    }
+}
+
+#[test]
+fn test_droid_configured_fail_closed_retains_claude_compatible_denial() {
+    let (stdout, stderr, code) = run_hook_mode_raw_with_options(
+        "{ malformed Droid payload",
+        &["--agent", "droid"],
+        &[("DCG_FAIL_CLOSED", "1")],
+    );
+    assert_droid_denial(&stdout, &stderr, code);
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("invalid-config.toml");
+    std::fs::write(&config_path, "[packs]\nenabled = 7\n").unwrap();
+    let (stdout, stderr, code) = run_hook_mode_raw_with_options(
+        &droid_payload("git status"),
+        &["--agent", "droid"],
+        &[("DCG_CONFIG", config_path.to_str().unwrap())],
+    );
+    assert_droid_denial(&stdout, &stderr, code);
+}
+
+#[test]
+fn test_droid_unverified_commands_preserve_ask_and_deny_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("command-limit.toml");
+    std::fs::write(&config_path, "[general]\nmax_command_bytes = 5\n").unwrap();
+    for decision in ["ask", "deny"] {
+        let (stdout, stderr, code) = run_hook_mode_raw_with_options(
+            &droid_payload("git status"),
+            &["--agent", "droid"],
+            &[
+                ("DCG_CONFIG", config_path.to_str().unwrap()),
+                ("DCG_UNVERIFIED_DECISION", decision),
+            ],
+        );
+        assert_eq!(code, 0, "{stderr}");
+        let output: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(output["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(output["hookSpecificOutput"]["permissionDecision"], decision);
+    }
+}
+
+#[test]
+fn test_droid_payload_history_is_attributed_to_droid() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("history.db");
+    let (stdout, stderr, code) = run_hook_mode_raw_with_options(
+        &droid_payload("git reset --hard"),
+        &[],
+        &[
+            ("DCG_HISTORY_DISABLED", "0"),
+            ("DCG_HISTORY_ENABLED", "1"),
+            ("DCG_HISTORY_DB", database.to_str().unwrap()),
+            ("CLAUDECODE", "1"),
+        ],
+    );
+    assert_droid_denial(&stdout, &stderr, code);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let agent: String = connection
+        .query_row(
+            "SELECT agent_type FROM commands ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(agent, "droid");
+}
+
+#[test]
+fn test_droid_hook_never_self_heals_unrelated_claude_settings() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let claude_default = home.join(".claude/settings.json");
+    let claude_override_dir = home.join("claude-active");
+    let claude_override = claude_override_dir.join("settings.json");
+    let stale = r#"{"operatorSetting":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/stale/dcg"}]}]}}"#;
+    for path in [&claude_default, &claude_override] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, stale).unwrap();
+    }
+    let env = [
+        ("HOME", home.to_str().unwrap()),
+        ("USERPROFILE", home.to_str().unwrap()),
+        ("CLAUDECODE", "1"),
+        ("CLAUDE_CONFIG_DIR", claude_override_dir.to_str().unwrap()),
+        ("DCG_SELF_HEAL_HOOK", "1"),
+    ];
+    for args in [&[][..], &["--agent", "droid"][..]] {
+        let (stdout, stderr, code) =
+            run_hook_mode_raw_with_options(&droid_payload("git status"), args, &env);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        for path in [&claude_default, &claude_override] {
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                stale,
+                "Droid changed unrelated {}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn test_droid_script_payload_does_not_claim_nested_execute_coverage() {
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Script",
+        "tool_input": {"code": "await Execute({ command: 'git reset --hard HEAD' })"}
+    });
+    let (stdout, stderr, code) =
+        run_hook_mode_raw_with_options(&payload.to_string(), &["--agent", "droid"], &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stdout.is_empty(),
+        "Script source is not a shell command: {stdout}"
+    );
+}

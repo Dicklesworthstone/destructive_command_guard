@@ -46,6 +46,9 @@
 //!   (#572). It is deliberately not inferred from a parent process name.
 //! - Amp: the generated plugin (`dcg install --amp`) passes `--agent amp`
 //!   (#577). No process name is consulted (`amp` is also an editor's name).
+//! - Factory Droid: `dcg install --droid` passes `--agent droid`; its documented
+//!   `FACTORY_PROJECT_DIR` hook variable and exact `droid` process basename
+//!   are fallbacks. Hook mode also recognizes the distinctive `Execute` tool.
 //! - Pi (earendil-works `pi` coding agent): `PI_CODING_AGENT=true` env var (set
 //!   by `pi` into the environment of the subprocesses it spawns).
 //! - Posit Assistant: `PA_PROJECT_DIR=<workspace root>` env var, set in every
@@ -148,6 +151,11 @@ pub enum Agent {
     /// (`dcg install --amp`) whose `tool.call` handler runs `dcg --agent amp`
     /// for every shell command (#577).
     Amp,
+    /// Factory Droid (<https://docs.factory.com/harness/hooks>). Its `Execute`
+    /// tool sends Claude-compatible `PreToolUse` payloads. The installer pins
+    /// this identity with `--agent droid` so profiles also work when the hook
+    /// environment is cleared or the payload cannot be parsed (#617).
+    Droid,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -181,6 +189,7 @@ impl Agent {
             Self::Reasonix => "reasonix",
             Self::Muse => "muse",
             Self::Amp => "amp",
+            Self::Droid => "droid",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -210,6 +219,7 @@ impl Agent {
                 | Self::Reasonix
                 | Self::Muse
                 | Self::Amp
+                | Self::Droid
         )
     }
 
@@ -238,6 +248,7 @@ impl Agent {
     /// - `"reasonix"`, `"deepseek-reasonix"` -> `Reasonix`
     /// - `"muse"`, `"muse-code"` -> `Muse`
     /// - `"amp"`, `"ampcode"` -> `Amp`
+    /// - `"droid"`, `"factory-droid"`, `"factory"` -> `Droid`
     /// - `"unknown"` -> `Unknown`
     /// - Any other value -> `Custom(value)`
     #[must_use]
@@ -263,6 +274,7 @@ impl Agent {
             "reasonix" | "deepseekreasonix" => Self::Reasonix,
             "muse" | "musecode" | "metamuse" => Self::Muse,
             "amp" | "ampcode" => Self::Amp,
+            "droid" | "factorydroid" | "factory" | "droidcli" => Self::Droid,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -291,6 +303,7 @@ impl fmt::Display for Agent {
             Self::Reasonix => write!(f, "Reasonix"),
             Self::Muse => write!(f, "Muse Code"),
             Self::Amp => write!(f, "Amp"),
+            Self::Droid => write!(f, "Factory Droid"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -731,6 +744,18 @@ fn detect_from_environment() -> Option<DetectionResult> {
         ));
     }
 
+    // Factory documents this variable for hooks. Like PA_PROJECT_DIR it
+    // describes a workspace and may be inherited by another agent, so keep
+    // existing identifying markers ahead of it. Installed hooks use the
+    // explicit --agent droid flag, which takes precedence over all env vars.
+    if std::env::var_os("FACTORY_PROJECT_DIR").is_some() {
+        return Some(DetectionResult::new(
+            Agent::Droid,
+            DetectionMethod::Environment,
+            Some("FACTORY_PROJECT_DIR".to_string()),
+        ));
+    }
+
     None
 }
 
@@ -938,6 +963,7 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "omp" | "oh-my-pi" => Some(Agent::Omp),
         "crush" => Some(Agent::Crush),
         "reasonix" => Some(Agent::Reasonix),
+        "droid" => Some(Agent::Droid),
         // No "muse" entry: Muse Code is identified only by the explicit
         // `--agent muse` its installed hook carries (#572). That identity
         // changes the profile and the answer shape, so it must not follow an
@@ -1107,6 +1133,42 @@ mod tests {
         assert!(Agent::Omp.is_known());
         assert!(!Agent::Unknown.is_known());
         assert!(!Agent::Custom("x".to_string()).is_known());
+    }
+
+    #[test]
+    fn test_droid_identity_mappings() {
+        assert_eq!(Agent::Droid.config_key(), "droid");
+        assert!(Agent::Droid.is_known());
+        assert_eq!(Agent::Droid.to_string(), "Factory Droid");
+        for name in [
+            "droid",
+            "Droid",
+            "factory-droid",
+            "factory_droid",
+            "factory",
+            "droid-cli",
+        ] {
+            assert_eq!(Agent::from_name(name), Agent::Droid, "{name}");
+        }
+        let explicit = explicit_agent_from_args(["dcg", "--agent", "droid"]);
+        assert_eq!(
+            from_explicit(explicit.as_deref().unwrap()).agent,
+            Agent::Droid
+        );
+        for process in [
+            "droid",
+            "/home/user/.local/bin/droid",
+            r"C:\tools\droid.exe",
+        ] {
+            assert_eq!(
+                agent_from_process_name(process),
+                Some(Agent::Droid),
+                "{process}"
+            );
+        }
+        for process in ["android", "droid-helper", "factory", "/tmp/droid-notes.txt"] {
+            assert_eq!(agent_from_process_name(process), None, "{process}");
+        }
     }
 
     #[test]
@@ -1439,6 +1501,7 @@ mod env_tests {
         "CRUSH",
         "PI_CODING_AGENT",
         "PA_PROJECT_DIR",
+        "FACTORY_PROJECT_DIR",
     ];
 
     fn with_env_var<F, R>(key: &str, value: &str, f: F) -> R
@@ -1703,6 +1766,26 @@ mod env_tests {
             assert_eq!(result.method, DetectionMethod::Environment);
             assert_eq!(result.matched_value, Some("CRUSH".to_string()));
         });
+    }
+
+    #[test]
+    fn test_detect_droid_from_documented_hook_environment() {
+        with_env_var("FACTORY_PROJECT_DIR", "/work/project", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::Droid);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value.as_deref(), Some("FACTORY_PROJECT_DIR"));
+        });
+    }
+
+    #[test]
+    fn test_droid_workspace_marker_preserves_existing_agent_priority() {
+        with_env_vars(
+            &[("FACTORY_PROJECT_DIR", "/work"), ("CLAUDECODE", "1")],
+            || {
+                assert_eq!(detect_agent_with_details().agent, Agent::ClaudeCode);
+            },
+        );
     }
 
     #[test]

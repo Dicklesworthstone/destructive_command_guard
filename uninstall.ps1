@@ -679,6 +679,65 @@ function Unconfigure-ReasonixHook {
   $removed
 }
 
+function Test-DroidDcgRegistration {
+  # Conservative inventory only. Unreadable or unexpected file kinds require
+  # native inspection before we can safely remove the DCG executable.
+  param([string]$FactoryDir)
+  foreach ($relative in @('hooks.json', 'settings.json', 'settings.local.json', 'hooks/hooks.json')) {
+    $candidate = Join-Path $FactoryDir $relative
+    if (-not (Test-Path -LiteralPath $candidate)) { continue }
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { return $true }
+    try {
+      # An escaped JSON executable name still invokes DCG. The native parser
+      # decides ownership; Unicode escapes are a conservative inventory hit.
+      if ((Get-Content -LiteralPath $candidate -Raw -ErrorAction Stop) -match '(?i)dcg|\\u[0-9a-f]{4}') { return $true }
+    } catch {
+      return $true
+    }
+  }
+  $false
+}
+
+function Unconfigure-DroidHook {
+  # Use the same native editor as manual uninstall, before deleting dcg.exe.
+  # This handles both Factory JSON shapes and removes only DCG-owned hooks.
+  param([string]$Binary, [string]$HomeDir = $HOME, [string]$RepoRoot = '')
+  $userConfigured = Test-DroidDcgRegistration -FactoryDir (Join-Path $HomeDir '.factory')
+  $projectConfigured = (-not [string]::IsNullOrWhiteSpace($RepoRoot)) -and
+    (Test-DroidDcgRegistration -FactoryDir (Join-Path $RepoRoot '.factory'))
+  if (-not $userConfigured -and -not $projectConfigured) { return $true }
+  if ([string]::IsNullOrWhiteSpace($Binary) -or -not (Test-Path -LiteralPath $Binary -PathType Leaf)) {
+    Write-Warn "Factory Droid cleanup requires DCG with Droid support. Run 'dcg uninstall --droid' and --project in each configured project."
+    return $false
+  }
+  try {
+    $Binary = [System.IO.Path]::GetFullPath($Binary)
+    if ($userConfigured) {
+      & $Binary uninstall --droid | Out-Host
+      if ($LASTEXITCODE -ne 0) {
+        Write-Warn "Factory Droid user hook cleanup failed; inspect ~/.factory before removing DCG."
+        return $false
+      }
+    }
+    if ($projectConfigured) {
+      Push-Location -LiteralPath $RepoRoot
+      try {
+        & $Binary uninstall --droid --project | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+          Write-Warn "Factory Droid project hook cleanup failed at $RepoRoot/.factory."
+          return $false
+        }
+      } finally {
+        Pop-Location
+      }
+    }
+  } catch {
+    Write-Warn "Factory Droid hook cleanup failed: $_"
+    return $false
+  }
+  $true
+}
+
 function Get-DcgRepositoryRoot {
   param([string]$StartDir = (Get-Location).Path)
   try {
@@ -953,6 +1012,11 @@ if (Unconfigure-OmpExtension) { Write-Ok "Removed Oh My Pi extension" }
 if (Unconfigure-CrushHook -RepoRoot (Get-DcgRepositoryRoot)) { Write-Ok "Removed Crush hook" }
 
 if (Unconfigure-ReasonixHook -RepoRoot (Get-DcgRepositoryRoot)) { Write-Ok "Removed Reasonix hook" }
+
+if (-not (Unconfigure-DroidHook -Binary $binary -RepoRoot (Get-DcgRepositoryRoot))) {
+  Write-Err "Factory Droid hook cleanup is incomplete; retaining the DCG binary."
+  exit 1
+}
 
 if (Test-Path $binary -PathType Leaf) {
   Remove-Item -Force -Path $binary

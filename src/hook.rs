@@ -1,8 +1,8 @@
 //! Hook protocol handling.
 //!
 //! This module handles JSON input/output for supported hook protocols
-//! (Claude Code, Codex CLI, Copilot, VS Code Copilot Chat, Gemini, and Hermes
-//! Agent). It parses incoming hook requests and formats denial responses.
+//! (Claude Code, Factory Droid, Codex CLI, Copilot, VS Code Copilot Chat, Gemini,
+//! and Hermes Agent). It parses incoming hook requests and formats denials.
 
 use crate::evaluator::MatchSpan;
 use crate::exit_codes::EXIT_HOOK_BLOCK;
@@ -660,6 +660,11 @@ pub enum HookProtocol {
     /// exit 0 — so no dedicated variant is needed. Its hook env var
     /// `PA_PROJECT_DIR` is consulted in [`detect_protocol`] only to keep a
     /// `powershell`-named shell tool from being classified as Codex.
+    ///
+    /// Factory Droid's `Execute` tool uses this same contract: snake_case
+    /// `tool_name` / `tool_input.command`, a `PreToolUse` event, JSON
+    /// `hookSpecificOutput.permissionDecision` on exit 0, and exit 2 as a
+    /// blocking fallback. It needs no separate response implementation.
     ClaudeCompatible,
     /// Copilot hook protocol (top-level permission decision and reason).
     Copilot,
@@ -2038,6 +2043,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
             | "cmd.exe"
             | "shell"
             | "exec_command"
+            | "execute"
     ) || is_vscode_terminal_tool(&tool_name);
     let has_codex_turn_id = input
         .turn_id
@@ -2216,6 +2222,9 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             // Muse Code exposes it next to `shell` (#572); a matched call
             // that dcg did not recognize had no opinion, and so ran.
             | "exec_command"
+            // Factory Droid's Execute tool uses tool_input.command (#617).
+            // It names a generic shell executor, not a particular dialect.
+            | "execute"
             // Hermes Agent shell tool. Distinct from Cursor's "terminal"
             // wrapper script which translates upstream to "Bash" before
             // invoking dcg, so the only path here is genuine Hermes input.
@@ -2232,6 +2241,24 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
 }
 
 impl HookInput {
+    /// Whether the envelope identifies Factory Droid's direct `Execute`
+    /// hook. Factory tool names and matchers are case-sensitive; a generic
+    /// lowercased shell alias is sufficient to evaluate a command, but must
+    /// not by itself select a different agent's profile. Other hosts' strong
+    /// markers keep their established protocol and identity.
+    #[must_use]
+    pub fn is_droid_execute(&self) -> bool {
+        self.tool_name.as_deref() == Some("Execute")
+            && self
+                .hook_event_name
+                .as_deref()
+                .is_none_or(|event| event == "PreToolUse")
+            && self.cursor_version.is_none()
+            && self.tool_call.is_none()
+            && self.tool_calls.is_none()
+            && detect_protocol(self) == HookProtocol::ClaudeCompatible
+    }
+
     /// Identify an unambiguous non-Claude host sharing Claude's response
     /// protocol, solely to select its self-healing settings path. Call only
     /// after [`detect_protocol`] returned [`HookProtocol::ClaudeCompatible`]
@@ -2251,6 +2278,9 @@ impl HookInput {
             .is_some_and(|version| !version.trim().is_empty())
         {
             return Some(crate::agent::Agent::CursorIde);
+        }
+        if self.is_droid_execute() {
+            return Some(crate::agent::Agent::Droid);
         }
         None
     }
@@ -4923,6 +4953,66 @@ mod tests {
     }
 
     #[test]
+    fn test_droid_execute_uses_shared_claude_command_extraction() {
+        let input = parse_hook_input(
+            r#"{
+            "session_id": "droid-session-617",
+            "transcript_path": "/home/user/.factory/sessions/session.jsonl",
+            "cwd": "/work/project",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Execute",
+            "tool_input": {
+                "command": "git reset --hard HEAD",
+                "timeout": 90,
+                "riskLevel": "high",
+                "riskLevelReason": "Discards work"
+            },
+            "tool_use_id": "call_execute_617"
+        }"#,
+        )
+        .unwrap();
+        assert!(input.is_droid_execute());
+        assert!(input.is_shell_tool_call());
+        assert_eq!(
+            input.claude_compatible_host_for_self_heal(),
+            Some(crate::agent::Agent::Droid)
+        );
+        let extracted = extract_command_with_context(&input).unwrap();
+        assert_eq!(extracted.command, "git reset --hard HEAD");
+        assert_eq!(extracted.protocol, HookProtocol::ClaudeCompatible);
+        assert_eq!(extracted.dialect, ShellDialect::Unknown);
+    }
+
+    #[test]
+    fn test_droid_identity_does_not_override_other_host_markers() {
+        for payload in [
+            r#"{"event":"pre-tool-use","tool_name":"Execute","tool_input":{"command":"git status"}}"#,
+            r#"{"turn_id":"codex-turn","tool_name":"Execute","tool_input":{"command":"git status"}}"#,
+            r#"{"cursor_version":"1.0","tool_name":"Execute","tool_input":{"command":"git status"}}"#,
+            r#"{"tool_name":"execute","tool_input":{"command":"git status"}}"#,
+            r#"{"hook_event_name":"PostToolUse","tool_name":"Execute","tool_input":{"command":"git status"}}"#,
+        ] {
+            let input = parse_hook_input(payload).unwrap();
+            assert!(!input.is_droid_execute(), "{payload}");
+        }
+    }
+
+    #[test]
+    fn test_droid_script_is_not_misrepresented_as_a_shell_command() {
+        // Script contains JavaScript and can invoke tools itself. Its text is
+        // not a shell command; nested Execute coverage requires host evidence.
+        for tool in ["Script", "Read", "ExecuteStatus", "mcp__other__Execute"] {
+            let payload = serde_json::json!({
+                "tool_name": tool,
+                "tool_input": {"command": "git reset --hard", "code": "await Execute({ command: 'git reset --hard' })"}
+            });
+            let input = parse_hook_input(&payload.to_string()).unwrap();
+            assert!(!input.is_droid_execute());
+            assert!(extract_command_with_context(&input).is_none(), "{tool}");
+        }
+    }
+
+    #[test]
     fn test_monitor_command_uses_claude_protocol_and_posix_dialect() {
         for tool_name in ["Monitor", "monitor", "MONITOR"] {
             let input: HookInput = serde_json::from_value(serde_json::json!({
@@ -4998,6 +5088,7 @@ mod tests {
             "run_command",
             "powershell.exe",
             "shell",
+            "Execute",
         ] {
             assert_eq!(
                 shell_dialect_for_tool_name(Some(tool_name)),

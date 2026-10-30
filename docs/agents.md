@@ -23,6 +23,7 @@ trust to well-behaved agents while maintaining strict controls for unknown ones.
 | Crush | Environment | `CRUSH=1` (set by Crush for hook subprocesses and `bash`-tool commands; the generic `AGENT`/`AI_AGENT` markers are not consulted). Hook payloads are recognized by their `event: "PreToolUse"` + `tool_input` envelope — see [crush-integration.md](crush-integration.md) |
 | Muse Code | Explicit flag only | The hook written by `dcg install --muse` passes `--agent muse` (Muse clears the hook environment). Its payload looks like Codex's (`turn_id`), so without the flag `[agents.codex-cli]` applies; the identity is never taken from the payload or a process name — see [muse-integration.md](muse-integration.md) |
 | Amp | Explicit bridge | The plugin written by `dcg install --amp` passes `--agent amp`; no environment marker or process name is consulted — see [amp-integration.md](amp-integration.md) |
+| Factory Droid | Explicit hook identity / hook payload / environment / process | `dcg install --droid` writes `--agent droid`; an `Execute` PreToolUse payload also identifies Droid. `FACTORY_PROJECT_DIR` and the exact `droid` process name are fallbacks. See [Factory Droid](#factory-droid) for configuration and the unverified Script boundary. |
 | Pi | Environment | `PI_CODING_AGENT=true` |
 | Posit Assistant | Environment | `PA_PROJECT_DIR` (set in hook subprocesses; checked last among environment markers so agents with their own markers win — environment detection still precedes parent-process detection) |
 
@@ -34,6 +35,147 @@ Agent detection follows this priority order:
 2. **Environment variables**: Most agents set identifying env vars
 3. **Parent process inspection**: Fallback check of process tree
 4. **Unknown**: Default when no agent is detected
+
+In hook mode, Droid's native `Execute` PreToolUse payload can supersede an
+inherited environment marker from another agent. An explicit `--agent` still
+wins, and other recognized native protocol markers remain authoritative.
+
+### Factory Droid
+
+Install the hook with the current DCG binary, then start a new Droid session:
+
+```bash
+dcg install --droid
+dcg doctor
+```
+
+`install.sh` and `install.ps1` also detect the `droid` executable or the user's
+`.factory` directory and delegate to this native installer. Add `--project` to
+install into the project's `.factory` directory instead: DCG uses the Git root
+when inside a repository, or the current directory in a non-Git project.
+Installation is idempotent; `--force` refreshes a stale DCG registration while preserving other
+hooks and settings. The hook command is an absolute DCG executable path followed
+by `--agent droid`, so `[agents.droid]` applies even if Droid clears environment
+variables or launches the hook through an intermediate shell.
+
+Factory documents two distinct JSON layouts:
+
+| File | Hook map | Selection |
+|------|----------|-----------|
+| `~/.factory/hooks.json` or `<project>/.factory/hooks.json` | Top-level `PreToolUse` | Takes precedence over settings hooks at the same scope |
+| `.factory/hooks/hooks.json` | Top-level `PreToolUse` | Legacy standalone location; check Droid's effective view when combined with newer files |
+| `.factory/settings.json` | `hooks.PreToolUse` | Documented fallback when `hooks.json` is absent; local/legacy interactions are described below |
+| `.factory/settings.local.json` | `hooks.PreToolUse` | Local settings override; keep its effective hooks in mind when diagnosing fallback settings |
+
+The installer selects an existing `hooks.json` first, then a
+`settings.local.json` containing `hooks.PreToolUse`, then a legacy
+`hooks/hooks.json`, and otherwise `settings.json`. This is DCG's installation
+selection order; Factory's public documentation does not fully specify merging
+when local settings and legacy files coexist. Confirm the chosen registration
+in Droid's effective view. For a fresh scope DCG uses `settings.json`. It does not alter
+organization-managed hooks, `hooksDisabled`, or organizational restrictions such
+as `allowManagedHooksOnly`. Those settings can prevent local hooks from running.
+Use Droid's `/hooks` effective view and `droid --debug` to check host loading.
+
+`dcg doctor` checks the selected user and project files, exact `Execute` matcher,
+unfiltered synchronous registration, and the absolute path of the DCG executable
+running doctor. A different executable path is treated as stale because it may
+refer to a version without Droid support. Reinstall using the desired executable
+to refresh that path. Malformed JSON, duplicate keys, invalid hook definitions,
+and visible disabled-hook controls are reported without discarding configuration.
+Factory does not document a per-hook Windows shell selector; DCG does not write
+Claude-specific PowerShell settings into Factory files. Verify the installed
+command's live dispatch on native Windows as well as the effective registration.
+
+For example, a **settings.json** registration has this shape (substitute the
+actual absolute executable path; quote the path inside the command when it
+contains spaces):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Execute",
+        "hooks": [
+          {"type": "command", "command": "/absolute/path/to/dcg --agent droid"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+In a standalone **hooks.json**, omit the outer `hooks` wrapper. Matchers are
+case-sensitive: `Bash`, `execute`, and `Execute` select different tools.
+
+The hook receives a snake_case payload such as:
+
+```json
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Execute",
+  "tool_input": {"command": "git status", "timeout": 60, "riskLevel": "low"}
+}
+```
+
+DCG evaluates `tool_input.command` using the shared command evaluator and agent
+profile. A denial is delivered as
+`hookSpecificOutput.permissionDecision: "deny"` with a reason, on exit 0.
+Allowed commands produce no stdout, preserving Droid's own permission checks.
+Factory also documents exit 2 as a blocking response; DCG uses it as a fallback
+if a blocking JSON verdict cannot be written. Other nonzero exit codes are
+hook errors, not documented blocks.
+
+Remove DCG's entries without removing unrelated configuration:
+
+```bash
+dcg uninstall --droid              # User scope, including inactive locations
+dcg uninstall --droid --project    # Current project scope
+```
+
+Both standalone and settings-wrapped files are checked so an inactive DCG
+registration does not reappear when a higher-priority file is later removed.
+Settings files remain in place, and organization-managed hooks are untouched.
+
+#### Loading regressions and Script-mode coverage
+
+Factory's published contract is the basis for this integration. A report against
+Droid **0.186.0** describes standalone hook files not loading, while project
+`settings.json` worked; the report remains separate from DCG's parser and
+installer tests. If an existing standalone file is not loaded by your Droid
+version, review its contents and move the complete hook map into settings using
+Factory's supported configuration flow. Merely adding DCG to settings while a
+standalone file shadows it is not proof of protection.
+
+**Nested `Execute` calls inside Droid's `Script` tool are unverified.** Factory
+describes Script as able to call other tools, but the public hook documentation
+does not establish whether each nested call dispatches `PreToolUse`. DCG's
+installed matcher covers `Execute` events that Droid actually delivers. It
+does not inspect the separate Script tool as if it were a shell command, and
+neither a valid registration nor a synthetic Execute test proves nested coverage.
+
+To investigate a specific Droid version safely, use a disposable project and a
+temporary audit hook that records `tool_name` and `tool_input.command`. First
+exercise harmless direct Execute commands, then have Script invoke the same
+commands. Require a separate **Execute** hook event for every nested invocation;
+an outer Script event is insufficient. To verify enforcement as well as event
+delivery, add a temporary high-severity [external pack](configuration.md#external-packs-yaml)
+that denies an otherwise harmless canary, such as printing a unique marker.
+Confirm the marker is never printed when the command is denied, for both direct
+and nested calls. Record the Droid version, model, effective hook configuration,
+captured events, and canary outcome. Until that succeeds, treat Script execution
+as outside verified protection and restrict it through Factory's controls where
+available.
+
+References: [Factory hooks](https://docs.factory.com/harness/hooks),
+[Droid settings](https://docs.factory.com/droid-cli/settings),
+[hook-loading report](https://github.com/Factory-AI/factory/issues/3),
+[Script announcement](https://factory.com/news/frontier-harness), and
+[SDK hook messages](https://docs.factory.com/sdk/typescript). SDK `hook` stream
+messages can help observe dispatch; their presence alone does not prove a deny
+prevented execution. `dcg doctor` inspects the local registration; it does not
+verify the live Factory dispatcher.
 
 ### Oh My Pi (`omp`)
 
@@ -238,6 +380,10 @@ additional_allowlist = ["npm run build", "cargo test"]
 trust_level = "medium"
 extra_packs = ["strict_git"]
 
+[agents.droid]
+trust_level = "medium"
+extra_packs = ["strict_git"]
+
 # Restrict unknown agents
 [agents.unknown]
 trust_level = "low"
@@ -433,6 +579,7 @@ How hosts read exit 2 with nothing on stdout:
 | Gemini CLI | Blocks (exit 2 is its blocking error) |
 | Copilot CLI | Blocks (`preToolUse` hooks that exit 2 deny the call) |
 | Crush | Blocks; stderr is the reason |
+| Factory Droid | Blocks; `PreToolUse` exit 2 is documented as a blocking error |
 | Grok | Blocks (exit 2 is a documented explicit deny) |
 | Codex CLI | Blocks in current releases (exit 2 with the reason on stderr is documented); some earlier builds logged it as a hook failure and failed open |
 | Hermes | Blocks in current releases (a `pre_tool_call` hook exiting 2 blocks even with no JSON on stdout); earlier builds only warned |

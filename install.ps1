@@ -2192,6 +2192,7 @@ function Detect-Agents {
     'Reasonix' = ((@($reasonixHomes | Where-Object {
           Test-Path -LiteralPath $_ -PathType Container -ErrorAction SilentlyContinue
         }).Count -gt 0) -or (_has 'reasonix'))
+    'Droid' = ((_dir '.factory') -or (_has 'droid'))
   }
 }
 
@@ -2199,7 +2200,7 @@ function Get-DetectedAgentNames {
   # The display-names of agents Detect-Agents flagged as present, in order.
   param($Agents)
   @(
-    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit', 'Omp', 'Crush', 'Reasonix')) {
+    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit', 'Omp', 'Crush', 'Reasonix', 'Droid')) {
       if ($Agents[$name]) { $name }
     }
   )
@@ -2238,6 +2239,7 @@ Configured agents (when detected, or with -Force/-EasyMode):
   Oh My Pi     (active profile's extensions/dcg-guard.ts via dcg install --omp)
   Crush        (~/.config/crush/crush.json hooks.PreToolUse via dcg install --crush)
   Reasonix     (%APPDATA%\reasonix\settings.json hooks.PreToolUse via dcg install --reasonix)
+  Factory Droid (~/.factory Execute PreToolUse via dcg install --droid)
   Grok / agy   via dcg install --grok / --agy under -EasyMode when detected
 '@
   exit 0
@@ -2687,6 +2689,25 @@ if ($detectedAgents['Reasonix'] -or $forceConfig) {
   }
 } else {
   Write-Info "Reasonix not detected; re-run with -EasyMode to configure its hook anyway"
+}
+
+# Factory's hooks.json/settings.json precedence and JSON preservation belong
+# to the native installer, shared with `dcg install --droid` on every platform.
+if ($detectedAgents['Droid'] -or $forceConfig) {
+  Write-Host ""
+  try {
+    & $dcgExe install --droid --force
+    if ($LASTEXITCODE -eq 0) {
+      Write-Ok "Configured Factory Droid Execute hook via 'dcg install --droid'"
+      Write-Info "Restart Droid and inspect /hooks. Nested Script coverage is unverified."
+    } else {
+      Write-Warn "'dcg install --droid' exited with code $LASTEXITCODE"
+    }
+  } catch {
+    Write-Warn "Factory Droid hook configuration failed: $_"
+  }
+} else {
+  Write-Info "Factory Droid not detected; re-run with -EasyMode to configure its hook anyway"
 }
 
 # Grok (xAI) and Antigravity (agy): configured via the dcg binary itself rather

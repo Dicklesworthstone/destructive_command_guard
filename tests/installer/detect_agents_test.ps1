@@ -77,9 +77,17 @@ try {
     Check ($a['Omp'] -eq $false) "Oh My Pi NOT detected"
     Check ($a['Crush'] -eq $false) "Crush NOT detected (no ~/.config/crush, no crush on PATH)"
     Check ($a['Reasonix'] -eq $false) "Reasonix NOT detected (no Reasonix home, no reasonix on PATH)"
+    Check ($a['Droid'] -eq $false) "Factory Droid NOT detected (no ~/.factory, no droid on PATH)"
     $names = Get-DetectedAgentNames $a
     Check (($names -join ',') -eq 'Claude,Gemini,Grok') "summary lists detected agents in config order (got '$($names -join ',')')"
     Remove-Item -Recurse -Force $h1 -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1a: Factory Droid detected from ~/.factory"
+    $droidHome = New-TempHome
+    New-Item -ItemType Directory -Path (Join-Path $droidHome '.factory') | Out-Null
+    $droidAgents = Detect-Agents -HomeDir $droidHome
+    Check ($droidAgents['Droid'] -eq $true) "Factory Droid detected (~/.factory present)"
+    Check (((Get-DetectedAgentNames $droidAgents) -join ',') -eq 'Droid') "summary lists only Droid"
 
     Write-Host "Test 1b: Posit Assistant detected from ~/.posit/assistant"
     $h1b = New-TempHome

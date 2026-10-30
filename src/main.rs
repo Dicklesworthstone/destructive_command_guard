@@ -19,7 +19,7 @@
 
 use clap::Parser;
 use colored::Colorize;
-use destructive_command_guard::agent::{Agent, detect_agent};
+use destructive_command_guard::agent::{Agent, DetectionMethod, detect_agent_with_details};
 use destructive_command_guard::allowlist::LayeredAllowlist;
 use destructive_command_guard::cli::{self, Cli};
 // Exit codes are used by cli.rs for robot mode; main.rs uses them for hook mode errors
@@ -2160,7 +2160,8 @@ fn main() {
     let config_phase = phase(ProfilePhase::ConfigLoad);
     let config = Config::load();
     destructive_command_guard::output::install_theme_config(&config);
-    let detected_agent = detect_agent();
+    let agent_detection = detect_agent_with_details();
+    let detected_agent = agent_detection.agent;
     // Armed with the detected agent's protocol until the payload names its own
     // (below); a panic before then still fails closed.
     set_hook_panic_policy(Some(HookPanicPolicy {
@@ -2175,6 +2176,21 @@ fn main() {
     // late would otherwise start every evaluation near-exhausted).
     let max_input_bytes = config.general.max_hook_input_bytes();
     let hook_read = hook::read_hook_input(max_input_bytes);
+
+    // Factory's Execute envelope is a stronger signal than an inherited
+    // environment marker (for example Droid started from a Claude terminal).
+    // Pin its profile and history label before any hook work. An explicit
+    // --agent override remains authoritative, and other hosts keep their
+    // existing identity/protocol selection.
+    let detected_agent = if agent_detection.method != DetectionMethod::Explicit
+        && hook_read
+            .as_ref()
+            .is_ok_and(hook::HookInput::is_droid_execute)
+    {
+        Agent::Droid
+    } else {
+        detected_agent
+    };
 
     // A config error is not a command-policy match and cannot be allowlisted.
     // Read the envelope only to select the correct blocking wire protocol.
@@ -2616,7 +2632,7 @@ fn print_help() {
     emit_stderr!("  {}", "─".repeat(50).bright_black());
     emit_stderr!("    Runs as a pre-execution shell hook for Claude Code, Codex CLI,");
     emit_stderr!("    Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent,");
-    emit_stderr!("    OpenCode, and Oh My Pi (omp).");
+    emit_stderr!("    OpenCode, Oh My Pi (omp), and Factory Droid.");
     emit_stderr!("    Compatible agents, including Codex, receive protocol-specific stdout JSON.");
     emit_stderr!();
 
@@ -2963,6 +2979,35 @@ mod tests {
             );
             assert!(!host_requires_fail_closed(&other), "{other:?}");
         }
+    }
+
+    #[test]
+    fn droid_keeps_claude_compatible_denial_and_payloadless_fallback() {
+        let protocol = hook_protocol_for_agent(&Agent::Droid);
+        assert_eq!(protocol, hook::HookProtocol::ClaudeCompatible);
+        assert_eq!(host_hook_protocol(protocol, &Agent::Droid), protocol);
+        assert_eq!(
+            effective_agent_for_hook_protocol(protocol, &Agent::Droid),
+            Agent::Droid
+        );
+        assert_eq!(
+            history_agent_type_for_protocol(protocol, &Agent::Droid),
+            "droid"
+        );
+        assert_eq!(blocking_verdict_exit_code(protocol, Ok(())), EXIT_SUCCESS);
+        assert_eq!(
+            blocking_verdict_exit_code(protocol, Err(io::Error::from(io::ErrorKind::BrokenPipe))),
+            destructive_command_guard::exit_codes::EXIT_HOOK_BLOCK,
+        );
+        assert_eq!(
+            payloadless_hook_protocol(&Agent::Droid, Some(r#"{"event":"PreToolUse","toolArgs":{"#)),
+            protocol,
+            "an installed Droid hook must not be rerouted by a malformed payload",
+        );
+        assert!(
+            !host_requires_fail_closed(&Agent::Droid),
+            "retain existing configured malformed-input policy"
+        );
     }
 
     #[test]

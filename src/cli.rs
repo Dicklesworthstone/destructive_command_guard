@@ -312,7 +312,7 @@ pub enum Command {
 
     /// Install the hook into Claude Code settings (or another agent with
     /// `--grok`, `--agy`, `--opencode`, `--omp`, `--crush`, `--reasonix`,
-    /// `--muse`, or `--amp`)
+    /// `--muse`, `--amp`, or `--droid`)
     ///
     /// Claude user settings honor CLAUDE_CONFIG_DIR when non-empty, otherwise
     /// ~/.claude/settings.json is used.
@@ -322,8 +322,8 @@ pub enum Command {
         #[arg(long)]
         force: bool,
 
-        /// Install to project-level `.claude/settings.json` (in the current repo)
-        /// instead of user-level settings (CLAUDE_CONFIG_DIR or ~/.claude)
+        /// Install to the selected agent's project configuration (in the
+        /// current repository) instead of user-level settings
         #[arg(long)]
         project: bool,
 
@@ -424,6 +424,17 @@ pub enum Command {
             conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush", "reasonix", "muse"]
         )]
         amp: bool,
+
+        /// Install Factory Droid's Execute PreToolUse hook. Updates an existing
+        /// `.factory/hooks.json`, local hook settings, or legacy hook file;
+        /// otherwise uses `.factory/settings.json`. User scope by default,
+        /// project scope with `--project` (Git root, otherwise current directory).
+        /// Restart Droid after installation.
+        #[arg(
+            long,
+            conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush", "reasonix", "muse", "amp"]
+        )]
+        droid: bool,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -447,7 +458,8 @@ pub enum Command {
     },
 
     /// Remove the hook from Claude Code settings (or from Crush with `--crush`,
-    /// Reasonix with `--reasonix`, Muse Code with `--muse`, Amp with `--amp`)
+    /// Reasonix with `--reasonix`, Muse Code with `--muse`, Amp with `--amp`,
+    /// Factory Droid with `--droid`)
     #[command(name = "uninstall")]
     Uninstall {
         /// Also remove configuration files
@@ -475,6 +487,16 @@ pub enum Command {
         /// of touching Claude Code settings; a file dcg did not write is kept
         #[arg(long, conflicts_with = "purge")]
         amp: bool,
+
+        /// Remove only dcg hooks from all supported user-level Factory files.
+        /// Use `--project` to remove the current project's registrations.
+        #[arg(long, conflicts_with_all = ["purge", "crush", "reasonix", "muse", "amp"])]
+        droid: bool,
+
+        /// Remove Factory Droid hooks from the Git root (or current directory
+        /// outside Git) instead of user settings.
+        #[arg(long, requires = "droid")]
+        project: bool,
     },
 
     /// Update dcg to the latest release (re-runs the installer)
@@ -2583,8 +2605,11 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             reasonix,
             muse,
             amp,
+            droid,
         }) => {
-            if amp {
+            if droid {
+                install_droid_hook(force, project)?;
+            } else if amp {
                 install_amp_plugin(force, project)?;
             } else if muse {
                 install_muse_hook(force)?;
@@ -2617,8 +2642,12 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             reasonix,
             muse,
             amp,
+            droid,
+            project,
         }) => {
-            if amp {
+            if droid {
+                uninstall_droid_hook(project)?;
+            } else if amp {
                 uninstall_amp_plugin()?;
             } else if muse {
                 uninstall_muse_hook()?;
@@ -11408,6 +11437,28 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         }
     }
 
+    if droid_appears_in_use() {
+        let check = droid_doctor_check(fix);
+        issues += usize::from(check.status == DoctorCheckStatus::Error || check.fixed);
+        fixed += usize::from(check.fixed);
+        wired_to_an_agent |= check.status == DoctorCheckStatus::Ok;
+        print!("Checking Factory Droid hook registration... ");
+        if check.status == DoctorCheckStatus::Ok {
+            println!("{}", "OK".green());
+        } else {
+            println!("{}", "ERROR".red());
+        }
+        println!("  {}", check.message);
+        if let Some(remediation) = check.remediation {
+            println!("  → {remediation}");
+        }
+        let coverage = droid_coverage_check();
+        println!("  {} {}", "Coverage note:".yellow(), coverage.message);
+        if let Some(remediation) = coverage.remediation {
+            println!("  → {remediation}");
+        }
+    }
+
     // Check 3b1c: Muse Code hook registration (#572). Muse reads hooks only
     // from its own settings.json. `collect_doctor_report` carries the same
     // check (id `muse_hook`).
@@ -12182,7 +12233,10 @@ fn doctor_rich(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome
 fn doctor_pass_summary(report: &DoctorReport) -> &'static str {
     let wired = report.checks.iter().all(|check| {
         !(check.id == "claude_settings" && check.status == DoctorCheckStatus::Warning)
-    });
+    }) || report
+        .checks
+        .iter()
+        .any(|check| check.id == "droid_hook" && check.status == DoctorCheckStatus::Ok);
     if wired {
         "All checks passed!"
     } else {
@@ -12997,6 +13051,16 @@ fn collect_doctor_report(
             remediation,
             fixed: reasonix_fixed,
         });
+    }
+
+    if droid_appears_in_use() {
+        let check = droid_doctor_check(fix);
+        issues += usize::from(check.status == DoctorCheckStatus::Error || check.fixed);
+        fixed += usize::from(check.fixed);
+        checks.push(check);
+        // This states an evidence boundary; it is not a failed registration
+        // and therefore does not make --strict fail on every Droid install.
+        checks.push(droid_coverage_check());
     }
 
     // Muse Code hook registration (#572). Mirrored in `doctor_pretty`.
@@ -15433,6 +15497,633 @@ fn reasonix_user_settings_register_dcg() -> Result<bool, String> {
 /// settings file it reads, exists.
 fn reasonix_appears_in_use() -> bool {
     reasonix_home().is_dir() || reasonix_user_settings_path().is_file()
+}
+
+// ---------------------------------------------------------------------------
+// Factory Droid hook registration (#617)
+// ---------------------------------------------------------------------------
+
+const DROID_SHELL_MATCHER: &str = "Execute";
+
+/// The supported user/project documents, never org-managed settings. Factory's
+/// standalone hooks files contain the event map directly; settings wrap it.
+fn droid_hook_files(directory: &std::path::Path) -> [(std::path::PathBuf, bool); 4] {
+    [
+        (directory.join("hooks.json"), true),
+        (directory.join("settings.local.json"), false),
+        (directory.join("hooks").join("hooks.json"), true),
+        (directory.join("settings.json"), false),
+    ]
+}
+
+fn droid_user_config_dir() -> std::path::PathBuf {
+    crate::config::home_dir()
+        .unwrap_or_default()
+        .join(".factory")
+}
+
+fn droid_project_config_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let root = find_repo_root_from_cwd().map_or_else(std::env::current_dir, Ok)?;
+    Ok(root.join(".factory"))
+}
+
+/// Missing files are distinct from unreadable files, invalid JSON, and broken
+/// managed symlinks. In particular, --force never discards an ambiguous file.
+fn read_droid_document(
+    path: &std::path::Path,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !path.is_symlink() => {
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("{}: {error}", path.display()).into()),
+    };
+    let document = parse_hook_settings_json(&content)
+        .map_err(|error| format!("{}: invalid Factory JSON: {error}", path.display()))?;
+    if !document.is_object() {
+        return Err(format!("{}: expected a Factory JSON object", path.display()).into());
+    }
+    Ok(Some(document))
+}
+
+fn droid_pre_tool_use(
+    document: &serde_json::Value,
+    standalone: bool,
+) -> Result<Option<&Vec<serde_json::Value>>, Box<dyn std::error::Error>> {
+    if !document.is_object() {
+        return Err("Invalid Factory document (expected a JSON object)".into());
+    }
+    let events = if standalone {
+        if document.get("hooks").is_some() {
+            return Err(
+                "Factory hooks.json must contain an unwrapped event map, not a hooks wrapper"
+                    .into(),
+            );
+        }
+        document
+    } else {
+        let Some(events) = document.get("hooks") else {
+            return Ok(None);
+        };
+        events
+    };
+    let events = events
+        .as_object()
+        .ok_or("Invalid Factory hooks (expected an event map)")?;
+    let Some(groups) = events.get("PreToolUse") else {
+        return Ok(None);
+    };
+    let groups = groups
+        .as_array()
+        .ok_or("Invalid Factory PreToolUse (expected a matcher-group array)")?;
+    for group in groups {
+        let group = group
+            .as_object()
+            .ok_or("Invalid Factory PreToolUse group (expected an object)")?;
+        for key in ["matcher", "commandRegex"] {
+            if group.get(key).is_some_and(|value| !value.is_string()) {
+                return Err(format!("Invalid Factory hook {key} (expected a string)").into());
+            }
+        }
+        let handlers = group
+            .get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("Invalid Factory matcher hooks (expected a command array)")?;
+        for handler in handlers {
+            if handler.get("type").and_then(serde_json::Value::as_str) != Some("command")
+                || handler
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|command| command.trim().is_empty())
+            {
+                return Err("Invalid Factory hook handler (expected type command and a nonempty command string)".into());
+            }
+            if handler
+                .get("timeout")
+                .is_some_and(|value| value.as_f64().is_none_or(|timeout| timeout <= 0.0))
+            {
+                return Err("Invalid Factory hook timeout (expected positive seconds)".into());
+            }
+        }
+    }
+    Ok(Some(groups))
+}
+
+fn droid_handler_is_dcg(handler: &serde_json::Value) -> bool {
+    handler
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(is_dcg_command)
+}
+
+fn droid_hook_command_for_executable(executable: &std::path::Path) -> std::io::Result<String> {
+    if !executable.is_absolute() {
+        return Err(std::io::Error::other(
+            "Factory requires an absolute dcg executable path",
+        ));
+    }
+    let program = executable
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("Factory hook executable path must be UTF-8"))?;
+    #[cfg(windows)]
+    let program = {
+        // Factory documents a command string, not Claude's PowerShell `shell`
+        // selector. Quote the program itself; reject expansion-bearing paths
+        // instead of depending on an undocumented Windows shell's escaping.
+        if program.contains(['"', '$', '%', '!', '`', '\n', '\r']) {
+            return Err(std::io::Error::other(
+                "Factory hook path contains shell expansion characters; install dcg in a plain path",
+            ));
+        }
+        format!("\"{program}\"")
+    };
+    #[cfg(not(windows))]
+    let program = posix_quote_hook_program(program);
+    Ok(format!("{program} --agent droid"))
+}
+
+fn droid_handler_is_synchronous(handler: &serde_json::Value) -> bool {
+    handler.get("async").is_none_or(|value| value == false)
+        && handler.get("disabled").is_none_or(|value| value == false)
+        && handler.get("enabled").is_none_or(|value| value == true)
+        && handler
+            .get("timeout")
+            .is_none_or(|value| value.as_f64().is_some_and(|timeout| timeout > 0.0))
+}
+
+/// Reconcile only dcg's handlers using the same ownership parser and policy
+/// merge as the other native integrations. A commandRegex group must never
+/// become the canonical group: that silently leaves other Execute calls out,
+/// while clearing its filter would widen unrelated handlers sharing it.
+fn install_droid_hook_into_document(
+    document: &mut serde_json::Value,
+    standalone: bool,
+    force: bool,
+    command: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let original = droid_pre_tool_use(document, standalone)?
+        .cloned()
+        .unwrap_or_default();
+    let previous = original
+        .iter()
+        .filter_map(|group| group.get("hooks").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter(|handler| droid_handler_is_dcg(handler));
+    let handler = merge_host_owned_hook_fields(
+        serde_json::json!({"type": "command", "command": command}),
+        previous,
+        DCG_OWNED_HOOK_KEYS,
+    )?;
+    if !droid_handler_is_synchronous(&handler) {
+        return Err(
+            "Factory dcg hook is disabled, asynchronous, or has an invalid timeout; review its policy before reinstalling"
+                .into(),
+        );
+    }
+    let mut groups = original;
+    let canonical_index = groups.iter().position(|group| {
+        group.get("matcher").and_then(serde_json::Value::as_str) == Some(DROID_SHELL_MATCHER)
+            && group.get("commandRegex").is_none()
+    });
+    let mut canonical = canonical_index
+        .map(|index| groups.remove(index))
+        .unwrap_or_else(|| serde_json::json!({"matcher": DROID_SHELL_MATCHER, "hooks": []}));
+    let handlers = canonical["hooks"]
+        .as_array_mut()
+        .expect("validated Factory command array");
+    handlers.retain(|handler| !droid_handler_is_dcg(handler));
+    handlers.insert(0, handler);
+    remove_dcg_hooks_from_pre_tool_use(&mut groups);
+    groups.insert(0, canonical);
+
+    let mut candidate = document.clone();
+    let events = if standalone {
+        &mut candidate
+    } else {
+        candidate
+            .as_object_mut()
+            .expect("validated Factory document")
+            .entry("hooks")
+            .or_insert_with(|| serde_json::json!({}))
+    };
+    events["PreToolUse"] = serde_json::Value::Array(groups);
+    let changed = force || candidate != *document;
+    if changed {
+        *document = candidate;
+    }
+    Ok(changed)
+}
+
+fn uninstall_droid_hook_from_document(
+    document: &mut serde_json::Value,
+    standalone: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if droid_pre_tool_use(document, standalone)?.is_none() {
+        return Ok(false);
+    }
+    let events = if standalone {
+        document
+    } else {
+        &mut document["hooks"]
+    };
+    let groups = events["PreToolUse"]
+        .as_array_mut()
+        .expect("validated Factory matcher array");
+    Ok(remove_dcg_hooks_from_pre_tool_use(groups))
+}
+
+/// Prefer an existing modern hook file; never create one that shadows the
+/// operator's settings hooks. When it is absent, honor local PreToolUse hooks
+/// and legacy files before creating settings.json. Factory does not precisely
+/// document local/legacy merging; doctor calls this a selected source and asks
+/// the operator to verify the Effective tab, not proof of live dispatch.
+fn droid_install_target(
+    directory: &std::path::Path,
+) -> Result<(std::path::PathBuf, bool), Box<dyn std::error::Error>> {
+    for (path, standalone) in droid_hook_files(directory) {
+        let document = read_droid_document(&path)?;
+        if standalone && document.is_some() {
+            return Ok((path, true));
+        }
+        if document.as_ref().is_some_and(|document| {
+            document
+                .get("hooks")
+                .and_then(|hooks| hooks.get("PreToolUse"))
+                .is_some()
+        }) {
+            return Ok((path, false));
+        }
+    }
+    Ok((directory.join("settings.json"), false))
+}
+
+fn validate_droid_scope(directory: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    for (path, standalone) in droid_hook_files(directory) {
+        if let Some(document) = read_droid_document(&path)? {
+            droid_pre_tool_use(&document, standalone)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Report visible hook-disabling controls without ever clearing them. Local
+/// settings overlay their corresponding settings at the same scope.
+fn droid_scope_control_issue(
+    directory: &std::path::Path,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut controls = std::collections::BTreeMap::new();
+    for name in ["settings.json", "settings.local.json"] {
+        let path = directory.join(name);
+        if let Some(document) = read_droid_document(&path)? {
+            for key in ["hooksDisabled", "allowManagedHooksOnly"] {
+                if let Some(value) = document.get(key) {
+                    let enabled = value
+                        .as_bool()
+                        .ok_or_else(|| format!("{}: {key} must be a boolean", path.display()))?;
+                    controls.insert(key, (enabled, path.clone()));
+                }
+            }
+        }
+    }
+    Ok(controls.into_iter().find_map(|(key, (enabled, path))| {
+        enabled.then(|| {
+            format!(
+                "{} sets {key}=true; user/project hooks may not run",
+                path.display()
+            )
+        })
+    }))
+}
+
+fn droid_managed_settings_path() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var_os("ProgramFiles")
+            .map_or_else(
+                || std::path::PathBuf::from(r"C:\Program Files"),
+                std::path::PathBuf::from,
+            )
+            .join("Factory")
+            .join("settings.json")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::path::PathBuf::from("/Library/Application Support/Factory/settings.json")
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        std::path::PathBuf::from("/etc/factory/settings.json")
+    }
+}
+
+fn droid_managed_control_issue() -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let path = droid_managed_settings_path();
+    if let Some(document) = read_droid_document(&path)? {
+        for key in ["hooksDisabled", "allowManagedHooksOnly"] {
+            let value = document
+                .get(key)
+                .map(|value| {
+                    value
+                        .as_bool()
+                        .ok_or_else(|| format!("{}: {key} must be a boolean", path.display()))
+                })
+                .transpose()?;
+            if value == Some(true) {
+                return Ok(Some(format!(
+                    "{} sets {key}=true; ask the Factory administrator to configure the guard",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn write_droid_document(
+    path: &std::path::Path,
+    document: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_droid_user_writable_path(path)?;
+    let mut content = serde_json::to_string_pretty(document)?;
+    content.push('\n');
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_installer_hook_settings(path, &content)
+}
+
+/// Ordinary dotfile-manager symlinks are supported, but a user/project alias
+/// to the known org-managed settings must remain read-only here as well.
+fn ensure_droid_user_writable_path(
+    path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let target = canonicalize_droid_destination(path)?;
+    let managed = droid_managed_settings_path();
+    let managed = canonicalize_droid_destination(&managed)?;
+    if target == managed {
+        return Err(format!(
+            "{} resolves to org-managed Factory settings; refusing to modify it",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Resolve an existing ancestor before reattaching new path components. A new
+/// settings.json beneath a directory symlink needs the same managed boundary
+/// as a symlink to an already-existing settings.json.
+fn canonicalize_droid_destination(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                for component in suffix.into_iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && !ancestor.is_symlink() =>
+            {
+                let Some(name) = ancestor.file_name() else {
+                    return Err(error);
+                };
+                suffix.push(name.to_owned());
+                let Some(parent) = ancestor.parent() else {
+                    return Err(error);
+                };
+                ancestor = parent;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn install_droid_hook_at(
+    directory: &std::path::Path,
+    force: bool,
+) -> Result<(std::path::PathBuf, bool), Box<dyn std::error::Error>> {
+    if let Some(issue) = droid_managed_control_issue()?.or(droid_scope_control_issue(directory)?) {
+        return Err(format!("{issue}. Settings were left unchanged").into());
+    }
+    validate_droid_scope(directory)?;
+    let (path, standalone) = droid_install_target(directory)?;
+    let mut document = read_droid_document(&path)?.unwrap_or_else(|| serde_json::json!({}));
+    let command = droid_hook_command_for_executable(&current_dcg_executable()?)?;
+    let changed = install_droid_hook_into_document(&mut document, standalone, force, &command)?;
+    if changed {
+        write_droid_document(&path, &document)?;
+    }
+    Ok((path, changed))
+}
+
+fn install_droid_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = if project {
+        droid_project_config_dir()?
+    } else {
+        droid_user_config_dir()
+    };
+    let (path, changed) = install_droid_hook_at(&directory, force)?;
+    println!(
+        "Factory Droid hook {}: {}",
+        if changed {
+            "installed"
+        } else {
+            "already installed"
+        },
+        path.display()
+    );
+    println!("Restart Droid, then check /hooks (Effective) and a harmless denial canary.");
+    println!("Direct Execute payloads are supported; nested Script coverage is unverified.");
+    if path.file_name().is_some_and(|name| name == "hooks.json") {
+        println!(
+            "Droid 0.186.0 has a reported hooks.json loading regression (Factory-AI/factory#3); verify live dispatch on your version."
+        );
+    }
+    Ok(())
+}
+
+fn uninstall_droid_hook(project: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = if project {
+        droid_project_config_dir()?
+    } else {
+        droid_user_config_dir()
+    };
+    let mut changes = Vec::new();
+    // Validate every supported document before writing any of them. Removing
+    // only the active entry can leave a shadowed dcg registration to reappear
+    // later, or leave an invalid file hiding a still-active registration.
+    for (path, standalone) in droid_hook_files(&directory) {
+        if let Some(mut document) = read_droid_document(&path)? {
+            if uninstall_droid_hook_from_document(&mut document, standalone)? {
+                ensure_droid_user_writable_path(&path)?;
+                changes.push((path, document));
+            }
+        }
+    }
+    for (path, document) in &changes {
+        write_droid_document(path, document)?;
+        println!("Removed Factory Droid dcg hook: {}", path.display());
+    }
+    if changes.is_empty() {
+        println!("No dcg hooks found in {}", directory.display());
+    }
+    Ok(())
+}
+
+/// Ownership recognition accepts old commands for safe repair/removal, but
+/// health requires exactly the invocation we install. Extra CLI arguments,
+/// shell operators, or a bare relative dcg must never count as protection.
+fn droid_document_registers_guard(
+    document: &serde_json::Value,
+    standalone: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(groups) = droid_pre_tool_use(document, standalone)? else {
+        return Ok(false);
+    };
+    let running = std::fs::canonicalize(current_dcg_executable()?)?;
+    for group in groups {
+        if group.get("matcher").and_then(serde_json::Value::as_str) != Some(DROID_SHELL_MATCHER)
+            || group.get("commandRegex").is_some()
+        {
+            continue;
+        }
+        for handler in group["hooks"].as_array().expect("validated command array") {
+            if handler.get("type").and_then(serde_json::Value::as_str) != Some("command")
+                || !droid_handler_is_synchronous(handler)
+                || handler.get("shell").is_some()
+            {
+                continue;
+            }
+            let Some(command) = handler.get("command").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(program) = dcg_command_program(command) else {
+                continue;
+            };
+            let path = std::path::Path::new(&program);
+            if !path.is_absolute()
+                || !path.is_file()
+                || !std::fs::canonicalize(path).is_ok_and(|resolved| resolved == running)
+            {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if !std::fs::metadata(path)
+                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+                {
+                    continue;
+                }
+            }
+            if droid_hook_command_for_executable(path)
+                .is_ok_and(|expected| command.trim() == expected)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn droid_config_dirs() -> Vec<std::path::PathBuf> {
+    let mut directories = vec![droid_user_config_dir()];
+    if let Ok(project) = droid_project_config_dir() {
+        if !directories.contains(&project) {
+            directories.push(project);
+        }
+    }
+    directories
+}
+
+fn droid_appears_in_use() -> bool {
+    droid_config_dirs()
+        .iter()
+        .any(|directory| directory.is_dir())
+        || which_executable("droid").is_some()
+        || crate::agent::detect_agent() == crate::agent::Agent::Droid
+}
+
+fn probe_droid_registration() -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
+    if let Some(issue) = droid_managed_control_issue()? {
+        return Err(issue.into());
+    }
+    let mut registrations = Vec::new();
+    for directory in droid_config_dirs() {
+        if let Some(issue) = droid_scope_control_issue(&directory)? {
+            return Err(issue.into());
+        }
+        validate_droid_scope(&directory)?;
+        let (path, standalone) = droid_install_target(&directory)?;
+        if let Some(document) = read_droid_document(&path)? {
+            if droid_document_registers_guard(&document, standalone)? {
+                registrations.push(path);
+            }
+        }
+    }
+    Ok(registrations)
+}
+
+/// Shared by pretty, rich, and JSON renderers so --strict and --fix agree.
+fn droid_doctor_check(fix: bool) -> DoctorCheck {
+    let mut check = DoctorCheck {
+        id: "droid_hook",
+        name: "Factory Droid hook registration",
+        status: DoctorCheckStatus::Error,
+        message: String::new(),
+        remediation: Some("Run 'dcg install --droid' (or '--droid --project'), then inspect /hooks (Effective). Review disabled controls; doctor never clears them.".to_string()),
+        fixed: false,
+    };
+    let registration = match probe_droid_registration() {
+        Ok(paths) if paths.is_empty() && fix => {
+            match install_droid_hook_at(&droid_user_config_dir(), false) {
+                Ok(_) => {
+                    let repaired = probe_droid_registration();
+                    check.fixed = repaired.as_ref().is_ok_and(|paths| !paths.is_empty());
+                    repaired
+                }
+                Err(error) => Err(error),
+            }
+        }
+        result => result,
+    };
+    match registration {
+        Ok(paths) if !paths.is_empty() => {
+            check.status = DoctorCheckStatus::Ok;
+            check.message = format!(
+                "Execute guard registered in selected source(s): {}. This is a static configuration check, not live Droid dispatch verification.",
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            check.remediation = None;
+        }
+        Ok(_) => {
+            check.message = "No effective Factory Execute guard found. Check case-sensitive Execute, an unfiltered synchronous command hook, and this executable's absolute dcg path with only --agent droid. hooks.json takes precedence over settings hooks; lower files may contain shadowed registrations.".to_string();
+        }
+        Err(error) => {
+            check.message = format!("Cannot verify Factory Droid hook registration: {error}");
+        }
+    }
+    check
+}
+
+fn droid_coverage_check() -> DoctorCheck {
+    DoctorCheck {
+        id: "droid_coverage",
+        name: "Factory Droid runtime coverage",
+        status: DoctorCheckStatus::Warning,
+        message: "Direct Execute payload handling is supported. Script nested-call coverage, runtime overlays, and remote org policy are not verified by doctor; Droid 0.186.0 also has a reported hooks.json loading regression (Factory-AI/factory#3).".to_string(),
+        remediation: Some("Restart Droid, inspect /hooks (Effective), and verify a harmless denial canary with droid --debug. See docs/agents.md for the separate Script probe.".to_string()),
+        fixed: false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -19768,6 +20459,10 @@ fn ensure_hook_registered_inner(
     agent: &crate::agent::Agent,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let settings_path = match agent {
+        // Factory has its own configuration and precedence rules. Hook-mode
+        // evaluation must not repair a different host's Claude settings;
+        // Factory registration is handled by install and doctor --fix.
+        crate::agent::Agent::Droid => return Ok(()),
         crate::agent::Agent::ClaudeCode | crate::agent::Agent::Unknown => claude_settings_path(),
         _ => default_claude_settings_path(),
     };
@@ -26529,6 +27224,7 @@ if ($errors.Count -ne 0) {
             reasonix: _,
             muse: _,
             amp: _,
+            droid: _,
         }) = cli.command
         {
             assert!(!force);
@@ -26557,6 +27253,7 @@ if ($errors.Count -ne 0) {
             reasonix: _,
             muse: _,
             amp: _,
+            droid: _,
         }) = cli.command
         {
             assert!(force);
@@ -26585,6 +27282,7 @@ if ($errors.Count -ne 0) {
             reasonix: _,
             muse: _,
             amp: _,
+            droid: _,
         }) = cli.command
         {
             assert!(!force);
@@ -26613,6 +27311,7 @@ if ($errors.Count -ne 0) {
             reasonix: _,
             muse: _,
             amp: _,
+            droid: _,
         }) = cli.command
         {
             assert!(!force);
@@ -26641,6 +27340,7 @@ if ($errors.Count -ne 0) {
             reasonix: _,
             muse: _,
             amp: _,
+            droid: _,
         }) = cli.command
         {
             assert!(!force);
@@ -26669,6 +27369,7 @@ if ($errors.Count -ne 0) {
             reasonix: _,
             muse: _,
             amp: _,
+            droid: _,
         }) = cli.command
         {
             assert!(!force);
@@ -26697,6 +27398,7 @@ if ($errors.Count -ne 0) {
             reasonix: _,
             muse: _,
             amp: _,
+            droid: _,
         }) = cli.command
         {
             assert!(!force);
@@ -26725,6 +27427,7 @@ if ($errors.Count -ne 0) {
             reasonix: _,
             muse: _,
             amp: _,
+            droid: _,
         }) = cli.command
         {
             assert!(force);
@@ -26753,6 +27456,7 @@ if ($errors.Count -ne 0) {
             reasonix: _,
             muse: _,
             amp: _,
+            droid: _,
         }) = cli.command
         {
             assert!(force);
@@ -26781,6 +27485,7 @@ if ($errors.Count -ne 0) {
             reasonix: _,
             muse: _,
             amp: _,
+            droid: _,
         }) = cli.command
         {
             assert!(force);
@@ -26828,12 +27533,66 @@ if ($errors.Count -ne 0) {
             ("--muse", "--omp"),
             ("--muse", "--crush"),
             ("--muse", "--reasonix"),
+            ("--droid", "--grok"),
+            ("--droid", "--agy"),
+            ("--droid", "--opencode"),
+            ("--droid", "--omp"),
+            ("--droid", "--crush"),
+            ("--droid", "--reasonix"),
+            ("--droid", "--muse"),
+            ("--droid", "--amp"),
         ] {
             assert!(
                 Cli::try_parse_from(["dcg", "install", left, right]).is_err(),
                 "install must reject conflicting targets {left} and {right}"
             );
         }
+    }
+
+    #[test]
+    fn test_cli_parse_install_and_uninstall_droid() {
+        let cli =
+            Cli::try_parse_from(["dcg", "install", "--droid", "--project", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Install {
+                droid: true,
+                project: true,
+                force: true,
+                ..
+            })
+        ));
+        let cli = Cli::try_parse_from(["dcg", "uninstall", "--droid", "--project"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Uninstall {
+                droid: true,
+                project: true,
+                purge: false,
+                ..
+            })
+        ));
+        for other in ["--purge", "--crush", "--reasonix", "--muse", "--amp"] {
+            assert!(Cli::try_parse_from(["dcg", "uninstall", "--droid", other]).is_err());
+        }
+        assert!(Cli::try_parse_from(["dcg", "uninstall", "--project"]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn droid_destination_resolves_new_settings_beneath_a_directory_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp.path().join("managed-factory");
+        std::fs::create_dir(&managed).unwrap();
+        let user_factory = temp.path().join(".factory");
+        std::os::unix::fs::symlink(&managed, &user_factory).unwrap();
+        let alias = user_factory.join("settings.json");
+        assert!(!alias.exists());
+        assert_eq!(
+            canonicalize_droid_destination(&alias).unwrap(),
+            managed.join("settings.json")
+        );
+        assert!(!alias.exists(), "resolution must remain read-only");
     }
 
     /// #572: `--muse` parses on install and uninstall; Muse has no project
@@ -26865,6 +27624,7 @@ if ($errors.Count -ne 0) {
             reasonix,
             muse,
             amp,
+            ..
         }) = cli.command
         {
             assert!(muse);

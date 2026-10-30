@@ -270,6 +270,7 @@ POSIT_ASSISTANT_VERSION=""
 OPENCODE_VERSION=""
 CRUSH_VERSION=""
 REASONIX_VERSION=""
+DROID_VERSION=""
 OMP_VERSION=""
 
 print_agent_scan_notice() {
@@ -538,6 +539,15 @@ detect_agents() {
     [[ -n "$reasonix_bin" ]] && REASONIX_VERSION=$(try_version "$reasonix_bin")
   fi
 
+  # Factory Droid uses ~/.factory and an optional native `droid` CLI.
+  local droid_bin
+  droid_bin=$(builtin type -P droid 2>/dev/null || true)
+  if [[ -d "$HOME/.factory" ]] \
+    || [[ -n "$droid_bin" && -f "$droid_bin" && -x "$droid_bin" ]]; then
+    DETECTED_AGENTS+=("droid")
+    [[ -n "$droid_bin" ]] && DROID_VERSION=$(try_version "$droid_bin")
+  fi
+
   # Oh My Pi (`omp`) — require an external executable on PATH. Config/profile
   # state can outlive an uninstall, while command lookup also accepts aliases
   # and functions that the non-interactive installer cannot safely identify as
@@ -626,6 +636,11 @@ print_detected_agents() {
           [[ -n "$REASONIX_VERSION" ]] && ver_info=" (${REASONIX_VERSION})"
           gum style --foreground 42 "  ✓ Reasonix${ver_info}"
           ;;
+        droid)
+          local ver_info=""
+          [[ -n "$DROID_VERSION" ]] && ver_info=" (${DROID_VERSION})"
+          gum style --foreground 42 "  ✓ Factory Droid${ver_info}"
+          ;;
         omp)
           local ver_info=""
           [[ -n "$OMP_VERSION" ]] && ver_info=" (${OMP_VERSION})"
@@ -698,6 +713,11 @@ print_detected_agents() {
           local ver_info=""
           [[ -n "$REASONIX_VERSION" ]] && ver_info=" (${REASONIX_VERSION})"
           echo -e "  \033[0;32m✓\033[0m Reasonix${ver_info}"
+          ;;
+        droid)
+          local ver_info=""
+          [[ -n "$DROID_VERSION" ]] && ver_info=" (${DROID_VERSION})"
+          echo -e "  \033[0;32m✓\033[0m Factory Droid${ver_info}"
           ;;
         omp)
           local ver_info=""
@@ -2013,6 +2033,8 @@ CRUSH_STATUS=""  # "created"|"merged"|"skipped"|"failed"
 CRUSH_FAILURE_REASON=""
 REASONIX_STATUS=""  # "created"|"merged"|"skipped"|"failed"
 REASONIX_FAILURE_REASON=""
+DROID_STATUS=""  # "configured"|"skipped"|"failed"
+DROID_FAILURE_REASON=""
 OMP_STATUS=""  # "created"|"merged"|"skipped"|"failed"|"conflict"
 OMP_FAILURE_REASON=""
 POSIT_ASSISTANT_BACKUP=""
@@ -3920,6 +3942,36 @@ configure_crush() {
   return 1
 }
 
+configure_droid() {
+  # Keep Factory's standalone hooks.json/settings.json precedence and safe
+  # JSON editing in the Rust installer. The installed hook uses Execute and
+  # an absolute dcg path with --agent droid, even in a scrubbed environment.
+  if ! is_agent_detected "droid"; then
+    DROID_STATUS="skipped"
+    return 0
+  fi
+
+  local dcg_bin="$DEST/dcg"
+  if [ ! -x "$dcg_bin" ]; then
+    DROID_STATUS="failed"
+    DROID_FAILURE_REASON="dcg binary not found at $dcg_bin"
+    return 1
+  fi
+
+  local output
+  if output=$("$dcg_bin" install --droid --force 2>&1); then
+    DROID_STATUS="configured"
+    AUTO_CONFIGURED=1
+    # Native diagnostics include disabled hooks and host-loading caveats.
+    [ -z "$output" ] || info "$output"
+    return 0
+  fi
+
+  DROID_STATUS="failed"
+  DROID_FAILURE_REASON=$(printf '%s' "$output" | tail -n 1)
+  return 1
+}
+
 configure_reasonix() {
   # Reasonix runs native `PreToolUse` hooks from <Reasonix home>/settings.json
   # and reads only their exit status (#358). As with Crush, the freshly
@@ -4144,6 +4196,9 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
 
   # Configure Reasonix (if installed); same failure handling as Crush.
   configure_reasonix || true
+
+  # Configure Factory Droid through the same native installer as manual setup.
+  configure_droid || true
 
   # Configure Oh My Pi (if installed)
   # A refusal/failure is a terminal OMP_STATUS state rendered in the summary;
@@ -4461,6 +4516,19 @@ case "$REASONIX_STATUS" in
     else
       summary_lines+=("Reasonix:    Configuration failed")
     fi
+    ;;
+esac
+
+case "$DROID_STATUS" in
+  configured)
+    summary_lines+=("Droid:       Configured Execute PreToolUse hook")
+    summary_lines+=("             Restart Droid and inspect /hooks; Script coverage is unverified")
+    ;;
+  skipped|"")
+    summary_lines+=("Droid:       Not installed (skipped)")
+    ;;
+  failed)
+    summary_lines+=("Droid:       Configuration failed ($DROID_FAILURE_REASON)")
     ;;
 esac
 

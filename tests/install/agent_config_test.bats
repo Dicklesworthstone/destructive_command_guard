@@ -6215,3 +6215,141 @@ PYEOF
     grep -q 'keep.sh' "$HOME/.reasonix/settings.json"
     unset REASONIX_HOME
 }
+
+# ============================================================================
+# Factory Droid bootstrap delegation (#617). Native JSON editing and hook
+# evaluation are exercised against the real binary in the Rust CLI tests.
+# ============================================================================
+
+make_droid_mock_dcg() {
+    export DCG_TEST_DROID_CALLS="$TEST_TMPDIR/droid-calls"
+    export DCG_TEST_DROID_FAILURE="${1:-0}"
+    cat > "$DEST/dcg" <<'MOCKEOF'
+#!/bin/bash
+printf '%s\n' "$PWD: $*" >> "$DCG_TEST_DROID_CALLS"
+if [ "$DCG_TEST_DROID_FAILURE" != 0 ]; then
+    echo "Invalid Factory Droid hook configuration" >&2
+    exit 1
+fi
+echo "Factory Droid hook configuration checked"
+MOCKEOF
+    chmod +x "$DEST/dcg"
+}
+
+@test "detect_agents: Factory Droid detected from ~/.factory" {
+    mkdir -p "$HOME/.factory"
+    detect_agents
+    is_agent_detected droid
+}
+
+@test "detect_agents: Factory Droid requires a directory or external executable" {
+    droid() { printf 'fake droid\n'; }
+    detect_agents
+    ! is_agent_detected droid
+    unset -f droid
+
+    mkdir -p "$TEST_TMPDIR/droid-bin"
+    printf '#!/bin/sh\nprintf "droid 1.0.0\\n"\n' > "$TEST_TMPDIR/droid-bin/droid"
+    chmod +x "$TEST_TMPDIR/droid-bin/droid"
+    PATH="$TEST_TMPDIR/droid-bin:$PATH"
+    AGENT_VERSION_LOOKUP=1
+    detect_agents
+    is_agent_detected droid
+    [ -n "$DROID_VERSION" ]
+}
+
+@test "configure_droid: skips undetected agents without invoking binary" {
+    DETECTED_AGENTS=()
+    make_droid_mock_dcg
+    configure_droid
+    [ "$DROID_STATUS" = skipped ]
+    [ ! -f "$DCG_TEST_DROID_CALLS" ]
+    [ ! -e "$HOME/.factory/settings.json" ]
+}
+
+@test "configure_droid: delegates exact native install and preserves bootstrap config bytes" {
+    DETECTED_AGENTS=(droid)
+    AUTO_CONFIGURED=0
+    make_droid_mock_dcg
+    mkdir -p "$HOME/.factory"
+    printf '%s\n' '{"theme":"dark","hooks":{"Stop":[{"command":"audit"}]}}' > "$HOME/.factory/settings.json"
+    cp "$HOME/.factory/settings.json" "$TEST_TMPDIR/factory-before.json"
+    configure_droid
+    [ "$DROID_STATUS" = configured ]
+    [ "$AUTO_CONFIGURED" -eq 1 ]
+    grep -Fqx "$PWD: install --droid --force" "$DCG_TEST_DROID_CALLS"
+    cmp -s "$TEST_TMPDIR/factory-before.json" "$HOME/.factory/settings.json"
+}
+
+@test "configure_droid: reports native failure without claiming protection" {
+    DETECTED_AGENTS=(droid)
+    AUTO_CONFIGURED=0
+    make_droid_mock_dcg 1
+    configure_droid && return 1
+    [ "$DROID_STATUS" = failed ]
+    [ "$AUTO_CONFIGURED" -eq 0 ]
+    [[ "$DROID_FAILURE_REASON" == *"Invalid Factory Droid"* ]]
+}
+
+@test "unconfigure_droid: delegates user and project cleanup before binary removal" {
+    make_droid_mock_dcg
+    mkdir -p "$HOME/.factory" "$TEST_WORKDIR/.factory" "$TEST_WORKDIR/.git" "$TEST_WORKDIR/subdir"
+    printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Execute","hooks":[{"command":"dcg --agent droid"}]}]}}' > "$HOME/.factory/settings.json"
+    cp "$HOME/.factory/settings.json" "$TEST_WORKDIR/.factory/settings.json"
+    cd "$TEST_WORKDIR/subdir"
+    unconfigure_droid "$DEST/dcg"
+    grep -Fqx "$PWD: uninstall --droid" "$DCG_TEST_DROID_CALLS"
+    grep -Fqx "$TEST_WORKDIR: uninstall --droid --project" "$DCG_TEST_DROID_CALLS"
+    [ -x "$DEST/dcg" ]
+}
+
+@test "unconfigure_droid: reports native errors and preserves configuration" {
+    make_droid_mock_dcg 1
+    mkdir -p "$HOME/.factory"
+    printf '%s\n' '{"PreToolUse":[{"matcher":"Execute","hooks":[{"command":"dcg --agent droid"}]}]}' > "$HOME/.factory/hooks.json"
+    cp "$HOME/.factory/hooks.json" "$TEST_TMPDIR/droid-before.json"
+    run unconfigure_droid "$DEST/dcg"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"cleanup failed"* ]]
+    cmp -s "$TEST_TMPDIR/droid-before.json" "$HOME/.factory/hooks.json"
+}
+
+@test "unconfigure_droid: Factory settings without DCG do not require a binary" {
+    mkdir -p "$HOME/.factory"
+    printf '%s\n' '{"theme":"dark","hooksDisabled":true}' > "$HOME/.factory/settings.json"
+    run unconfigure_droid "$TEST_TMPDIR/missing-dcg"
+    [ "$status" -eq 0 ]
+}
+
+@test "unconfigure_droid: missing binary with possible registration is actionable" {
+    mkdir -p "$HOME/.factory/hooks"
+    printf '%s\n' '{"PreToolUse":[{"matcher":"Execute","hooks":[{"command":"dcg --agent droid"}]}]}' > "$HOME/.factory/hooks/hooks.json"
+    run unconfigure_droid "$TEST_TMPDIR/missing-dcg"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"requires a DCG binary"* ]]
+}
+
+@test "full uninstaller: keeps binary when Factory Droid cleanup fails" {
+    make_droid_mock_dcg 1
+    mkdir -p "$HOME/.local/bin" "$HOME/.factory"
+    cp "$DEST/dcg" "$HOME/.local/bin/dcg"
+    printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Execute","hooks":[{"command":"dcg --agent droid"}]}]}}' > "$HOME/.factory/settings.json"
+    run bash "$UNINSTALL_SCRIPT" --yes --keep-config --keep-history
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"retaining the DCG binary"* ]]
+    [ -x "$HOME/.local/bin/dcg" ]
+    grep -q 'dcg --agent droid' "$HOME/.factory/settings.json"
+}
+
+@test "full uninstaller: escaped Factory command names still require native cleanup" {
+    make_droid_mock_dcg 1
+    mkdir -p "$HOME/.local/bin" "$HOME/.factory"
+    cp "$DEST/dcg" "$HOME/.local/bin/dcg"
+    printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Execute","hooks":[{"type":"command","command":"/opt/\u0064\u0063\u0067 --agent droid"}]}]}}' > "$HOME/.factory/settings.json"
+    cp "$HOME/.factory/settings.json" "$TEST_TMPDIR/escaped-factory-before.json"
+    run bash "$UNINSTALL_SCRIPT" --yes --keep-config --keep-history
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"retaining the DCG binary"* ]]
+    [ -x "$HOME/.local/bin/dcg" ]
+    cmp -s "$TEST_TMPDIR/escaped-factory-before.json" "$HOME/.factory/settings.json"
+}

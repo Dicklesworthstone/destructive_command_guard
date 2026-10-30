@@ -11,12 +11,15 @@
 
 </div>
 
-A high-performance hook for AI coding agents that blocks destructive commands before they execute, protecting your work from accidental deletion across Claude Code, Codex CLI, Gemini CLI, Copilot CLI, VS Code Copilot Chat, Cursor, Hermes Agent, Grok (xAI), Posit Assistant, Oh My Pi, and related tools.
+A high-performance hook for AI coding agents that blocks destructive commands before they execute, protecting your work from accidental deletion across Claude Code, Codex CLI, Gemini CLI, Copilot CLI, VS Code Copilot Chat, Cursor, Hermes Agent, Grok (xAI), Posit Assistant, Oh My Pi, Factory Droid's Execute tool, and related tools.
 
 **Supported:** [Claude Code](https://claude.ai/code), [Codex CLI 0.125.0+](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks), [VS Code Copilot Chat](https://code.visualstudio.com/docs/agent-customization/hooks), [Cursor IDE](https://cursor.com), [Hermes Agent](https://github.com/NousResearch/hermes-agent), [Posit Assistant](https://positron.posit.co/assistant/) (Positron/RStudio extension, standalone server, and `pa` terminal client), [Grok (xAI)](https://x.ai/news/grok-build-cli) (native `~/.grok/hooks/` plus Claude compatibility layer), [Antigravity CLI (`agy`)](https://antigravity.google) (native `~/.gemini/config/hooks.json` via `dcg install --agy`), [OpenCode](https://opencode.ai) (native `tool.execute.before` plugin via `dcg install --opencode` — see [docs/opencode-integration.md](docs/opencode-integration.md)), [Oh My Pi (`omp`)](https://omp.sh) (native `tool_call` extension via `dcg install --omp`), [Crush](https://github.com/charmbracelet/crush) (native `hooks.PreToolUse` entry in `crush.json` via `dcg install --crush` — see [docs/crush-integration.md](docs/crush-integration.md)), [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) (native `hooks.PreToolUse` entry in `settings.json` via `dcg install --reasonix` — see [docs/reasonix-integration.md](docs/reasonix-integration.md)), [Muse Code](https://dev.meta.ai/docs/muse-code) (native `hooks.PreToolUse` matcher group in `~/.config/muse/settings.json` via `dcg install --muse` — see [docs/muse-integration.md](docs/muse-integration.md)), [Amp](https://ampcode.com) (native `tool.call` plugin via `dcg install --amp` — see [docs/amp-integration.md](docs/amp-integration.md)), [Pi](https://github.com/earendil-works/pi) (via [extension recipe](docs/pi-integration.md)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only)
 
 <div align="center">
 <h3>Quick Install</h3>
+
+Factory Droid's `Execute` tool is supported through `dcg install --droid`;
+see [coverage and Script-mode limitations](docs/agents.md#factory-droid).
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
@@ -1058,7 +1061,7 @@ The easiest way to install is using the install script, which downloads a prebui
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
 ```
 
-Easy mode auto-detects your platform, downloads the right binary, verifies SHA256 checksums, configures all supported AI agent hooks and bridges (Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, Posit Assistant, Oh My Pi, OpenCode, Crush, Reasonix, Aider), and updates your PATH. For Codex CLI 0.125.0+, the installer merges a `PreToolUse` Bash hook into `~/.codex/hooks.json`; invalid JSON or malformed existing Codex hook shapes are left unchanged and reported instead of being overwritten.
+Easy mode auto-detects your platform, downloads the right binary, verifies SHA256 checksums, configures all supported AI agent hooks and bridges (Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, Posit Assistant, Oh My Pi, OpenCode, Crush, Reasonix, Factory Droid, Aider), and updates your PATH. For Codex CLI 0.125.0+, the installer merges a `PreToolUse` Bash hook into `~/.codex/hooks.json`; invalid JSON or malformed existing Codex hook shapes are left unchanged and reported instead of being overwritten.
 
 ### Homebrew
 
@@ -1293,7 +1296,7 @@ irm https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guar
 ```
 
 The Unix uninstaller:
-- Removes dcg hooks and marker-owned bridges from Claude Code, Codex CLI, Cursor IDE, Gemini CLI, GitHub Copilot CLI (user-level plus legacy repo-local), Hermes Agent, Posit Assistant, OpenCode, Oh My Pi, Crush, Reasonix, and Aider
+- Removes dcg hooks and marker-owned bridges from Claude Code, Codex CLI, Cursor IDE, Gemini CLI, GitHub Copilot CLI (user-level plus legacy repo-local), Hermes Agent, Posit Assistant, OpenCode, Oh My Pi, Crush, Reasonix, Factory Droid (through the installed DCG binary), and Aider
 - Removes the dcg binary
 - Removes configuration (`~/.config/dcg/`) and history (the
   `history.db` SQLite files in `~/.config/dcg/` or
@@ -1471,6 +1474,26 @@ reads `{"decision":"deny","reason":"…"}` back on exit 0. Allowed commands stay
 silent (Crush's normal permission prompt still applies — dcg never
 pre-approves). Start a new Crush session after editing the config. See
 [docs/crush-integration.md](docs/crush-integration.md).
+
+## Factory Droid Configuration
+
+Run `dcg install --droid` for user-wide protection, or add `--project` for the
+current project (the Git root when present, otherwise the current directory).
+The installer registers the case-sensitive `Execute` tool
+with an absolute DCG path and `--agent droid`, preserves unrelated hooks and
+settings, and honors Factory's standalone hook-file precedence. A fresh install
+uses `.factory/settings.json`; an existing `.factory/hooks.json` is
+updated using its unwrapped event-map format. `dcg uninstall --droid` removes
+user registrations; add `--project` to remove project registrations.
+
+Start a new Droid session and inspect `/hooks` after installation. `dcg doctor`
+checks the registration, and `[agents.droid]` configures agent-specific policy.
+Destructive `tool_input.command` values receive the same evaluation as other
+supported shell tools, with a Claude-compatible JSON denial. Hook loading has
+had version-specific regressions, and **nested Execute calls inside Droid's
+Script tool are not verified as protected**. See [Factory Droid integration and
+verification](docs/agents.md#factory-droid) for configuration locations,
+diagnostics, and a safe procedure to establish live coverage on your version.
 
 ## Reasonix Configuration
 
@@ -3580,7 +3603,7 @@ See [Escape Hatch / Bypass](#escape-hatch--bypass). Options include `DCG_BYPASS=
 
 **Q: Does this work with other AI coding tools?**
 
-Yes. dcg natively supports Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, VS Code Copilot Chat, Cursor IDE, OpenCode, Oh My Pi (`omp`), Crush, Reasonix, Muse Code, and Amp interception paths. Aider has limited git-hook support, and Continue is detected but cannot be auto-configured because it does not expose a pre-execution shell hook.
+Yes. dcg natively supports Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, VS Code Copilot Chat, Cursor IDE, OpenCode, Oh My Pi (`omp`), Crush, Reasonix, Muse Code, Amp, and Factory Droid's `Execute` interception paths. Droid's nested Script-mode calls remain unverified; see [Factory Droid](docs/agents.md#factory-droid). Aider has limited git-hook support, and Continue is detected but cannot be auto-configured because it does not expose a pre-execution shell hook.
 
 **Q: What about database, Docker, Kubernetes, and cloud commands?**
 

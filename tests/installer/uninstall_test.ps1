@@ -749,5 +749,29 @@ try {
     }
 } finally { Pop-Location; $env:CLAUDE_CONFIG_DIR = $savedClaudeConfigDir }
 
+Write-Host "Test Droid: conservative inventory and missing-binary safety"
+$droidHome = New-Tmp
+$droidDir = Join-Path $droidHome '.factory'
+New-Item -ItemType Directory -Force -Path (Join-Path $droidDir 'hooks') | Out-Null
+$missingDcg = Join-Path $droidHome 'missing-dcg.exe'
+Check (Unconfigure-DroidHook -Binary $missingDcg -HomeDir $droidHome) "Droid: empty Factory config does not require a binary"
+foreach ($relative in @('hooks.json', 'settings.json', 'settings.local.json', 'hooks/hooks.json')) {
+    $candidate = Join-Path $droidDir $relative
+    $fixture = '{"hooks":{"PreToolUse":[{"matcher":"Execute","hooks":[{"command":"dcg --agent droid"}]}]}}'
+    [System.IO.File]::WriteAllText($candidate, $fixture)
+    Check (Test-DroidDcgRegistration -FactoryDir $droidDir) "Droid: inventory includes $relative"
+    Check (-not (Unconfigure-DroidHook -Binary $missingDcg -HomeDir $droidHome)) "Droid: missing binary cannot claim successful cleanup of $relative"
+    Check ([System.IO.File]::ReadAllText($candidate) -ceq $fixture) "Droid: failed cleanup leaves $relative byte-for-byte unchanged"
+    [System.IO.File]::WriteAllText($candidate, '{"theme":"dark"}')
+}
+Check (-not (Test-DroidDcgRegistration -FactoryDir $droidDir)) "Droid: unrelated Factory settings do not require cleanup"
+Check (Unconfigure-DroidHook -Binary $missingDcg -HomeDir $droidHome) "Droid: unrelated settings permit uninstall without a new DCG binary"
+$escapedDroidSettings = Join-Path $droidDir 'settings.json'
+$escapedDroidFixture = '{"hooks":{"PreToolUse":[{"matcher":"Execute","hooks":[{"type":"command","command":"/opt/\u0064\u0063\u0067 --agent droid"}]}]}}'
+[System.IO.File]::WriteAllText($escapedDroidSettings, $escapedDroidFixture)
+Check (Test-DroidDcgRegistration -FactoryDir $droidDir) "Droid: JSON-escaped executable names still require native inspection"
+Check (-not (Unconfigure-DroidHook -Binary $missingDcg -HomeDir $droidHome)) "Droid: escaped names cannot skip cleanup when the binary is missing"
+Check ([System.IO.File]::ReadAllText($escapedDroidSettings) -ceq $escapedDroidFixture) "Droid: escaped configuration remains unchanged on cleanup failure"
+
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
 Write-Host "All uninstall parity tests passed." -ForegroundColor Green

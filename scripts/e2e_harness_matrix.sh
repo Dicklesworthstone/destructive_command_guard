@@ -292,6 +292,20 @@ CLAUDE_ALLOW=$(jq -nc --arg c "$ALLOW_CMD" '{tool_name:"Bash",tool_input:{comman
 assert_case claude-code deny "$CLAUDE_DENY" deny \
   '.hookSpecificOutput.permissionDecision' deny
 assert_case claude-code allow "$CLAUDE_ALLOW" allow '.' ''
+
+# Factory Droid's shell tool is exactly Execute, with the same command field
+# as Claude Code. These synthetic wire tests do not establish that Droid
+# dispatches hooks for Execute calls nested inside its separate Script tool.
+$JSON_OUTPUT || echo "Factory Droid Execute"
+DROID_DENY=$(jq -nc --arg c "$DENY_CMD" '{session_id:"droid_session",transcript_path:"/tmp/droid.jsonl",cwd:"/tmp/project",hook_event_name:"PreToolUse",tool_name:"Execute",tool_input:{command:$c,timeout:60,description:"Run a shell command",riskLevel:"high"},tool_use_id:"call_droid_1"}')
+DROID_ALLOW=$(jq -nc --arg c "$ALLOW_CMD" '{session_id:"droid_session",hook_event_name:"PreToolUse",tool_name:"Execute",tool_input:{command:$c,timeout:60,riskLevel:"low"}}')
+assert_case droid deny "$DROID_DENY" deny \
+  '.hookSpecificOutput.permissionDecision' deny
+assert_case droid allow "$DROID_ALLOW" allow '.' ''
+assert_case droid read-tool-ignored \
+  "$(jq -nc --arg c "$DENY_CMD" '{hook_event_name:"PreToolUse",tool_name:"Read",tool_input:{command:$c,file_path:"README.md"}}')" \
+  allow '.' ''
+
 # A PowerShell payload is judged as PowerShell on every host. This used to be
 # host-conditional, on the theory that the coverage lived in windows.filesystem
 # (default-ON on Windows, opt-in elsewhere) and so a Unix host must allow. #451
