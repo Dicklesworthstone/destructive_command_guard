@@ -328,7 +328,7 @@ fn argv_needs_field_analysis(node: Node<'_, StrDoc<SupportLang>>) -> bool {
 /// POSIX distinguishes IFS whitespace from other separators. Empty fields
 /// before/interior to non-whitespace separators survive; a final separator
 /// terminates the preceding field rather than inventing a final argument.
-fn fields<'a>(value: &'a str, ifs: &str) -> Result<Vec<&'a str>, ()> {
+pub(super) fn fields<'a>(value: &'a str, ifs: &str) -> Result<Vec<&'a str>, ()> {
     if value.len() > MAX_VALUE_BYTES
         || ifs.len() > MAX_VALUE_BYTES
         || !ifs.is_ascii()

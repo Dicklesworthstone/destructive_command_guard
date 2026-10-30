@@ -16,7 +16,7 @@ const MAX_PATH_COMPONENTS: usize = 64;
 enum GitPathKind {
     Directory,
     Hooks,
-    Config,
+    File(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +26,14 @@ pub(super) struct GitPath {
     /// use: appending `name` to `/a/..` makes `/a/..name`, not `/name`.
     /// Its normalized components never escape the symbolic root.
     tail: String,
+    /// Git may remove a trailing slash or dot component while formatting its
+    /// output. Do not join another component onto an uncertain query boundary.
+    /// Once literal text has been appended, its exact boundary is known.
+    requires_separator: bool,
+    /// Literal path inputs which may appear in Git's output. They are shape
+    /// evidence only: the policy alias must never stand in for these bytes
+    /// when deciding whether an unquoted expansion is one shell field.
+    output_inputs: Vec<String>,
 }
 
 impl GitPath {
@@ -33,6 +41,8 @@ impl GitPath {
         Self {
             kind,
             tail: String::new(),
+            requires_separator: true,
+            output_inputs: Vec::new(),
         }
     }
 
@@ -42,8 +52,8 @@ impl GitPath {
         if suffix.is_empty() {
             return Some(self.clone());
         }
-        if self.tail.is_empty() && !suffix.starts_with('/')
-            || self.kind == GitPathKind::Config
+        if self.requires_separator && !suffix.starts_with('/')
+            || matches!(self.kind, GitPathKind::File(_))
             || self.tail.len().saturating_add(suffix.len()) > MAX_PATH_BYTES
             || suffix.contains('\0')
         {
@@ -54,23 +64,60 @@ impl GitPath {
         Some(Self {
             kind: self.kind,
             tail,
+            requires_separator: false,
+            output_inputs: self.output_inputs.clone(),
         })
+    }
+
+    pub(super) fn one_unquoted_field(&self, ifs: &str) -> bool {
+        // Keep the scanner's denial-only interpretation of an otherwise
+        // unspecified Git environment. A custom non-whitespace separator
+        // cannot be checked against an opaque root, and observed root text
+        // must not be hidden by the semantic `.git` spelling.
+        if !ifs.chars().all(|ch| matches!(ch, ' ' | '\t' | '\n')) {
+            return false;
+        }
+        let splits_or_globs = |text: &str| {
+            text.chars()
+                .any(|ch| ifs.contains(ch) || matches!(ch, '*' | '?' | '[' | '('))
+        };
+        !splits_or_globs(&self.tail)
+            && self
+                .output_inputs
+                .iter()
+                .all(|input| !input.is_empty() && !splits_or_globs(input))
+    }
+
+    fn query_boundary(mut self) -> Self {
+        self.requires_separator = self
+            .tail
+            .rsplit('/')
+            .next()
+            .is_none_or(|component| matches!(component, "" | "." | ".."));
+        let components = normalized_components(&self.tail)
+            .expect("GitPath construction checks the symbolic root");
+        self.tail = if components.is_empty() {
+            String::new()
+        } else {
+            format!("/{}", components.join("/"))
+        };
+        self
     }
 
     /// An alias for the existing protected-path table. A bare directory gets
     /// a trailing slash so the table recognizes its directory anchor as well.
     pub(super) fn policy_path(&self) -> String {
         let base = match self.kind {
-            GitPathKind::Directory => ".git",
-            GitPathKind::Hooks => ".git/hooks",
-            GitPathKind::Config => ".git/config",
+            GitPathKind::Directory => ".git".to_owned(),
+            GitPathKind::Hooks => ".git/hooks".to_owned(),
+            GitPathKind::File(name) => format!(".git/{name}"),
         };
         let tail = normalized_components(&self.tail)
             .expect("GitPath construction checks the symbolic root")
             .join("/");
         if tail.is_empty() {
-            if self.kind == GitPathKind::Config {
-                base.to_owned()
+            if matches!(self.kind, GitPathKind::File(_)) {
+                base
             } else {
                 format!("{base}/")
             }
@@ -112,46 +159,78 @@ pub(super) fn resolve_query(source: &str) -> Option<GitPath> {
         return None;
     }
     let mut index = 1;
+    let mut output_inputs = Vec::new();
+    let mut hooks_path = None;
     while argv.get(index)?.as_str() != "rev-parse" {
         let option = argv.get(index)?.as_str();
         match option {
-            "-C" | "-c" | "--git-dir" | "--work-tree" => {
-                argv.get(index + 1)?;
+            "-C" | "--git-dir" | "--work-tree" => {
+                let input = argv.get(index + 1)?;
+                // `git -C ''` explicitly leaves the current directory alone.
+                if option != "-C" || !input.is_empty() {
+                    output_inputs.push(input.clone());
+                }
+                index += 2;
+            }
+            "-c" => {
+                let setting = argv.get(index + 1)?;
+                let (key, value) = setting.split_once('=').unwrap_or((setting, ""));
+                if key.eq_ignore_ascii_case("core.hooksPath") {
+                    hooks_path = Some(value.to_owned());
+                }
                 index += 2;
             }
             "--bare" | "--no-pager" | "--no-optional-locks" => index += 1,
-            _ if attached_global_option(option) => index += 1,
-            _ => return None,
+            _ => {
+                output_inputs.push(attached_global_option(option)?.to_owned());
+                index += 1;
+            }
         }
     }
     index += 1;
-    while argv.get(index).is_some_and(|argument| {
-        matches!(
-            argument.as_str(),
-            "--path-format=absolute" | "--path-format=relative"
-        )
-    }) {
+    let mut path = None;
+    let mut reformats_paths = false;
+    while let Some(argument) = argv.get(index) {
+        match argument.as_str() {
+            // These options do not print anything, and rev-parse accepts them
+            // before or after the one path query. A format option only affects
+            // later queries; either spelling retains the same path origin.
+            "--path-format=absolute" | "--path-format=relative" => reformats_paths = true,
+            "--quiet" | "-q" => {}
+            "--git-dir" | "--absolute-git-dir" | "--git-common-dir" if path.is_none() => {
+                path = Some(GitPath::new(GitPathKind::Directory));
+            }
+            "--git-path" if path.is_none() => {
+                index += 1;
+                let operand = argv.get(index)?;
+                let queried = administered_path(operand)?;
+                output_inputs.push(operand.clone());
+                path = Some(if reformats_paths {
+                    queried.query_boundary()
+                } else {
+                    queried
+                });
+            }
+            _ => return None,
+        }
         index += 1;
     }
-    match &argv[index..] {
-        [query]
-            if matches!(
-                query.as_str(),
-                "--git-dir" | "--absolute-git-dir" | "--git-common-dir"
-            ) =>
+    path.map(|mut path| {
+        if path.kind == GitPathKind::Hooks
+            && let Some(input) = hooks_path
         {
-            Some(GitPath::new(GitPathKind::Directory))
+            output_inputs.push(input);
         }
-        [query, path] if query == "--git-path" => administered_path(path),
-        _ => None,
-    }
+        path.output_inputs = output_inputs;
+        path
+    })
 }
 
-fn attached_global_option(option: &str) -> bool {
-    ["--git-dir=", "--work-tree="].iter().any(|prefix| {
+fn attached_global_option(option: &str) -> Option<&str> {
+    ["--git-dir=", "--work-tree="].iter().find_map(|prefix| {
         option
             .strip_prefix(prefix)
-            .is_some_and(|value| !value.is_empty())
+            .filter(|value| !value.is_empty())
     })
 }
 
@@ -164,16 +243,31 @@ fn administered_path(path: &str) -> Option<GitPath> {
     // directory, whereas `hooks/../config` can leave a relocated hooks root.
     let trimmed = path.trim_start_matches("./");
     if path != trimmed
-        && (trimmed == "config" || trimmed == "hooks" || trimmed.starts_with("hooks/"))
+        && (administered_file(trimmed).is_some()
+            || trimmed == "hooks"
+            || trimmed.starts_with("hooks/"))
     {
         return GitPath::new(GitPathKind::Directory).append_literal(&format!("/{path}"));
     }
-    if path == "config" {
-        Some(GitPath::new(GitPathKind::Config))
+    if let Some(name) = administered_file(path) {
+        // In particular, `index` can be relocated through GIT_INDEX_FILE.
+        // Retain only the exact file identity, never its unknown parent.
+        Some(GitPath::new(GitPathKind::File(name)))
     } else if path == "hooks" {
         Some(GitPath::new(GitPathKind::Hooks))
     } else {
         GitPath::new(GitPathKind::Hooks).append_literal(path.strip_prefix("hooks")?)
+    }
+}
+
+fn administered_file(path: &str) -> Option<&'static str> {
+    match path {
+        "config" => Some("config"),
+        "HEAD" => Some("HEAD"),
+        "index" => Some("index"),
+        "config.worktree" => Some("config.worktree"),
+        "config.lock" => Some("config.lock"),
+        _ => None,
     }
 }
 
@@ -279,6 +373,99 @@ mod tests {
     }
 
     #[test]
+    fn nonprinting_query_options_preserve_one_path_result() {
+        for options in [
+            "--quiet --git-dir",
+            "-q --git-common-dir",
+            "--git-dir --quiet",
+            "--git-dir --path-format=absolute",
+            "--path-format=relative -q --git-dir --path-format=absolute",
+        ] {
+            let source = format!("git rev-parse {options}");
+            assert_eq!(resolve_query(&source).unwrap().policy_path(), ".git/");
+        }
+        for source in [
+            "git rev-parse --quiet --git-dir --git-common-dir",
+            "git rev-parse --git-path hooks --quiet --git-dir",
+            "git rev-parse --quiet --show-toplevel",
+            "git rev-parse --git-dir --path-format=unknown",
+            "git rev-parse --quiet --path-format=absolute",
+        ] {
+            assert!(resolve_query(source).is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn administered_files_keep_exact_file_identity() {
+        for name in ["config", "HEAD", "index", "config.worktree", "config.lock"] {
+            let source = format!("git -C /linked/worktree rev-parse --git-path {name} -q");
+            let path = resolve_query(&source).unwrap();
+            assert_eq!(path.policy_path(), format!(".git/{name}"));
+            // The index may be relocated to any filename. Neither its parent
+            // nor a neighboring filename inherits the returned file's origin.
+            for suffix in [".bak", "/../notes.txt", "/child"] {
+                assert!(path.append_literal(suffix).is_none(), "{name}{suffix}");
+            }
+            let literal_relative = format!("git rev-parse --git-path ./{name}");
+            assert_eq!(
+                resolve_query(&literal_relative).unwrap().policy_path(),
+                format!(".git/{name}")
+            );
+        }
+        for name in ["HEAD.backup", "index-backup", "config.worktree-other"] {
+            assert!(resolve_query(&format!("git rev-parse --git-path {name}")).is_none());
+        }
+    }
+
+    #[test]
+    fn unquoted_fields_use_explicit_path_inputs_instead_of_policy_aliases() {
+        const DEFAULT_IFS: &str = " \t\n";
+        for source in [
+            "git -c core.hooksPath='/tmp/hooks /tmp/notes' rev-parse --git-path hooks",
+            "git -c core.hooksPath='/tmp/hooks*' rev-parse --git-path hooks/pre-commit",
+            "git -c Core.HooksPath='/tmp/hooks?' rev-parse --git-path hooks",
+            "git --git-dir='/tmp/admin dir' rev-parse --git-dir",
+            "git --git-dir '/tmp/admin[12]' rev-parse --git-path index",
+            "git --work-tree='/tmp/work tree' rev-parse --git-common-dir",
+            "git --work-tree '/tmp/work*' rev-parse --absolute-git-dir",
+            "git -C '/tmp/a worktree' rev-parse --git-dir",
+            "git rev-parse --path-format=relative --git-path 'hooks/a b/../pre-commit'",
+        ] {
+            let path = resolve_query(source).unwrap();
+            assert!(path.policy_path().starts_with(".git/"), "{source}");
+            assert!(!path.one_unquoted_field(DEFAULT_IFS), "{source}");
+        }
+        let spaced = resolve_query(
+            "git -c core.hooksPath='/tmp/hooks /tmp/notes' rev-parse --git-path hooks",
+        )
+        .unwrap();
+        assert!(spaced.one_unquoted_field(""));
+        assert!(spaced.one_unquoted_field("\n"));
+        assert!(
+            !spaced
+                .append_literal("/pre-commit")
+                .unwrap()
+                .one_unquoted_field(DEFAULT_IFS)
+        );
+        for source in [
+            "git rev-parse --git-dir",
+            "git -C '' rev-parse --git-dir",
+            "git -c core.hooksPath='/tmp/hooks /tmp/notes' rev-parse --git-dir",
+            "git -c core.hooksPath='/tmp/hooks /tmp/notes' rev-parse --git-path ./hooks",
+            "git -c core.hooksPath='/tmp/hooks /tmp/notes' -c core.hooksPath=/tmp/hooks rev-parse --git-path hooks",
+        ] {
+            let path = resolve_query(source).unwrap();
+            assert!(path.one_unquoted_field(DEFAULT_IFS), "{source}");
+            assert!(!path.one_unquoted_field("."), "{source}");
+        }
+        assert!(
+            !resolve_query("git -c core.hooksPath= rev-parse --git-path hooks")
+                .unwrap()
+                .one_unquoted_field(DEFAULT_IFS)
+        );
+    }
+
+    #[test]
     fn relocated_hooks_keep_their_own_root() {
         for source in [
             "git rev-parse --git-path hooks/pre-commit",
@@ -364,6 +551,45 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn formatted_query_boundaries_do_not_turn_siblings_into_hook_paths() {
+        for format in ["absolute", "relative"] {
+            for operand in ["hooks/", "hooks/.", "hooks/a/..", "hooks/a/b/.."] {
+                let source = format!(
+                    "git -c core.hooksPath=/tmp/hooks rev-parse --path-format={format} --git-path {operand}"
+                );
+                let path = resolve_query(&source).unwrap();
+                assert!(path.append_literal("notes").is_none(), "{source}");
+                assert!(path.append_literal("/pre-commit").is_some(), "{source}");
+            }
+        }
+        let unchanged = resolve_query("git rev-parse --git-path hooks/a/..").unwrap();
+        assert_eq!(
+            unchanged.append_literal("notes").unwrap().policy_path(),
+            ".git/hooks/a/..notes"
+        );
+        // A format option after the query cannot change text already printed.
+        let unchanged =
+            resolve_query("git rev-parse --git-path hooks/a/.. --path-format=absolute").unwrap();
+        assert_eq!(
+            unchanged.append_literal("notes").unwrap().policy_path(),
+            ".git/hooks/a/..notes"
+        );
+        let filename =
+            resolve_query("git rev-parse --path-format=absolute --git-path hooks/a/../pre-commit")
+                .unwrap();
+        assert_eq!(
+            filename.append_literal(".sample").unwrap().policy_path(),
+            ".git/hooks/pre-commit.sample"
+        );
+        // Suffixes appended after the query still retain their exact bytes.
+        let path = filename.append_literal("/../a/..").unwrap();
+        assert_eq!(
+            path.append_literal("notes").unwrap().policy_path(),
+            ".git/hooks/a/..notes"
+        );
     }
 
     #[test]

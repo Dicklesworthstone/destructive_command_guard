@@ -209,6 +209,8 @@ fn reported_scalar_destinations_have_their_literal_rule_identity() {
         "f=/etc/sudoers; result=$(tee -a \"$f\")",
         "f=/etc/sudoers; export result=$(tee -a \"$f\")",
         "if true; then f=/etc/sudoers; tee -a \"$f\"; fi",
+        "f=/etc/sudoers; while tee \"$f\"; do break; done",
+        "f=/etc/sudoers; until tee \"$f\"; do break; done",
     ] {
         fixture.deny(source, CREDENTIAL);
     }
@@ -269,6 +271,8 @@ fn scalar_values_are_snapshots_and_child_scopes_do_not_replace_them() {
         "f=/tmp/out; read f; tee -a \"$f\"",
         "f=/etc/sudoers; printf -- '%n' f; tee -a \"$f\"",
         r#"f=/etc/sudoers; printf '%s' "$((f=0))" "$(tee "$f")""#,
+        r#"f=/etc/sudoers; for x in "$((f=0))" "$(tee "$f")"; do :; done"#,
+        r#"f=/etc/sudoers; case "$((f=0))$(tee "$f")" in *) :;; esac"#,
     ] {
         fixture.allow(source);
     }
@@ -289,6 +293,8 @@ fn quoted_data_reads_and_benign_scalar_destinations_keep_their_behavior() {
         "f=/etc/sudoers; cat \"$f\"",
         "f=/etc/sudoers; chmod 600 \"$f\"",
         "f=/etc/sudoers; cp \"$f\" /tmp/backup",
+        "f=/tmp/out; while tee \"$f\"; do break; done",
+        "f=/tmp/out; until tee \"$f\"; do break; done",
         "option='--target-directory=/tmp'; cp /etc/sudoers \"$option\"",
         "f='$(git rev-parse --git-dir)/config'; printf '%s' \"$f\"",
         "printf '%s' 'f=/etc/sudoers; tee -a $f'",
@@ -305,6 +311,7 @@ fn unresolved_option_fields_do_not_turn_protected_sources_into_destinations() {
         "f=/etc/sudoers; options='--target-directory /tmp'; cp $options \"$f\"",
         "f=~/.ssh/authorized_keys; options='-t /tmp'; install $options \"$f\"",
         "options='-t /tmp'; d=$(git rev-parse --git-dir); cp $options \"$d/config\"",
+        "f=/etc/sudoers; sudo -- cp \"$unknown\" \"$f\"",
     ] {
         fixture.allow(source);
     }
@@ -313,6 +320,41 @@ fn unresolved_option_fields_do_not_turn_protected_sources_into_destinations() {
         "f=/etc/sudoers; options='-t /tmp'; cp $options source >> \"$f\"",
         CREDENTIAL,
     );
+    // After the writer's own option terminator, quoted unknown scalars keep
+    // one operand each and cannot change a later proved destination's role.
+    for source in [
+        "f=/etc/sudoers; cp -- \"$unknown_source\" \"$f\"",
+        "f=/etc/sudoers; tee -- \"$unknown\" \"$f\"",
+        "f=/etc/sudoers; sudo -- cp -- \"$unknown_source\" \"$f\"",
+    ] {
+        fixture.deny(source, CREDENTIAL);
+    }
+}
+
+#[test]
+fn complete_scalar_fields_keep_splitting_and_command_name_semantics() {
+    let fixture = Fixture::new();
+    for source in [
+        "f=/etc/sudoers; empty=; tee $empty \"$f\"",
+        "f=/etc/sudoers; empty=; tee ${empty} \"$f\"",
+        "empty=; f=/etc/sudoers; tee $empty\"$f\"",
+        "empty=; f=/etc/sudoers; tee $empty${empty} \"$f\"",
+        "files='/tmp/out /etc/sudoers'; tee $files",
+        "options='-t /etc'; cp $options sudoers",
+        "v='a b'; f=/etc/sudoers; X=$v tee \"$f\"",
+    ] {
+        fixture.deny(source, CREDENTIAL);
+    }
+    for source in [
+        "files='/tmp/out /etc/sudoers'; tee \"$files\"",
+        "empty=; f=/tmp/out; tee \"$empty\" \"$f\"",
+        "runner='x=y'; f=/etc/sudoers; $runner tee \"$f\"",
+        "runner='x=y'; f=/etc/sudoers; \"$runner\" tee \"$f\"",
+        "runner=if; f=/etc/sudoers; $runner tee \"$f\"",
+        "runner='!'; f=/etc/sudoers; $runner tee \"$f\"",
+    ] {
+        fixture.allow(source);
+    }
 }
 
 #[test]
@@ -324,6 +366,8 @@ fn heredoc_data_and_process_substitution_arguments_preserve_execution_boundaries
         "f=/etc/sudoers; tee /tmp/out <<DATA\n$f\nDATA",
         "f=/tmp/out; tee \"$f\" <<'DATA'\n/etc/sudoers\nDATA",
         "f=/etc/sudoers; cat <<'DATA'\n$(tee -a \"$f\")\nDATA",
+        "f=/etc/sudoers; { :; } <<'DATA'\n$(tee -a \"$f\")\nDATA",
+        "f=/etc/sudoers; { f=/tmp/out; cat <<'INNER' | tee \"$f\"\ndata\nINNER\n} <<'OUTER'\ndata\nOUTER",
         "f=/etc/sudoers; tee /tmp/out <(printf '%s' \"$f\")",
     ] {
         fixture.allow(source);
@@ -332,6 +376,8 @@ fn heredoc_data_and_process_substitution_arguments_preserve_execution_boundaries
         "f=/etc/sudoers; tee -a \"$f\" <<'DATA'\nordinary input\nDATA",
         "f=/etc/sudoers; cat <<DATA\n$(tee -a \"$f\")\nDATA",
         "f=/etc/sudoers; cat <<'DATA' | tee -a \"$f\"\nordinary input\nDATA",
+        "f=/etc/sudoers; { :; } <<DATA\n$(tee -a \"$f\")\nDATA",
+        "f=/etc/sudoers; unused=x <<DATA\n$(tee -a \"$f\")\nDATA",
     ] {
         fixture.deny(source, CREDENTIAL);
     }
@@ -343,6 +389,8 @@ fn git_admin_queries_and_bound_values_reach_native_writer_rules() {
     for source in [
         "cp source .git/config",
         "cp source \"$(git rev-parse --git-dir)/config\"",
+        "cp source \"$(git rev-parse --quiet --git-dir)/config\"",
+        "cp source \"$(git rev-parse --git-dir --path-format=absolute)/config\"",
         "cp source $(git rev-parse --git-dir)/config",
         "cp source \"`git rev-parse --git-dir`/config\"",
         "cp source \"$(git rev-parse --absolute-git-dir)/config\"",
@@ -350,10 +398,16 @@ fn git_admin_queries_and_bound_values_reach_native_writer_rules() {
         "cp source \"$(git rev-parse --git-path hooks)/pre-commit\"",
         "cp source \"$(git rev-parse --git-path hooks/pre-commit)\"",
         "cp source \"$(git rev-parse --git-path config)\"",
+        "cp source \"$(git rev-parse --git-path HEAD)\"",
+        "cp source \"$(git rev-parse --git-path index)\"",
+        "cp source \"$(git rev-parse --git-path config.worktree)\"",
+        "cp source \"$(git rev-parse --git-path config.lock)\"",
         "cp config \"$(git rev-parse --git-dir)\"",
         "cp pre-commit \"$(git rev-parse --git-path hooks)\"",
         "dd if=source of=\"$(git rev-parse --git-path config)\"",
         "cp source \"$(git -c core.hooksPath=/tmp/hooks rev-parse --git-path hooks/pre-commit)\"",
+        "cp source \"$(git -c core.hooksPath='/tmp/hooks /tmp/notes' rev-parse --git-path hooks)\"",
+        "cp source \"$(git -c core.hooksPath='/tmp/dcg-hooks*' rev-parse --git-path hooks)\"",
         "cp source \"$(git -c core.hooksPath=/tmp/hooks rev-parse --git-path ./hooks/../config)\"",
         "cp source \"$(git rev-parse --git-dir)/hooks/../config\"",
         "cp source \"$(git rev-parse --git-path hooks)/sub/../pre-commit\"",
@@ -404,6 +458,9 @@ fn ordinary_queries_traversal_and_literal_query_text_are_not_git_destinations() 
         "cp source \"$(git rev-parse --git-path ../notes.txt)\"",
         "cp source \"$(git rev-parse --git-path hooks/../notes.txt)\"",
         "cp source \"$(git rev-parse --git-path hooks)/../notes.txt\"",
+        "cp source \"$(git -c core.hooksPath=/tmp/dcg-hooks rev-parse --path-format=absolute --git-path hooks/a/..)\"notes",
+        "cp source $(git -c core.hooksPath='/tmp/hooks /tmp/notes' rev-parse --git-path hooks)",
+        "cp source $(git -c core.hooksPath='/tmp/dcg-hooks*' rev-parse --git-path hooks)",
         "cp source '$(git rev-parse --git-dir)/config'",
         "cp source '`git rev-parse --git-dir`/config'",
         "d='$(git rev-parse --git-dir)'; cp source \"$d/config\"",
@@ -435,6 +492,18 @@ fn single_rule_grants_do_not_hide_other_indirect_destination_families() {
             GIT_WRITE,
             "d=$(git rev-parse --git-dir); tee -a \"$d/config\"",
             "f=/etc/sudoers; d=$(git rev-parse --git-dir); tee -a \"$d/config\" \"$f\"",
+            CREDENTIAL,
+        ),
+        (
+            CREDENTIAL,
+            "files='/tmp/out /etc/sudoers'; tee $files",
+            "files='/tmp/out /etc/sudoers .git/config'; tee $files",
+            GIT_WRITE,
+        ),
+        (
+            GIT_WRITE,
+            "files='/tmp/out .git/config'; tee $files",
+            "files='/tmp/out .git/config /etc/sudoers'; tee $files",
             CREDENTIAL,
         ),
         (

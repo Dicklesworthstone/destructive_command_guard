@@ -5,7 +5,7 @@
 //! reparses expanded data as shell syntax. Unknown values lose their proof.
 
 use super::super::word_splitting;
-use super::{CredentialFileWrite, Token, Word, classify_simple_command, git_redirect_write};
+use super::{CredentialFileWrite, Token, Word, classify_expanded_command, git_redirect_write};
 use crate::normalize::ShellDialect;
 use ast_grep_core::{AstGrep, Node, tree_sitter::StrDoc};
 use ast_grep_language::SupportLang;
@@ -132,6 +132,11 @@ impl Value {
         let Some(ifs) = state.ifs.as_deref() else {
             return false;
         };
+        if let Self::Git { path, .. } = self
+            && !path.one_unquoted_field(ifs)
+        {
+            return false;
+        }
         let Some(word) = self.word(0..0) else {
             return false;
         };
@@ -154,6 +159,77 @@ fn path_prefix(prefix: &str) -> bool {
         prefix,
         "" | "of=" | "-t" | "--target-directory=" | "-C" | "--directory=" | "-o"
     )
+}
+
+fn scalar_name(raw: &str) -> Option<&str> {
+    let name = raw
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .or_else(|| raw.strip_prefix('$'))?;
+    word_splitting::identifier(name).then_some(name)
+}
+
+/// Only a complete scalar read can be split independently of neighboring
+/// literal/quoted pieces. Expanded bytes stay data, including quotes and `$`.
+fn scalar_fields(raw: &str, state: &State, range: Range<usize>) -> Option<Vec<Word>> {
+    if state.attributes_unknown {
+        return None;
+    }
+    let value = state.values.get(scalar_name(raw)?)?.literal()?;
+    word_splitting::fields(value, state.ifs.as_deref()?)
+        .ok()?
+        .into_iter()
+        .map(|field| Value::Literal(field.to_owned()).word(range.clone()))
+        .collect()
+}
+
+fn quoted_scalar_field(raw: &str) -> bool {
+    raw.strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .and_then(scalar_name)
+        .is_some()
+}
+
+fn source_command<'a>(
+    node: &Node<'a, StrDoc<SupportLang>>,
+) -> Option<Node<'a, StrDoc<SupportLang>>> {
+    if node.kind() == "command" {
+        Some(node.clone())
+    } else {
+        node.field("body").filter(|body| body.kind() == "command")
+    }
+}
+
+/// Quoted opaque scalar operands after the writer's own `--` cannot inject
+/// options or alter operand count. Wrapper separators do not establish this
+/// boundary for the wrapped writer, and unknown unquoted fields never qualify.
+fn argv_ownership_proven(tokens: &[Token], unknown: &[(Range<usize>, bool)]) -> bool {
+    if unknown.is_empty() {
+        return true;
+    }
+    let words: Vec<_> = tokens
+        .iter()
+        .filter_map(|token| match token {
+            Token::Word(word) => Some(word),
+            _ => None,
+        })
+        .collect();
+    let Some(argv) = super::strip_prefixes_in_view(&words, false) else {
+        return false;
+    };
+    let mut operands = false;
+    let mut accepted = 0;
+    for word in argv.iter().skip(1) {
+        if let Some((_, single)) = unknown.iter().find(|(range, _)| *range == word.range) {
+            if !operands || !single {
+                return false;
+            }
+            accepted += 1;
+        } else if word.is_all_literal() && word.as_string() == "--" {
+            operands = true;
+        }
+    }
+    accepted == unknown.len()
 }
 
 #[derive(Clone)]
@@ -225,6 +301,7 @@ impl State {
 struct Decoded {
     value: Value,
     expanded: bool,
+    present: bool,
 }
 
 /// Decode a single scalar, retaining quoted data and expansion-time origins.
@@ -240,6 +317,7 @@ fn decode(raw: &str, state: &State, assignment: bool) -> Option<Decoded> {
     let mut quote = None;
     let mut index = 0;
     let mut expanded = false;
+    let mut quoted = false;
     while index < raw.len() {
         let ch = raw[index..].chars().next()?;
         let here = index;
@@ -247,7 +325,10 @@ fn decode(raw: &str, state: &State, assignment: bool) -> Option<Decoded> {
         match (quote, ch) {
             (Some('\''), '\'') | (Some('"'), '"') => quote = None,
             (Some('\''), _) => chunk.push(ch),
-            (None, '\'' | '"') => quote = Some(ch),
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                quoted = true;
+            }
             (_, '\\') => {
                 let next = raw[index..].chars().next()?;
                 index += next.len_utf8();
@@ -279,6 +360,7 @@ fn decode(raw: &str, state: &State, assignment: bool) -> Option<Decoded> {
                         return None;
                     }
                     index = end;
+                    quoted = true;
                     Value::Literal(word.as_string())
                 } else {
                     if state.attributes_unknown {
@@ -314,7 +396,11 @@ fn decode(raw: &str, state: &State, assignment: bool) -> Option<Decoded> {
                         })
                     })?
                 };
-                if !assignment && quote.is_none() && !next.one_unquoted_field(state) {
+                if !assignment
+                    && quote.is_none()
+                    && next.literal() != Some("")
+                    && !next.one_unquoted_field(state)
+                {
                     return None;
                 }
                 value = value.append(next)?;
@@ -348,9 +434,12 @@ fn decode(raw: &str, state: &State, assignment: bool) -> Option<Decoded> {
     if quote.is_some() {
         return None;
     }
+    let value = value.append(Value::Literal(chunk))?;
+    let present = quoted || value.literal().is_none_or(|value| !value.is_empty());
     Some(Decoded {
-        value: value.append(Value::Literal(chunk))?,
+        value,
         expanded,
+        present,
     })
 }
 
@@ -467,7 +556,7 @@ impl Scanner<'_> {
         }
         match node.kind().as_ref() {
             "program" | "variable_assignments" | "do_group" | "negated_command" => {
-                self.children(node, state, depth)
+                self.children(node, state, depth);
             }
             "variable_assignment" => {
                 if has_expansion_effect(node.clone()) {
@@ -487,15 +576,20 @@ impl Scanner<'_> {
                     self.heredoc_tail(node, &incoming, state, depth);
                 } else {
                     // Redirections open before an assignment/group runs.
-                    for child in node
-                        .children()
-                        .filter(|child| child.kind() == "file_redirect")
-                    {
+                    let incoming = state.clone();
+                    for child in node.children().filter(|child| {
+                        matches!(
+                            child.kind().as_ref(),
+                            "file_redirect" | "heredoc_redirect" | "herestring_redirect"
+                        )
+                    }) {
                         if has_expansion_effect(child.clone()) {
                             state.forget();
                         }
                         self.nested(child.clone(), state, depth + 1);
-                        self.targets(child, state);
+                        if child.kind() == "file_redirect" {
+                            self.targets(child, state);
+                        }
                     }
                     if let Some(body) = node.field("body") {
                         let before = state.clone();
@@ -503,11 +597,12 @@ impl Scanner<'_> {
                         // An open failure may prevent the body's assignments.
                         state.intersect(&before);
                     }
+                    self.heredoc_tail(node, &incoming, state, depth);
                 }
             }
             "subshell" => self.children(node, &mut state.clone(), depth),
             "compound_statement" if node.text().trim_start().starts_with('{') => {
-                self.children(node, state, depth)
+                self.children(node, state, depth);
             }
             "pipeline" => {
                 let incoming = state.clone();
@@ -530,25 +625,45 @@ impl Scanner<'_> {
             "for_statement" | "while_statement" | "c_style_for_statement" => {
                 let mut iteration = state.clone();
                 let body = node.field("body");
-                for header in node.children().filter(|child| {
-                    child.is_named()
-                        && body
-                            .as_ref()
-                            .is_none_or(|body| body.range() != child.range())
-                }) {
-                    self.nested(header, &iteration, depth + 1);
-                }
+                let headers: Vec<_> = node
+                    .children()
+                    .filter(|child| {
+                        child.is_named()
+                            && body
+                                .as_ref()
+                                .is_none_or(|body| body.range() != child.range())
+                    })
+                    .collect();
                 if node.kind() == "for_statement" {
+                    if headers
+                        .iter()
+                        .any(|header| has_expansion_effect(header.clone()))
+                    {
+                        iteration.forget();
+                    }
+                    for header in headers {
+                        self.nested(header, &iteration, depth + 1);
+                    }
                     if let Some(variable) = node.field("variable") {
                         iteration.values.remove(variable.text().as_ref());
                     }
-                    if has_expansion_effect(node.clone()) {
-                        iteration.forget();
+                } else if node.kind() == "while_statement" {
+                    // The first while/until condition always runs with the
+                    // incoming bindings, including direct writer commands.
+                    for header in headers {
+                        if word_splitting::has_async_terminator(&header) {
+                            self.walk(header, &mut iteration.clone(), depth + 1);
+                        } else {
+                            self.walk(header, &mut iteration, depth + 1);
+                        }
                     }
                 } else {
                     // Later iterations and arithmetic loop headers can change
                     // any binding. Body-local assignments can still prove it.
                     iteration.forget();
+                    for header in headers {
+                        self.nested(header, &iteration, depth + 1);
+                    }
                 }
                 if let Some(body) = body {
                     self.walk(body, &mut iteration, depth + 1);
@@ -559,6 +674,9 @@ impl Scanner<'_> {
             }
             "case_statement" => {
                 if let Some(value) = node.field("value") {
+                    if has_expansion_effect(value.clone()) {
+                        state.forget();
+                    }
                     self.nested(value, state, depth + 1);
                 }
                 for branch in node.children().filter(|child| child.kind() == "case_item") {
@@ -676,7 +794,7 @@ impl Scanner<'_> {
         }
     }
 
-    fn declaration(&mut self, node: Node<'_, StrDoc<SupportLang>>, state: &mut State) {
+    fn declaration(&self, node: Node<'_, StrDoc<SupportLang>>, state: &mut State) {
         let raw = node.text();
         let tokens = super::tokenize(raw.as_ref());
         let words: Vec<_> = tokens
@@ -726,15 +844,13 @@ impl Scanner<'_> {
                 _ => None,
             })
             .collect();
-        let Some(command_index) = words
-            .iter()
-            .position(|word| !crate::normalize::is_env_assignment(&word.as_string()))
-        else {
+        let Some(command_word) = words.first() else {
+            state.forget();
             return;
         };
-        let name = super::executable_name(words[command_index]);
+        let name = super::executable_name(command_word);
         let mutation = name.as_deref().is_none_or(word_splitting::mutates_shell);
-        let mut format_index = command_index + 1;
+        let mut format_index = 1;
         if words
             .get(format_index)
             .is_some_and(|word| word.is_all_literal() && word.as_string() == "--")
@@ -774,8 +890,18 @@ impl Scanner<'_> {
                     )
                 });
         } else if name.as_deref().is_some_and(word_splitting::special_builtin) {
-            for word in &words[..command_index] {
-                if let Some((name, _, _)) = word_splitting::assignment(&word.as_string()) {
+            let prefixes: Vec<_> = source_command(&node)
+                .into_iter()
+                .flat_map(|command| {
+                    command
+                        .children()
+                        .filter(|child| child.kind() == "variable_assignment")
+                        .map(|child| child.text().into_owned())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            for prefix in prefixes {
+                if let Some((name, _, _)) = word_splitting::assignment(&prefix) {
                     state.values.remove(name);
                     if name == "IFS" {
                         state.ifs = None;
@@ -789,6 +915,13 @@ impl Scanner<'_> {
         if depth > MAX_DEPTH {
             return;
         }
+        if matches!(
+            node.kind().as_ref(),
+            "command_substitution" | "process_substitution"
+        ) {
+            self.children(node, &mut state.clone(), depth);
+            return;
+        }
         for child in node.children() {
             self.visited += 1;
             if self.visited > MAX_NODES {
@@ -799,7 +932,7 @@ impl Scanner<'_> {
             }
             match child.kind().as_ref() {
                 "command_substitution" | "process_substitution" => {
-                    self.children(child, &mut state.clone(), depth)
+                    self.children(child, &mut state.clone(), depth);
                 }
                 // Quoted heredoc bodies have no expansion children. In an
                 // unquoted body only its typed expansions are executable.
@@ -816,7 +949,12 @@ impl Scanner<'_> {
         state: &mut State,
         depth: usize,
     ) {
-        let mut pending = vec![node];
+        // Only this statement's redirects own its continuation. Descending
+        // into a grouped body would revisit inner tails with the outer state.
+        let mut pending: Vec<_> = node
+            .children()
+            .filter(|child| child.kind() == "heredoc_redirect")
+            .collect();
         while let Some(part) = pending.pop() {
             self.visited += 1;
             if self.visited > MAX_NODES {
@@ -848,6 +986,9 @@ impl Scanner<'_> {
             return Vec::new();
         }
         let span = node.range();
+        let command_start = source_command(&node)
+            .and_then(|command| command.field("name"))
+            .map(|name| name.range().start);
         let Some(source) = self.source.get(span.clone()) else {
             return Vec::new();
         };
@@ -881,35 +1022,65 @@ impl Scanner<'_> {
         }
         let masked = masked.and_then(|bytes| String::from_utf8(bytes).ok());
         let raw = masked.as_deref().unwrap_or(source);
-        let mut tokens = super::tokenize(raw);
-        if tokens.len() > MAX_TOKENS {
+        let source_tokens = super::tokenize(raw);
+        if source_tokens.len() > MAX_TOKENS {
             return Vec::new();
         }
+        let mut tokens = Vec::new();
         let mut expanded = false;
-        let mut argv_proven = true;
+        let mut unknown = Vec::new();
         let mut materialized = 0usize;
-        for token in &mut tokens {
-            let argument = matches!(token, Token::Word(_));
-            let word = match token {
+        for mut token in source_tokens {
+            let argument = matches!(&token, Token::Word(_));
+            let word = match &mut token {
                 Token::Word(word) | Token::Write { target: word, .. } => word,
                 Token::Separator => continue,
             };
             let local = word.range.clone();
             let range = span.start + local.start..span.start + local.end;
-            if let Some(decoded) = decode(&raw[local], state, false)
+            // Assignment prefixes have syntactic ownership before expansion.
+            // Their RHS cannot turn into writer arguments, even if unknown.
+            if argument && command_start.is_some_and(|start| range.start < start) {
+                continue;
+            }
+            let source_word = &raw[local];
+            if argument && let Some(fields) = scalar_fields(source_word, state, range.clone()) {
+                expanded = true;
+                materialized += fields.iter().map(|word| word.text.len()).sum::<usize>();
+                tokens.extend(fields.into_iter().map(Token::Word));
+                if tokens.len() > MAX_TOKENS || materialized > MAX_MATERIALIZED_BYTES {
+                    return Vec::new();
+                }
+                continue;
+            }
+            if let Some(decoded) = decode(source_word, state, false)
                 && let Some(mut proven) = decoded.value.word(range.clone())
             {
                 expanded |= decoded.expanded;
+                if !decoded.present {
+                    if argument {
+                        // Unquoted empty pieces contribute no field, unless
+                        // another literal or quoted piece preserves the word.
+                        continue;
+                    }
+                    // An empty unquoted redirect is ambiguous, not a path.
+                    word.range = range;
+                    tokens.push(token);
+                    continue;
+                }
                 proven.glued_paren = word.glued_paren;
                 *word = proven;
             } else {
-                word.range = range;
-                argv_proven &= !argument;
+                word.range = range.clone();
+                if argument {
+                    unknown.push((range, quoted_scalar_field(source_word)));
+                }
             }
             materialized += word.text.len();
-            if materialized > MAX_MATERIALIZED_BYTES {
+            if tokens.len() >= MAX_TOKENS || materialized > MAX_MATERIALIZED_BYTES {
                 return Vec::new();
             }
+            tokens.push(token);
         }
         if !expanded {
             return tokens;
@@ -919,7 +1090,7 @@ impl Scanner<'_> {
                 if let Some(hit) = git_redirect_write(target, *mode) {
                     self.hits.push(hit);
                 }
-                if let Some(hit) = classify_simple_command(std::slice::from_ref(token)) {
+                if let Some(hit) = classify_expanded_command(std::slice::from_ref(token)) {
                     self.hits.push(hit);
                 }
             }
@@ -927,7 +1098,7 @@ impl Scanner<'_> {
         // An unresolved field can introduce options or several operands.
         // Do not mistake a protected source for the destination of `cp $opts
         // "$source"`. Independently proved redirections above remain writes.
-        if !argv_proven {
+        if !argv_ownership_proven(&tokens, &unknown) {
             return tokens;
         }
         // Keep all rule families. An allowlist for one target must not grant
@@ -937,24 +1108,37 @@ impl Scanner<'_> {
             .filter(|token| matches!(token, Token::Word(_)))
             .cloned()
             .collect();
+        // Several fields from `$files` share one source span. Give each field
+        // a distinct temporary range for the native policy, then map every
+        // finding back before it can leave this function. This preserves all
+        // rule families when an allowlist waives only one split destination.
+        let mut origins = Vec::new();
+        for (index, token) in remaining.iter_mut().enumerate() {
+            if let Token::Word(word) = token {
+                origins.push(word.range.clone());
+                word.range = index * (MAX_VALUE_BYTES + 1)..(index + 1) * (MAX_VALUE_BYTES + 1);
+            }
+        }
         for _ in 0..remaining.len() {
-            let Some(mut hit) = classify_simple_command(&remaining) else {
+            let Some(mut hit) = classify_expanded_command(&remaining) else {
                 break;
             };
-            let Some(word) = remaining.iter_mut().find_map(|token| {
-                let word = match token {
-                    Token::Word(word) | Token::Write { target: word, .. } => word,
-                    Token::Separator => return None,
-                };
-                (word.range.start <= hit.span.start && word.range.end >= hit.span.end)
-                    .then_some(word)
-            }) else {
+            let Some((index, word)) =
+                remaining.iter_mut().enumerate().find_map(|(index, token)| {
+                    let word = match token {
+                        Token::Word(word) | Token::Write { target: word, .. } => word,
+                        Token::Separator => return None,
+                    };
+                    (word.range.start <= hit.span.start && word.range.end >= hit.span.end)
+                        .then_some((index, word))
+                })
+            else {
                 break;
             };
             // Expanded option prefixes may be longer than their source
             // (`$out` can carry `of=/etc/sudoers`). Native suffix offsets are
             // decoded offsets, so report the original enclosing word instead.
-            hit.span = word.range.clone();
+            hit.span = origins[index].clone();
             word.text = vec!['x'];
             word.literal = vec![true];
             word.glued_paren = false;

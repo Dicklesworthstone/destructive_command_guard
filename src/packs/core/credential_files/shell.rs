@@ -3325,11 +3325,22 @@ fn skip_wrapper(name: &str, args: &[&Word]) -> Option<usize> {
 const MAX_WRAPPER_DEPTH: usize = 16;
 
 /// Drop reserved words, leading assignments, and wrapper commands.
-fn strip_prefixes<'a>(mut words: &'a [&'a Word]) -> Option<&'a [&'a Word]> {
+fn strip_prefixes<'a>(words: &'a [&'a Word]) -> Option<&'a [&'a Word]> {
+    strip_prefixes_in_view(words, true)
+}
+
+/// Expanded argv has already lost syntactic assignment/reserved-word roles.
+/// A value such as `x=y` or `if` is an executable name, not new shell syntax.
+fn strip_prefixes_in_view<'a>(
+    mut words: &'a [&'a Word],
+    source_syntax: bool,
+) -> Option<&'a [&'a Word]> {
     for _ in 0..MAX_WRAPPER_DEPTH {
         let first = *words.first()?;
         let text = first.as_string();
-        if crate::context::is_shell_command_prefix_reserved_word(&text) || is_env_assignment(&text)
+        if source_syntax
+            && (crate::context::is_shell_command_prefix_reserved_word(&text)
+                || is_env_assignment(&text))
         {
             words = &words[1..];
             continue;
@@ -3346,6 +3357,14 @@ fn strip_prefixes<'a>(mut words: &'a [&'a Word]) -> Option<&'a [&'a Word]> {
 }
 
 fn classify_simple_command(tokens: &[Token]) -> Option<CredentialFileWrite> {
+    classify_command_in_view(tokens, true)
+}
+
+fn classify_expanded_command(tokens: &[Token]) -> Option<CredentialFileWrite> {
+    classify_command_in_view(tokens, false)
+}
+
+fn classify_command_in_view(tokens: &[Token], source_syntax: bool) -> Option<CredentialFileWrite> {
     let mut words: Vec<&Word> = Vec::new();
     for token in tokens {
         match token {
@@ -3366,7 +3385,11 @@ fn classify_simple_command(tokens: &[Token]) -> Option<CredentialFileWrite> {
             Token::Separator => {}
         }
     }
-    let argv = strip_prefixes(&words)?;
+    let argv = if source_syntax {
+        strip_prefixes(&words)
+    } else {
+        strip_prefixes_in_view(&words, false)
+    }?;
     let (argv0, args) = argv.split_first()?;
     let kind = writer_kind(&executable_name(argv0)?)?;
     match kind {
