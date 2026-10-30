@@ -11717,6 +11717,190 @@ pub fn mask_non_expanding_data_heredocs(command: &str) -> std::borrow::Cow<'_, s
     mask_non_executing_heredocs_with_policy(command, true)
 }
 
+/// The output of a substitution inside stdin data is not an outer-shell
+/// executable name. This view is only for launcher discovery: callers must
+/// still inspect the original source's live substitutions independently.
+pub(crate) fn mask_launcher_stdin_data(command: &str) -> Cow<'_, str> {
+    if !command.contains("<<") || command.len() > MAX_SUBSTITUTION_SOURCE_BYTES {
+        return Cow::Borrowed(command);
+    }
+    let Some(heredocs) = active_heredocs(command) else {
+        return Cow::Borrowed(command);
+    };
+    let discarded = discarded_heredoc_operators(command);
+    let bodies: Vec<_> = heredocs
+        .iter()
+        .filter_map(|heredoc| match heredoc.body {
+            ActiveHeredocBody::Heredoc {
+                body_start,
+                body_end,
+                ..
+            } => Some(body_start..body_end),
+            ActiveHeredocBody::HereString => None,
+        })
+        .collect();
+    let mut output_executed = None;
+    let masked: Vec<_> = heredocs
+        .iter()
+        .filter_map(|heredoc| {
+            let ActiveHeredocBody::Heredoc {
+                body_start,
+                body_end,
+                ..
+            } = heredoc.body
+            else {
+                return None;
+            };
+            if discarded.contains(&heredoc.operator_start) {
+                return Some(body_start..body_end);
+            }
+            if heredoc.output != Some(HeredocOutput::Contained)
+                || heredoc.live_spans.is_none()
+                || stdin_is_the_program(command, heredoc.operator_start)
+            {
+                return None;
+            }
+            let target = extract_heredoc_target_command(command, heredoc.operator_start)?;
+            let data_sink = is_non_executing_heredoc_command(&target)
+                || is_noop_stdin_discarding_command(&target)
+                || is_structured_stdin_data_sink(command, heredoc.operator_start);
+            (data_sink
+                && !stdin_data_sink_may_be_overridden(command, heredoc.operator_start, &target)
+                && !*output_executed
+                    .get_or_insert_with(|| written_file_is_executed(command, &bodies)))
+            .then_some(body_start..body_end)
+        })
+        .collect();
+    if masked.is_empty() {
+        Cow::Borrowed(command)
+    } else {
+        Cow::Owned(blank_ranges(command, &masked))
+    }
+}
+
+/// Only simple literal assignments and no-op groups establish that no command
+/// reads this descriptor. A group containing `bash`, `read`, a substitution,
+/// or an unknown command can consume and execute the body and never qualifies.
+fn discarded_heredoc_operators(command: &str) -> Vec<usize> {
+    const MAX_PROOF_NODES: usize = 4096;
+    let Ok(ast) = try_parse_shell_ast(command) else {
+        return Vec::new();
+    };
+    if ast.root().get_inner_node().has_error() {
+        return Vec::new();
+    }
+    let nodes: Vec<_> = ast.root().dfs().take(MAX_PROOF_NODES + 1).collect();
+    if nodes.len() > MAX_PROOF_NODES {
+        return Vec::new();
+    }
+    let assignment_attributes_known = !nodes.iter().any(|node| match node.kind().as_ref() {
+        "declaration_command" | "function_definition" => true,
+        "command_name" => {
+            let text = node.text();
+            crate::normalize::decode_posix_literal_word(text.as_ref()).is_none_or(|name| {
+                matches!(
+                    name.as_ref(),
+                    "eval"
+                        | "."
+                        | "source"
+                        | "trap"
+                        | "declare"
+                        | "typeset"
+                        | "local"
+                        | "readonly"
+                        | "export"
+                        | "builtin"
+                        | "command"
+                        | "alias"
+                        | "unalias"
+                        | "enable"
+                )
+            })
+        }
+        _ => false,
+    });
+    let mut discarded = Vec::new();
+    let mut pending = vec![ast.root()];
+    while let Some(node) = pending.pop() {
+        if node.kind().as_ref() != "heredoc_redirect" {
+            if node.kind().as_ref() != "heredoc_body" {
+                pending.extend(node.children());
+            }
+            continue;
+        }
+        let Some(owner) = node.parent() else {
+            continue;
+        };
+        let Some(body) = owner.field("body") else {
+            continue;
+        };
+        if owner.kind().as_ref() != "redirected_statement"
+            || owner
+                .children()
+                .filter(ast_grep_core::Node::is_named)
+                .any(|child| child.range() != body.range() && child.range() != node.range())
+            || node
+                .children()
+                .filter(ast_grep_core::Node::is_named)
+                .any(|child| {
+                    !matches!(
+                        child.kind().as_ref(),
+                        "heredoc_start" | "heredoc_body" | "heredoc_end"
+                    )
+                })
+        {
+            continue;
+        }
+        let discards = if body.kind().as_ref() == "compound_statement"
+            && body.text().trim_start().starts_with('{')
+        {
+            body.children()
+                .filter(ast_grep_core::Node::is_named)
+                .all(|child| static_stdin_discarder(command, &child, assignment_attributes_known))
+        } else {
+            static_stdin_discarder(command, &body, assignment_attributes_known)
+        };
+        if discards && let Some(offset) = node.text().find("<<") {
+            discarded.push(node.range().start + offset);
+        }
+    }
+    discarded
+}
+
+fn static_stdin_discarder<D: ast_grep_core::Doc>(
+    command: &str,
+    node: &ast_grep_core::Node<'_, D>,
+    assignment_attributes_known: bool,
+) -> bool {
+    match node.kind().as_ref() {
+        "comment" => true,
+        "variable_assignment" if assignment_attributes_known => {
+            let text = node.text();
+            text.split_once('=').is_some_and(|(name, value)| {
+                is_static_shell_name(name)
+                    && crate::normalize::decode_posix_literal_word(value).is_some()
+            })
+        }
+        "command" => {
+            let Some(name) = node.field("name") else {
+                return false;
+            };
+            let name_text = name.text();
+            let Some(program) = crate::normalize::decode_posix_literal_word(name_text.as_ref())
+            else {
+                return false;
+            };
+            is_noop_stdin_discarding_command(&program)
+                && node
+                    .children()
+                    .filter(ast_grep_core::Node::is_named)
+                    .all(|child| child.range() == name.range())
+                && !stdin_data_sink_may_be_overridden(command, name.range().end, &program)
+        }
+        _ => false,
+    }
+}
+
 fn mask_non_executing_heredocs_with_policy(
     command: &str,
     require_quoted_delimiter: bool,
@@ -22721,6 +22905,39 @@ EOF";
             mask_non_executing_heredocs(&after).contains(&rmrf),
             "commands after the terminator must remain scannable: {after:?}"
         );
+    }
+
+    #[test]
+    fn launcher_stdin_view_does_not_promote_data_expansions_to_command_names() {
+        for command in [
+            "f=/etc/sudoers; cat <<DATA\n$(tee -a \"$f\")\nDATA",
+            "f=/etc/sudoers; { :; } <<'DATA'\n$(tee -a \"$f\")\nDATA",
+            "f=/etc/sudoers; { :; } <<DATA\n$(tee -a \"$f\")\nDATA",
+            "f=/etc/sudoers; unused=x <<DATA\n$(tee -a \"$f\")\nDATA",
+        ] {
+            let masked = mask_launcher_stdin_data(command);
+            assert_eq!(masked.len(), command.len(), "{command}");
+            assert!(!masked.contains("$(tee"), "{command}");
+            assert!(masked.contains("f=/etc/sudoers"), "{command}");
+        }
+        let expanding = "cat <<DATA\n$(tee /etc/sudoers)\nDATA";
+        assert!(mask_non_expanding_data_heredocs(expanding).contains("$(tee"));
+
+        // Real shell receivers and routes that run the data keep the normal
+        // launcher analysis. So do groups with a command that can read stdin.
+        for command in [
+            "sh <<'DATA'\n$(unknown) -c payload\nDATA",
+            "{ bash; } <<'DATA'\n$(unknown) -c payload\nDATA",
+            "{ read cmd; eval \"$cmd\"; } <<'DATA'\n$(unknown) -c payload\nDATA",
+            "{ : \"$(sh)\"; } <<'DATA'\n$(unknown) -c payload\nDATA",
+            "a[$(sh)]=x <<'DATA'\n$(unknown) -c payload\nDATA",
+            "declare -i value; value=other <<'DATA'\n$(unknown) -c payload\nDATA",
+            "declare -n value=items; value=other <<'DATA'\n$(unknown) -c payload\nDATA",
+            "cat <<'DATA' | sh\n$(unknown) -c payload\nDATA",
+            "cat > script.sh <<'DATA'\n$(unknown) -c payload\nDATA\nsh script.sh",
+        ] {
+            assert_eq!(mask_launcher_stdin_data(command), command, "{command}");
+        }
     }
 
     /// Cross-line soundness for the existing #109 data-sink path: a `cat`/`tee`

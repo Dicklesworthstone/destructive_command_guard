@@ -6089,13 +6089,21 @@ fn evaluate_windows_launcher_envelopes(
     // a Windows shell launcher. A quoted body that is a proven non-shell
     // interpreter's program (`python3 - <<'PY'`) is not shell syntax either:
     // its own language's analysis and the raw rescan judge it (#560).
-    // Expanding heredocs and executing targets stay visible, preserving the
-    // fail-closed path for real substitutions.
+    // Substitution output supplied as contained stdin data is not an outer
+    // executable name either. Only this launcher view hides those bodies;
+    // the original source still reaches live command-substitution analysis.
+    // Executing or ambiguous receivers retain the fail-closed launcher path.
     let data_view;
+    let stdin_view;
     let launcher_source = match outer_dialect {
         ShellDialect::Posix | ShellDialect::Unknown => {
             data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
-            crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref())
+            stdin_view = if outer_dialect == ShellDialect::Posix {
+                crate::heredoc::mask_launcher_stdin_data(data_view.as_ref())
+            } else {
+                Cow::Borrowed(data_view.as_ref())
+            };
+            crate::heredoc::mask_inert_interpreter_stdin(stdin_view.as_ref())
         }
         ShellDialect::PowerShell | ShellDialect::Cmd => std::borrow::Cow::Borrowed(command),
     };
@@ -27907,6 +27915,17 @@ fn literal_bash_source_range(
     command: &str,
     content: &crate::heredoc::ExtractedContent,
 ) -> Option<Range<usize>> {
+    literal_bash_source_range_with_flags(command, content, &["-c"])
+}
+
+/// Share exact source and receiver ownership without widening the flags that
+/// can establish an exemption. Additional flags are used only for the
+/// complete-source destination check, which can add protected-write findings.
+fn literal_bash_source_range_with_flags(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    inline_flags: &[&str],
+) -> Option<Range<usize>> {
     if command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
         || !matches!(
             content.language,
@@ -28028,7 +28047,7 @@ fn literal_bash_source_range(
             let shell_script = bash
                 && !nonlocal
                 && literal_posix_shell_program(program_name.as_ref())
-                && operand_text.as_ref() == "-c";
+                && inline_flags.contains(&operand_text.as_ref());
             let ssh_script = ssh_inline
                 && matches!(program_name.as_ref(), "ssh" | "/bin/ssh" | "/usr/bin/ssh")
                 && literal_ssh_destination(operand_text.as_ref());
@@ -34630,12 +34649,20 @@ fn evaluate_heredoc(
             let inner_ordered_packs = carrier_first_packs
                 .as_deref()
                 .unwrap_or(context.ordered_packs);
-            let contextual_redirects =
-                if per_command_pass && literal_bash_source_range(command, &content).is_some() {
-                    proven_bash_redirect_offsets(&content.content)
-                } else {
-                    Vec::new()
-                };
+            let literal_shell_source =
+                per_command_pass && literal_bash_source_range(command, &content).is_some();
+            let contextual_redirects = if literal_shell_source {
+                proven_bash_redirect_offsets(&content.content)
+            } else {
+                Vec::new()
+            };
+            let destination_source_context = per_command_pass
+                && crate::packs::core::credential_files::shell_destination_context_required(
+                    &content.content,
+                )
+                && (literal_shell_source
+                    || literal_bash_source_range_with_flags(command, &content, &["-lc", "-cl"])
+                        .is_some());
             let evaluate_source = |source: &str| {
                 evaluate_command_with_pack_order_deadline_at_path_inner(
                     source,
@@ -34654,7 +34681,7 @@ fn evaluate_heredoc(
                 )
             };
             let mut complete_source_result = None;
-            let inner_commands = if per_command_pass {
+            let mut inner_commands = if per_command_pass {
                 crate::heredoc::extract_shell_commands(&content.content)
             } else {
                 // Without a keyword or trigger the per-command pass has
@@ -34681,7 +34708,23 @@ fn evaluate_heredoc(
                     line_number: 1,
                 }]
             };
-            for inner in inner_commands {
+            if destination_source_context {
+                // `f=/etc/sudoers; tee "$f"` requires both statements. Keep
+                // the existing per-command checks as well: they reach bodies
+                // of functions and other constructs the outer walk may not
+                // evaluate. Only proven literal source may lend its bindings;
+                // an outer-shell interpolation can replace the script bytes.
+                inner_commands.insert(
+                    0,
+                    crate::heredoc::ExtractedShellCommand {
+                        text: content.content.clone(),
+                        start: 0,
+                        end: content.content.len(),
+                        line_number: 1,
+                    },
+                );
+            }
+            for (index, inner) in inner_commands.into_iter().enumerate() {
                 if deadline_exceeded(context.deadline) {
                     return Some(EvaluationResult::indeterminate_due_to_budget());
                 }
@@ -34696,11 +34739,12 @@ fn evaluate_heredoc(
                 // takes the same route, so a denial in it is mapped and
                 // line-numbered from its span.
                 let needs_source_context = !per_command_pass
+                    || (destination_source_context && index == 0)
                     || first_unquoted_output_redirect(&inner.text, ShellDialect::Posix)
                         .is_some_and(|operator| {
                             contextual_redirects.contains(&(inner.start + operator))
                         });
-                let result = if needs_source_context {
+                let mut result = if needs_source_context {
                     complete_source_result
                         .get_or_insert_with(|| evaluate_source(&content.content))
                         .clone()
@@ -34782,6 +34826,9 @@ fn evaluate_heredoc(
                     }
                     return Some(result);
                 }
+                // A grant for the complete script's destination remains an
+                // audit result, not permission for another extracted command.
+                record_nested_allowlist_hit(first_allowlist_hit, &mut result);
             }
         }
 

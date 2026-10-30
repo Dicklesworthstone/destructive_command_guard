@@ -88,7 +88,14 @@ impl Fixture {
         command
     }
 
-    fn assert(&self, source: &str, expected: &str, rule: Option<&str>, granted: bool) {
+    fn assert(
+        &self,
+        source: &str,
+        expected: &str,
+        rule: Option<&str>,
+        granted: bool,
+        require_span: bool,
+    ) {
         for hook in [false, true] {
             let mut command = self.command();
             let input = if hook {
@@ -131,7 +138,7 @@ impl Fixture {
             );
             if let Some(rule) = rule {
                 assert_eq!(json["rule_id"], rule, "{source:?}, hook={hook}: {json}");
-                if !hook {
+                if !hook && (require_span || !json["matched_span"].is_null()) {
                     let span = json["matched_span"]
                         .as_array()
                         .expect("native destination finding has an original-source span");
@@ -160,11 +167,11 @@ impl Fixture {
     }
 
     fn deny(&self, source: &str, rule: &str) {
-        self.assert(source, "deny", Some(rule), false);
+        self.assert(source, "deny", Some(rule), false, true);
     }
 
     fn allow(&self, source: &str) {
-        self.assert(source, "allow", None, false);
+        self.assert(source, "allow", None, false, false);
     }
 
     fn git(&self, cwd: &Path, arguments: &[&str]) -> String {
@@ -279,6 +286,117 @@ fn scalar_values_are_snapshots_and_child_scopes_do_not_replace_them() {
 }
 
 #[test]
+fn case_patterns_and_fallthrough_preserve_only_agreed_bindings() {
+    let fixture = Fixture::new();
+    for source in [
+        "f=/etc/sudoers; case x in x) tee \"$f\";; esac",
+        "f=/etc/sudoers; case \"$mode\" in first|second) tee \"$f\";; *) :;; esac",
+        "f=/etc/sudoers; case x in \"$(tee \"$f\")\") :;; esac",
+        "case x in x) f=/etc/sudoers; tee \"$f\";; esac",
+        "f=/etc/sudoers; case \"$mode\" in first) : ;& second) tee \"$f\";; esac",
+        "f=/etc/sudoers; case \"$mode\" in first) : ;;& *) tee \"$f\";; esac",
+        "f=/etc/sudoers; case x in x) f=/tmp/out & wait; tee \"$f\";; esac",
+    ] {
+        fixture.deny(source, CREDENTIAL);
+    }
+    for source in [
+        "f=/tmp/out; case x in x) tee \"$f\";; esac",
+        "f=/etc/sudoers; case x in x) f=/tmp/out; tee \"$f\";; esac",
+        "f=/tmp/out; case x in x) f=/etc/sudoers & wait; tee \"$f\";; esac",
+        r#"f=/etc/sudoers; case x in "$((f=0))") :;; *) tee "$f";; esac"#,
+        r#"f=/etc/sudoers; case x in "$((f=0))$(tee "$f")") :;; esac"#,
+        "f=/etc/sudoers; case x in x) f=/tmp/out ;& y) tee \"$f\";; esac",
+        "f=/etc/sudoers; case x in x) f=/tmp/out ;;& *) tee \"$f\";; esac",
+    ] {
+        fixture.allow(source);
+    }
+}
+
+#[test]
+fn conditional_joins_preserve_exhaustive_and_success_path_proofs() {
+    let fixture = Fixture::new();
+    for source in [
+        "if test \"$mode\"; then f=/etc/sudoers; else f=/etc/sudoers; fi; tee \"$f\"",
+        "if test \"$mode\"; then f=/etc/sudoers; elif test \"$other\"; then f=/etc/sudoers; else f=/etc/sudoers; fi; tee \"$f\"",
+        "if test \"$mode\" && f=/etc/sudoers; then tee \"$f\"; fi",
+    ] {
+        fixture.deny(source, CREDENTIAL);
+    }
+    for source in [
+        "f=/etc/sudoers; if test \"$mode\"; then f=/tmp/one; else f=/tmp/two; fi; tee \"$f\"",
+        "if test \"$mode\"; then f=/etc/sudoers; else f=/tmp/out; fi; tee \"$f\"",
+        "f=/tmp/out; if test \"$mode\"; then f=/etc/sudoers; fi; tee \"$f\"",
+        "f=/tmp/out; if test \"$mode\" && f=/etc/sudoers; then f=/tmp/out; else f=/tmp/out; fi; tee \"$f\"",
+    ] {
+        fixture.allow(source);
+    }
+}
+
+#[test]
+fn command_cache_rebinding_cannot_supply_false_writer_or_git_proofs() {
+    let fixture = Fixture::new();
+    for source in [
+        "hash -p /usr/bin/printf git; cp source \"$(git rev-parse --git-dir)\"",
+        "option=-p; hash \"$option\" /usr/bin/printf git; cp source \"$(git rev-parse --git-dir)\"",
+        "f=/etc/sudoers; hash -p /usr/bin/printf tee; tee \"$f\"",
+        "hash -p /usr/bin/printf tee; f=/etc/sudoers; tee \"$f\"",
+    ] {
+        fixture.allow(source);
+    }
+    for operation in [
+        "hash",
+        "hash -t git",
+        "hash -l",
+        "hash --help",
+        "hash -- -p",
+    ] {
+        fixture.deny(
+            &format!("f=/etc/sudoers; {operation}; tee \"$f\""),
+            CREDENTIAL,
+        );
+    }
+    fixture.deny(
+        "option=-t; f=/etc/sudoers; hash \"$option\" git; tee \"$f\"",
+        CREDENTIAL,
+    );
+}
+
+#[test]
+fn complete_literal_shell_bodies_keep_their_own_scalar_context() {
+    let fixture = Fixture::new();
+    for source in [
+        r#"bash -c 'f=/etc/sudoers; tee "$f"'"#,
+        r#"bash -lc 'f=/etc/sudoers; tee "$f"'"#,
+        r#"bash -cl 'f=/etc/sudoers; tee "$f"'"#,
+        "sh <<'SH'\nf=/etc/sudoers\ntee \"$f\"\nSH",
+    ] {
+        fixture.deny(source, CREDENTIAL);
+    }
+    for source in [
+        r#"bash -c 'd=$(git rev-parse --git-dir); tee "$d/config"'"#,
+        r#"bash -lc 'd=$(git rev-parse --git-dir); tee "$d/config"'"#,
+        r#"bash -cl 'd=$(git rev-parse --git-dir); tee "$d/config"'"#,
+    ] {
+        fixture.deny(source, GIT_WRITE);
+    }
+    for source in [
+        r#"bash -c 'f=/tmp/out; tee "$f"'"#,
+        r#"bash -lc 'f=/tmp/out; tee "$f"'"#,
+        r#"bash -cl 'f=/tmp/out; tee "$f"'"#,
+        "sh <<'SH'\nf=/tmp/out\ntee \"$f\"\nSH",
+        r#"printf '%s' 'f=/etc/sudoers; tee "$f"'"#,
+        r#"printf '%s\n' bash -lc 'f=/etc/sudoers; tee "$f"'"#,
+        r#"printf '%s' 'bash -lc f=/etc/sudoers; tee "$f"'"#,
+        r#"bash --help -lc 'f=/etc/sudoers; tee "$f"'"#,
+        r#"bash -nc 'f=/etc/sudoers; tee "$f"'"#,
+        r#"bash -c "f=/etc/sudoers; tee \"$f\"""#,
+        r#"f=/etc/sudoers; bash -c 'tee "$f"'"#,
+    ] {
+        fixture.allow(source);
+    }
+}
+
+#[test]
 fn quoted_data_reads_and_benign_scalar_destinations_keep_their_behavior() {
     let fixture = Fixture::new();
     for source in [
@@ -381,6 +499,31 @@ fn heredoc_data_and_process_substitution_arguments_preserve_execution_boundaries
     ] {
         fixture.deny(source, CREDENTIAL);
     }
+    // Command-substitution findings retain the existing optional-span
+    // contract. Their decision and native rule identity must still survive.
+    fixture.assert(
+        "cat <<DATA\n$(sh -c 'tee /etc/sudoers')\nDATA",
+        "deny",
+        Some(CREDENTIAL),
+        false,
+        false,
+    );
+    // Launcher-only masking must leave live nested launchers and receivers
+    // with unknown assignment semantics subject to their existing policies.
+    for source in [
+        "cat <<DATA\n$(pwsh -Command \"$payload\")\nDATA",
+        "a[$(sh)]=x <<'DATA'\n$(unknown) -c payload\nDATA",
+        "declare -i value; value=other <<'DATA'\n$(unknown) -c payload\nDATA",
+        "declare -n value=items; value=other <<'DATA'\n$(unknown) -c payload\nDATA",
+    ] {
+        fixture.assert(
+            source,
+            "deny",
+            Some("heredoc.shell:launcher-unverified"),
+            false,
+            false,
+        );
+    }
 }
 
 #[test]
@@ -394,7 +537,7 @@ fn git_admin_queries_and_bound_values_reach_native_writer_rules() {
         "cp source $(git rev-parse --git-dir)/config",
         "cp source \"`git rev-parse --git-dir`/config\"",
         "cp source \"$(git rev-parse --absolute-git-dir)/config\"",
-        "cp source \"$(git -C /r rev-parse --git-common-dir)/hooks/pre-commit\"",
+        "cp source \"$(git -C /r rev-parse --path-format=absolute --git-common-dir)/hooks/pre-commit\"",
         "cp source \"$(git rev-parse --git-path hooks)/pre-commit\"",
         "cp source \"$(git rev-parse --git-path hooks/pre-commit)\"",
         "cp source \"$(git rev-parse --git-path config)\"",
@@ -408,6 +551,11 @@ fn git_admin_queries_and_bound_values_reach_native_writer_rules() {
         "cp source \"$(git -c core.hooksPath=/tmp/hooks rev-parse --git-path hooks/pre-commit)\"",
         "cp source \"$(git -c core.hooksPath='/tmp/hooks /tmp/notes' rev-parse --git-path hooks)\"",
         "cp source \"$(git -c core.hooksPath='/tmp/dcg-hooks*' rev-parse --git-path hooks)\"",
+        "cp source \"$(git -C src -c core.hooksPath=hooks rev-parse --path-format=absolute --git-path hooks/pre-commit)\"",
+        "cp source \"$(git -C src --git-dir=/outside/admin rev-parse --git-path HEAD)\"",
+        "cp source \"$(git -C src --git-dir=/outside/admin rev-parse --git-path config.worktree)\"",
+        "cp source \"$(git -C src --git-dir=/outside/admin rev-parse --git-path config.lock)\"",
+        "cp source \"$(git -C src --git-dir=/outside/admin rev-parse --git-path ./hooks/pre-commit)\"",
         "cp source \"$(git -c core.hooksPath=/tmp/hooks rev-parse --git-path ./hooks/../config)\"",
         "cp source \"$(git rev-parse --git-dir)/hooks/../config\"",
         "cp source \"$(git rev-parse --git-path hooks)/sub/../pre-commit\"",
@@ -461,6 +609,11 @@ fn ordinary_queries_traversal_and_literal_query_text_are_not_git_destinations() 
         "cp source \"$(git -c core.hooksPath=/tmp/dcg-hooks rev-parse --path-format=absolute --git-path hooks/a/..)\"notes",
         "cp source $(git -c core.hooksPath='/tmp/hooks /tmp/notes' rev-parse --git-path hooks)",
         "cp source $(git -c core.hooksPath='/tmp/dcg-hooks*' rev-parse --git-path hooks)",
+        "cp source \"$(git -C src -c core.hooksPath=hooks rev-parse --git-path hooks/pre-commit)\"",
+        "cp source \"$(git -C src --git-dir=/outside/admin rev-parse --git-path config)\"",
+        "cp source \"$(git -C src --git-dir=/outside/admin rev-parse --git-path index)\"",
+        "cp source \"$(git -C src --git-dir=/outside/admin rev-parse --git-common-dir)/config\"",
+        "cp source \"$(git -C src --git-dir=/outside/admin rev-parse --git-path hooks/pre-commit)\"",
         "cp source '$(git rev-parse --git-dir)/config'",
         "cp source '`git rev-parse --git-dir`/config'",
         "d='$(git rev-parse --git-dir)'; cp source \"$d/config\"",
@@ -507,6 +660,24 @@ fn single_rule_grants_do_not_hide_other_indirect_destination_families() {
             CREDENTIAL,
         ),
         (
+            CREDENTIAL,
+            r#"bash -c 'f=/etc/sudoers; tee "$f"'"#,
+            r#"bash -c 'f=/etc/sudoers; d=$(git rev-parse --git-dir); tee "$f" "$d/config"'"#,
+            GIT_WRITE,
+        ),
+        (
+            CREDENTIAL,
+            r#"bash -lc 'f=/etc/sudoers; tee "$f"'"#,
+            r#"bash -lc 'f=/etc/sudoers; d=$(git rev-parse --git-dir); tee "$f" "$d/config"'"#,
+            GIT_WRITE,
+        ),
+        (
+            GIT_WRITE,
+            r#"bash -c 'd=$(git rev-parse --git-dir); tee "$d/config"'"#,
+            r#"bash -c 'f=/etc/sudoers; d=$(git rev-parse --git-dir); tee "$d/config" "$f"'"#,
+            CREDENTIAL,
+        ),
+        (
             GIT_APPEND,
             "printf x >> \"$(git rev-parse --git-dir)/config\"",
             "f=/etc/sudoers; printf x >> \"$(git rev-parse --git-dir)/config\"; tee -a \"$f\"",
@@ -522,7 +693,7 @@ fn single_rule_grants_do_not_hide_other_indirect_destination_families() {
         let fixture = Fixture::new();
         fixture.deny(control, grant);
         fixture.grant(grant);
-        fixture.assert(control, "allow", None, true);
+        fixture.assert(control, "allow", None, true, false);
         fixture.deny(combined, remaining);
     }
 }

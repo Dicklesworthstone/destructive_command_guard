@@ -19,6 +19,13 @@ enum GitPathKind {
     File(&'static str),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathFormat {
+    Default,
+    Absolute,
+    Relative,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct GitPath {
     kind: GitPathKind,
@@ -161,6 +168,8 @@ pub(super) fn resolve_query(source: &str) -> Option<GitPath> {
     let mut index = 1;
     let mut output_inputs = Vec::new();
     let mut hooks_path = None;
+    let mut git_dir = None;
+    let mut changes_directory = false;
     while argv.get(index)?.as_str() != "rev-parse" {
         let option = argv.get(index)?.as_str();
         match option {
@@ -169,6 +178,11 @@ pub(super) fn resolve_query(source: &str) -> Option<GitPath> {
                 // `git -C ''` explicitly leaves the current directory alone.
                 if option != "-C" || !input.is_empty() {
                     output_inputs.push(input.clone());
+                }
+                if option == "-C" {
+                    changes_directory |= !unchanged_directory(input);
+                } else if option == "--git-dir" {
+                    git_dir = Some(input.as_str());
                 }
                 index += 2;
             }
@@ -182,30 +196,46 @@ pub(super) fn resolve_query(source: &str) -> Option<GitPath> {
             }
             "--bare" | "--no-pager" | "--no-optional-locks" => index += 1,
             _ => {
-                output_inputs.push(attached_global_option(option)?.to_owned());
+                let input = attached_global_option(option)?;
+                output_inputs.push(input.to_owned());
+                if option.starts_with("--git-dir=") {
+                    git_dir = Some(input);
+                }
                 index += 1;
             }
         }
     }
     index += 1;
     let mut path = None;
-    let mut reformats_paths = false;
+    let mut format = PathFormat::Default;
     while let Some(argument) = argv.get(index) {
         match argument.as_str() {
             // These options do not print anything, and rev-parse accepts them
             // before or after the one path query. A format option only affects
             // later queries; either spelling retains the same path origin.
-            "--path-format=absolute" | "--path-format=relative" => reformats_paths = true,
+            "--path-format=absolute" => format = PathFormat::Absolute,
+            "--path-format=relative" => format = PathFormat::Relative,
             "--quiet" | "-q" => {}
             "--git-dir" | "--absolute-git-dir" | "--git-common-dir" if path.is_none() => {
+                // A relative result is interpreted by the caller's shell,
+                // which did not follow Git's -C options. Only retain an
+                // absolute result or an explicit literal .git spelling.
+                if changes_directory && !caller_anchored_directory(argument, format, git_dir) {
+                    return None;
+                }
                 path = Some(GitPath::new(GitPathKind::Directory));
             }
             "--git-path" if path.is_none() => {
                 index += 1;
                 let operand = argv.get(index)?;
                 let queried = administered_path(operand)?;
+                if changes_directory
+                    && !caller_anchored_path(&queried, format, git_dir, hooks_path.as_deref())
+                {
+                    return None;
+                }
                 output_inputs.push(operand.clone());
-                path = Some(if reformats_paths {
+                path = Some(if format != PathFormat::Default {
                     queried.query_boundary()
                 } else {
                     queried
@@ -224,6 +254,47 @@ pub(super) fn resolve_query(source: &str) -> Option<GitPath> {
         path.output_inputs = output_inputs;
         path
     })
+}
+
+fn caller_anchored_directory(query: &str, format: PathFormat, git_dir: Option<&str>) -> bool {
+    format == PathFormat::Absolute
+        || query == "--absolute-git-dir"
+        || query == "--git-dir"
+            && format == PathFormat::Default
+            && git_dir.is_some_and(|root| root.starts_with('/') || contains_git_component(root))
+}
+
+fn caller_anchored_path(
+    path: &GitPath,
+    format: PathFormat,
+    git_dir: Option<&str>,
+    hooks_path: Option<&str>,
+) -> bool {
+    if format != PathFormat::Default {
+        return format == PathFormat::Absolute;
+    }
+    match path.kind {
+        GitPathKind::Hooks => hooks_path.is_some_and(|root| root.starts_with('/')),
+        GitPathKind::Directory | GitPathKind::File("HEAD" | "config.worktree" | "config.lock") => {
+            git_dir.is_some_and(|root| root.starts_with('/'))
+        }
+        // GIT_INDEX_FILE and GIT_COMMON_DIR can supply relative paths even
+        // when --git-dir is explicitly absolute. The latter also owns config.
+        GitPathKind::File(_) => false,
+    }
+}
+
+fn unchanged_directory(path: &str) -> bool {
+    // Do not cancel pairs such as `-C subdir -C ..`: a symlink can make the
+    // second directory different from the caller's original directory.
+    !path.starts_with('/')
+        && path
+            .split('/')
+            .all(|component| matches!(component, "" | "."))
+}
+
+fn contains_git_component(path: &str) -> bool {
+    normalized_components(path).is_some_and(|components| components.contains(&".git"))
 }
 
 fn attached_global_option(option: &str) -> Option<&str> {
@@ -398,7 +469,9 @@ mod tests {
     #[test]
     fn administered_files_keep_exact_file_identity() {
         for name in ["config", "HEAD", "index", "config.worktree", "config.lock"] {
-            let source = format!("git -C /linked/worktree rev-parse --git-path {name} -q");
+            let source = format!(
+                "git -C /linked/worktree rev-parse --path-format=absolute --git-path {name} -q"
+            );
             let path = resolve_query(&source).unwrap();
             assert_eq!(path.policy_path(), format!(".git/{name}"));
             // The index may be relocated to any filename. Neither its parent
@@ -428,7 +501,7 @@ mod tests {
             "git --git-dir '/tmp/admin[12]' rev-parse --git-path index",
             "git --work-tree='/tmp/work tree' rev-parse --git-common-dir",
             "git --work-tree '/tmp/work*' rev-parse --absolute-git-dir",
-            "git -C '/tmp/a worktree' rev-parse --git-dir",
+            "git -C '/tmp/a worktree' rev-parse --path-format=absolute --git-dir",
             "git rev-parse --path-format=relative --git-path 'hooks/a b/../pre-commit'",
         ] {
             let path = resolve_query(source).unwrap();
@@ -470,7 +543,7 @@ mod tests {
         for source in [
             "git rev-parse --git-path hooks/pre-commit",
             "git -c core.hooksPath=/tmp/hooks rev-parse --git-path hooks/pre-commit",
-            "git -C /linked/worktree rev-parse --git-path hooks/pre-commit",
+            "git -C /linked/worktree rev-parse --path-format=absolute --git-path hooks/pre-commit",
         ] {
             let path = resolve_query(source).unwrap();
             assert_eq!(path.policy_path(), ".git/hooks/pre-commit");
@@ -524,6 +597,44 @@ mod tests {
                 resolve_query(&format!("git rev-parse --git-path {operand}")).is_none(),
                 "{operand}"
             );
+        }
+    }
+
+    #[test]
+    fn directory_changes_require_a_path_anchored_for_the_callers_shell() {
+        for source in [
+            "git -C src rev-parse --absolute-git-dir",
+            "git -C src rev-parse --path-format=relative --absolute-git-dir",
+            "git -C src rev-parse --path-format=absolute --git-common-dir",
+            "git -C src rev-parse --path-format=absolute --git-path hooks/pre-commit",
+            "git -C src --git-dir=/outside/admin rev-parse --git-dir",
+            "git -C src --git-dir=.git rev-parse --git-dir",
+            "git -C src --git-dir=backup/.git/admin rev-parse --git-dir",
+            "git -C src --git-dir=/outside/admin rev-parse --git-path HEAD",
+            "git -C src --git-dir=/outside/admin rev-parse --git-path config.worktree",
+            "git -C src --git-dir=/outside/admin rev-parse --git-path config.lock",
+            "git -C src --git-dir=/outside/admin rev-parse --git-path ./hooks/pre-commit",
+            "git -C src -c core.hooksPath=/tmp/hooks rev-parse --git-path hooks/pre-commit",
+            "git -C . rev-parse --git-path hooks/pre-commit",
+            "git -C '' -C ././ rev-parse --git-common-dir",
+        ] {
+            assert!(resolve_query(source).is_some(), "{source}");
+        }
+        for source in [
+            "git -C src -c core.hooksPath=hooks rev-parse --git-path hooks/pre-commit",
+            "git -C src -c core.hooksPath=/tmp/hooks rev-parse --path-format=relative --git-path hooks/pre-commit",
+            "git -C src rev-parse --git-common-dir",
+            "git -C src rev-parse --git-path hooks/pre-commit --path-format=absolute",
+            "git -C src rev-parse --path-format=absolute --path-format=relative --git-path hooks/pre-commit",
+            "git -C src --git-dir=/outside/admin rev-parse --path-format=relative --git-dir",
+            "git -C src --git-dir=.git/../notes rev-parse --git-dir",
+            "git -C src --git-dir=/outside/admin rev-parse --git-path config",
+            "git -C src --git-dir=/outside/admin rev-parse --git-path index",
+            "git -C src --git-dir=/outside/admin rev-parse --git-common-dir",
+            "git -C src --git-dir=/outside/admin rev-parse --git-path hooks/pre-commit",
+            "git -C src -C .. rev-parse --git-path hooks/pre-commit",
+        ] {
+            assert!(resolve_query(source).is_none(), "{source}");
         }
     }
 

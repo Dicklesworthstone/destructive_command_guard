@@ -33,6 +33,13 @@ pub(crate) fn may_name_protected_path(command: &str) -> bool {
     shell::may_name_protected_path(command) || word_splitting::candidate(command)
 }
 
+/// An extracted shell body can establish a destination in an earlier command.
+/// Its individual commands cannot retain that evidence. This is a candidate
+/// gate for an additional complete-source evaluation, never a path exemption.
+pub(crate) fn shell_destination_context_required(command: &str) -> bool {
+    word_splitting::candidate(command) || shell::indirection::candidate(command)
+}
+
 /// Scalar/IFS assignments and expansions belong to the outer shell, not to a quoted
 /// Python/Node program supplied on stdin (#560). Reuse the existing ownership
 /// proof instead of letting source text establish shell state or exhaust the
@@ -43,9 +50,7 @@ pub(crate) fn may_name_protected_path(command: &str) -> bool {
 /// `embedded::scan_command` below must always receive the original command.
 /// Do not apply a POSIX-only proof when the caller's dialect is unknown.
 fn scan_outer_writer_arguments(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWrite> {
-    let outer = if dialect == ShellDialect::Posix
-        && (word_splitting::candidate(command) || shell::indirection::candidate(command))
-    {
+    let outer = if dialect == ShellDialect::Posix && shell_destination_context_required(command) {
         crate::heredoc::mask_inert_interpreter_stdin(command)
     } else {
         std::borrow::Cow::Borrowed(command)

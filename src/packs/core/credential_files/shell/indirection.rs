@@ -232,6 +232,24 @@ fn argv_ownership_proven(tokens: &[Token], unknown: &[(Range<usize>, bool)]) -> 
     accepted == unknown.len()
 }
 
+/// Bash's `hash -p` can give a familiar command an unrelated implementation.
+/// Listing the cache leaves scalar values and producer identities unchanged.
+fn hash_may_rebind(args: &[&Word]) -> bool {
+    for word in args {
+        if !word.is_all_literal() {
+            return true;
+        }
+        let text = word.as_string();
+        if text == "-" || !text.starts_with('-') || text.starts_with("--") {
+            return false;
+        }
+        if text[1..].contains('p') {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Clone)]
 struct State {
     values: HashMap<String, Value>,
@@ -295,6 +313,14 @@ impl State {
         } else {
             self.values.remove(name);
         }
+    }
+}
+
+fn merge_path(paths: &mut Option<State>, next: State) {
+    if let Some(paths) = paths {
+        paths.intersect(&next);
+    } else {
+        *paths = Some(next);
     }
 }
 
@@ -672,22 +698,7 @@ impl Scanner<'_> {
                 state.attributes_unknown |= iteration.attributes_unknown;
                 state.commands_unknown |= iteration.commands_unknown;
             }
-            "case_statement" => {
-                if let Some(value) = node.field("value") {
-                    if has_expansion_effect(value.clone()) {
-                        state.forget();
-                    }
-                    self.nested(value, state, depth + 1);
-                }
-                for branch in node.children().filter(|child| child.kind() == "case_item") {
-                    let mut local = state.clone();
-                    local.forget();
-                    self.children(branch, &mut local, depth + 1);
-                    state.attributes_unknown |= local.attributes_unknown;
-                    state.commands_unknown |= local.commands_unknown;
-                }
-                state.forget();
-            }
+            "case_statement" => self.case_statement(node, state, depth),
             "test_command" => {
                 if has_expansion_effect(node.clone()) {
                     state.forget();
@@ -754,33 +765,157 @@ impl Scanner<'_> {
         state: &mut State,
         depth: usize,
     ) {
-        let mut alternative = None;
-        let mut merged: Option<State> = None;
+        let (mut finished, mut remaining) = self.conditional_clause(node.clone(), state, depth);
+        let mut exhaustive = false;
+        for alternative in node
+            .children()
+            .filter(|child| matches!(child.kind().as_ref(), "elif_clause" | "else_clause"))
+        {
+            if alternative.kind() == "elif_clause" {
+                let (branch, skipped) = self.conditional_clause(alternative, &remaining, depth + 1);
+                finished.intersect(&branch);
+                remaining = skipped;
+            } else {
+                self.children(alternative, &mut remaining, depth + 1);
+                finished.intersect(&remaining);
+                exhaustive = true;
+            }
+        }
+        // An explicit else consumes the final false path. Retaining a
+        // fictitious skipped path would lose assignments made by every arm.
+        if !exhaustive {
+            finished.intersect(&remaining);
+        }
+        *state = finished;
+    }
+
+    fn conditional_clause(
+        &mut self,
+        node: Node<'_, StrDoc<SupportLang>>,
+        incoming: &State,
+        depth: usize,
+    ) -> (State, State) {
+        if depth > MAX_DEPTH || self.visited >= MAX_NODES {
+            let mut unknown = incoming.clone();
+            unknown.forget();
+            return (unknown.clone(), unknown);
+        }
+        self.visited += 1;
+        let mut conditions = Vec::new();
+        let mut body = Vec::new();
+        let mut in_body = false;
         for child in node.children() {
             if child.kind() == "then" {
-                alternative = Some(state.clone());
-            } else if child.is_named() {
-                if matches!(child.kind().as_ref(), "elif_clause" | "else_clause") {
-                    let mut branch = alternative.clone().unwrap_or_else(|| state.clone());
-                    self.walk(child, &mut branch, depth + 1);
-                    merged
-                        .get_or_insert_with(|| state.clone())
-                        .intersect(&branch);
-                    if let Some(alternative) = &mut alternative {
-                        alternative.intersect(&branch);
-                    }
-                } else if word_splitting::has_async_terminator(&child) {
-                    self.walk(child, &mut state.clone(), depth + 1);
+                in_body = true;
+            } else if child.is_named()
+                && !matches!(child.kind().as_ref(), "elif_clause" | "else_clause")
+            {
+                if in_body {
+                    body.push(child);
                 } else {
-                    self.walk(child, state, depth + 1);
+                    conditions.push(child);
                 }
             }
         }
-        if let Some(other) = merged {
-            state.intersect(&other);
+        let mut success = incoming.clone();
+        let mut failure = incoming.clone();
+        for condition in conditions {
+            let mut before = success.clone();
+            before.intersect(&failure);
+            if word_splitting::has_async_terminator(&condition) {
+                self.walk(condition, &mut before.clone(), depth + 1);
+                success = before.clone();
+                failure = before;
+            } else {
+                (success, failure) = self.outcomes(condition, &before, depth + 1);
+            }
         }
-        if let Some(skipped) = alternative {
-            state.intersect(&skipped);
+        for statement in body {
+            if word_splitting::has_async_terminator(&statement) {
+                self.walk(statement, &mut success.clone(), depth + 1);
+            } else {
+                self.walk(statement, &mut success, depth + 1);
+            }
+        }
+        (success, failure)
+    }
+
+    fn case_statement(
+        &mut self,
+        node: Node<'_, StrDoc<SupportLang>>,
+        state: &mut State,
+        depth: usize,
+    ) {
+        let mut searching = state.clone();
+        if let Some(value) = node.field("value") {
+            if has_expansion_effect(value.clone()) {
+                searching.forget();
+            }
+            self.nested(value, &searching, depth + 1);
+        }
+        let mut fallthrough: Option<State> = None;
+        let mut finished: Option<State> = None;
+        for branch in node.children().filter(|child| child.kind() == "case_item") {
+            self.visited += 1;
+            if self.visited > MAX_NODES {
+                state.forget();
+                return;
+            }
+            let mut matched: Option<State> = None;
+            let mut body = Vec::new();
+            let mut in_body = false;
+            for child in branch.children() {
+                if child.kind() == ")" {
+                    in_body = true;
+                } else if child.is_named() {
+                    if in_body {
+                        body.push(child);
+                    } else {
+                        // Each tested pattern may match or permit the next
+                        // pattern to run. Pattern words are data; only their
+                        // expansions can execute commands or change values.
+                        if has_expansion_effect(child.clone()) {
+                            searching.forget();
+                        }
+                        self.nested(child, &searching, depth + 1);
+                        merge_path(&mut matched, searching.clone());
+                    }
+                }
+            }
+            // `;&` skips this item's patterns. Merge it with possible matching
+            // paths without assuming which pattern the shell selected.
+            if let Some(previous) = fallthrough.take() {
+                merge_path(&mut matched, previous);
+            }
+            let Some(mut selected) = matched else {
+                state.forget();
+                return;
+            };
+            for statement in body {
+                if word_splitting::has_async_terminator(&statement) {
+                    self.walk(statement, &mut selected.clone(), depth + 1);
+                } else {
+                    self.walk(statement, &mut selected, depth + 1);
+                }
+            }
+            if branch.children().any(|child| child.kind() == ";&") {
+                fallthrough = Some(selected);
+            } else if branch.children().any(|child| child.kind() == ";;&") {
+                // Retesting keeps body effects, while an unmatched preceding
+                // item can reach the same next pattern without those effects.
+                searching.intersect(&selected);
+            } else {
+                merge_path(&mut finished, selected);
+            }
+        }
+        // A case may match no item. We do not interpret patterns to remove
+        // that path, including when a pattern happens to look unconditional.
+        merge_path(&mut finished, searching);
+        if let Some(last) = fallthrough {
+            merge_path(&mut finished, last);
+        }
+        if let Some(finished) = finished {
+            *state = finished;
         }
     }
 
@@ -849,7 +984,8 @@ impl Scanner<'_> {
             return;
         };
         let name = super::executable_name(command_word);
-        let mutation = name.as_deref().is_none_or(word_splitting::mutates_shell);
+        let mutation = name.as_deref().is_none_or(word_splitting::mutates_shell)
+            || name.as_deref() == Some("hash") && hash_may_rebind(&words[1..]);
         let mut format_index = 1;
         if words
             .get(format_index)
@@ -877,6 +1013,7 @@ impl Scanner<'_> {
                         | "trap"
                         | "alias"
                         | "unalias"
+                        | "hash"
                         | "enable"
                         | "builtin"
                         | "command"
