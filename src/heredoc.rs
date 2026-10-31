@@ -2337,7 +2337,15 @@ fn extract_content_with_scan_view(
                 skip_count = skip_reasons.len(),
                 "tier2_complete: partial extraction with skips"
             );
-            if skip_reasons.iter().any(SkipReason::stopped_early) {
+            //
+            // One shape observation is unread source: a quoted heredoc to an
+            // interpreter, with no terminator line and a candidate in it. The
+            // evaluator answers that from these reasons, so they must reach it.
+            if skip_reasons.iter().any(|reason| {
+                reason.stopped_early()
+                    || (matches!(reason, SkipReason::UnterminatedHeredoc { .. })
+                        && unterminated_stdin_has_dynamic_source(command))
+            }) {
                 ExtractionResult::Partial {
                     extracted,
                     skipped: skip_reasons,

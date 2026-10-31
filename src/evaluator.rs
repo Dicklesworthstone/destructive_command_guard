@@ -34334,8 +34334,8 @@ fn evaluate_heredoc(
         });
     }
 
-    let (contents, fallback_needed) = match extraction {
-        ExtractionResult::Extracted(contents) => (contents, false),
+    let (contents, fallback_needed, skipped) = match extraction {
+        ExtractionResult::Extracted(contents) => (contents, false, Vec::new()),
         ExtractionResult::NoContent => return None,
         ExtractionResult::Skipped(reasons) => {
             let is_timeout = reasons
@@ -34396,10 +34396,6 @@ fn evaluate_heredoc(
             return None;
         }
         ExtractionResult::Partial { extracted, skipped } => {
-            if let Some(undecided) = unterminated_stdin_verdict(command, &skipped) {
-                return Some(undecided);
-            }
-
             // Check strict mode settings for skipped items
             let is_timeout = skipped
                 .iter()
@@ -34432,7 +34428,7 @@ fn evaluate_heredoc(
             // any source was skipped.
             let fallback_needed = !skipped.is_empty();
 
-            (extracted, fallback_needed)
+            (extracted, fallback_needed, skipped)
         }
         ExtractionResult::Failed(err) => {
             if let Some(blocked) =
@@ -35052,6 +35048,11 @@ fn evaluate_heredoc(
         if let Some(blocked) = check_exec_sink_fallback(command, context, first_allowlist_hit) {
             return Some(blocked);
         }
+    }
+
+    // Asked last, so a deny in what was extracted stands.
+    if let Some(undecided) = unterminated_stdin_verdict(command, &skipped) {
+        return Some(undecided);
     }
 
     // Every backstop has had its say and none proved a deny, but a body the

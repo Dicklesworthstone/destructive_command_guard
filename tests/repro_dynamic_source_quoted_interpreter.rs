@@ -275,6 +275,38 @@ fn nesting_at_any_depth_ends_in_a_verdict() {
 }
 
 #[test]
+fn no_terminator_after_extracted_text_is_read_the_same() {
+    const OPEN: &str = "python3 <<'EOF'\nimport os\nexec(os.environ['P'])";
+    let decided: Vec<String> = [
+        format!("python3 -c 'print(1)'\n{OPEN}"),
+        format!("python3 -c 'print(1)' && {OPEN}"),
+        format!("cat <<'A'\nhello\nA\n{OPEN}"),
+        format!("python3 <<'A'\nprint(1)\nA\n{OPEN}"),
+        format!("cat <<< hello\n{OPEN}"),
+        "node -e 'console.log(1)'\nnode <<'EOF'\nconst p = process.env.P\nconsole.log(eval(p))"
+            .to_string(),
+    ]
+    .into_iter()
+    .filter(|command| decision(command) != "indeterminate")
+    .collect();
+    assert_eq!(decided, Vec::<String>::new());
+
+    // A deny in what was extracted still stands.
+    assert_eq!(
+        decision(&format!("python3 <<'A'\nexec(x)\nA\n{OPEN}")),
+        "deny"
+    );
+
+    for command in [
+        "python3 -c 'print(1)'\npython3 <<'EOF'\nprint(2)",
+        "python3 -c 'print(1)'\npython3 <<'EOF'\nprint(2)\nEOF",
+        "python3 -c 'print(1)'\ncat <<'EOF'\nexec(x)",
+    ] {
+        assert_eq!(decision(command), "allow", "{command:?}");
+    }
+}
+
+#[test]
 fn a_harmless_literal_stays_allowed() {
     for (receiver, body) in [
         ("node", "eval('1+1')"),
