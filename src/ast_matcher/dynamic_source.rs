@@ -1767,6 +1767,9 @@ mod tests {
         }
     }
 
+    /// The reader's own limit. The evaluator never reaches it for a heredoc:
+    /// `active_heredocs` stops at the same size, so a larger body is not proved
+    /// inert and keeps its outer-shell reading.
     #[test]
     fn the_size_limit_is_an_error_not_a_clean_reading() {
         let code = format!("eval(x)\n{}", "a = 1\n".repeat(MAX_DYNAMIC_SOURCE_BYTES));
