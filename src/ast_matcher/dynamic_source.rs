@@ -75,17 +75,11 @@ static RUBY_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static PERL_CANDIDATE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\beval\b").expect("perl dynamic source regex compiles"));
-/// A form the Perl walker reads as code but Perl does not, holding a quote or
-/// `#` that can start a false region: a regex or `tr`, a quote-like operator,
-/// a slash-delimited pattern, POD, or a here-document.
-static PERL_DESYNC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(concat!(
-        r#"(?m)(?:[=!]~|\b(?:m|s|y|tr|q|qq|qw|qr|qx)\s*[^\s\w,;=)]).*['"`#]"#,
-        r#"|/[^/\n]*['"`#][^/\n]*/"#,
-        r"|^=[A-Za-z]",
-        r#"|<<~?\s*['"\w]"#,
-    ))
-    .expect("perl desynchronising form regex compiles")
+/// `eval` in code a double-quoted string runs: after `@{[` or `${\`, or inside a
+/// subscript. `${name}` and a subscript that closes first run no `eval`.
+static PERL_INTERPOLATED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)[$@]\{\s*[\[\\].*\beval\b|[$@][\w:]*(?:->)?[\[{][^\]}]*\beval\b")
+        .expect("perl interpolated code regex compiles")
 });
 
 /// Whether this module reads `language`. A language it does not read has no
@@ -1043,10 +1037,13 @@ fn decode_quoted(body: &str, quote: char) -> Option<String> {
 
 /// Perl has no grammar here, so this walks the source the way the other Perl
 /// scans do: comments and quoted text are skipped, and an `eval` word in code
-/// is read by what follows it.
+/// is read by what follows it. The walk is in step with Perl until the first
+/// form that can start a false region, and every region after that is unproven.
 fn perl_reading(code: &str) -> Result<DynamicSourceReading, MatchError> {
     let bytes = code.as_bytes();
     let mut reading = DynamicSourceReading::default();
+    let mut unproven = false;
+    let mut read_to = 0;
     let mut index = 0;
     while index < bytes.len() {
         match bytes[index] {
@@ -1055,7 +1052,7 @@ fn perl_reading(code: &str) -> Result<DynamicSourceReading, MatchError> {
                 while index < bytes.len() && bytes[index] != b'\n' {
                     index += 1;
                 }
-                perl_check_skipped(code, start..index, true)?;
+                perl_check_skipped(code, start..index, unproven)?;
             }
             // `$'`, `$"` and `` $` `` are variables.
             quote @ (b'"' | b'\'' | b'`')
@@ -1068,7 +1065,7 @@ fn perl_reading(code: &str) -> Result<DynamicSourceReading, MatchError> {
                 let start = index;
                 let end = perl_quoted_end(bytes, index);
                 index = end.unwrap_or(bytes.len());
-                perl_check_skipped(code, start..index, end.is_some())?;
+                perl_check_skipped(code, start..index, unproven || end.is_none())?;
             }
             b'e' if perl_eval_word_at(bytes, index) => {
                 let word_end = index + 4;
@@ -1080,46 +1077,175 @@ fn perl_reading(code: &str) -> Result<DynamicSourceReading, MatchError> {
                 }
                 index = word_end;
             }
-            _ => index += 1,
+            _ => {
+                unproven = unproven || perl_form_can_desync(bytes, index, &mut read_to);
+                index += 1;
+            }
         }
     }
     Ok(reading)
 }
 
 /// A region the walker skipped hides nothing unless `eval` is in it. Where it
-/// is, the region has to be proved real: a string that never closes is not,
-/// and neither is one in a body with a form that can start a false region.
+/// is, the region has to be proved real, and a string has to run no code.
 fn perl_check_skipped(
     code: &str,
     region: std::ops::Range<usize>,
-    closed: bool,
+    unproven: bool,
 ) -> Result<(), MatchError> {
-    if code
-        .get(region)
-        .is_some_and(|text| PERL_CANDIDATE.is_match(text))
-        && (!closed || PERL_DESYNC.is_match(code))
+    let Some(text) = code.get(region) else {
+        return Ok(());
+    };
+    if (unproven && PERL_CANDIDATE.is_match(text))
+        || (text.starts_with(['"', '`']) && PERL_INTERPOLATED.is_match(text))
     {
         return Err(reading_error(ScriptLanguage::Perl, "string boundary"));
     }
     Ok(())
 }
 
-/// The offset just past the string opening at `start`, if it closes.
+/// Whether the code at `index` opens text the walker would read as code, with a
+/// quote or `#` in it that can start a false region: a quote-like operator, a
+/// pattern, POD or a here-document. `read_to` is the end of the last form proved
+/// clean. Nothing inside one is opened again, so each byte is scanned once.
+fn perl_form_can_desync(bytes: &[u8], index: usize, read_to: &mut usize) -> bool {
+    if index < *read_to {
+        return false;
+    }
+    let form = match bytes[index] {
+        b'=' => {
+            return (index == 0 || bytes[index - 1] == b'\n')
+                && bytes.get(index + 1).is_some_and(u8::is_ascii_alphabetic);
+        }
+        b'<' => return perl_opens_here_document(bytes, index),
+        b'/' if perl_slash_opens_pattern(bytes, index) => Some((index, 1)),
+        b'm' | b'q' | b's' | b't' | b'y' => perl_quote_like_at(bytes, index),
+        _ => None,
+    };
+    let Some((open, parts)) = form else {
+        return false;
+    };
+    let mut end = perl_quoted_end(bytes, open);
+    if parts == 2 {
+        end = end.and_then(|first| {
+            let bracket = matches!(bytes[open], b'(' | b'[' | b'{' | b'<');
+            perl_quoted_end(
+                bytes,
+                if bracket {
+                    perl_skip_space(bytes, first)
+                } else {
+                    first - 1
+                },
+            )
+        });
+    }
+    let Some(end) = end else {
+        return true;
+    };
+    *read_to = end;
+    bytes[open..end]
+        .iter()
+        .any(|byte| matches!(byte, b'\'' | b'"' | b'`' | b'#'))
+}
+
+/// `<<X`, `<<~X`, `<<"X"` and `<< 'X'`. `1 << 2` and `$x << $y` are shifts.
+fn perl_opens_here_document(bytes: &[u8], index: usize) -> bool {
+    if !bytes[index..].starts_with(b"<<") {
+        return false;
+    }
+    let name = index + 2 + usize::from(bytes.get(index + 2) == Some(&b'~'));
+    bytes
+        .get(name)
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        || matches!(
+            bytes.get(perl_skip_space(bytes, name)),
+            Some(b'"' | b'\'' | b'`')
+        )
+}
+
+/// A `/` after a value divides, and after anything else it opens a pattern. A
+/// `}` can end a block as well as a subscript, so it counts as anything else.
+fn perl_slash_opens_pattern(bytes: &[u8], index: usize) -> bool {
+    let before = bytes[..index].trim_ascii_end();
+    let word = before
+        .iter()
+        .rev()
+        .take_while(|byte| perl_word_byte(**byte))
+        .count();
+    let head = before.len() - word;
+    match before.last() {
+        Some(b')' | b']') => false,
+        Some(_) if word > 0 => {
+            !(before[head].is_ascii_digit()
+                || (head > 0 && matches!(before[head - 1], b'$' | b'@' | b'%' | b'&')))
+        }
+        _ => true,
+    }
+}
+
+/// Where the delimiter of a quote-like operator at `start` sits, and how many
+/// delimited parts follow. Any byte can delimit, so `s,a,b,` is one, and so is
+/// `s xaxbx`. `$s`, `->s`, `Foo::s`, `-s $file`, `{s}` and `s => 1` are not.
+fn perl_quote_like_at(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let before = &bytes[..start];
+    if before.ends_with(b"->")
+        || before.ends_with(b"::")
+        || before.last().is_some_and(|byte| {
+            perl_word_byte(*byte) || matches!(byte, b'$' | b'@' | b'%' | b'&' | b'-')
+        })
+    {
+        return None;
+    }
+    let word = bytes[start..]
+        .iter()
+        .take_while(|byte| perl_word_byte(**byte))
+        .count();
+    let parts = match &bytes[start..start + word] {
+        b"m" | b"q" | b"qq" | b"qr" | b"qw" | b"qx" => 1,
+        b"s" | b"tr" | b"y" => 2,
+        _ => return None,
+    };
+    let open = perl_skip_space(bytes, start + word);
+    match *bytes.get(open)? {
+        b'#' if open > start + word => None,
+        b')' | b']' | b'}' | b'>' => None,
+        b'=' if bytes.get(open + 1) == Some(&b'>') => None,
+        _ => Some((open, parts)),
+    }
+}
+
+/// The offset just past the text delimited at `start`, if it closes. A bracket
+/// delimiter nests.
 fn perl_quoted_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let quote = bytes[start];
+    let open = *bytes.get(start)?;
+    let close = match open {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        b'<' => b'>',
+        byte => byte,
+    };
+    let mut depth = 0_usize;
     let mut index = start + 1;
     while index < bytes.len() {
         match bytes[index] {
-            b'\\' => index += 2,
-            byte if byte == quote => return Some(index + 1),
-            _ => index += 1,
+            b'\\' => index += 1,
+            byte if byte == close && depth == 0 => return Some(index + 1),
+            byte if byte == close => depth -= 1,
+            byte if byte == open => depth += 1,
+            _ => {}
         }
+        index += 1;
     }
     None
 }
 
+const fn perl_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 fn perl_eval_word_at(bytes: &[u8], index: usize) -> bool {
-    let word_char = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let word_char = |byte: u8| perl_word_byte(byte);
     let before = &bytes[..index];
     bytes[index..].starts_with(b"eval")
         && bytes.get(index + 4).is_none_or(|byte| !word_char(*byte))
@@ -1562,6 +1688,85 @@ mod tests {
                 ("$x =~ /#/; eval $ENV{P};\n", P),
                 ("=pod\n\n'tis here.\n\n=cut\neval $ENV{P};\n", P),
                 ("my $s = q( ' );\neval $ENV{P};\n", P),
+            ]),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn each_perl_form_ends_the_string_proof() {
+        use ScriptLanguage::Perl as P;
+        assert_eq!(
+            readable(&[
+                // Quote-like, across lines.
+                ("my $s = q(\n'\n);\neval $ENV{P};\nprint 'y';\n", P),
+                ("$x =~ m{\n  '\n}x;\neval $ENV{P};\nprint 'y';\n", P),
+                // Any delimiter.
+                ("s,',b,;\neval $ENV{P};\nprint 'y';\n", P),
+                ("y;';x;;\neval $ENV{P};\nprint 'y';\n", P),
+                ("s= '=b=;\neval $ENV{P};\nprint 'y';\n", P),
+                ("s x 'xbx;\neval $ENV{P};\nprint 'y';\n", P),
+                ("my $s = q' ';\neval $ENV{P};\nprint 'y';\n", P),
+                ("my $s = q#a#; eval $ENV{P};\n", P),
+                // Only the second part holds the quote.
+                ("s{a}\n  {'};\neval $ENV{P};\nprint 'y';\n", P),
+                ("s/a/'/;\neval $ENV{P};\nprint 'y';\n", P),
+                // Patterns.
+                ("$x =~ /\n'\n/x;\neval $ENV{P};\nprint 'y';\n", P),
+                ("split /'/, $x;\neval $ENV{P};\nprint 'y';\n", P),
+                (
+                    "if ($x) { print 1 }\n/'/ and print 2;\neval $ENV{P};\nprint 'y';\n",
+                    P
+                ),
+                // POD and here-documents.
+                ("=pod\n\n'tis\n\n=cut\neval $ENV{P};\nprint 'y';\n", P),
+                ("print <<T;\n'tis\nT\neval $ENV{P};\nprint 'y';\n", P),
+                ("print <<\"T\";\n'tis\nT\neval $ENV{P};\nprint 'y';\n", P),
+                ("print <<~T;\n  'tis\n  T\neval $ENV{P};\nprint 'y';\n", P),
+            ]),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn code_a_perl_string_runs_is_not_a_closed_string() {
+        use ScriptLanguage::Perl as P;
+        assert_eq!(
+            readable(&[
+                ("print \"@{[ eval $ENV{P} ]}\";\n", P),
+                ("print \"${\\ eval $ENV{P} }\";\n", P),
+                ("print \"${ eval $ENV{P} }\";\n", P),
+                ("print \"$h{eval $ENV{P}}\";\n", P),
+                ("print \"$a[eval $ENV{P}]\";\n", P),
+                ("print \"@{[ map { $_ } eval $ENV{P} ]}\";\n", P),
+            ]),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn a_perl_message_that_names_eval_stays_clean() {
+        use ScriptLanguage::Perl as P;
+        assert_eq!(
+            with_sites(&[
+                // `%s` in a string is no quote-like operator.
+                ("printf \"%s: eval failed, don't retry\\n\", $x;\n", P),
+                // Before the first form the walk is still in step.
+                ("print \"eval failed\\n\";\n$x =~ /'/;\n", P),
+                // Division, a file test, keys, a shift and a plain name.
+                (
+                    "$a = $b / 2;\nprint \"it's\\n\";\n$c = $d / 3;\nprint \"eval\\n\";\n",
+                    P
+                ),
+                ("if (-s $f) { print \"eval: it's\\n\"; }\n", P),
+                ("my %h = (s => 1, y => 2, q => 3);\nprint \"eval\\n\";\n", P),
+                ("$h{s} = 1;\nprint \"eval\\n\";\n", P),
+                ("$n = 1 << 2;\nprint \"eval\\n\";\n", P),
+                ("print \"${n} eval failed\\n\";\n", P),
+                ("print \"$x[0]: eval failed\\n\";\n", P),
+                // Forms with no quote in them change nothing.
+                ("my $s = q(plain);\nprint \"eval\\n\";\n", P),
+                ("$x =~ s/a/b/;\nprint \"eval\\n\";\n", P),
             ]),
             Vec::<&str>::new()
         );
