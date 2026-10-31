@@ -35020,6 +35020,13 @@ fn evaluate_heredoc(
         if let Some(blocked) = exec_sink_pack_verdict(command, &content, context) {
             return Some(blocked);
         }
+        // Source the body builds and runs in its own language, which no
+        // layer above reads.
+        if let Some(blocked) =
+            dynamic_source_verdict(command, &content, context, first_allowlist_hit)
+        {
+            return Some(blocked);
+        }
     }
 
     if fallback_needed {
@@ -35414,8 +35421,334 @@ fn check_exec_sink_fallback(
         if let Some(blocked) = exec_sink_pack_verdict(command, &item, context) {
             return Some(blocked);
         }
+        if let Some(blocked) = dynamic_source_verdict(command, &item, context, first_allowlist_hit)
+        {
+            return Some(blocked);
+        }
     }
     None
+}
+
+/// Whether `content` goes to an interpreter that may be Python 2, whose
+/// backticks evaluate. `python3` cannot run them: they are a syntax error.
+fn receiver_may_be_python2(content: &crate::heredoc::ExtractedContent) -> bool {
+    content.language == crate::heredoc::ScriptLanguage::Python
+        && content.execution_target().is_some_and(|target| {
+            let name = target.rsplit(['/', '\\']).next().unwrap_or(target);
+            name == "python" || name.starts_with("python2")
+        })
+}
+
+/// Dynamic execution in a quoted interpreter body's own language.
+///
+/// The bodies [`crate::heredoc::mask_inert_interpreter_stdin`] blanks for
+/// outer-shell consumers are the ones this judges: with no POSIX `eval` to
+/// answer for them, `eval(atob(x))` would reach no layer at all. Any other
+/// body keeps its outer-shell reading, so nothing here applies to it.
+///
+/// A site whose source cannot be read denies, under a rule an operator can
+/// allowlist. A literal is judged as the source it is, one level deep. A
+/// reading that cannot finish is recorded like the interpreter literal
+/// analysis, so a positive finding still denies and an allow becomes
+/// Indeterminate.
+fn dynamic_source_verdict(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    let python2 = receiver_may_be_python2(content);
+    if !crate::ast_matcher::has_dynamic_source_candidates(
+        &content.content,
+        content.language,
+        python2,
+    ) || !content
+        .content_range
+        .as_ref()
+        .is_some_and(|range| crate::heredoc::range_is_inert_interpreter_stdin(command, range))
+    {
+        return None;
+    }
+    let reading = match dynamic_source_reading_within_deadline(content, Some(python2), context) {
+        Ok(reading) => reading,
+        Err(decided) => return decided.map(|result| *result),
+    };
+    for site in &reading.sites {
+        if deadline_exceeded(context.deadline) {
+            return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+        let blocked = match &site.source {
+            crate::ast_matcher::DynamicSource::Unverified => unverified_dynamic_source_verdict(
+                command,
+                content,
+                site,
+                context,
+                first_allowlist_hit,
+            ),
+            crate::ast_matcher::DynamicSource::Literal(source) => literal_dynamic_source_verdict(
+                command,
+                content,
+                site,
+                source,
+                context,
+                first_allowlist_hit,
+            ),
+        };
+        if blocked.is_some() {
+            return blocked;
+        }
+    }
+    if reading.python2_backticks
+        && (deadline_exceeded(context.deadline)
+            || !crate::packs::regex_engine::record_incomplete_analysis(
+                "python2_backticks",
+                &"a backtick expression that only Python 2 can run",
+            ))
+    {
+        return Some(EvaluationResult::indeterminate_due_to_budget());
+    }
+    None
+}
+
+/// How long to wait for one reading on its worker thread. The parse takes far
+/// less than the scan budget, so under load what runs out is the wall clock
+/// while that thread waits to be scheduled, and a harmless program comes back
+/// unverified. A quarter of what remains of the deadline covers that wait, and
+/// the deadline still bounds it.
+fn dynamic_source_wait(
+    scan_budget: std::time::Duration,
+    remaining: std::time::Duration,
+) -> std::time::Duration {
+    scan_budget.max(remaining / 4).min(remaining)
+}
+
+/// Run the reading on its worker thread:
+/// of a body with `python2` set, of a literal without it.
+/// `Err(None)` carries on with the failure recorded for this request.
+fn dynamic_source_reading_within_deadline(
+    content: &crate::heredoc::ExtractedContent,
+    python2: Option<bool>,
+    context: HeredocEvaluationContext<'_>,
+) -> Result<crate::ast_matcher::DynamicSourceReading, Option<Box<EvaluationResult>>> {
+    let mut budget = crate::ast_matcher::protected_scan_budget_for(content.content.len());
+    if let Some(deadline) = context.deadline {
+        let Some(remaining) = deadline.remaining() else {
+            return Err(Some(Box::new(
+                EvaluationResult::indeterminate_due_to_budget(),
+            )));
+        };
+        budget = dynamic_source_wait(budget, remaining);
+    }
+    let reading = if let Some(python2) = python2 {
+        crate::ast_matcher::dynamic_source_reading(
+            &content.content,
+            content.language,
+            python2,
+            budget,
+        )
+    } else {
+        crate::ast_matcher::literal_source_reading(&content.content, content.language, budget)
+    };
+    reading.map_err(|error| {
+        tracing::debug!(%error, "dynamic source analysis did not complete");
+        if deadline_exceeded(context.deadline)
+            || !crate::packs::regex_engine::record_incomplete_analysis(
+                "dynamic_source_analysis",
+                &error,
+            )
+        {
+            Some(Box::new(EvaluationResult::indeterminate_due_to_budget()))
+        } else {
+            None
+        }
+    })
+}
+
+/// One AST-level finding, weighed the way the exec-sink backstop weighs each
+/// of its matches.
+fn dynamic_source_finding_verdict(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    site: &crate::ast_matcher::DynamicSourceSite,
+    finding: &crate::ast_matcher::PatternMatch,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    let (pack_id, pattern_name) = split_ast_rule_id(&finding.rule_id);
+    let allow_hit =
+        context
+            .allowlists
+            .match_rule_at_path(&pack_id, &pattern_name, context.project_path);
+    let pattern_match = PatternMatch {
+        reason: format_heredoc_denial_reason(content, finding, &pack_id, &pattern_name),
+        pack_id: Some(pack_id),
+        pattern_name: Some(pattern_name),
+        severity: Some(ast_severity_to_pack_severity(finding.severity)),
+        source: MatchSource::HeredocAst,
+        matched_span: map_heredoc_span(command, content, site.start, site.end),
+        matched_text_preview: Some(finding.matched_text_preview.clone()),
+        explanation: None,
+        suggestions: &[],
+    };
+    if let Some(hit) = allow_hit {
+        if first_allowlist_hit.is_none() {
+            *first_allowlist_hit = Some((pattern_match, hit.layer, hit.entry.reason.clone()));
+        }
+        return None;
+    }
+    Some(EvaluationResult {
+        decision: EvaluationDecision::Deny,
+        pattern_info: Some(pattern_match),
+        allowlist_override: None,
+        effective_mode: Some(crate::packs::DecisionMode::Deny),
+        skipped_due_to_budget: false,
+        quick_rejected: false,
+        regex_evaluation_incomplete: false,
+        branch_context: None,
+        session_occurrence: None,
+        graduated_response: None,
+        bypass_method: None,
+    })
+}
+
+fn unverified_dynamic_source_verdict(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    site: &crate::ast_matcher::DynamicSourceSite,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    use crate::heredoc::ScriptLanguage;
+
+    let language = match content.language {
+        ScriptLanguage::Python => "python",
+        ScriptLanguage::JavaScript => "javascript",
+        ScriptLanguage::TypeScript => "typescript",
+        ScriptLanguage::Ruby => "ruby",
+        ScriptLanguage::Perl => "perl",
+        _ => "unknown",
+    };
+    let line_number = content.content.get(..site.start).map_or(1, |prefix| {
+        prefix.bytes().filter(|byte| *byte == b'\n').count() + 1
+    });
+    let finding = crate::ast_matcher::PatternMatch {
+        rule_id: format!("heredoc.{language}.dynamic_source"),
+        reason: format!(
+            "{}() runs source that dcg cannot statically verify",
+            site.callee
+        ),
+        matched_text_preview: content
+            .content
+            .get(site.start..site.end)
+            .map_or_else(String::new, |text| text.chars().take(60).collect()),
+        start: site.start,
+        end: site.end,
+        line_number,
+        severity: crate::ast_matcher::Severity::High,
+        suggestion: None,
+    };
+    dynamic_source_finding_verdict(
+        command,
+        content,
+        site,
+        &finding,
+        context,
+        first_allowlist_hit,
+    )
+}
+
+/// Judge a literal handed to `eval` and its kin as the source it is, with the
+/// same layers a body gets. One level: a further dynamic call inside the
+/// literal is source this will not chase, so it counts as unverified.
+fn literal_dynamic_source_verdict(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    site: &crate::ast_matcher::DynamicSourceSite,
+    source: &str,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    let mut literal = content.clone();
+    literal.content = source.to_string();
+    literal.content_range = None;
+    literal.word_range = None;
+    literal.additional_execution_target = None;
+
+    for finding in crate::ast_matcher::scan_filesystem_sink_fallback(source, literal.language) {
+        if finding.severity.blocks_by_default() {
+            let blocked = dynamic_source_finding_verdict(
+                command,
+                &literal,
+                site,
+                &finding,
+                context,
+                first_allowlist_hit,
+            );
+            if blocked.is_some() {
+                return blocked;
+            }
+        }
+    }
+    let matches = DEFAULT_MATCHER
+        .find_matches(source, literal.language)
+        .or_else(|err| retry_transient_ast_failure(err, &literal, context));
+    let Ok(matches) = matches else {
+        return unverified_dynamic_source_verdict(
+            command,
+            content,
+            site,
+            context,
+            first_allowlist_hit,
+        );
+    };
+    for finding in matches {
+        if finding.severity.blocks_by_default() {
+            let blocked = dynamic_source_finding_verdict(
+                command,
+                &literal,
+                site,
+                &finding,
+                context,
+                first_allowlist_hit,
+            );
+            if blocked.is_some() {
+                return blocked;
+            }
+        }
+    }
+    if let Some(blocked) =
+        exec_sink_backstop_verdict(command, &literal, context, first_allowlist_hit)
+    {
+        return Some(blocked);
+    }
+    if let Some(blocked) = exec_sink_pack_verdict(command, &literal, context) {
+        return Some(blocked);
+    }
+    let reading = match dynamic_source_reading_within_deadline(&literal, None, context) {
+        Ok(reading) => reading,
+        Err(decided) => return decided.map(|result| *result),
+    };
+    // A call reaches a shell by more spellings than the sink table lists
+    // (`getattr(__import__('os'), 'system')`), and no other layer reads this
+    // text as shell, so a string in the literal is judged wherever it sits.
+    let strings = reading
+        .strings
+        .into_iter()
+        .map(|command| crate::ast_matcher::ReconstructedCommand {
+            command,
+            start: site.start,
+            end: site.end,
+        })
+        .collect();
+    if let Some(blocked) =
+        reconstructed_interpreter_commands_verdict(command, content, context, strings)
+    {
+        return Some(blocked);
+    }
+    if reading.sites.is_empty() {
+        return None;
+    }
+    unverified_dynamic_source_verdict(command, content, site, context, first_allowlist_hit)
 }
 
 /// Explicit language/content exemptions apply to every executable-source
@@ -36713,6 +37046,18 @@ pub fn apply_branch_strictness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dynamic_source_wait_outlasts_a_scheduling_delay_inside_the_deadline() {
+        let ms = std::time::Duration::from_millis;
+        // A loaded host can hold the worker thread past the 20 ms scan budget.
+        assert_eq!(dynamic_source_wait(ms(20), ms(1000)), ms(250));
+        // A large body keeps the scan budget its size earned.
+        assert_eq!(dynamic_source_wait(ms(320), ms(1000)), ms(320));
+        // Nothing waits past the deadline.
+        assert_eq!(dynamic_source_wait(ms(320), ms(40)), ms(40));
+        assert_eq!(dynamic_source_wait(ms(20), ms(10)), ms(10));
+    }
 
     #[test]
     fn issue_598_legacy_safe_patterns_keep_the_original_command_spelling() {
