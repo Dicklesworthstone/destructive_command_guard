@@ -373,18 +373,42 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   program that ran decoded or computed source reached no check at all. `eval`,
   `exec`, `compile` with `exec`, `Function` and `new Function` including
   tagged templates, `instance_eval` and their kin now deny as
-  `heredoc.<language>.dynamic_source` when dcg cannot read their source. A
-  string literal is judged as source one level deep, and the strings inside
-  it as commands, so `eval("1 + 1")` stays allowed and a literal that runs a
-  shell pipeline does not, however the call reaches it. That includes an
+  `heredoc.<language>:dynamic_source` when dcg cannot read their source. A
+  string literal is judged as source one level deep, so `eval("1 + 1")` stays
+  allowed and a literal that runs a shell pipeline does not. That includes an
   `exec` of a literal that imports `subprocess` under another name, which
-  0.15.3 allowed. A name bound once to a literal at the top level counts as
-  that literal. In the synthetic comparison above, this denies again 180
-  forms that run and that the change to quoted heredocs would otherwise have
-  allowed. It scans what it can reach and no more: it runs only on quoted
-  heredocs dcg has proved go to the interpreter, not on unquoted heredocs and
-  not on inline `node -e` or `python3 -c`. Of 657 synthetic forms that run and
-  that 0.15.3 also allowed, 431 stay allowed (63ca20f0).
+  0.15.3 allowed. In Python, JavaScript, TypeScript and Ruby each constant
+  string inside the literal is also judged as a command. That second reading
+  does not reach Perl literals or f-strings with a replacement field, and a
+  string split across `+` is judged a piece at a time. A name bound once to a
+  literal at the top level
+  counts as that literal, unless the body could rebind it unseen: `globals()`,
+  `locals()`, `vars()`, `setattr`, a star import, a Ruby `binding`, JavaScript
+  `with` or a write through `globalThis`, or the name inside a string. A
+  reading that stops at a limit, an unfinished parse, an unproven Perl string
+  boundary or a quoted heredoc with no terminator line comes back
+  `indeterminate`, not allowed. PHP and Go have no reader, so those bodies keep
+  their 0.15.3 shell reading of `eval`. In the synthetic comparison above, this
+  denies again 180 forms that run and that the change to quoted heredocs would
+  otherwise have allowed. It scans what it can reach and no more: it runs only
+  on quoted heredocs dcg has proved go to the interpreter, not on unquoted
+  heredocs and not on inline `node -e` or `python3 -c`. Of 657 synthetic forms
+  that run and that 0.15.3 also allowed, 431 stay allowed (63ca20f0).
+- **A computed command given to a language's own process call is not read.**
+  This limit is the same in 0.15.3, and the check above does not answer it. A
+  literal dangerous command in these forms denies in both releases; a command
+  built at run time is allowed in both. In Ruby: backticks, `%x`, `system`,
+  `exec`, `spawn`, `IO.popen`, `Open3` and `open` with a pipe. In Perl:
+  backticks, `qx`, `readpipe`, `system`, `exec` and `open` with a pipe. In PHP:
+  backticks, `shell_exec`, `system`, `passthru`, `exec`, `popen` and
+  `proc_open`. In Python: `os.system` and `subprocess` with `shell=True`. In
+  Node: `child_process`. Also allowed in both releases: `eval.bind()` with no
+  arguments; a form the shell reading misses in a body given to `deno run -`,
+  such as `(globalThis as any).eval(x)`, because dcg has not proved that command
+  reads stdin as its program and so does not read it as TypeScript; Python
+  `eval` and `exec` spelled with compatibility characters, reached through an
+  import alias, or taken from `__builtins__.__dict__` or `vars(builtins)`; PHP
+  `create_function`; Perl `s///ee` and `do $file`.
 - **Inline programs are read as the whole shell word (#570).** A `-c`/`-e`
   program was judged by its first quoted piece only, so a call after an
   embedded quote, as in
