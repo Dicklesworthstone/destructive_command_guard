@@ -294,9 +294,17 @@ fn no_terminator_after_extracted_text_is_read_the_same() {
     assert_eq!(decided, Vec::<String>::new());
 
     // A deny in what was extracted still stands.
+    assert_denied_as(
+        &format!("python3 <<'A'\nimport shutil\nshutil.rmtree('/etc')\nA\n{OPEN}"),
+        "heredoc.python:shutil_rmtree",
+    );
+    assert_denied_as(&format!("git reset --hard\n{OPEN}"), "core.git:reset-hard");
+
+    // The reader needs its body proved, and an open heredoc in the command ends
+    // that proof, so this one is undecided. It was allowed before this check.
     assert_eq!(
         decision(&format!("python3 <<'A'\nexec(x)\nA\n{OPEN}")),
-        "deny"
+        "indeterminate"
     );
 
     for command in [
