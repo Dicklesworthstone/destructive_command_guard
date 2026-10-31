@@ -381,10 +381,46 @@ fn source_of<D: ast_grep_core::Doc>(
     }
 }
 
+/// Whether a word equal to `name` appears in `text`.
+fn text_names(text: &str, name: &str) -> bool {
+    text.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+        .any(|word| word == name)
+}
+
+/// A form that can change a name without mentioning it as an identifier: a
+/// write through a scope object or a binding, a star import, a `with` scope.
+fn can_rebind_unseen<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+) -> bool {
+    let kind = node.kind();
+    match language {
+        ScriptLanguage::Python => {
+            kind.as_ref() == "wildcard_import"
+                || (kind.as_ref() == "identifier"
+                    && matches!(
+                        node.text().as_ref(),
+                        "globals" | "locals" | "vars" | "setattr" | "__dict__"
+                    ))
+        }
+        ScriptLanguage::Ruby => kind.as_ref() == "identifier" && node.text().as_ref() == "binding",
+        _ => {
+            kind.as_ref() == "with_statement"
+                || (kind.as_ref() == "identifier"
+                    && matches!(
+                        node.text().as_ref(),
+                        "globalThis" | "global" | "window" | "self"
+                    ))
+        }
+    }
+}
+
 /// The literal `name` is bound to, when the program's only two mentions of
 /// `name` are one top-level assignment of that literal and the use after it.
 /// A third mention could rebind, mutate or alias the value, so it ends this
-/// proof rather than being reasoned about.
+/// proof rather than being reasoned about. So does the name inside a string or
+/// symbol, which is how `globals()["x"]` and `exec("x = ...")` reach it, and any
+/// form that can rebind it without naming it.
 fn sole_literal_binding<D: ast_grep_core::Doc>(
     root: &ast_grep_core::Node<'_, D>,
     name: &str,
@@ -393,10 +429,16 @@ fn sole_literal_binding<D: ast_grep_core::Doc>(
     let mut mentions = 0_usize;
     let mut value = None;
     for (index, node) in root.dfs().enumerate() {
-        if index >= MAX_DYNAMIC_SOURCE_NODES {
+        if index >= MAX_DYNAMIC_SOURCE_NODES || can_rebind_unseen(&node, language) {
             return None;
         }
-        if node.kind().as_ref() != "identifier" || node.text().as_ref() != name {
+        let kind = node.kind();
+        if (kind.contains("string") || kind.as_ref() == "simple_symbol")
+            && text_names(node.text().as_ref(), name)
+        {
+            return None;
+        }
+        if !kind.contains("identifier") || node.text().as_ref() != name {
             continue;
         }
         mentions += 1;
@@ -1657,6 +1699,31 @@ mod tests {
         assert_eq!(
             sources("new Function('a, b', 'return a + b')", J),
             literal("Function", "return a + b")
+        );
+    }
+
+    #[test]
+    fn a_form_that_can_rebind_unseen_ends_the_literal_proof() {
+        use ScriptLanguage::{JavaScript as J, Python as P, Ruby as R};
+        assert_eq!(
+            not_unverified(&[
+                ("code = 'a'\nglobals()['code'] = read()\nexec(code)", P),
+                ("code = 'a'\nglobals()[name] = read()\nexec(code)", P),
+                ("code = 'a'\nlocals()[name] = read()\nexec(code)", P),
+                ("code = 'a'\nvars()[name] = read()\nexec(code)", P),
+                ("code = 'a'\nsetattr(mod, name, read())\nexec(code)", P),
+                ("code = 'a'\nfrom m import *\nexec(code)", P),
+                ("code = 'a'\nexec('code = read()')\nexec(code)", P),
+                ("let s = 'a'; ({ s } = o); eval(s);", J),
+                ("let s = 'a'; [s] = o; eval(s);", J),
+                ("let s = 'a'; globalThis.s = x; eval(s);", J),
+                ("let s = 'a'; globalThis[name] = x; eval(s);", J),
+                ("var s = 'a'; with (o) { eval(s); }", J),
+                ("var s = 'a'; eval('s = x'); eval(s);", J),
+                ("s = 'a'\nbinding.local_variable_set(:s, x)\neval(s)", R),
+                ("s = 'a'\neval('s = x')\neval(s)", R),
+            ]),
+            Vec::<&str>::new()
         );
     }
 
