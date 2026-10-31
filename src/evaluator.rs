@@ -13024,7 +13024,7 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
         // untouched, and inside a body a pipeline hands to a shell the pipeline
         // collector recursively evaluates that body, where the eval is seen again.
         let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
-        let eval_view = crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
+        let eval_view = crate::heredoc::mask_dynamic_source_read_stdin(data_view.as_ref());
         collect_posix_eval_sinks(eval_view.as_ref(), &mut sinks);
         let mut interpreter_heredocs = Vec::new();
         collect_posix_pipeline_executable_sinks(command, &mut sinks, &mut interpreter_heredocs);

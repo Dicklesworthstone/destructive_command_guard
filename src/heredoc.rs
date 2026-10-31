@@ -9341,6 +9341,10 @@ pub(crate) fn mask_inert_interpreter_stdin(command: &str) -> Cow<'_, str> {
     }
     let bodies: Vec<_> = heredocs
         .iter()
+        .filter(|heredoc| {
+            extract_heredoc_target_command(command, heredoc.operator_start)
+                .is_some_and(|target| blank(&target))
+        })
         .filter_map(|heredoc| inert_interpreter_stdin_body(command, heredoc))
         .collect();
     if bodies.is_empty() {

@@ -151,6 +151,24 @@ fn a_dangerous_literal_denies_as_what_it_runs() {
 }
 
 #[test]
+fn a_language_with_no_reader_keeps_the_posix_eval_reading() {
+    let not_denied: Vec<String> = [
+        "<?php\neval(base64_decode(getenv('P')));",
+        "<?php $a = 1; eval(base64_decode(getenv('P')));",
+        "<?php\nif (true) {\n    eval(base64_decode(getenv('P')));\n}",
+        "<?php\neval(getenv('P'));",
+        "<?php\neval('echo 1;');",
+        "eval(base64_decode(getenv('P')));",
+    ]
+    .iter()
+    .map(|body| heredoc("php", body))
+    .filter(|command| decide(command)["rule_id"] != "heredoc.posix:eval-dynamic")
+    .collect();
+    assert_eq!(not_denied, Vec::<String>::new());
+    assert_eq!(decision(&heredoc("php", "<?php\necho 1 + 1;")), "allow");
+}
+
+#[test]
 fn a_harmless_literal_stays_allowed() {
     for (receiver, body) in [
         ("node", "eval('1+1')"),

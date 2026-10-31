@@ -19,7 +19,7 @@ pub use source_analysis::*;
 pub(crate) use bash_temp_policy::literal_temp_rm;
 pub(crate) use dynamic_source::{
     DynamicSource, DynamicSourceReading, DynamicSourceSite, dynamic_source_reading,
-    has_dynamic_source_candidates, literal_source_reading,
+    has_dynamic_source_candidates, literal_source_reading, reads_dynamic_source,
 };
 
 use crate::heredoc::ScriptLanguage;

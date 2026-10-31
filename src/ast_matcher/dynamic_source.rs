@@ -1259,6 +1259,17 @@ mod tests {
     }
 
     #[test]
+    fn only_a_language_with_a_reader_leaves_the_posix_eval_view() {
+        use ScriptLanguage::{Go, JavaScript, Perl, Php, Python, Ruby, TypeScript};
+        for language in [JavaScript, TypeScript, Python, Ruby, Perl] {
+            assert!(reads_dynamic_source(language), "{language:?}");
+        }
+        for language in [Php, Go] {
+            assert!(!reads_dynamic_source(language), "{language:?}");
+        }
+    }
+
+    #[test]
     fn the_size_limit_is_an_error_not_a_clean_reading() {
         let code = format!("eval(x)\n{}", "a = 1\n".repeat(MAX_DYNAMIC_SOURCE_BYTES));
         assert!(
