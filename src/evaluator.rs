@@ -13019,6 +13019,8 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
         // JavaScript's `eval` does not invoke POSIX `eval`. The two existing
         // ownership masks remove only those bodies from this syntax view;
         // interpreter source still reaches its language and raw-pattern scans.
+        // A language with no dynamic source reader keeps this reading: without
+        // it, PHP's `eval` of decoded text reaches no layer at all.
         //
         // An eval that is real stays visible either way: outside any heredoc it is
         // untouched, and inside a body a pipeline hands to a shell the pipeline
@@ -34358,6 +34360,9 @@ fn evaluate_heredoc(
             if let Some(blocked) = check_exec_sink_fallback(command, context, first_allowlist_hit) {
                 return Some(blocked);
             }
+            if let Some(undecided) = unterminated_stdin_verdict(command, &reasons) {
+                return Some(undecided);
+            }
 
             let strict_timeout = is_timeout && !context.heredoc_settings.fallback_on_timeout;
             let strict_other = !is_timeout && !context.heredoc_settings.fallback_on_parse_error;
@@ -34391,6 +34396,10 @@ fn evaluate_heredoc(
             return None;
         }
         ExtractionResult::Partial { extracted, skipped } => {
+            if let Some(undecided) = unterminated_stdin_verdict(command, &skipped) {
+                return Some(undecided);
+            }
+
             // Check strict mode settings for skipped items
             let is_timeout = skipped
                 .iter()
@@ -35427,6 +35436,21 @@ fn check_exec_sink_fallback(
         }
     }
     None
+}
+
+/// A quoted interpreter heredoc with no terminator line has no reader, so it
+/// is recorded like a reading that could not finish: a positive finding still
+/// denies, and an allow becomes Indeterminate.
+fn unterminated_stdin_verdict(command: &str, reasons: &[SkipReason]) -> Option<EvaluationResult> {
+    (reasons
+        .iter()
+        .any(|reason| matches!(reason, SkipReason::UnterminatedHeredoc { .. }))
+        && crate::heredoc::unterminated_stdin_has_dynamic_source(command)
+        && !crate::packs::regex_engine::record_incomplete_analysis(
+            "unterminated_interpreter_stdin",
+            &"a quoted interpreter heredoc with no terminator line",
+        ))
+    .then(EvaluationResult::indeterminate_due_to_budget)
 }
 
 /// Whether `content` goes to an interpreter that may be Python 2, whose

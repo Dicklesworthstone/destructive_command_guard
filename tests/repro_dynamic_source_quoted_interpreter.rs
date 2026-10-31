@@ -169,6 +169,37 @@ fn a_language_with_no_reader_keeps_the_posix_eval_reading() {
 }
 
 #[test]
+fn a_heredoc_with_no_terminator_is_undecided_if_it_can_run_dynamic_source() {
+    let decided: Vec<String> = [
+        "python3 <<'EOF'\nimport os\nexec(os.environ['P'])",
+        "python3 - <<'EOF'\nimport os\nexec(input())\n",
+        "python3 <<'EOF'\nimport os\nexec(os.environ['P'])\nEOF ",
+        "cd /home/u/work/x && python3 - <<'PY'\nexec(input())",
+        "cd /home/u/work/x && python3 - <<'PY'\nimport os\nexec(input())",
+    ]
+    .iter()
+    .filter(|command| decision(command) != "indeterminate")
+    .map(ToString::to_string)
+    .collect();
+    assert_eq!(decided, Vec::<String>::new());
+
+    // A word `eval` at the start of a line still has its shell reading here.
+    assert_denied_as(
+        "python3 - <<'EOF'\neval(input())\n",
+        "heredoc.posix:eval-dynamic",
+    );
+
+    for command in [
+        "python3 <<'EOF'\nprint(1 + 1)",
+        "cat <<'EOF'\nexec(x)",
+        "cat <<< 'x'\nprint(1)",
+        "echo $((1<<3))",
+    ] {
+        assert_eq!(decision(command), "allow", "{command:?}");
+    }
+}
+
+#[test]
 fn a_harmless_literal_stays_allowed() {
     for (receiver, body) in [
         ("node", "eval('1+1')"),

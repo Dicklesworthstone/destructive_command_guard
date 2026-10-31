@@ -295,6 +295,18 @@ fn tree_reading(
             return Err(reading_error(language, "call site limit"));
         }
     }
+    // A call in text the grammar could not finish may have no node. A site that
+    // already denies needs no more; anything else would end in allow unread.
+    if !strings
+        && !reading.python2_backticks
+        && root.get_inner_node().has_error()
+        && !reading
+            .sites
+            .iter()
+            .any(|site| site.source == DynamicSource::Unverified)
+    {
+        return Err(reading_error(language, "unfinished source grammar"));
+    }
     Ok(reading)
 }
 
@@ -1613,6 +1625,23 @@ mod tests {
         );
         assert_eq!(sources("(((eval)))(x)", J), unverified("eval"));
         assert_eq!(sources("(((eval)))(x)", P), unverified("eval"));
+    }
+
+    #[test]
+    fn an_unfinished_parse_is_an_error_not_a_clean_reading() {
+        use ScriptLanguage::{JavaScript as J, Python as P, Ruby as R};
+        assert_eq!(
+            readable(&[
+                ("def x(\neval('1+1')", R),
+                ("def f(\nexec('1')", P),
+                ("class {\neval('1+1')", J),
+            ]),
+            Vec::<&str>::new()
+        );
+        // A site that already denies needs no more.
+        assert_eq!(sources("eval(x)\n)(", J), unverified("eval"));
+        // A literal that does not parse is a string.
+        assert!(literal_source_reading("eval is )( no code", P, Duration::from_secs(5)).is_ok());
     }
 
     #[test]

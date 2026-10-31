@@ -9327,6 +9327,79 @@ fn inert_interpreter_stdin_body(command: &str, heredoc: &ActiveHeredoc) -> Optio
 /// destructive-pattern scan, including opaque or aliased execution sinks.
 #[must_use]
 pub(crate) fn mask_inert_interpreter_stdin(command: &str) -> Cow<'_, str> {
+    mask_interpreter_stdin_bodies(command, |_| true)
+}
+
+/// The view for the POSIX `eval` reading alone. A body leaves that reading only
+/// when a reader for its language answers in its place, so `php` and `go` bodies
+/// stay visible here, and every other consumer keeps the full mask.
+#[must_use]
+pub(crate) fn mask_dynamic_source_read_stdin(command: &str) -> Cow<'_, str> {
+    mask_interpreter_stdin_bodies(command, |target| {
+        let name = target.rsplit(['/', '\\']).next().unwrap_or(target);
+        crate::ast_matcher::reads_dynamic_source(ScriptLanguage::from_command(name))
+    })
+}
+
+/// Whether a quoted heredoc with no terminator line gives a non-shell
+/// interpreter a dynamic execution candidate. Bash runs that text to end of
+/// input, and extraction skips it, so no reader sees it. The answer only moves
+/// an allow to Indeterminate, so it asks for less proof than an exemption does.
+#[must_use]
+pub(crate) fn unterminated_stdin_has_dynamic_source(command: &str) -> bool {
+    let limits = ExtractionLimits::structural_scan();
+    let timeout = Duration::from_millis(limits.timeout_ms);
+    HEREDOC_EXTRACTOR.captures_iter(command).any(|cap| {
+        let (Some(operator), Some(word)) = (cap.get(0), cap.get(2)) else {
+            return false;
+        };
+        let words = shell_words::split(word.as_str()).unwrap_or_default();
+        let [delimiter] = words.as_slice() else {
+            return false;
+        };
+        let Some(line_end) = command[operator.end()..]
+            .find('\n')
+            .map(|rel| operator.end() + rel)
+        else {
+            return false;
+        };
+        let heredoc_type = match cap.get(1).map(|variant| variant.as_str()) {
+            Some("-") => HeredocType::TabStripped,
+            Some("~") => HeredocType::IndentStripped,
+            _ => HeredocType::Standard,
+        };
+        if !word.as_str().contains(['\'', '"', '\\'])
+            || command.as_bytes()[..operator.start()].last() == Some(&b'<')
+            || !matches!(
+                extract_heredoc_body(
+                    command,
+                    line_end,
+                    delimiter,
+                    heredoc_type,
+                    false,
+                    &limits,
+                    Instant::now(),
+                    timeout,
+                ),
+                Err(SkipReason::UnterminatedHeredoc { .. })
+            )
+        {
+            return false;
+        }
+        let Some(target) = extract_heredoc_target_command(command, operator.start()) else {
+            return false;
+        };
+        let name = target.rsplit(['/', '\\']).next().unwrap_or(&target);
+        is_non_shell_interpreter_stdin_command(&target)
+            && crate::ast_matcher::has_dynamic_source_candidates(
+                &command[line_end..],
+                ScriptLanguage::from_command(name),
+                name == "python" || name.starts_with("python2"),
+            )
+    })
+}
+
+fn mask_interpreter_stdin_bodies(command: &str, blank: impl Fn(&str) -> bool) -> Cow<'_, str> {
     if !command.contains("<<") {
         return Cow::Borrowed(command);
     }
