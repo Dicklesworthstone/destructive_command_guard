@@ -214,7 +214,10 @@ fn a_string_in_a_literal_is_judged_however_the_call_reaches_it() {
 fn a_harmless_string_in_a_literal_stays_allowed() {
     for (receiver, body) in [
         ("python3 -", r#"print(eval("__import__('os').getcwd()"))"#),
-        ("python3 -", r#"eval("__import__('os').system('echo hello')")"#),
+        (
+            "python3 -",
+            r#"eval("__import__('os').system('echo hello')")"#,
+        ),
         ("ruby", r#"eval("`echo hello`")"#),
     ] {
         let command = heredoc(receiver, body);
