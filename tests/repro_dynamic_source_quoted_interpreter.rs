@@ -261,6 +261,20 @@ fn a_heredoc_with_no_terminator_is_undecided_if_it_can_run_dynamic_source() {
 }
 
 #[test]
+fn nesting_at_any_depth_ends_in_a_verdict() {
+    let open = "(".repeat(30_000);
+    let close = ")".repeat(30_000);
+    for body in [
+        format!("{open}globalThis{close}.eval(process.env.P);"),
+        format!("{open}globalThis{close}[\"eval\"](process.env.P);"),
+        format!("new {open}Function{close}(process.env.P)();"),
+        format!("new {open}globalThis{close}.Function(process.env.P)();"),
+    ] {
+        assert_eq!(decision(&heredoc("node -", &body)), "indeterminate");
+    }
+}
+
+#[test]
 fn a_harmless_literal_stays_allowed() {
     for (receiver, body) in [
         ("node", "eval('1+1')"),
