@@ -35050,7 +35050,11 @@ fn evaluate_heredoc(
         }
     }
 
-    // Asked last, so a deny in what was extracted stands.
+    // No row pins this order; it is kept late as defence. Under the
+    // evaluator's regex scope this call only records the incomplete analysis
+    // and returns `None`, so a deny in what was extracted stands wherever it
+    // is asked. Only a caller with no scope gets `Some` here, and asked last,
+    // that caller still sees such a deny first.
     if let Some(undecided) = unterminated_stdin_verdict(command, &skipped) {
         return Some(undecided);
     }
