@@ -885,6 +885,16 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   allow-once code is offered for an `indeterminate`, and raising
   `hook_timeout_ms`, which the message suggests, does not help: this is a work
   limit, not a clock.
+- **A heredoc with no terminator beside one that runs unproven code.** A
+  closed `python3 <<'A'` heredoc whose body is `exec(x)`, followed in the same
+  command by an interpreter heredoc that never ends, comes back
+  `indeterminate`; 0.15.3 allowed it. A client with a review prompt asks, any
+  other client blocks, and `general.unverified_decision = "deny"` denies it
+  everywhere. The message says dcg could not finish "within 1000ms" and
+  suggests raising `hook_timeout_ms`, but no clock ran out (the check takes
+  about 70 ms) and raising it does not help: the cause is the
+  `unterminated_interpreter_stdin` named in brackets
+  (bd-indeterminate-reason-wording-jcpy).
 - **A harmless `perl -pe`, `perl -ne` or `ruby -pe` filter on a pipe (#611,
   #624).** `tail -n 3 x | perl -pe 's/foo/bar/' | cut -c1-130` is denied as
   `heredoc.posix:pipeline-consumer`, in 0.15.3 as well. The rule cannot simply
