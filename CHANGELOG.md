@@ -11,114 +11,819 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## Unreleased
+## [v0.16.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.16.0) -- 2026-10-31 [Release]
 
-### Fixed
+This release closes commands that ran unguarded (writes hidden by `IFS`
+splitting, by shell variables or by `git rev-parse` paths, redirections
+written against the command word, upper-case program names, ssh_config
+command options, OpenCode v2's `shell` tool, and Python, Deno, Bun and awk
+process calls dcg did not read) and adds Amp, Muse Code and Factory Droid
+integrations. It also fixes a long list of false positives reported against
+0.15.3, most of them in quoted Python and Node heredocs, and makes a
+configuration file that fails to load block commands instead of being
+skipped.
 
-- **Keep executable prose substitutions visible to custom packs (#614).**
-  Custom rules can match active backticks and `$()` inside GitHub CLI body,
-  Git message, Beads Rust description, and other registered data arguments.
-  The custom matching view preserves substitution delimiters and enclosing
-  quotes while keeping inert prose and checked producer output masked.
-  Keyword selection uses the same view; original source spans, safe-pattern
-  authorization, rule allowlists, and built-in inner-command checks remain
-  intact. Single-quoted and escaped literal markers retain their data treatment.
-- **Audit universal allowlist globs as unrestricted (#545).** Doctor now
-  recognizes composite patterns such as `**/`, `**/*`, and `**/**` that match
-  every working directory, including equivalent normalized root paths.
-  Permanent grants using these patterns receive the existing actionable
-  rule and provenance warnings in project, user, and system layers. Bounded
-  patterns and temporary or inactive entries retain their classifications;
-  the audit does not change matching or rewrite grants in `--fix` mode.
-- **Inspect complete inline programs inside compound shell commands (#544).**
-  Python and JavaScript literals carried through variables remain checked
-  when the invocation has another statement, a pipeline, redirection, an
-  environment assignment, or supported trailing operands. Exact source ownership
-  is proved separately from eligibility for the documentation exemption, so
-  another shell consumer cannot suppress inspection. Static argument arrays
-  remain data, and recovered commands keep their own rule and allowlist
-  ownership. Later Node options that can replace its program cannot establish
-  executable-source ownership for the earlier argument.
-- **Follow literal execution dependencies without scanning argument data (#544).**
-  A bounded proof now follows a static string into a direct literal Python
-  `exec`/`eval` or JavaScript `eval` program that passes it to a known shell sink.
-  The recovered command retains its own rule and allowlist identity. Static
-  argv and option literals owned by named execution checks keep their data
-  roles, while callbacks, nested calls, dynamic options, and shell source
-  remain visible. Unreferenced strings and evaluated print calls are not
-  promoted to executable shell commands. Hoisted JavaScript declarations and
-  ambiguous identifier spellings withdraw the optional binding proof. The
-  POSIX eval collector respects proven interpreter stdin ownership while
-  language analysis and shell consumers retain the original source.
-- **Accept literal numeric ports in data-transfer proofs (#543).** Static
-  decimal SSH and SCP port arguments retain the existing file-data treatment.
-  Variable ports, substitutions, and unproved transport options remain visible
-  to execution checks.
-- **Review Python source selected by shell expansion (#538).** A Python `-c`
-  program supplied entirely by an unresolved shell expansion receives the
-  existing inline-launcher denial rule. The check follows Python option
-  ownership and outer shell quoting, preserving literal or escaped dollar
-  signs, statically resolved source, and `-c` text passed as script arguments.
-- **Inspect the arguments produced by executable variables (#540).** Literal
-  assignments such as `X='git reset --hard'; $X` now reach the Git rule for
-  the expanded command instead of being mistaken for one quoted executable
-  name. Quoted variable references preserve one argument, while supported
-  unquoted expansion splits fields without reinterpreting their contents as
-  shell syntax. Unknown splitting, globbing, and interpreter flags introduced
-  by expansion require review. Rule-specific grants and original source spans
-  remain attached to the command that actually needs them.
-- **Keep quoted flowctl receipt text as data (#538, #540).** Complete static
-  `gate check` and `gate receipt` command operands can contain quoted shell
-  punctuation without triggering destructive-command rules. Live expansions,
-  incomplete words, unknown options, redirects, and later commands retain
-  their execution checks. Regression cases exercise both `dcg test` and the
-  actual hook protocol. The inline extractor shares the complete receipt
-  grammar, so a dynamic `FLOWCTL` executable no longer causes static receipt
-  values to be inspected as speculative shell programs.
-- **Keep interpreter callbacks independent of outer execution grants (#544).**
-  Literal command evidence inside callbacks, assignments, and argument side
-  effects can no longer inherit an enclosing call's already-checked status.
-  Destructive commands carried through variables retain their own rule and
-  cannot be hidden by an allowlist entry for the outer execution sink. Static
-  argument arrays and option values preserve their existing data treatment.
-- **Check substitutions carried by interpreter variables (#544).** Python and
-  JavaScript literal values passed through variables or opaque calls now reach
-  the existing command evaluator, including encoded substitution markers.
-  Bounded analysis preserves source spans, language escape semantics, named
-  execution rules, and their allowlist ownership. Proven documentation in an
-  isolated inline invocation or quoted heredoc remains data; unverified or
-  incomplete analysis cannot silently approve a command.
-- **Read complete quoted heredoc delimiters (#544).** Backslash quoting and
-  adjacent quoted fragments, such as `<<D\OC` and `<<D'OC'`, now retain the
-  exact interpreter source boundary in both the extractor and bundled Bash
-  parser. Any quoted fragment correctly suppresses outer-shell expansion in
-  the body. This prevents false denials of literal documentation and keeps
-  subsequent commands visible. Unsupported delimiter syntax cannot select a
-  shorter, misleading terminator.
-- **Inspect GNU tar helpers inside shell groups (#540).** Helper discovery now
-  reaches actual tar invocations inside parentheses and brace groups, preserving
-  their original command context. Enclosing file writes or earlier state changes
-  prevent a helper from relying on stale local-file evidence, including a
-  PostgreSQL checkpoint helper whose input is overwritten by the caller's
-  redirect. Read-only groups retain the existing helper checks.
-- **Analyze scripts written by tee before execution (#540).** A quoted heredoc
-  written to literal files by `tee` and immediately run by a supported
-  interpreter now receives the same language-aware safety checks as a script
-  written by `cat`. This catches destructive Python and JavaScript filesystem
-  calls while recognizing genuine language literals and arrow operators.
-  Source identity requires an unambiguous overwrite and interpreter handoff;
-  append mode, dynamic paths, extra consumers, and outputs that replace an
-  interpreter retain conservative analysis. Ordinary data writes and the
-  existing cat-based transfer-data checks keep their behavior.
-- **Doctor audits unrestricted allowlist exceptions (#545).** Active whole-rule
-  grants with no working-directory restriction or expiration now produce
-  actionable warnings naming the rule, source layer/file, reason, and available
-  author/timestamp metadata. Destructive filesystem and Git exceptions are
-  marked high risk. The audit covers trusted project, user, and system layers,
-  preserves warnings alongside parse errors, and distinguishes scoped,
-  temporary, expired, and inactive entries using runtime semantics. Doctor
-  leaves allowlist files and matching behavior unchanged, including in `--fix`
-  mode; its JSON v1 schema and warning-only exit behavior are preserved.
+**A configuration file that fails to load now blocks every shell command
+(#568).** In 0.15.3 a user or system `config.toml` that did not parse, held
+an invalid policy value or could not be read was skipped, and dcg ran with
+its defaults, without that file's block rules. Now the hook denies every
+shell command with a reason that names the file and points to
+`dcg doctor --strict`, and `dcg test` exits 3 with a `configuration_error`.
+`DCG_FAIL_CLOSED` and `DCG_UNVERIFIED_DECISION` cannot open it up again. A
+`DCG_CONFIG` that names a missing file is handled the same way. A malformed
+repository `.dcg.toml` that dcg found on its own is still not fatal. After
+upgrading, run `dcg test 'git status'` once to confirm your configuration
+loads (5b1d5bf3).
+
+**OpenCode and Oh My Pi users: regenerate the plugin or bridge after
+upgrading.** OpenCode v2 calls its shell tool `shell`, which the plugin
+generated by earlier versions skipped, so every v2 shell command ran
+unguarded (#547). The Oh My Pi bridge treated a dcg exit without a readable
+verdict as an allow (#564). Both fixes live in the generated files. Run
+`dcg install --opencode --force` or `dcg install --omp --force`, or let
+`dcg update` do it (it does when its installer detects the agent, unless you
+pass `--no-configure`), then restart the agent (e31cc145, 450a2897).
+
+**Claude Code users who set `CLAUDE_CONFIG_DIR`: run `dcg install` or
+`dcg doctor --fix` after upgrading (#541).** Earlier versions never read that
+variable and put the hook in `~/.claude/settings.json`, so the profile
+Claude Code actually used may have no dcg hook, and nothing reported it
+(65004aa6, 4911e6f3).
+
+**Custom pack authors: check your packs after upgrading.** A rule that can
+only match zero width now stops its pack from loading, safe patterns now
+match the original command with its environment assignments and wrappers,
+and `packs.disabled` now turns off packs loaded from `custom_paths`. See
+Behaviour changes below (11b3f00a, e0554cd0, c490820f).
+
+### Behaviour changes you may notice
+
+- **Each command is also read without its redirections.** The shell removes
+  a redirection from argv wherever it stands, but packs read it as a word.
+  Written against the command word or before it, a redirection took the
+  executable position and hid the command, so `git>/dev/null reset --hard`
+  was allowed; written after an operand, it ended the command early. Pack
+  matching now also reads every command with its redirections blanked, under
+  POSIX, Cmd and PowerShell syntax, and a denial from either reading wins.
+  Where a command's input comes from (a heredoc fed to `psql`, for example)
+  is still read from the full command. In a replay of about 79,000 commands
+  this changed 58 verdicts, all from allow to deny; six were agent commands
+  whose `git` call took an unquoted variable and ended in a redirection,
+  which the dynamic-token rule could not see before (f8e60ac3, a43e38e5,
+  9b06d946, cfca5d4a, 90648c46).
+- **Shell payloads without a pack keyword are judged whole (#551).** A
+  `bash -c`, `sh -c`, ssh or heredoc script went back through the evaluator
+  only when it contained a pack keyword, so `$G -D main` was denied while
+  `bash -c '$G -D main'` was allowed, and `sh -c 'eval "$X"'` got through
+  while `eval "$X"` is denied as `heredoc.posix:eval-dynamic`. Such a script
+  is now evaluated once, whole, as its text is at top level. Two results
+  change beyond the issue: a keyword-less here-string to an unknown program
+  (`mytool <<< "$a -d $b"`) now gets the Bash reading and is denied, and awk
+  printing into `sh -c "eval $(cat)"` is reported as
+  `heredoc.posix:eval-dynamic` instead of `core.git:reset-hard` (57515f5f).
+- **An unquoted brace list voids the home-directory `mv` exemptions.** Bash
+  expands `{a,b}` before `mv` runs, so the exemption checked a different
+  path than the one moved: `mv ~/{..,a}/{..,b}/etc ~/Documents/x` (which
+  moves `/etc`) and `mv ~/{Documents,.ssh}/id_rsa ~/Documents/y` were
+  allowed. An unquoted `{` now sends the move to
+  `mv-sensitive-source-root-home`, for the Trash moves too. Ordinary brace
+  lists such as `mv ~/Documents/{a,b}.txt ~/Documents/dir/` are denied as a
+  result; spell the operands out. Quoted braces are literal and stay allowed
+  (b9ecd7dc, 414d1d7b).
+- **Custom safe patterns match the original command (#598).** A safe pattern
+  used to see the normalized command, with environment assignments, wrappers
+  and executable paths stripped, so an exemption for
+  `/usr/bin/python3 -I /opt/tools/run_check.py --check` also covered it with
+  `PATH=/somewhere` in front, or under `env` or `sudo`. Safe patterns now
+  match the original segment; destructive patterns still read the normalized
+  text, and custom destructive patterns read the original as well. A nested
+  command (`bash -c '…'`) inherits a custom exemption only when a safe
+  pattern covers the whole carrier, and an earlier statement that can change
+  shell state (`export PATH=…;`) withholds a later segment's exemption. Put
+  the exact wrapper or assignment in the pattern when it is intended; see
+  `docs/custom-packs.md`. Built-in previews that dcg proves from the
+  command's arguments, such as `kubectl … --dry-run=client` and
+  `helm uninstall … --dry-run`, still hold behind `sudo`, `env` or an
+  assignment (e0554cd0, 861727a2).
+- **`packs.disabled` turns off packs loaded from `custom_paths` (#588).**
+  Every loaded external pack was enabled regardless, so a disabled custom
+  pack kept denying commands, and `dcg packs --enabled`, `dcg config` and
+  `dcg doctor` counted it. External packs now follow the built-in rule:
+  loading enables a pack, `packs.disabled` disables it by exact ID or by
+  category (a bare prefix does not), and an agent profile's `extra_packs` and
+  `disabled_packs` apply on top. `dcg test --with-packs` still re-enables one
+  for a single run (c490820f).
+- **A custom rule that can only match zero width is rejected (#558).** A
+  pattern made only of lookarounds and anchors validated but never matched
+  any text, so a pack built on one guarded nothing. Such a pattern now fails
+  validation when the pack loads, with an error asking for a consuming match,
+  and the pack is not loaded. Patterns with any consuming part, including
+  nullable ones and ones containing literal punctuation, are unaffected
+  (11b3f00a, a4f1fd0f).
+- **Escape-free tagged template literals are judged as shell.** zx, Bun Shell
+  and execa run a `$` template as a shell command, so
+  `` $`echo $(git reset --hard)` `` through zx in `node -e` was allowed. A
+  tagged template with no backslash in it is now read as a shell command
+  line. The cost, failing closed: a non-shell tag whose text looks
+  destructive as shell, such as `` html`<p>$(document).ready()</p>` ``, is
+  denied as `redirect-truncate-dynamic-path`. Templates with escapes
+  (`String.raw` with escaped backticks) keep their earlier treatment
+  (fce07096).
+
+### Agent integrations
+
+- **Amp: new plugin, `dcg install --amp` (#577).** Amp runs tools without
+  asking. `dcg install --amp` writes a dcg-owned `dcg-guard.js` to
+  `${XDG_CONFIG_HOME:-~/.config}/amp/plugins/` (or `.amp/plugins/` with
+  `--project`), refreshing a stale dcg copy and refusing to overwrite a
+  user's file; `dcg uninstall --amp` removes it. The plugin checks every
+  shell command a tool call carries, rejects the call on deny, opens Amp's
+  confirmation dialog on ask, and rejects when dcg gives no verdict unless
+  `DCG_BRIDGE_CRASH_DECISION=allow`. `--agent amp` selects `[agents.amp]`,
+  and `dcg doctor` reports an `amp_plugin` check. Reload Amp's plugins after
+  installing (9d964c1c).
+- **Muse Code: hook support, `dcg install --muse` (#572).** `dcg install
+  --muse` adds a matcher group for Muse's `shell`, `exec_command` and `bash`
+  tools to `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`, keeping
+  `schema_version` (adding `1` when missing) and every other key;
+  `dcg uninstall --muse` removes it and `dcg doctor` reports a `muse_hook`
+  check. The hook command carries `--agent muse`, which selects
+  `[agents.muse]`; Muse's Codex-shaped payload used to select
+  `[agents.codex-cli]`. An unreadable payload or a shell call without a
+  command is denied. The installers do not configure Muse yet, so run
+  `dcg install --muse` once and start a new session. For every agent, a tool
+  named `exec_command` is now a shell tool and its `cmd` argument is checked
+  next to `command`; Muse's `exec_command` calls ran unchecked before
+  (54a755dc).
+- **Factory Droid: `Execute` hook, `dcg install --droid` (#617).**
+  `dcg install --droid` registers dcg for Droid's `Execute` tool at user
+  scope, or with `--project` in the project's `.factory` directory (the Git
+  root, or the current directory outside Git). It picks among the hooks and
+  settings files Factory documents and keeps other hooks, host options,
+  symlinks and permissions. The hook command carries `--agent droid`, which
+  selects `[agents.droid]`. `install.sh` and `install.ps1` detect Droid and
+  run this installer, and the uninstallers remove it. `dcg doctor` checks the
+  `Execute` matcher, the active file and the executable path. Commands that
+  Droid's Script mode runs through nested `Execute` calls are not verified;
+  see `docs/agents.md` (efc1092e).
+- **OpenCode: the plugin guards v2's `shell` tool (#547).** OpenCode v2
+  renamed its shell tool from `bash` to `shell`, and the plugin returned
+  early for any name but `bash`, so every v2 shell command ran unguarded. The
+  plugin now guards `bash` and `shell`, checks any other tool that carries a
+  `command` argument (with a warning on stderr), blocks a shell call whose
+  command is missing or empty, and fails loudly when OpenCode's v2 hook API
+  is missing. Regenerate the plugin, as described above (e31cc145).
+- **Oh My Pi: a missing verdict follows the unverified policy (#563,
+  #564).** The generated bridge allowed a command when dcg exited 0 or 2
+  without a readable allow verdict. Empty, malformed or unknown output is now
+  reported and handled by `DCG_UNVERIFIED_DECISION`. The bridge also gives
+  dcg 25 seconds instead of 30, so it answers before Oh My Pi's own 30-second
+  tool-call limit. Regenerate the bridge, as described above (450a2897).
+- **Antigravity: denials match its strict output contract (#573).**
+  Antigravity CLI 1.4.0 parses hook output strictly and rejected dcg's
+  denials because of the extra `systemMessage`, `ruleId` and `remediation`
+  fields. A denial is now exactly `{"decision":"deny","reason":…}` on stdout
+  with exit code 0; the rule and the allow-once guidance stay in `reason`.
+  Warnings go to stderr with empty stdout, leaving the permission decision to
+  Antigravity (16b42252).
+- **A command carried in several argument keys is checked in every key.**
+  When a hook payload had more than one command-bearing key (Antigravity's
+  `command` and `CommandLine`, or a stringified `args` object), a harmless or
+  unfinished value in one could hide a destructive command in another. Each
+  distinct key is now evaluated. Native Antigravity commands are also
+  recovered from malformed or oversized JSON (10bc819c).
+- **Claude Code: `CLAUDE_CONFIG_DIR` is honoured (#541).** `dcg install`,
+  `dcg uninstall`, `dcg doctor`, hook self-healing and both installers now
+  use `$CLAUDE_CONFIG_DIR/settings.json` when the variable is set and
+  non-empty (a leading `~` is expanded, a relative path is resolved from the
+  current directory). Doctor names the file it checked, `--strict` fails when
+  that profile has no protection, and `--fix` installs into it.
+  `install --project` still writes the repository's `.claude/settings.json`.
+  Grok's Claude compatibility layer still reads `~/.claude/settings.json`;
+  use `dcg install --grok` for Grok (65004aa6, f922413f, 4911e6f3).
+- **Codex: `dcg doctor` follows `CODEX_HOME` (#539).** Doctor always read
+  `~/.codex/hooks.json` and `~/.codex/config.toml`, so with a custom
+  `CODEX_HOME` it reported a registered hook as missing and `--fix` edited
+  the wrong file. Both files now come from `CODEX_HOME` when it is set, and
+  messages name the real path (5683b5d8).
+- **Installs and repairs keep your hook settings (#582, #345).** Fields of
+  dcg's hook entry that dcg does not own, such as `timeout` and
+  `onFailure: "block"`, were dropped by the shell and PowerShell installers,
+  by `dcg install --force` when they sat on a later duplicate entry, and by
+  the Grok repair, which overwrote the whole file. Every install and repair
+  path (Claude Code, Codex, Gemini, Posit Assistant, Grok, Reasonix, Crush,
+  Muse, Antigravity) now refreshes only `type`, `command` and `shell`, merges
+  compatible fields from duplicate entries, and refuses conflicting ones
+  without writing. Settings with duplicate JSON keys are refused instead of
+  resolved silently. Writes are atomic and keep ownership, mode, symlinks
+  and, on Linux, ACLs and extended attributes. Repeated installs leave a
+  current file byte-identical (c64fc94e, 2250ddbf, 2074df77, 88a1ced5,
+  27c94602, 05b24145, 53e4dc38).
+- **MCP: `check_command` takes a `dialect`.** The MCP server's
+  `check_command` tool accepts `dialect` (`posix`, `powershell`, `cmd` or
+  `unknown`) and echoes the dialect it used; an invalid value is a tool error
+  instead of being ignored. Without it the check keeps the conservative
+  multi-shell `unknown` reading (b49653a1).
+
+### Commands that ran unguarded
+
+- **Writes hidden by `IFS` field splitting (#558, #565).**
+  `S=/tmp/a@/etc/shadow; IFS=@; echo x | tee $S` writes `/etc/shadow`, but
+  dcg read `$S` as one harmless path. Destinations of `tee`, `cp`, `mv`,
+  `dd`, `install`, `ln`, `sed -i` and `perl -i` that depend on a rebound
+  `IFS` are now split the way the shell splits them before the credential and
+  Git-internals rules run. That covers `export`, `printf -v` and `%n`,
+  redirected or background assignments, brace-expanded exports, line
+  continuations, wrappers such as `env`, `command`, `nice` and `stdbuf`,
+  `tee.exe` spellings, and `"${S:+$@}"`. A destination dcg cannot resolve is
+  denied under both rule families, and a grant for one family does not hide
+  the other (231ca344, 1850ae1a, 9ce33b7c, e2ea6b1b, e77f026b, 882eea6d,
+  4de45eae, 191cad7d).
+- **Writes whose destination comes from a variable or `git rev-parse` (#609,
+  #613).** `f=~/.ssh/authorized_keys; echo x | tee -a $f` and
+  `cp source "$(git rev-parse --git-path hooks)/pre-commit"` were allowed.
+  dcg now follows literal values bound earlier in the same command and the
+  `git rev-parse` path queries it recognises (`--git-dir`,
+  `--git-common-dir`, `--absolute-git-dir`, `--git-path`), including linked
+  worktrees, `core.hooksPath`, `-C` and `bash -c` bodies, and judges the
+  resulting path under the existing credential, Git-internals and redirect
+  rules. The query is never run. Paths such as `~/.ssh/known_hosts` stay
+  allowed (12036e96, 4850e2da, e4e06296).
+- **A variable used as the command runs what it holds (#540).**
+  `X='git reset --hard'; $X` was read as one quoted program name, so the Git
+  rule never saw it. Literal assignments now expand into argv the way the
+  shell splits them; `"$X"` stays one argument. Splitting, globbing or
+  interpreter flags dcg cannot predict require review, and rule grants and
+  source spans stay with the command that needs them (29fb1a2c).
+- **Program names in another case are judged like lower case.** On macOS and
+  Windows, whose filesystems ignore case by default, `GIT reset --hard` runs
+  git, but the packs and the shell analysis compared lower-case names and
+  allowed it. Every command is now also read with recognised program names
+  folded to lower case (through quotes, backslashes, directories and a `.exe`
+  suffix), on every platform; arguments keep their case, and a heredoc
+  delimiter is never folded. Allowlist entries and grants still bind to the
+  command as written (5ce8e2b4, 53199ed9).
+- **A `#` inside a word no longer hides the rest of the line.** dcg took a
+  `#` after a blank inside `${…}`, after a carriage return or form feed, or
+  right after a substitution's closing `)` for a comment, so in
+  `echo ${x:- #}; rm -rf /` the command after it went unchecked. A `#` now
+  starts a comment only where the shell starts one. Heredoc bodies also end
+  where the shell ends them: an unclosed quote, `${` or backquote in a body
+  line (`echo it's`) no longer swallows the commands after the terminator,
+  and an unquoted delimiter joined across a backslash-newline ends the body
+  as Bash does (786b5aed, 90648c46, d56aa46c).
+- **A quoted `;`, `|` or `&` no longer hides later operands.** Filesystem
+  rules that stay inside one command stopped at the separator byte even when
+  it was quoted, so `mv "a & b" /etc /tmp/x`, `find "a;b" / -delete` and
+  `rsync -a --delete "a & b" /tmp/src/ /etc/` were allowed while the same
+  commands with a quoted space were denied. Those rules now run again with
+  quoted and escaped separators masked; the extra pass can only add denials
+  (2350e9bb).
+- **ssh_config command options are judged.** `-o ProxyCommand=…`,
+  `LocalCommand`, `KnownHostsCommand` and `RemoteCommand` on `ssh`, `scp` and
+  `sftp` carry command lines that were never evaluated. They are now judged
+  like the remote command, in every spelling OpenSSH accepts; a value that is
+  only an expansion is denied as unverifiable (6bd0bede).
+- **GNU tar helpers inside shell groups (#540).** Helper discovery now
+  reaches `tar` invocations inside `( … )` and `{ …; }` with their original
+  context. A write or state change earlier in the group, such as a redirect
+  that overwrites a PostgreSQL checkpoint helper's input, stops the helper
+  from relying on stale local-file evidence (7c50fa7b).
+- **`xargs -I{}` keeps the command it runs.** The `-I` placeholder was
+  blanked as data, so in `xargs -I{} chmod 777 {}` the rules took `chmod` for
+  the placeholder value and lost the executed command, while the harmless
+  `xargs -I{} echo chmod 777 {}` was attributed to `chmod`. The placeholder
+  is no longer masked, and `xargs -I{} unlink {}` is judged like
+  `xargs unlink` (b91648a1).
+- **A safety regex that runs out of work is never an allow.** When a rule's
+  backtracking budget ran out, warning or log policy, confidence scoring or
+  the rebase-recovery exemption could still let the command through. Such a
+  failure is now incomplete analysis: a proven denial elsewhere still denies,
+  and otherwise the command is reviewed or blocked under the unverified
+  policy (553263f1).
+- **`system.services` blocks kernel module unloads.** An agent "fixed" an
+  NVIDIA driver/library mismatch with
+  `sudo modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia` over ssh;
+  the kernel oopsed in the framebuffer console teardown, and every new pty
+  and `ps aux` hung until the host was rebooted. With the pack enabled, three
+  High rules deny `modprobe -r`/`--remove` (including clusters such as
+  `-rf`), `rmmod`, and an unquoted remote unload
+  (`ssh host sudo modprobe -r x`). The words as data
+  (`grep -rn "modprobe -r"`, `echo rmmod`) are not matched (81fb9a39).
+- **`system.permissions`: path aliases, `setfacl` and special bits.** With
+  the pack enabled, recursive `chmod`, `chown` and `chgrp` of a protected
+  system or home path spelled with `.`, `..` or repeated `/` (`/etc/.`,
+  `//etc`, `/usr/../etc`) are denied like the plain path; a test run
+  against the previous parser found 21 such bypasses. `setfacl` is parsed in full, in both GNU
+  and BSD option order, so a later `--test` or `--help` does not undo an
+  earlier protected recursive change and an ACL value is not taken for a
+  target. Symbolic setuid and setgid modes are recognised in any letter
+  order, an unresolved later argument keeps the alias and special-bit
+  denials, and a grant for one rule leaves the others in force (b1aa2905,
+  e272047a, 627a4272, deae3ee5).
+- **`careful_company_running_windows.guardrails`: dcg's own state is harder
+  to weaken (#610).** With the pack enabled, `dcg-policy-self-weakening` now
+  also catches shell writes to the allow-once and pending-exception stores
+  (redirects, `tee`, `cp`/`mv`/`install`, `sed -i`, `truncate`, `dd`),
+  including configured store paths and literal `cd` changes; reads and
+  unrelated writes stay allowed. Global options written before the
+  subcommand no longer hide `dcg uninstall` or an allowlist grant, and an
+  `--agent` value named `test` or `explain` no longer makes a mutating dcg
+  command look like self-inspection (025d06a0, 07c53c96, a2b42bdf).
+
+### Embedded code and heredocs
+
+- **Inline programs are read as the whole shell word (#570).** A `-c`/`-e`
+  program was judged by its first quoted piece only, so a call after an
+  embedded quote, as in
+  `python3 -c 'import os; os.system('\''git reset --hard'\'')'`, or the same
+  program double-quoted with escapes, was missed. The program word is now
+  decoded in full, quote concatenation included, for `bash -c`, `sh -c`,
+  Python, Node, Ruby, Perl, awk and osascript; a word that is not static
+  stays partial and follows the unverified policy. A launcher inside another
+  command's quoted operand (`tar -I 'sh -c "…"'`) is read from the decoded
+  operand (3df42406, ec28682b, 091bddcc, 2d97d80c).
+- **Deno and Bun process APIs and JavaScript template literals (#570).**
+  `new Deno.Command("git", {args: [...]})`, `Deno.run`, `Bun.spawn` and
+  `Bun.spawnSync` were allowed while the `child_process` twin of each was
+  denied, and a template literal handed to an exec sink
+  (`` execSync(`git reset --hard`) ``) was read as a fully dynamic value.
+  They now get the same checks as `child_process`; an argv dcg cannot read
+  (a spread, a computed key) is unverified, as it is for `spawnSync`
+  (cadddd69, 5501d889).
+- **awk commands are judged after awk's escapes.** The command in
+  `system("echo x\ngit reset --hard")`, or with `\073` for `;`, read as one
+  harmless `echo`. Commands awk runs (`system()`, `| "…"`, `"…" | getline`)
+  are now decoded with octal, `\x` and control escapes first, and a pipe
+  target whose `-c` string runs its stdin (`print … | "sh -c \"cat | sh\""`)
+  is recognised as a shell (2d97d80c).
+- **Strings that reach a shell from Python or JavaScript are checked
+  (#544).** Literal substitutions (`$(…)`, backticks) carried through
+  variables or opaque calls, and a static string passed to a literal Python
+  `exec`/`eval` or JavaScript `eval` program that hands it to a shell sink,
+  now go to the command evaluator with their own rule and allowlist identity,
+  including escaped and quote-concatenated `-c`/`-e` spellings. Unreferenced
+  strings, printed text, static argv and option values stay data; hoisted
+  JavaScript declarations and ambiguous names withdraw the proof, and
+  incomplete analysis cannot approve a command (467a3be3, f9e87482,
+  b91648a1).
+- **Inline programs stay checked inside compound commands (#544).** A
+  literal Python or JavaScript program carried through a variable is still
+  inspected next to another statement, a pipeline, a redirection, an
+  environment assignment or supported trailing operands. Another shell
+  consumer cannot claim the documentation exemption for it, and a later Node
+  option that replaces the program cannot claim the earlier argument. Static
+  argument arrays stay data (f9e87482).
+- **Python `-c` source supplied by an expansion is reviewed (#538).** When an
+  unresolved shell expansion supplies the whole `python3 -c` program, it now
+  gets the inline-launcher denial. Python option ownership and outer quoting
+  are followed, so literal or escaped dollar signs, statically resolved
+  source and `-c` text passed as script arguments keep their treatment
+  (f9e87482).
+- **Python `subprocess` argv passed by name (#602).**
+  `args = ['rm', '-rf', '/home/user']` followed by `subprocess.run(args)` was
+  allowed, although the same list written inline is denied. When a sink's
+  whole argv is a bare name, each list or tuple literal bound to that name is
+  now read in its place, and pack rules see the command
+  (`cmd = ['dd', 'if=/dev/zero', 'of=/dev/sda']`). Every literal binding
+  counts, which errs toward denial; `cmd = ['git', 'status']` and
+  `sys.argv[1:]` stay allowed (efbd488c).
+- **More ways to reach `shutil.rmtree` are caught (#549).** The temp-path
+  exemption accepted the temp root itself, so `shutil.rmtree('/tmp')` (also
+  `/tmp/.`, `/private/tmp` and `/tmp/build/../..` spellings) passed as
+  cleanup; only real descendants are exempt now. Also caught:
+  `from shutil import rmtree as wipe`, `getattr(shutil, 'rmtree')(…)`,
+  `shutil.__dict__['rmtree']`, `rmtree.__call__`, a default argument
+  `def f(remove=shutil.rmtree)`, and a `tempfile.mkdtemp()` result after
+  `tempfile`, `os` or `os.path` was rebound or patched. Literal temp
+  descendants stay allowed, now including adjacent literals such as
+  `'/tmp/' 'build'` (00a1c8b5, ecf3fc08, dec8bcb4, 9ca6ddef, 869dcb3e,
+  99308253, f339fae1).
+- **Scripts a heredoc writes and a program then runs get language checks
+  (#540, #583).** A quoted heredoc written by `tee` to a literal file and run
+  by a supported interpreter is now checked like one written by `cat`. The
+  written Python or Node script stays checked when the interpreter gets flags
+  or script arguments, and when the run is chained on the heredoc line:
+  `cat > a.py <<'EOF' && python3 a.py` with `shutil.rmtree('/home/user')` in
+  the body was allowed and is now denied. Append mode, dynamic paths and
+  extra consumers keep conservative analysis (7c50fa7b, a2b42bdf, 1b2da8c3).
+- **A heredoc is inert interpreter source only when the interpreter reads
+  its program from it (#560).** With `python3 -c '…' <<'PY'` or
+  `python3 script.py <<'PY'`, the program can read the body and run it as
+  shell (`os.system(sys.stdin.read())`), so such a body keeps its shell
+  checks (a42c2847).
+
+### False positives fixed
+
+- **`unlink`, `mkfs`, `mkswap` and `wipefs` judge the program that runs
+  (#550, #600).** These rules matched the tool's name anywhere on the line,
+  so `ob sync-unlink`, `foo --unlink`, `find . -name unlink`,
+  `which mkfs.vfat mkfs.ext4`, `man mkswap wipefs` and
+  `ls /sbin/mkfs.vfat` were refused. They now judge the program a segment
+  runs, quoted or path-prefixed, through `sudo`, `env`, `timeout`,
+  `find -exec`, `xargs`, `flock`, `doas`, `parallel` and `busybox`, and
+  through `ssh`, `toybox`, `docker`, `podman`, `nerdctl`, `kubectl`, `oc`,
+  `lxc` and `incus`. Launchers whose grammar dcg does not model (`watch`,
+  `strace`, `chroot`, …) expose every operand (3e78579f, e7d9de8e, 644aa608,
+  2b725878).
+- **Docker and Podman force removal needs a real `-f` (#548).**
+  `docker rm probe-xf`, `docker image rm cve-followup/web:1.2` and
+  `docker network rm probe-net && grep -f patterns.txt file.txt` were read
+  as force removals. The flag must now be an option word of that `docker` or
+  `podman` command; `docker rm c1 -f`, `-vf`, `--force` and Bash's `$'-f'`
+  still match. `umount -f` is scoped the same way (f6fdf447, 644aa608).
+- **Home-directory and Trash `mv` with `;`, `|` or `&` in a quoted name
+  (#552).** Any quoted operand containing one of these characters defeated
+  the exemptions, so `mv "/Users/u/Documents/a & b.txt" ~/.Trash/` was
+  denied while the same name with a space was allowed. Quoted separators are
+  now file-name bytes there; unquoted ones, backslash escapes, home roots,
+  dotfiles and `..` are checked as before (45277d46, 414d1d7b).
+- **Assignment-only commands bind every name (#574).** `B=/tmp/b T=/tmp/t`
+  stored `/tmp/b T=/tmp/t` as the value of `B` and lost `T`, so later
+  redirects into `$T` were denied. Each word is now its own binding, and
+  `read` changes only the names it reads (`S=/tmp/x; read x;
+  cat a > "$S/o"` keeps the proof for `S`) (f6fdf447).
+- **`rm -rf` of a literal temp path inside `sh -c` (#576).**
+  `sh -c 'rm -rf /tmp/probe'` and `bash -c 'rm -rf /var/tmp/probe'` were
+  denied as `core.filesystem:rm-rf-root-home` although the same text is
+  allowed at top level and through `eval`, `sudo` and `ssh`. A single-quoted
+  script that is one literal `rm` of `/tmp` or `/var/tmp` descendants now
+  gets the same exemption; temp roots, traversal, globs, expansions, extra
+  commands and outer redirects stay denied (bb3a7d19, 418cb2dc, 0e40cc0f).
+- **Temporary directories over ssh and under `TMPDIR` (#554, #590).**
+  `ssh h 'T=$(mktemp -d); echo x > $T/s'` is judged like the same script run
+  locally. Paths spelled literally under the `TMPDIR` dcg started with
+  (macOS's `/var/folders/…/T/`, for example) satisfy
+  `redirect-truncate-dynamic-path` the way `/tmp` paths do; `$TMPDIR` itself
+  is still not trusted, and home, system, credential and symlinked roots stay
+  denied (0e40cc0f, a2b42bdf).
+- **`git -C $dir` followed by a read-only subcommand (#597).**
+  `git -C $r log main $b` (and `diff`, `rev-list`, `merge-base`, `cherry`)
+  was denied as `core.git:branch-dynamic-token`, on the theory that `$r`
+  could split into `dir branch` and `$b` into `-D`. A literal subcommand
+  after the option value now decides; `git -C $r branch $b`, and a splitting
+  path followed by a flag, an expansion or an unknown word, stay denied
+  (5c060064).
+- **Commit-message files copied with `scp` or `ssh` stay data (#543).** A
+  later `scp` or `ssh` reference made a quoted heredoc written to a file look
+  executable, so ordinary prose beginning with `eval` reached the eval
+  scanner. The whole literal write, commit and transfer workflow is now
+  proved first, renamed copies included, and literal numeric ports
+  (`-p 2222`, `-P 2222`) are accepted. Unknown consumers, expansions,
+  pipelines into a shell, custom transports, and transfers onto executables,
+  protected files or Git hooks keep their checks (1e1a0df0, f9e87482).
+- **Quoted `flowctl` receipt text stays data (#538, #540).** Complete static
+  `flowctl gate check` and `gate receipt` operands can hold quoted shell
+  punctuation without triggering destructive-command rules, including when
+  `FLOWCTL` is a variable. Live expansions, incomplete words, unknown
+  options, redirects and later commands keep their checks (29fb1a2c,
+  f9e87482).
+- **Python and Node heredocs that only build and print text (#544, #586).**
+  Backticks in strings of a quoted `python3 -` or `node -` heredoc were put
+  back into the shell scan, so documentation edit scripts matched Git
+  branch-deletion rules. When dcg proves the program is straight-line code
+  that builds strings, prints them and reads or writes files through
+  `open`/`fs`, those literals are masked from the shell view. If it opens no
+  file at all, every literal is data, so text that merely spells a command
+  (a `curl` upload line in #586) no longer matches its pack. Where the
+  printed text goes (a pipe into a shell, a substitution, a redirect into a
+  profile or cron file) is judged as before (c255094a, 78a965bf).
+- **Quoted interpreter heredocs are not parsed as Bash (#560, #591).** A
+  `python3 - <<'EOF'` or `node - <<'EOF'` body containing an apostrophe and a
+  backtick, `<(` or `>(`, regex literals, tuples or many shell-looking
+  strings could be read with the outer shell's quoting or as substitutions.
+  When dcg proves the interpreter reads the body as its program, the body is
+  kept out of outer-shell syntax, and its strings count as shell commands
+  only with execution evidence. That now also holds after `cd dir &&`, with
+  Python run-mode flags or program arguments, and with commands after the
+  heredoc when its output reaches only the terminal. A quoted `cat` body
+  written under `~` no longer counts as input to a following `python3 -`
+  heredoc (#591). Output piped to a shell, scripts written and then run, and
+  destructive strings behind a stray quote stay denied (efd67d2f, db83e37a,
+  11ca1062, 1a13a629, 9b55141b).
+- **Quoted heredoc delimiters written in pieces (#544).** `<<D\OC` and
+  `<<D'OC'` now mark the whole delimiter as quoted in both the extractor and
+  the bundled Bash parser, so the body is literal text and the commands after
+  its terminator stay visible. Unsupported delimiter syntax cannot pick a
+  shorter terminator (467a3be3).
+- **A quoted body written to a file holds no live commands (#604).** In
+  `cat > f <<'SH'`, a body line such as `X=$(pwd)` followed by
+  `trap x EXIT` was read as a deferred command and refused as incomplete
+  analysis, and a `python3 - <<'PY'` heredoc inside the body was judged as a
+  program about to run. Both are now data. The same body piped to a shell,
+  run as a file, sourced or written to `~/.bashrc` keeps its checks
+  (f4b71bcd).
+- **`cd` before a written script, and a consumer on the heredoc line
+  (#583).** `cd client && cat > f <<'EOF' … EOF` followed by `node f`, and
+  `cat > f <<'EOF' && node f`, read every JavaScript arrow in the body as a
+  truncating redirect. A literal `cd` with one plain directory, and exactly
+  one `&& <interpreter> <same file>` on the heredoc line, now keep the proof
+  that the body is the program that runs; a shell consumer, `||`, pipes and
+  longer chains do not (4f83afa7, 1b2da8c3).
+- **Python `tar` argv built from module constants (#562).**
+  `subprocess.Popen(['tar', '-cf', '-', '-C', src, name])` with `src` and
+  `name` bound once at module level to a string or `Path('…')` was denied as
+  `core.filesystem:tar-exec-unverified`. In straight-line programs such
+  constants now resolve to their literal value, for archive programs only; a
+  constant that is itself a helper option still denies, and shell or
+  interpreter code arguments are never resolved. A replay of 44,471 commands
+  changed exactly the two reported verdicts (35a6b333).
+- **Python call text inside strings and comments (#601).** An edit script
+  that quotes `subprocess.run([…` in a search or replacement string, or
+  mentions it in a comment, was refused as an unverified exec-sink call.
+  Comments and plain string literals are now read as text unless the program
+  can run a string (`exec`, `eval`, `compile`, `subprocess`, `importlib`,
+  …); destructive literal argv in a string still blocks (66e108c9).
+- **A variable bound to a literal interpreter path (#608).**
+  `PY=/usr/bin/python3; $PY -c '…'` was denied as an obfuscated inline
+  launcher, while the literal command was judged by its program. The bound
+  interpreter is now read like the literal one: a harmless program is
+  allowed, a program that runs `shutil.rmtree` is still denied, and an unset
+  variable, a binding that carries its own `-c`, or a command-substitution
+  binding stays an unverified launcher. The same binding inside a
+  `bash -c` or ssh script is not resolved yet; see Known issues (5f6c4117).
+
+### Custom packs
+
+- **Custom rules see executable substitutions inside prose arguments
+  (#614).** Custom rules and their keyword selection can now match active
+  backticks and `$()` inside GitHub CLI bodies, Git messages, Beads Rust
+  descriptions and other registered data arguments, after dcg has checked
+  the inner command. Inert prose, single-quoted or escaped markers and
+  checked producer output stay masked, and source spans, safe-pattern
+  authorization, rule allowlists and built-in checks are unchanged. A fully
+  quoted `--message=value` stays data for the Git rules (f5a5f7fa).
+- **External packs are selected by the program a command runs (#592).** An
+  external pack runs only when one of its keywords is present, and the gate
+  read the command text, so a program reached through a variable, a
+  substitution, a glob, a brace expansion, `$"…"` quoting or quotes inside a
+  launcher's operand (`xargs my''tool`) skipped the pack entirely. Selection
+  now also resolves each segment's program through wrappers and launchers,
+  with quotes and escapes removed, and evaluates every enabled external pack
+  when a segment's program cannot be known. The `time`, `timeout` and `chrt`
+  parsers no longer take an option word for the program or the duration
+  (`time /opt/bin/tool`, `timeout -vk 5 10 prog`), which had made dcg resolve
+  the wrong program. In a proven POSIX command, a word written with quotes
+  inside it (`zap''all`) is matched as the word the shell passes (bc01a991,
+  3d1bfe2b, b33f3ef5).
+- **Keyword-less external packs apply inside nested shell bodies.** An
+  external pack with no keywords was not enforced in an executable nested
+  body such as `bash -c '…'`; it now is, while inert data stays masked
+  (553263f1).
+
+### Allow-once and allowlists
+
+- **Exact allow-once grants for quoted interpreter commands can be redeemed
+  (#599).** A grant for `'/usr/bin/python3' -c 'print(1)'` was never used:
+  the obfuscated-launcher check denied the command before the grant lookup
+  ran. Such grants are now looked up first, also when the command sits inside
+  an alias or a trap. Explicit block overrides still win, a grant matches
+  only its original bytes in its directory scope, and it is used once. Of 16
+  exact-grant cases, 0.15.3 honoured 6; this release honours all 16
+  (deff5c07, 07c53c96).
+- **Stored grants and pending codes are validated when read (#610).**
+  Records with an unsupported schema, a malformed or future timestamp, or a
+  lifetime longer than 24 hours are skipped and later pruned without
+  disabling valid neighbours, and a grant is expired at its expiry
+  timestamp. Scope uses the request's working directory, resolved so `..`
+  and symlinks cannot escape it. A project grant must name an existing
+  repository root, cannot cover a filesystem root, and stops at nested
+  repositories, submodules and worktrees; an unknown request directory
+  cannot borrow the hook process's own (82423efc, 025d06a0).
+- **Grants match the request as it was sent.** Whole-command allowlist
+  entries, allow overrides and allow-once grants are compared with the
+  original request through child extraction, detection rewrites, case
+  folding and policy replays, so a command dcg derived from another cannot
+  match a grant meant for the original. Rule grants still cover only their
+  own findings (c4d3ad3d).
+- **Interpreter callbacks keep their own rule ownership (#544).** A command
+  in a callback, an assignment or an argument's side effect could inherit the
+  already-checked status of the enclosing execution call, so an allowlist
+  entry for that outer sink also covered it. Such commands now keep their own
+  rule and need their own grant; static argument arrays and option values
+  stay data (29fb1a2c).
+
+### Windows and PowerShell
+
+- **Python heredocs no longer switch on the Windows packs on Linux and macOS
+  (#569).** A regex such as `r'[^\n]{0,40}(x|y)'` or a word such as
+  `install-l` in a quoted `python3 - <<'PY'` body looked like PowerShell, so
+  the hook activated `windows.*` and denied the program as
+  `windows.filesystem:windows-filesystem-semantic-unverified`, depending on
+  the body's length; `dcg test` disagreed. On a non-Windows host, a quoted
+  heredoc that a non-shell interpreter provably reads as its program no
+  longer activates those packs, unless the command names `pwsh`,
+  `powershell` or a `.exe` program. As a result
+  `os.system("echo & rd /s /q C:\Users")` in such a heredoc is allowed there,
+  because `/bin/sh` has no `rd`. When `windows.filesystem` is enabled and a
+  command exceeds its statement bound, the answer is now indeterminate
+  instead of a misattributed denial (39f68574).
+- **PowerShell: chained dcg diagnostics are allowed, and an alias cannot
+  borrow dcg's self-inspection mask (#584).**
+  `& 'C:/example/dcg.exe' test --help; & 'C:/example/dcg.exe' config --format json`
+  was denied because the mask left the call operator `&` behind; it is now
+  masked with the call. A command that can rebind the `dcg` name
+  (`Set-Alias dcg Remove-Item`, functions, `iex`, `Import-Module`, also when
+  split with Unicode quotes) gets no mask, so
+  `Set-Alias dcg Remove-Item; dcg test -Recurse -Force <dir>`, which was
+  allowed, is denied. Dot-sourced script blocks (`. { … }`) are now judged
+  as running their body (a79ef24c, 76a7df24).
+- **`dcg test` and `dcg explain` use the Windows packs for Windows dialects
+  (#589).** On Linux and macOS, `dcg test --dialect cmd` and
+  `dcg explain --dialect ps` used only the host's packs and could report an
+  allow that the live Windows hook denies. Explicit Cmd and PowerShell
+  dialects, and recognised Windows syntax in the unknown dialect, now enable
+  the default Windows packs; configured exclusions and per-run overrides
+  still apply (cb746887).
+- **Git Bash `cmd //c` is read as `cmd /c` (#561).** MSYS2 rewrites a
+  leading `/c` as a path, so Git Bash users write `cmd //c` or `cmd //k`.
+  From a POSIX shell these, with preceding host switches, are now read as
+  `/c` and `/k` and the payload is judged as Cmd; native Cmd and PowerShell
+  are unchanged, and unknown doubled switches still fail closed (0555a06f).
+
+### CLI
+
+- **`dcg doctor` warns about unrestricted allowlist grants (#545).** An
+  active whole-rule grant with no working-directory restriction and no
+  expiry now produces a warning naming the rule, the layer and file, the
+  reason and any recorded author or timestamp; destructive filesystem and
+  Git grants are marked high risk. Path globs that match every directory
+  (`**/`, `**/*`, `**/**`, or an equivalent root path) count as
+  unrestricted. Project, user and system layers are covered, and warnings
+  still show next to parse errors. Doctor changes nothing, including under
+  `--fix`, and the JSON v1 output and warning-only exit status are unchanged
+  (d7c2e70d, 2c7c0156).
+- **A fallback denial names the rule that owns the text.** When
+  embedded-code analysis cannot finish, dcg scans the whole command
+  conservatively. A destructive command next to such a program was then
+  reported as incomplete embedded-code analysis, and the suggested remedy was
+  to waive that backstop. The command is now also checked by the packs
+  alone, and their denial (`core.git:reset-hard`, for example) is the
+  reported verdict; otherwise the fallback denial stands. Either way the
+  command is denied (a6f82fe6).
+- **Timeout reasons say where the time went (#571).** An indeterminate
+  answer now ends with the stage and phase that ran out, the elapsed wall
+  time and the process CPU time, for example
+  `(stage: evaluation, phase: regex_compile; elapsed 1152ms, process CPU 91ms)`.
+  Low CPU against high wall time means the host did not schedule dcg; CPU
+  close to wall time means the input was slow to analyse (cd3d3c25).
+- **Copy-safe hints in denials.** The suggested `dcg explain -- …` command
+  is printed only when every argument is a plain literal, so copying it
+  cannot run an expansion or change quoting. Other commands are pointed to
+  `dcg test --stdin --explain`, with a bounded JSON preview; the warning
+  footer follows the same rule (ad98f9f4).
+- **The Trash advice says which moves it covers (#605).**
+  `rm-rf-root-home` and `mv-sensitive-source-root-home` suggested
+  `mv <path> ~/.Trash/` for any path, but the Trash exemption admits only
+  sources under a home or temp directory and relative paths, so following the
+  advice for `/opt/<x>` led to a second denial. Both explanations now name
+  the sources it covers. No rule changed (b4aaf0bb).
+- **`DCG_PROFILE=1` prints hook phase timings.** Set on a single hook
+  invocation, it appends one `DCG_PROFILE ` JSON line to stderr with
+  per-phase wall times and call counts, without command text. See
+  `docs/performance-issue-555.md` (fb60af11).
+
+### Performance
+
+- **Read-only commands with inert redirections skip pack work (#571).**
+  `ls 2>/dev/null` selected `core.filesystem` and `system.disk` and compiled
+  both, although no rule in either can match a redirection to the null
+  device; on a busy host that pushed read-only commands past the hook
+  deadline. Pack selection now ignores redirections to or from `/dev/null`
+  and descriptor duplication when every redirection on the line is of that
+  kind; the selected packs still match the original text. Median CPU per
+  hook run: `ls 2>/dev/null` 36.3 to 9.6 ms, `ls 2>&1` 23.8 to 9.6 ms,
+  `cargo build --release 2>&1 | tail -5` 24.8 to 10.1 ms. A replay of 44,471
+  commands gave identical verdicts (cd3d3c25).
+- **Large heredocs cost less to check (#555).** The hook no longer repeats
+  work on a big `python3 - <<'EOF'` or `node - <<'EOF'` program: ast-grep
+  rules compile lazily per language and each AST is walked once, stdin
+  provenance is not rescanned for every reader, and completed heredoc
+  extractions and documentation-mask analyses are reused within a command.
+  Analysis limits for interpreter heredocs now scale with the program, so
+  benign 600 to 1,000-line Python and JavaScript heredocs finish within
+  them, and the fork-bomb rule no longer exhausts its search on long programs
+  full of function calls. The 256 KiB source cap still bounds the work
+  (fb60af11, ca1b3dcb, 50c3580d, eff12d30, b6f4a498, 1475a05f).
+
+### Command history and logs
+
+- **The history size cap is enforced against what SQLite committed.** The
+  cap was checked against the main database file's length, which misses
+  pages still in the write-ahead log and growth by another connection; in
+  one probe a 1 MiB cap was accepted while the database held about 2 MiB.
+  Writers now check the page limit SQLite enforces inside every write
+  transaction, and opening the database no longer forces a truncating
+  checkpoint (418918d9, 8d1e50d7, 7d48fed8).
+- **History writes neither repeat nor silently lose rows (#433).** After a
+  failed batch fell back to row-by-row inserts, recovery could insert the
+  already-committed rows again, and an insert inside an unfinished
+  transaction could be counted as written. Recovery now resumes after the
+  committed rows and rolls back before reopening. The writer's queue is
+  bounded at 4,096 entries and 16 MiB of pending text, and shutdown is never
+  blocked by it (98459f37, 70e203d5, e234e926).
+- **Full log redaction covers every persisted field (#585).** With
+  `[logging.redaction] mode = "full"`, free-form reasons, caller labels,
+  audit paths, and allow-once command hashes and short codes still reached
+  the log files and could reveal command content. They are now replaced
+  (`[REDACTED]`, `Diagnostic details redacted.`), while decisions, rule IDs,
+  timestamps and timings stay. Allow-once audit events, management actions
+  and the legacy `[general] log_file` follow the same policy (97e5364e,
+  d4746536).
+
+### Installers
+
+- **The one-line installer runs on stock macOS again, and says when it needs
+  bash (#587).** A change made after 0.15.3 put `case` statements inside a
+  command substitution, which macOS's `/bin/bash` 3.2 cannot parse, so
+  `curl … | bash` stopped before installing anything. The snippet is now
+  read without a command substitution, and the block written to `~/.bashrc`
+  or `~/.zshrc` is byte-identical, so existing installs are not rewritten.
+  `install.sh` and `uninstall.sh` piped to a shell other than bash (dash,
+  zsh, ksh and others) now exit with the bash one-liner to use instead of
+  failing on `set -o pipefail`, and `install.sh` leaves POSIX mode when bash
+  runs it as `sh` (8eca632c, f9374e5a).
+- **The installer reads the latest version from one-line API responses.**
+  When GitHub's API returned minified JSON, `install.sh` took the release
+  body for the version. It now extracts `tag_name` and requires a
+  version-shaped tag (37874bd2).
+
+### Dependencies
+
+- **Security and routine updates.** `rustls` 0.23.46 (RUSTSEC-2026-0346 to
+  0349), `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382), `webpki-roots` and
+  `webpki-root-certs` 1.0.11 (RUSTSEC-2026-0381, RUSTSEC-2026-0383),
+  `ctutils` 0.4.7 (RUSTSEC-2026-0385) and `pulldown-cmark` 0.13.6
+  (RUSTSEC-2026-0414); `cargo audit` now reports only the unmaintained
+  `unsafe-libyaml` warning, through `serde_yaml`. Routine bumps: `tokio`
+  1.54.1, `serde_json` 1.0.154, `toml` 1.1.8, `toml_edit` 0.25.17, `libc`
+  0.2.191, `self_update` 1.3.1, `schemars` 1.2.3, `sha2` 0.11.1, `smallvec`
+  1.16.4 and `winresource` 0.1.34. `ast-grep-core` stays at 0.45.3 to match
+  the vendored language adapter (bab32ea5, c0d206d7, 82df7311, 9c90d059,
+  607e9272, f655ead5, 9d76299f, cdf17b49).
+
+### Known issues
+
+- **Replay of real agent commands.** 8,000 recent shell commands from real
+  agent sessions were replayed through `dcg test` against 0.15.3 and this
+  release on an idle host. 0.16.0 blocks 11 that 0.15.3 allowed (0.14%) and
+  allows 4 that 0.15.3 blocked; the candidates held back on 2026-10-14 and
+  2026-10-23 newly blocked 66 and 63 of 8,000. Of the 11, two are intended
+  (a PowerShell script block read from stdin over ssh, and
+  `-EncodedCommand` taken from a variable), one is arguable (a `>` with a
+  dynamic target inside an ssh `bash -c` loop), one is an ssh script with an
+  unterminated backtick that the remote shell cannot parse either, and seven
+  are false positives, listed below. On a heavily loaded host, slow
+  evaluations can also come back `indeterminate`, which blocks.
+- **An ssh script loses the home-directory `mv` exemption (#620).**
+  `ssh h 'mv -n /home/u/work/x /home/u/work/x.old'` is denied as
+  `core.filesystem:mv-sensitive-source-root-home`, while the same `mv` typed
+  locally is allowed. 0.15.3 did not evaluate ssh scripts without a pack
+  keyword (#551); `bash -c '…'` already gave this denial in 0.15.3.
+- **A quoted `>` in an argument of an unresolved command word
+  (#621).** `$G grep -n "-> Result<Performance\|Performance {" src` is
+  denied as `core.filesystem:redirect-truncate-dynamic-path`. With `G=git`
+  bound earlier in the same command, or with `git` written out, it is
+  allowed.
+- **A literal interpreter binding inside `bash -c` or ssh (#608).**
+  `bash -c 'PY=/usr/bin/python3; $PY -c "x = 1"'` and the same script sent
+  through `ssh h '…'` are still denied as
+  `heredoc.posix:inline-launcher-unverified`. 0.15.3 allowed them only
+  because it did not evaluate such scripts without a pack keyword (#551).
+  The top-level form is fixed in this release.
+- **Shell punctuation inside quoted Python heredoc literals (#544, #560).**
+  Three replayed Python heredocs whose string literals contain backticks or
+  other shell syntax are still denied, and a long Python heredoc sent over
+  ssh can exhaust the analysis budget and come back `indeterminate`.
+- **`while IFS= read` with an unquoted path variable (#566).** One replayed
+  loop is denied as `core.filesystem:credential-file-write`.
+- **An inline-code flag behind a variable command word (#622).**
+  `G=git; $G log -p -1 | tail -5` is denied as
+  `heredoc.posix:inline-launcher-unverified`, in 0.15.3 as well: `-p` is
+  read as an interpreter's inline-code flag even though the binding names
+  `git`.
+- **Tests that fail at this tag (#623).** On a machine with no dcg
+  configuration, five tests in dcg's own suite fail. No failing case lets a
+  command through: each is an over-block or a different rule name. Four of
+  the tests decide exactly as 0.15.3 does:
+  `repro_313_powershell_read_only_false_positives` —
+  `escaped_dcg_options_keep_agent_values_and_inspection_arguments_as_data`,
+  `escaped_dcg_syntax_cannot_hide_guardrail_changes` and
+  `native_agent_argument_boundaries_are_dialect_specific` (with
+  `--dialect unknown`, a PowerShell backtick in a dcg command is read as a
+  POSIX substitution and denied as `heredoc.posix:substitution-unverified`),
+  and `cli_e2e` —
+  `custom_pack_loading_tests::exact_command_grants_do_not_reappear_after_detection_rewrites`
+  (upper-case PowerShell `GIT RESET --HARD` is denied as
+  `core.git:git-alias-semantic-unverified` rather than `core.git:reset-hard`).
+  The fifth is new in this release:
+  `global_options_preserve_inspection_and_argument_data` expects
+  `dcg --agent='dcg --robot allow-once abc --yes' allowlist list` to be
+  allowed, as 0.15.3 did. With the opt-in
+  `careful_company_running_windows.guardrails` pack it is now denied as
+  `dcg-policy-self-weakening`.
+  `repro_313_powershell_read_only_false_positives::hook_protocol_keeps_guardrails_active_with_global_options`
+  also fails when a system-wide `/etc/dcg/config.toml` adds a custom pack.
 
 ## [v0.15.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.3) -- 2026-10-08 [Release]
 
