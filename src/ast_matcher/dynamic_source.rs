@@ -28,6 +28,8 @@ const MAX_DYNAMIC_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_DYNAMIC_SOURCE_SITES: usize = 128;
 const MAX_DYNAMIC_LITERAL_BYTES: usize = 64 * 1024;
 const MAX_DYNAMIC_SOURCE_NODES: usize = 512 * 1024;
+/// Parentheses, sequences and casts around a callee.
+const MAX_CALLEE_DEPTH: usize = 8;
 
 /// What a dynamic-execution call runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +66,7 @@ static PYTHON_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(?:eval|exec|execfile)\b").expect("python dynamic source regex compiles")
 });
 static JAVASCRIPT_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\beval\b|Function\b|\bconstructor\b|\brunIn(?:This|New)?Context\b|\bcompileFunction\b|\bvm\.Script\b")
+    Regex::new(r"\beval\b|Function\b|\bconstructor\b|\brunIn(?:This|New)?Context\b|\bcompileFunction\b|\bvm\.Script\b|\\u")
         .expect("javascript dynamic source regex compiles")
 });
 static RUBY_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
@@ -280,9 +282,9 @@ fn tree_reading(
             return Err(reading_error(language, "AST node limit"));
         }
         match language {
-            ScriptLanguage::Python => read_python_node(&node, &root, python2, &mut reading),
+            ScriptLanguage::Python => read_python_node(&node, &root, python2, &mut reading)?,
             ScriptLanguage::Ruby => read_ruby_node(&node, &root, &mut reading),
-            _ => read_javascript_node(&node, &root, language, &mut reading),
+            _ => read_javascript_node(&node, &root, language, &mut reading)?,
         }
         if strings {
             reading.strings.extend(constant_string(&node, language));
@@ -453,17 +455,19 @@ fn read_python_node<D: ast_grep_core::Doc>(
     root: &ast_grep_core::Node<'_, D>,
     python2: bool,
     reading: &mut DynamicSourceReading,
-) {
+) -> Result<(), MatchError> {
     match node.kind().as_ref() {
         "call" => {
-            let Some(callee) = node
-                .field("function")
-                .and_then(|function| python_dynamic_callee(&function))
+            let Some(function) = node.field("function") else {
+                return Ok(());
+            };
+            let Some(callee) = python_dynamic_callee(&function, 0)
+                .map_err(|()| reading_error(ScriptLanguage::Python, "callee nesting limit"))?
             else {
-                return;
+                return Ok(());
             };
             let Some(arguments) = node.field("arguments") else {
-                return;
+                return Ok(());
             };
             // `eval()` with no argument raises; nothing runs.
             if let Some(program) = positional_arguments(&arguments).first() {
@@ -492,9 +496,31 @@ fn read_python_node<D: ast_grep_core::Doc>(
         }
         _ => {}
     }
+    Ok(())
 }
 
+/// `Err` is nesting past the limit, as for [`js_dynamic_callee`].
 fn python_dynamic_callee<D: ast_grep_core::Doc>(
+    function: &ast_grep_core::Node<'_, D>,
+    depth: usize,
+) -> Result<Option<String>, ()> {
+    if depth >= MAX_CALLEE_DEPTH {
+        return Err(());
+    }
+    // `(eval)(x)`.
+    if function.kind().as_ref() == "parenthesized_expression" {
+        return match function
+            .children()
+            .find(|child| child.is_named() && child.kind().as_ref() != "comment")
+        {
+            Some(inner) => python_dynamic_callee(&inner, depth + 1),
+            None => Ok(None),
+        };
+    }
+    Ok(python_plain_callee(function))
+}
+
+fn python_plain_callee<D: ast_grep_core::Doc>(
     function: &ast_grep_core::Node<'_, D>,
 ) -> Option<String> {
     match function.kind().as_ref() {
@@ -549,7 +575,10 @@ fn python_name_is_handed_on<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_
             "assignment" => parent
                 .field("right")
                 .is_some_and(|right| right.range() == node.range()),
-            "argument_list" => true,
+            "keyword_argument" => parent
+                .field("value")
+                .is_some_and(|value| value.range() == node.range()),
+            "argument_list" | "boolean_operator" | "conditional_expression" => true,
             _ => false,
         })
 }
@@ -568,17 +597,19 @@ fn read_javascript_node<D: ast_grep_core::Doc>(
     root: &ast_grep_core::Node<'_, D>,
     language: ScriptLanguage,
     reading: &mut DynamicSourceReading,
-) {
+) -> Result<(), MatchError> {
     match node.kind().as_ref() {
         "call_expression" => {
-            let Some(callee) = node
-                .field("function")
-                .and_then(|function| js_dynamic_callee(&function, 0))
+            let Some(function) = node.field("function") else {
+                return Ok(());
+            };
+            let Some(callee) = js_dynamic_callee(&function, 0)
+                .map_err(|()| reading_error(language, "callee nesting limit"))?
             else {
-                return;
+                return Ok(());
             };
             let Some(arguments) = node.field("arguments") else {
-                return;
+                return Ok(());
             };
             // A tag is called with the template's text.
             if arguments.kind().as_ref() == "template_string" {
@@ -593,18 +624,35 @@ fn read_javascript_node<D: ast_grep_core::Doc>(
                 .field("constructor")
                 .and_then(|constructor| js_dynamic_constructor(&constructor))
             else {
-                return;
+                return Ok(());
             };
             if let Some(arguments) = node.field("arguments") {
                 push_js_call_site(node, &arguments, callee, root, language, reading);
             }
         }
-        // `const run = eval; run(x)`, `[eval].map(...)`.
-        "identifier" if node.text().as_ref() == "eval" && js_name_is_handed_on(node) => {
+        // `const run = eval; run(x)`, `[eval].map(...)`, `const F = Function`.
+        "identifier" => {
+            let name = node.text();
+            let handed_on = if js_source_constructor(name.as_ref()) {
+                js_name_is_aliased(node)
+            } else {
+                name.as_ref() == "eval" && js_name_is_handed_on(node)
+            };
+            if handed_on {
+                push_site(reading, node, name.as_ref(), DynamicSource::Unverified);
+            }
+        }
+        // `const { eval: run } = globalThis`.
+        "pair_pattern"
+            if node
+                .field("key")
+                .is_some_and(|key| matches!(key.text().as_ref(), "eval" | "Function")) =>
+        {
             push_site(reading, node, "eval", DynamicSource::Unverified);
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// `eval` and the `vm` calls run their first argument. The `Function` family
@@ -619,7 +667,8 @@ fn push_js_call_site<D: ast_grep_core::Doc>(
     reading: &mut DynamicSourceReading,
 ) {
     let arguments = positional_arguments(arguments);
-    let source_family = js_source_constructor(&callee) || callee == "constructor";
+    let source_family =
+        js_source_constructor(&callee) || callee == "constructor" || callee.contains('\\');
     let program = if source_family {
         arguments.last()
     } else {
@@ -628,11 +677,14 @@ fn push_js_call_site<D: ast_grep_core::Doc>(
     let Some(program) = program else {
         return;
     };
+    let parameters = arguments.len().saturating_sub(1);
     let source = if source_family
-        && arguments
+        && (arguments
             .iter()
             .any(|argument| literal_value(argument, language).is_none())
-    {
+            || arguments[..parameters].iter().any(|argument| {
+                literal_value(argument, language).is_some_and(|text| !js_plain_parameters(&text))
+            })) {
         DynamicSource::Unverified
     } else {
         source_of(program, root, language)
@@ -640,69 +692,115 @@ fn push_js_call_site<D: ast_grep_core::Doc>(
     push_site(reading, node, callee, source);
 }
 
+/// A parameter list of plain names runs nothing. A default value would.
+fn js_plain_parameters(text: &str) -> bool {
+    text.chars()
+        .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$' | ',' | ' '))
+}
+
 fn js_global_object<D: ast_grep_core::Doc>(object: &ast_grep_core::Node<'_, D>) -> bool {
-    object.kind().as_ref() == "identifier"
-        && matches!(
-            object.text().as_ref(),
-            "globalThis" | "global" | "window" | "self"
-        )
+    match js_wrapped_expression(object) {
+        Some(inner) => js_global_object(&inner),
+        None => {
+            object.kind().as_ref() == "identifier"
+                && matches!(
+                    object.text().as_ref(),
+                    "globalThis" | "global" | "window" | "self"
+                )
+        }
+    }
+}
+
+/// The expression inside parentheses or a TypeScript cast, which changes
+/// nothing at run time.
+fn js_wrapped_expression<'tree, D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'tree, D>,
+) -> Option<ast_grep_core::Node<'tree, D>> {
+    let named = || {
+        node.children()
+            .filter(|child| child.is_named() && child.kind().as_ref() != "comment")
+    };
+    match node.kind().as_ref() {
+        "as_expression" | "satisfies_expression" | "non_null_expression" => named().next(),
+        // `(0, eval)(x)` is an indirect eval. Only the last expression of the
+        // sequence is the callee.
+        "parenthesized_expression" | "sequence_expression" | "type_assertion" => named().last(),
+        _ => None,
+    }
 }
 
 fn js_global_source_name(name: &str) -> bool {
     name == "eval" || name == "Function"
 }
 
+/// `Err` is nesting past the limit: nothing is known about that callee, which
+/// is not the same as knowing it is not a site.
 fn js_dynamic_callee<D: ast_grep_core::Doc>(
     function: &ast_grep_core::Node<'_, D>,
     depth: usize,
-) -> Option<String> {
-    if depth >= 8 {
-        return None;
+) -> Result<Option<String>, ()> {
+    if depth >= MAX_CALLEE_DEPTH {
+        return Err(());
     }
-    match function.kind().as_ref() {
+    if let Some(inner) = js_wrapped_expression(function) {
+        return js_dynamic_callee(&inner, depth + 1);
+    }
+    Ok(match function.kind().as_ref() {
         "identifier" => {
             let name = function.text();
-            (name.as_ref() == "eval" || js_source_constructor(name.as_ref()))
+            // `\u0065val` is `eval`, and no name here needs an escape.
+            (name.as_ref() == "eval" || js_source_constructor(name.as_ref()) || name.contains('\\'))
                 .then(|| name.into_owned())
         }
-        "member_expression" => {
-            let name = function.field("property")?.text().into_owned();
-            let object = function.field("object")?;
-            let site = match name.as_str() {
-                "eval" | "Function" => js_global_object(&object),
-                // `(() => {}).constructor("...")` is `Function`.
-                "constructor" => !matches!(object.kind().as_ref(), "this" | "super"),
-                "runInThisContext" | "runInNewContext" | "runInContext" | "compileFunction" => true,
-                _ => false,
-            };
-            site.then_some(name)
-        }
-        "subscript_expression" => {
-            let object = function.field("object")?;
-            let index = function.field("index")?;
-            let name = static_interpreter_literal(&index, ScriptLanguage::JavaScript, 0)?;
-            (js_global_object(&object) && js_global_source_name(&name)).then_some(name)
-        }
-        // `(0, eval)(x)` is an indirect eval. Only the last expression of the
-        // sequence is the callee.
-        "parenthesized_expression" | "sequence_expression" => {
-            let last = function
-                .children()
-                .filter(|child| child.is_named() && child.kind().as_ref() != "comment")
-                .last()?;
-            js_dynamic_callee(&last, depth + 1)
-        }
+        "member_expression" => js_member_callee(function),
+        "subscript_expression" => js_subscript_callee(function),
         _ => None,
-    }
+    })
+}
+
+fn js_member_callee<D: ast_grep_core::Doc>(
+    function: &ast_grep_core::Node<'_, D>,
+) -> Option<String> {
+    let name = function.field("property")?.text().into_owned();
+    let object = function.field("object")?;
+    let site = match name.as_str() {
+        "eval" | "Function" => js_global_object(&object),
+        // `(() => {}).constructor("...")` is `Function`.
+        "constructor" => !matches!(object.kind().as_ref(), "this" | "super"),
+        "runInThisContext" | "runInNewContext" | "runInContext" | "compileFunction" => true,
+        // `eval.call(null, x)` runs what `eval` runs.
+        "call" | "apply" | "bind" => {
+            return (object.kind().as_ref() == "identifier"
+                && (object.text().as_ref() == "eval"
+                    || js_source_constructor(object.text().as_ref())))
+            .then(|| object.text().into_owned());
+        }
+        _ => false,
+    };
+    site.then_some(name)
+}
+
+fn js_subscript_callee<D: ast_grep_core::Doc>(
+    function: &ast_grep_core::Node<'_, D>,
+) -> Option<String> {
+    let object = function.field("object")?;
+    let index = function.field("index")?;
+    let name = static_interpreter_literal(&index, ScriptLanguage::JavaScript, 0)?;
+    ((js_global_object(&object) && js_global_source_name(&name))
+        || (name == "constructor" && !matches!(object.kind().as_ref(), "this" | "super")))
+    .then_some(name)
 }
 
 fn js_dynamic_constructor<D: ast_grep_core::Doc>(
     constructor: &ast_grep_core::Node<'_, D>,
 ) -> Option<String> {
+    if let Some(inner) = js_wrapped_expression(constructor) {
+        return js_dynamic_constructor(&inner);
+    }
     match constructor.kind().as_ref() {
         "identifier" => {
             let name = constructor.text();
-            js_source_constructor(name.as_ref()).then(|| name.into_owned())
+            (js_source_constructor(name.as_ref()) || name.contains('\\')).then(|| name.into_owned())
         }
         "member_expression" => {
             let name = constructor.field("property")?.text().into_owned();
@@ -710,15 +808,24 @@ fn js_dynamic_constructor<D: ast_grep_core::Doc>(
             let site = match name.as_str() {
                 "Function" => js_global_object(&object),
                 "Script" => object.text().as_ref() == "vm",
+                "constructor" => !matches!(object.kind().as_ref(), "this" | "super"),
                 _ => false,
             };
             site.then_some(name)
         }
+        "subscript_expression" => js_subscript_callee(constructor),
         _ => None,
     }
 }
 
 fn js_name_is_handed_on<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> bool {
+    js_name_is_aliased(node)
+        || node
+            .parent()
+            .is_some_and(|parent| matches!(parent.kind().as_ref(), "arguments" | "array"))
+}
+
+fn js_name_is_aliased<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> bool {
     node.parent()
         .is_some_and(|parent| match parent.kind().as_ref() {
             "variable_declarator" => parent
@@ -727,7 +834,13 @@ fn js_name_is_handed_on<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>
             "assignment_expression" => parent
                 .field("right")
                 .is_some_and(|right| right.range() == node.range()),
-            "arguments" | "array" => true,
+            // `(x || eval)(y)`. `x instanceof Function` is not a value.
+            "binary_expression" => parent
+                .field("operator")
+                .is_some_and(|operator| matches!(operator.text().as_ref(), "||" | "&&" | "??")),
+            "ternary_expression" => parent
+                .field("condition")
+                .is_none_or(|condition| condition.range() != node.range()),
             _ => false,
         })
 }
@@ -1440,6 +1553,110 @@ mod tests {
                 ("Foo::eval($x);", P),
             ]),
             Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn a_callee_past_the_nesting_limit_is_an_error() {
+        use ScriptLanguage::{JavaScript as J, Python as P};
+        let parens = format!("{}eval{}(x)", "(".repeat(12), ")".repeat(12));
+        let sequences = format!("{}eval{}(x)", "(0, ".repeat(12), ")".repeat(12));
+        assert_eq!(
+            readable(&[
+                (parens.as_str(), J),
+                (sequences.as_str(), J),
+                (parens.as_str(), P),
+            ]),
+            Vec::<&str>::new()
+        );
+        assert_eq!(sources("(((eval)))(x)", J), unverified("eval"));
+        assert_eq!(sources("(((eval)))(x)", P), unverified("eval"));
+    }
+
+    #[test]
+    fn python_callee_shapes_are_sites() {
+        use ScriptLanguage::Python as P;
+        assert_eq!(
+            not_unverified(&[
+                ("(exec)(x)", P),
+                ("((eval))(x)", P),
+                ("Thread(target=exec, args=(x,)).start()", P),
+                ("(a or eval)(x)", P),
+                ("(eval if a else print)(x)", P),
+            ]),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            with_sites(&[
+                ("f(eval=1)", P),
+                ("f(exec=x)", P),
+                ("x = y.eval", P),
+                ("(print)(x)", P),
+            ]),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn javascript_callee_shapes_are_sites() {
+        use ScriptLanguage::{JavaScript as J, TypeScript as T};
+        assert_eq!(
+            not_unverified(&[
+                ("eval.call(null, x)", J),
+                ("eval.apply(null, [x])", J),
+                ("eval.bind(null)(x)", J),
+                ("Function.call(null, x)()", J),
+                ("Function.apply(null, [x])()", J),
+                ("const F = Function; F(x)();", J),
+                ("const F = Function; new F(x)();", J),
+                ("(() => {})['constructor'](x)();", J),
+                ("[]['filter']['constructor'](x)();", J),
+                ("(() => {})[`constructor`](x)();", J),
+                ("const f = () => {}; new f.constructor(x)();", J),
+                ("const f = () => {}; new f['constructor'](x)();", J),
+                ("const { eval: run } = globalThis; run(x);", J),
+                ("(a || eval)(x)", J),
+                ("(a ? eval : print)(x)", J),
+                ("\\u0065val(x)", J),
+                ("\\u{65}val(x)", J),
+                ("new \\u0046unction(x)()", J),
+                ("(globalThis as any).eval(x)", T),
+                ("(<any>globalThis).eval(x)", T),
+                ("globalThis!.eval(x)", T),
+                ("(eval as any)(x)", T),
+                ("(Function as any)(x)()", T),
+                ("new (Function as any)(x)()", T),
+            ]),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            with_sites(&[
+                ("x instanceof Function", J),
+                ("new this.constructor(x)", J),
+                ("x.constructor.name", J),
+                ("x.call(null, y)", J),
+                ("const o = { eval: 1 };", J),
+                ("(print as any)(x)", T),
+                ("const s = '\\u0041';", J),
+            ]),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn function_parameters_are_judged_as_well_as_the_body() {
+        use ScriptLanguage::JavaScript as J;
+        assert_eq!(
+            not_unverified(&[
+                ("new Function('a = process.env.P', 'return a')", J),
+                ("new Function('a = eval(b)', 'return a')", J),
+                ("Function('{ a } = b', 'return a')", J),
+            ]),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            sources("new Function('a, b', 'return a + b')", J),
+            literal("Function", "return a + b")
         );
     }
 
