@@ -56,8 +56,43 @@ match the original command with its environment assignments and wrappers,
 and `packs.disabled` now turns off packs loaded from `custom_paths`. See
 Behaviour changes below (11b3f00a, e0554cd0, c490820f).
 
+**Two heredoc checks are looser than in 0.15.3, on purpose.** Quoted
+interpreter heredocs are now judged in the interpreter's language, and a
+substitution in an unquoted heredoc body is judged as the command inside it.
+Some text that 0.15.3 refused because it could not verify it is now allowed.
+See Behaviour changes and Known issues below (f9e87482, e4e06296).
+
 ### Behaviour changes you may notice
 
+- **Quoted interpreter heredocs are judged in the interpreter's language
+  (#544, #560).** 0.15.3 also read a body given to `python3 -`, `node`, `ruby`
+  or `perl` as shell, and refused what it could not prove harmless. When dcg
+  proves the interpreter reads the body as its program, that shell reading is
+  gone, so a backtick or `$(…)` in the body is no longer a substitution. This
+  loosens fail-closed behaviour. In a sample of the rows this change moved,
+  160 went from deny to allow, 9 from allow to indeterminate and 2 from deny
+  to indeterminate; those are counts from the sample, not totals. In a wider
+  synthetic comparison with 0.15.3, across about 40,000 heredoc forms, 851
+  that 0.15.3 denied are allowed here: 153 are the unquoted bodies in the next
+  entry, 76 hold commands that are allowed when typed plainly, and 622 cannot
+  run what they contain, because Python rejects the body or the text sits in
+  a JavaScript template literal with no `${}`. A `python` or `python2` body
+  with a backtick expression comes back `indeterminate`, because Python 2
+  evaluates it; 137 forms do. Dynamic execution in these bodies has a new
+  check, with limits; see Embedded code and heredocs (f9e87482).
+- **A substitution in an unquoted heredoc body is judged as the command inside
+  it.** In `git commit -F - <<EOF` or `cat <<EOF`, a `$(…)` in the body really
+  runs. 0.15.3 denied every such body as `heredoc.shell:launcher-unverified`.
+  This release judges the inner command as if it were typed plainly, which
+  loosens fail-closed behaviour: a substitution whose command dcg cannot
+  resolve, or one that is harmless when typed plainly, is now allowed. The
+  same substitution in `git commit -m "$(…)"` was already allowed in 0.15.3,
+  which explains the inconsistency and does not make the change safer. Still
+  denied: a destructive command dcg recognises in the substitution
+  (`rm -rf /`, a home or relative path, `cd /etc && rm -rf *`), `sh -c`,
+  `python3 -c`, `eval`, `curl | sh`, and any substitution in a body fed to
+  `sh` or `bash`. Three of dcg's own tests still expect the old deny; see
+  Known issues (e4e06296).
 - **Each command is also read without its redirections.** The shell removes
   a redirection from argv wherever it stands, but packs read it as a word.
   Written against the command word or before it, a redirection took the
@@ -333,6 +368,23 @@ Behaviour changes below (11b3f00a, e0554cd0, c490820f).
 
 ### Embedded code and heredocs
 
+- **Dynamic execution in a quoted interpreter heredoc is read in that
+  language.** With the shell reading gone, a Node, Python, Ruby or Perl
+  program that ran decoded or computed source reached no check at all. `eval`,
+  `exec`, `compile` with `exec`, `Function` and `new Function` including
+  tagged templates, `instance_eval` and their kin now deny as
+  `heredoc.<language>.dynamic_source` when dcg cannot read their source. A
+  string literal is judged as source one level deep, and the strings inside
+  it as commands, so `eval("1 + 1")` stays allowed and a literal that runs a
+  shell pipeline does not, however the call reaches it. That includes an
+  `exec` of a literal that imports `subprocess` under another name, which
+  0.15.3 allowed. A name bound once to a literal at the top level counts as
+  that literal. In the synthetic comparison above, this denies again 180
+  forms that run and that the change to quoted heredocs would otherwise have
+  allowed. It scans what it can reach and no more: it runs only on quoted
+  heredocs dcg has proved go to the interpreter, not on unquoted heredocs and
+  not on inline `node -e` or `python3 -c`. Of 657 synthetic forms that run and
+  that 0.15.3 also allowed, 431 stay allowed (63ca20f0).
 - **Inline programs are read as the whole shell word (#570).** A `-c`/`-e`
   program was judged by its first quoted piece only, so a call after an
   embedded quote, as in
@@ -766,15 +818,46 @@ Behaviour changes below (11b3f00a, e0554cd0, c490820f).
 
 - **Replay of real agent commands.** 8,000 recent shell commands from real
   agent sessions were replayed through `dcg test` against 0.15.3 and this
-  release on an idle host. 0.16.0 blocks 11 that 0.15.3 allowed (0.14%) and
+  release on an idle host. 0.16.0 blocks 12 that 0.15.3 allowed (0.15%) and
   allows 4 that 0.15.3 blocked; the candidates held back on 2026-10-14 and
-  2026-10-23 newly blocked 66 and 63 of 8,000. Of the 11, two are intended
+  2026-10-23 newly blocked 66 and 63 of 8,000. Of the 12, two are intended
   (a PowerShell script block read from stdin over ssh, and
   `-EncodedCommand` taken from a variable), one is arguable (a `>` with a
   dynamic target inside an ssh `bash -c` loop), one is an ssh script with an
-  unterminated backtick that the remote shell cannot parse either, and seven
+  unterminated backtick that the remote shell cannot parse either, and eight
   are false positives, listed below. On a heavily loaded host, slow
   evaluations can also come back `indeterminate`, which blocks.
+- **A Python heredoc that runs source it read at run time.** A body that
+  passes text read from a file to `exec`, such as `exec(open(path).read())`
+  or a slice of it, is denied as `heredoc.python:dynamic_source`. One of the
+  8,000 replayed commands did this, to reuse a helper script, and it was
+  harmless. dcg cannot tell that from an attack: the source is not in the
+  command, so there is nothing to read.
+- **An `eval` of a string built at run time, at the start of a line.** Some of
+  these calls in a quoted Python, JavaScript or Ruby heredoc are no longer
+  denied. 0.15.3 denied them only because of a shell-word match on `eval` at
+  the start of a line, which also blocked harmless code such as
+  `eval("1 + 2")`, and the same call anywhere else on a line was always
+  allowed.
+- **The word `copy` in a script, with the opt-in guardrails pack.** With
+  `careful_company_running_windows.guardrails` on, a harmless script that uses
+  the word `copy`, such as `copy.deepcopy` in a Python heredoc, can come back
+  `indeterminate`. The pack's `agent-hook-config-overwrite` rule reaches its
+  regex work limit, and dcg treats an unfinished check as unverified, so a
+  client with a review prompt asks and any other client blocks. Two of the
+  8,000 replayed commands did this, at 1.9 and 2.5 KB, both with that pack on.
+  The default packs are not affected. The rule is unchanged from 0.15.3; since
+  025d06a0 the pack reads anything that might write, so this rule now reaches
+  these commands. To get past it, approve the prompt, run the script from a
+  file, or allow the exact command with `dcg allowlist add-command`. No
+  allow-once code is offered for an `indeterminate`, and raising
+  `hook_timeout_ms`, which the message suggests, does not help: this is a work
+  limit, not a clock.
+- **A harmless `perl -pe`, `perl -ne` or `ruby -pe` filter on a pipe (#611,
+  #624).** `tail -n 3 x | perl -pe 's/foo/bar/' | cut -c1-130` is denied as
+  `heredoc.posix:pipeline-consumer`, in 0.15.3 as well. The rule cannot simply
+  skip inline code, because an `/e` flag makes a substitution executable.
+  With no pipe, `perl -pe '…' file` is allowed.
 - **An ssh script loses the home-directory `mv` exemption (#620).**
   `ssh h 'mv -n /home/u/work/x /home/u/work/x.old'` is denied as
   `core.filesystem:mv-sensitive-source-root-home`, while the same `mv` typed
@@ -793,8 +876,9 @@ Behaviour changes below (11b3f00a, e0554cd0, c490820f).
   The top-level form is fixed in this release.
 - **Shell punctuation inside quoted Python heredoc literals (#544, #560).**
   Three replayed Python heredocs whose string literals contain backticks or
-  other shell syntax are still denied, and a long Python heredoc sent over
-  ssh can exhaust the analysis budget and come back `indeterminate`.
+  other shell syntax are still denied. A `\"` outside a string in a quoted
+  Python or Node heredoc comes back `indeterminate` in about 50 ms; Python
+  could not run such a body either.
 - **`while IFS= read` with an unquoted path variable (#566).** One replayed
   loop is denied as `core.filesystem:credential-file-write`.
 - **An inline-code flag behind a variable command word (#622).**
@@ -803,9 +887,18 @@ Behaviour changes below (11b3f00a, e0554cd0, c490820f).
   read as an interpreter's inline-code flag even though the binding names
   `git`.
 - **Tests that fail at this tag (#623).** On a machine with no dcg
-  configuration, five tests in dcg's own suite fail. No failing case lets a
-  command through: each is an over-block or a different rule name. Four of
-  the tests decide exactly as 0.15.3 does:
+  configuration, nine tests in dcg's own suite fail. Three expect the deny
+  that the unquoted heredoc change in Behaviour changes removed, so in these
+  a command runs that the test says must stay denied:
+  `cross_pack_true_positive_controls_still_deny`,
+  `executing_receivers_and_expanding_bodies_stay_denied` and
+  `unquoted_delimiter_with_command_substitution_stays_denied`. That conflict
+  between e4e06296 and these tests is open. A fourth,
+  `literal_command_queries_and_quoted_wrapper_operands_remain_harmless`, is
+  an over-block new in this release: a `command -pv tee` with a path in a
+  variable split on `IFS` is denied as `credential-file-write` (4850e2da). The
+  other five are over-blocks or a different rule name. Four of those decide
+  exactly as 0.15.3 does:
   `repro_313_powershell_read_only_false_positives` —
   `escaped_dcg_options_keep_agent_values_and_inspection_arguments_as_data`,
   `escaped_dcg_syntax_cannot_hide_guardrail_changes` and
@@ -824,6 +917,11 @@ Behaviour changes below (11b3f00a, e0554cd0, c490820f).
   `dcg-policy-self-weakening`.
   `repro_313_powershell_read_only_false_positives::hook_protocol_keeps_guardrails_active_with_global_options`
   also fails when a system-wide `/etc/dcg/config.toml` adds a custom pack.
+  Separately, `installed_bridge_applies_unverified_posture_when_dcg_cannot_start`
+  in `repro_504_omp_bridge_missing_cwd` fails in about one run in twenty with
+  `Text file busy`, on this release's code before and after its last changes.
+  The test copies the dcg binary and runs the copy while sibling tests fork,
+  and the failure comes before any dcg code runs.
 
 ## [v0.15.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.3) -- 2026-10-08 [Release]
 
