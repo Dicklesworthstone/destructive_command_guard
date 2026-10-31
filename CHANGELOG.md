@@ -379,15 +379,17 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   `exec` of a literal that imports `subprocess` under another name, which
   0.15.3 allowed. In Python, JavaScript, TypeScript and Ruby each constant
   string inside the literal is also judged as a command. That second reading
-  does not reach Perl literals or f-strings with a replacement field, and a
-  string split across `+` is judged a piece at a time. A name bound once to a
+  does not reach Perl literals, or strings with an interpolated field: `{x}` in
+  an f-string, `${x}` in a template, `#{x}` in Ruby. A string split across `+`
+  is judged a piece at a time. A name bound once to a
   literal at the top level
   counts as that literal, unless the body could rebind it unseen: `globals()`,
   `locals()`, `vars()`, `setattr`, a star import, a Ruby `binding`, JavaScript
   `with` or a write through `globalThis`, or the name inside a string. A
-  reading that stops at a limit, an unfinished parse, an unproven Perl string
-  boundary or a quoted heredoc with no terminator line comes back
-  `indeterminate`, not allowed. PHP and Go have no reader, so those bodies keep
+  reading that stops at a limit, an unfinished parse or an unproven Perl string
+  boundary comes back `indeterminate`, not allowed. So does a quoted heredoc to
+  an interpreter with no terminator line, when a candidate word is present. PHP
+  and Go have no reader, so those bodies keep
   their 0.15.3 shell reading of `eval`. In the synthetic comparison above, this
   denies again 180 forms that run and that the change to quoted heredocs would
   otherwise have allowed. It scans what it can reach and no more: it runs only
@@ -407,8 +409,14 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   such as `(globalThis as any).eval(x)`, because dcg has not proved that command
   reads stdin as its program and so does not read it as TypeScript; Python
   `eval` and `exec` spelled with compatibility characters, reached through an
-  import alias, or taken from `__builtins__.__dict__` or `vars(builtins)`; PHP
-  `create_function`; Perl `s///ee` and `do $file`.
+  import alias, or taken from `__builtins__.__dict__` or `vars(builtins)`;
+  Python `run = builtins.eval`, an escaped name in an `exec` literal, and a
+  write through `f_globals` under a computed name; JavaScript
+  `const run = globalThis.eval`, `globalThis.eval.call`,
+  `Reflect.construct(Function, ...)`, `.constructor` taken as a value, and a
+  `\\u` escape in a property name; Ruby `::Kernel.eval`; PHP `create_function`;
+  Perl `s///ee` and `do $file`. An aliased call has no end to chase, so dcg
+  scans what it can reach.
 - **Inline programs are read as the whole shell word (#570).** A `-c`/`-e`
   program was judged by its first quoted piece only, so a call after an
   embedded quote, as in

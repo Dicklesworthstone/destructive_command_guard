@@ -199,8 +199,10 @@ fn the_string_reading_stops_here() {
     let denied: Vec<String> = [
         // Perl has no grammar here, so no strings are read out of a literal.
         ("perl", r#"eval("f('rm -\\x72f /etc')");"#),
-        // An f-string with a replacement field has no constant value.
+        // A string with an interpolated field has no constant value.
         ("python3 -", r#"eval("f(f'rm -\\x72f /etc/{x}')")"#),
+        ("node -", r#"eval("f(`rm -\\x72f /etc/${x}`)")"#),
+        ("ruby -", r#"eval('f("rm\t-rf /etc/#{x}")')"#),
         // Each part of a split string is judged alone.
         ("python3 -", r#"eval("f('rm -' + '\\x72f /etc')")"#),
     ]
