@@ -73,6 +73,32 @@ static RUBY_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static PERL_CANDIDATE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\beval\b").expect("perl dynamic source regex compiles"));
+/// A form the Perl walker reads as code but Perl does not, holding a quote or
+/// `#` that can start a false region: a regex or `tr`, a quote-like operator,
+/// a slash-delimited pattern, POD, or a here-document.
+static PERL_DESYNC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r#"(?m)(?:[=!]~|\b(?:m|s|y|tr|q|qq|qw|qr|qx)\s*[^\s\w,;=)]).*['"`#]"#,
+        r#"|/[^/\n]*['"`#][^/\n]*/"#,
+        r"|^=[A-Za-z]",
+        r#"|<<~?\s*['"\w]"#,
+    ))
+    .expect("perl desynchronising form regex compiles")
+});
+
+/// Whether this module reads `language`. A language it does not read has no
+/// answer here for a POSIX `eval` reading to give way to.
+#[must_use]
+pub(crate) const fn reads_dynamic_source(language: ScriptLanguage) -> bool {
+    matches!(
+        language,
+        ScriptLanguage::Python
+            | ScriptLanguage::JavaScript
+            | ScriptLanguage::TypeScript
+            | ScriptLanguage::Ruby
+            | ScriptLanguage::Perl
+    )
+}
 
 /// The cheap gate. A body with none of these names costs one regex scan.
 #[must_use]
@@ -842,16 +868,24 @@ fn perl_reading(code: &str) -> Result<DynamicSourceReading, MatchError> {
     while index < bytes.len() {
         match bytes[index] {
             b'#' if index == 0 || bytes[index - 1] != b'$' => {
+                let start = index;
                 while index < bytes.len() && bytes[index] != b'\n' {
                     index += 1;
                 }
+                perl_check_skipped(code, start..index, true)?;
             }
+            // `$'`, `$"` and `` $` `` are variables.
             quote @ (b'"' | b'\'' | b'`')
-                if quote != b'\''
-                    || index == 0
-                    || !(bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_') =>
+                if (index == 0 || bytes[index - 1] != b'$')
+                    && (quote != b'\''
+                        || index == 0
+                        || !(bytes[index - 1].is_ascii_alphanumeric()
+                            || bytes[index - 1] == b'_')) =>
             {
-                index = perl_quoted_end(bytes, index);
+                let start = index;
+                let end = perl_quoted_end(bytes, index);
+                index = end.unwrap_or(bytes.len());
+                perl_check_skipped(code, start..index, end.is_some())?;
             }
             b'e' if perl_eval_word_at(bytes, index) => {
                 let word_end = index + 4;
@@ -869,29 +903,73 @@ fn perl_reading(code: &str) -> Result<DynamicSourceReading, MatchError> {
     Ok(reading)
 }
 
-/// The offset just past the string opening at `start`, or the end of input
-/// when it never closes.
-fn perl_quoted_end(bytes: &[u8], start: usize) -> usize {
+/// A region the walker skipped hides nothing unless `eval` is in it. Where it
+/// is, the region has to be proved real: a string that never closes is not,
+/// and neither is one in a body with a form that can start a false region.
+fn perl_check_skipped(
+    code: &str,
+    region: std::ops::Range<usize>,
+    closed: bool,
+) -> Result<(), MatchError> {
+    if code
+        .get(region)
+        .is_some_and(|text| PERL_CANDIDATE.is_match(text))
+        && (!closed || PERL_DESYNC.is_match(code))
+    {
+        return Err(reading_error(ScriptLanguage::Perl, "string boundary"));
+    }
+    Ok(())
+}
+
+/// The offset just past the string opening at `start`, if it closes.
+fn perl_quoted_end(bytes: &[u8], start: usize) -> Option<usize> {
     let quote = bytes[start];
     let mut index = start + 1;
     while index < bytes.len() {
         match bytes[index] {
             b'\\' => index += 2,
-            byte if byte == quote => return index + 1,
+            byte if byte == quote => return Some(index + 1),
             _ => index += 1,
         }
     }
-    bytes.len()
+    None
 }
 
 fn perl_eval_word_at(bytes: &[u8], index: usize) -> bool {
     let word_char = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let before = &bytes[..index];
     bytes[index..].starts_with(b"eval")
         && bytes.get(index + 4).is_none_or(|byte| !word_char(*byte))
-        // `$eval`, `@eval`, `%eval`, `&eval`, `->eval`, `Foo::eval`.
+        // `$eval`, `@eval`, `%eval`, `&eval`, `->eval`, `Foo::eval`. `CORE::eval`
+        // is the builtin itself.
         && (index == 0
+            || before.ends_with(b"CORE::")
+            || before.ends_with(b"CORE::GLOBAL::")
             || !(word_char(bytes[index - 1])
                 || matches!(bytes[index - 1], b'$' | b'@' | b'%' | b'&' | b'>' | b':')))
+}
+
+/// Whether the `{` just before `start` opens a hash subscript: it follows a
+/// variable, an arrow or another subscript with no space. `{eval}` anywhere
+/// else is a block that runs `$_`.
+fn perl_opens_key(bytes: &[u8], start: usize) -> bool {
+    let Some(brace) = start.checked_sub(1).filter(|brace| bytes[*brace] == b'{') else {
+        return false;
+    };
+    let before = &bytes[..brace];
+    if before.ends_with(b"->") || matches!(before.last(), Some(b'}' | b']')) {
+        return true;
+    }
+    let word = before
+        .iter()
+        .rev()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(**byte, b'_' | b':'))
+        .count();
+    word > 0
+        && before
+            .len()
+            .checked_sub(word + 1)
+            .is_some_and(|sigil| matches!(before[sigil], b'$' | b'@' | b'%'))
 }
 
 fn perl_skip_space(bytes: &[u8], mut index: usize) -> usize {
@@ -906,7 +984,7 @@ fn perl_eval_site(code: &str, start: usize, word_end: usize) -> Option<DynamicSo
     let mut next = perl_skip_space(bytes, word_end);
     // `{eval => 1}` and `$h{eval}` name a key.
     if bytes[next..].starts_with(b"=>")
-        || (bytes.get(next) == Some(&b'}') && start > 0 && bytes[start - 1] == b'{')
+        || (bytes.get(next) == Some(&b'}') && perl_opens_key(bytes, start))
     {
         return None;
     }
@@ -940,10 +1018,7 @@ fn perl_literal_argument(code: &str, start: usize, parenthesized: bool) -> Optio
     if !matches!(quote, b'"' | b'\'') {
         return None;
     }
-    let end = perl_quoted_end(bytes, start);
-    if end < start + 2 || bytes.get(end - 1) != Some(&quote) {
-        return None;
-    }
+    let end = perl_quoted_end(bytes, start)?;
     let body = code.get(start + 1..end - 1)?;
     if quote == b'"' && body.contains(['$', '@']) {
         return None;
@@ -1256,6 +1331,116 @@ mod tests {
         ] {
             assert_eq!(sources(code, P), Vec::new(), "{code}");
         }
+    }
+
+    /// Rows that do not end in a site read as `Unverified`, all of them, so a
+    /// red run names every shape it lost.
+    fn not_unverified<'a>(rows: &[(&'a str, ScriptLanguage)]) -> Vec<&'a str> {
+        rows.iter()
+            .filter(|(code, language)| {
+                !dynamic_source_reading(code, *language, false, Duration::from_secs(5)).is_ok_and(
+                    |reading| {
+                        reading
+                            .sites
+                            .iter()
+                            .any(|site| site.source == DynamicSource::Unverified)
+                    },
+                )
+            })
+            .map(|(code, _)| *code)
+            .collect()
+    }
+
+    fn readable<'a>(rows: &[(&'a str, ScriptLanguage)]) -> Vec<&'a str> {
+        rows.iter()
+            .filter(|(code, language)| {
+                dynamic_source_reading(code, *language, false, Duration::from_secs(5)).is_ok()
+            })
+            .map(|(code, _)| *code)
+            .collect()
+    }
+
+    fn with_sites<'a>(rows: &[(&'a str, ScriptLanguage)]) -> Vec<&'a str> {
+        rows.iter()
+            .filter(|(code, language)| !sources(code, *language).is_empty())
+            .map(|(code, _)| *code)
+            .collect()
+    }
+
+    #[test]
+    fn perl_text_the_walker_cannot_place_is_an_error() {
+        use ScriptLanguage::Perl as P;
+        assert_eq!(
+            readable(&[
+                ("$x =~ /'/;\neval $ENV{P};\n", P),
+                ("$x =~ /'/;\neval $ENV{P};\nprint 'y';\n", P),
+                ("$x =~ tr/'/\"/;\neval $ENV{P};\n", P),
+                ("$x =~ s/'/ /;\neval $ENV{P};\n", P),
+                ("$x =~ /#/; eval $ENV{P};\n", P),
+                ("=pod\n\n'tis here.\n\n=cut\neval $ENV{P};\n", P),
+                ("my $s = q( ' );\neval $ENV{P};\n", P),
+            ]),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn a_perl_quote_that_hides_no_eval_stays_clean() {
+        use ScriptLanguage::Perl as P;
+        assert_eq!(
+            with_sites(&[
+                ("eval { $x =~ /'/ };", P),
+                ("eval { $x =~ /'/ };\nprint 1;\n", P),
+                ("eval { $s =~ tr/'/x/ };", P),
+                ("eval { $x =~ /#/ };\nprint 'done';\n", P),
+                ("print \"eval\";\n$x =~ /y/;\n", P),
+            ]),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn perl_punctuation_variables_open_no_string() {
+        use ScriptLanguage::Perl as P;
+        assert_eq!(
+            not_unverified(&[
+                ("print $\"; eval $ENV{P};", P),
+                ("print $'; eval $ENV{P};", P),
+                ("print $`; eval $ENV{P};", P),
+            ]),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn perl_eval_word_forms_are_sites() {
+        use ScriptLanguage::Perl as P;
+        assert_eq!(
+            not_unverified(&[
+                ("CORE::eval $ENV{P};", P),
+                ("CORE::eval($ENV{P});", P),
+                ("CORE::GLOBAL::eval($ENV{P});", P),
+                ("for ($ENV{P}) {eval}", P),
+                ("$_ = $ENV{P}; {eval}", P),
+                ("print map {eval} @list;", P),
+                // An apostrophe after a word opens no string.
+                ("=pod\n\nIt's here.\n\n=cut\neval $ENV{P};\n", P),
+                ("my $s = q(it's);\neval $ENV{P};\n", P),
+            ]),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            with_sites(&[
+                ("$h{eval} = 1;", P),
+                ("$h->{eval} = 1;", P),
+                ("$h->{a}{eval} = 1;", P),
+                ("$h[0]{eval} = 1;", P),
+                ("$$h{eval} = 1;", P),
+                ("@h{eval} = (1);", P),
+                ("Foo::eval($x);", P),
+            ]),
+            Vec::<&str>::new()
+        );
     }
 
     #[test]
