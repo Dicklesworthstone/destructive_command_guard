@@ -414,7 +414,7 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   write through `f_globals` under a computed name; JavaScript
   `const run = globalThis.eval`, `globalThis.eval.call`,
   `Reflect.construct(Function, ...)`, `.constructor` taken as a value, and a
-  `\\u` escape in a property name; Ruby `::Kernel.eval`; PHP `create_function`;
+  `\u` escape in a property name; Ruby `::Kernel.eval`; PHP `create_function`;
   Perl `s///ee` and `do $file`. An aliased call has no end to chase, so dcg
   scans what it can reach.
 - **Inline programs are read as the whole shell word (#570).** A `-c`/`-e`

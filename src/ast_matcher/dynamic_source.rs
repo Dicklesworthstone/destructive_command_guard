@@ -1245,16 +1245,15 @@ const fn perl_word_byte(byte: u8) -> bool {
 }
 
 fn perl_eval_word_at(bytes: &[u8], index: usize) -> bool {
-    let word_char = |byte: u8| perl_word_byte(byte);
     let before = &bytes[..index];
     bytes[index..].starts_with(b"eval")
-        && bytes.get(index + 4).is_none_or(|byte| !word_char(*byte))
+        && bytes.get(index + 4).is_none_or(|byte| !perl_word_byte(*byte))
         // `$eval`, `@eval`, `%eval`, `&eval`, `->eval`, `Foo::eval`. `CORE::eval`
         // is the builtin itself.
         && (index == 0
             || before.ends_with(b"CORE::")
             || before.ends_with(b"CORE::GLOBAL::")
-            || !(word_char(bytes[index - 1])
+            || !(perl_word_byte(bytes[index - 1])
                 || matches!(bytes[index - 1], b'$' | b'@' | b'%' | b'&' | b'>' | b':')))
 }
 
