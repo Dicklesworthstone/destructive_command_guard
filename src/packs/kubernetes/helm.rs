@@ -43,18 +43,59 @@ macro_rules! helm_argument {
     };
 }
 
+macro_rules! helm_invocation {
+    ($suffix:expr) => {
+        concat!(
+            r"^[ \t]*(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+/)?helm[ \t]+(?:",
+            helm_global_option!(),
+            r"[ \t]+)*",
+            $suffix
+        )
+    };
+}
+
 macro_rules! helm_safe_pattern {
     ($name:literal, $suffix:expr) => {
         SafePattern {
             name: $name,
-            regex: LazyCompiledRegex::new(concat!(
-                r"^[ \t]*(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+/)?helm[ \t]+(?:",
-                helm_global_option!(),
-                r"[ \t]+)*",
-                $suffix
-            )),
+            regex: LazyCompiledRegex::new(helm_invocation!($suffix)),
         }
     };
+}
+
+// Consume complete arguments on BOTH sides of the evidence. In particular, a
+// later `--dry-run=false` must revoke an earlier preview. Mixed
+// disabling/enabling flags are conservatively denied; positive repeats and
+// dry-run text consumed as data remain valid. This expression remains
+// compatible with the linear regex engine.
+macro_rules! helm_dry_run {
+    () => {
+        concat!(
+            r"(?:uninstall|delete|rollback|upgrade)(?:[ \t]+",
+            helm_argument!(),
+            r")*[ \t]+--dry-run(?:=(?:true|client|server))?(?:[ \t]+(?:",
+            helm_argument!(),
+            r"|--dry-run(?:=(?:true|client|server))?))*[ \t]*$"
+        )
+    };
+}
+
+static HELM_DRY_RUN_INVOCATION: LazyCompiledRegex =
+    LazyCompiledRegex::new(helm_invocation!(helm_dry_run!()));
+
+/// Prove a Helm preview on the command as the shell runs it.
+///
+/// Since #598 a regex exemption must also match the original segment, and
+/// these grammars are anchored at the executable (#435), so a wrapper or a
+/// leading assignment the shell strips before helm runs (`sudo`, `env`,
+/// `nice`, `time`, `NAME=value`) withdrew a real `--dry-run` that 0.15.3
+/// admitted. As with kubectl's proof, the unchanged `helm-dry-run` grammar
+/// reads the command after the detection view's wrapper stripping; the
+/// destructive patterns still see every view.
+pub(crate) fn dry_run_is_effectively_safe(command: &str) -> bool {
+    let stripped = crate::normalize::strip_wrapper_prefixes(command);
+    !stripped.wrapper_limit_reached
+        && HELM_DRY_RUN_INVOCATION.is_match(stripped.normalized.as_ref())
 }
 
 /// Create the Helm pack.
@@ -86,21 +127,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         helm_safe_pattern!("helm-get", r"get(?=\s|$)"),
         helm_safe_pattern!("helm-search", r"search(?=\s|$)"),
         helm_safe_pattern!("helm-repo", r"repo(?=\s|$)"),
-        // Consume complete arguments on BOTH sides of the evidence. In
-        // particular, a later `--dry-run=false` must revoke an earlier
-        // preview. Mixed disabling/enabling flags are conservatively denied;
-        // positive repeats and dry-run text consumed as data remain valid.
-        // This expression remains compatible with the linear regex engine.
-        helm_safe_pattern!(
-            "helm-dry-run",
-            concat!(
-                r"(?:uninstall|delete|rollback|upgrade)(?:[ \t]+",
-                helm_argument!(),
-                r")*[ \t]+--dry-run(?:=(?:true|client|server))?(?:[ \t]+(?:",
-                helm_argument!(),
-                r"|--dry-run(?:=(?:true|client|server))?))*[ \t]*$"
-            )
-        ),
+        helm_safe_pattern!("helm-dry-run", helm_dry_run!()),
         helm_safe_pattern!("helm-template", r"template(?=\s|$)"),
         helm_safe_pattern!("helm-lint", r"lint(?=\s|$)"),
         helm_safe_pattern!("helm-diff", r"diff(?=\s|$)"),

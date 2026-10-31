@@ -36889,6 +36889,47 @@ mod tests {
     }
 
     #[test]
+    fn issue_598_helm_previews_survive_wrappers_the_shell_strips() {
+        // Helm's exemptions are anchored at the executable (#435), so reading
+        // only the raw segment withdrew a real preview behind a wrapper or a
+        // leading assignment, while the same wrapper still left the real
+        // uninstall denied.
+        for command in [
+            "sudo helm uninstall reviewed --dry-run",
+            "sudo -u deploy helm uninstall reviewed --dry-run",
+            "env KUBECONFIG=/k helm uninstall reviewed --dry-run",
+            "KUBECONFIG=/k helm uninstall reviewed --dry-run",
+            "nice helm rollback reviewed 1 --dry-run",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["kubernetes.helm"],
+                ShellDialect::Posix,
+            );
+            assert!(result.is_allowed(), "{command}: {result:?}");
+        }
+        for command in [
+            "sudo helm uninstall reviewed",
+            "sudo -u deploy helm uninstall reviewed",
+            "env KUBECONFIG=/k helm uninstall reviewed",
+            "sudo helm uninstall reviewed --dry-run=false",
+            "sudo helm uninstall reviewed --dry-run --dry-run=false",
+            "sudo helm uninstall reviewed --description --dry-run",
+            "sudo helm uninstall reviewed --description=--dry-run",
+            "sudo helm uninstall reviewed; echo --dry-run",
+            "sudo helm uninstall reviewed | grep -- --dry-run",
+            "sudo helm uninstall reviewed --dry-run; helm uninstall other",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["kubernetes.helm"],
+                ShellDialect::Posix,
+            );
+            assert!(result.is_denied(), "{command}: {result:?}");
+        }
+    }
+
+    #[test]
     fn issue_598_aws_preview_requires_a_real_static_flag() {
         for command in [
             "env LABEL=reviewed bash -c 'aws ec2 terminate-instances --instance-ids i-reviewed --dry-run'",
