@@ -231,6 +231,83 @@ fn a_language_with_no_reader_keeps_the_posix_eval_reading() {
     assert_eq!(decision(&heredoc("php", "<?php\necho 1 + 1;")), "allow");
 }
 
+/// One reading judges at most 128 calls. A call whose source cannot be read
+/// still denies past that, wherever it is in the body; a body of literal calls
+/// alone was not read to its end, so it stays undecided. Every row is checked
+/// before the assertion, so a failure lists all the rows that moved.
+#[test]
+fn unreadable_source_denies_past_the_call_site_limit() {
+    let mut moved = Vec::new();
+    for (receiver, harmless, variable, rule) in [
+        (
+            "perl -",
+            "eval \"1\";",
+            "eval $x;",
+            "heredoc.perl:dynamic_source",
+        ),
+        (
+            "python3 -",
+            "exec(\"1\")",
+            "exec(x)",
+            "heredoc.python:dynamic_source",
+        ),
+        (
+            "node -",
+            "eval(\"1\");",
+            "eval(x);",
+            "heredoc.javascript:dynamic_source",
+        ),
+        (
+            "ruby -",
+            "eval(\"1\")",
+            "eval(x)",
+            "heredoc.ruby:dynamic_source",
+        ),
+    ] {
+        let repeated = |line: &str, count: usize| vec![line; count].join("\n");
+        for (row, body, expected) in [
+            ("one call on a variable", variable.to_string(), rule),
+            (
+                "127 literal calls, then one on a variable",
+                format!("{}\n{variable}", repeated(harmless, 127)),
+                rule,
+            ),
+            (
+                "128 literal calls, then one on a variable",
+                format!("{}\n{variable}", repeated(harmless, 128)),
+                rule,
+            ),
+            (
+                "one call on a variable, then 200 literal calls",
+                format!("{variable}\n{}", repeated(harmless, 200)),
+                rule,
+            ),
+            (
+                "200 literal calls, then one on a variable",
+                format!("{}\n{variable}", repeated(harmless, 200)),
+                rule,
+            ),
+            ("200 calls on a variable", repeated(variable, 200), rule),
+            (
+                "200 literal calls",
+                repeated(harmless, 200),
+                "indeterminate",
+            ),
+        ] {
+            let verdict = decide(&heredoc(receiver, &body));
+            let got = if verdict["decision"] == "deny" {
+                verdict["rule_id"].as_str().unwrap_or("deny").to_string()
+            } else {
+                verdict["decision"].as_str().unwrap_or("?").to_string()
+            };
+            if got != expected {
+                moved.push(format!("{receiver}: {row}: {got}, expected {expected}"));
+            }
+        }
+    }
+    assert_eq!(moved, Vec::<String>::new());
+}
+
 #[test]
 fn a_heredoc_with_no_terminator_is_undecided_if_it_can_run_dynamic_source() {
     let decided: Vec<String> = [

@@ -60,6 +60,25 @@ pub(crate) struct DynamicSourceReading {
     pub(crate) python2_backticks: bool,
     /// The constant strings in the source, when the reading asked for them.
     pub(crate) strings: Vec<String>,
+    /// The body has more calls or strings than one reading judges. Only the
+    /// sites whose source cannot be read are kept, and the rest is unread.
+    pub(crate) site_limit_exceeded: bool,
+}
+
+/// Past the call-site limit nothing more is judged, except a site whose source
+/// cannot be read: it denies by itself, so it is still worth finding. Literals
+/// and strings are dropped. `None` while no such site has turned up.
+fn past_site_limit(reading: &mut DynamicSourceReading) -> Option<DynamicSourceReading> {
+    reading.site_limit_exceeded = true;
+    reading.strings.clear();
+    reading
+        .sites
+        .retain(|site| site.source == DynamicSource::Unverified);
+    if reading.sites.is_empty() {
+        None
+    } else {
+        Some(std::mem::take(reading))
+    }
 }
 
 static PYTHON_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
@@ -255,6 +274,18 @@ fn tree_reading(
     python2: bool,
     strings: bool,
 ) -> Result<DynamicSourceReading, MatchError> {
+    tree_reading_within(code, language, python2, strings, MAX_DYNAMIC_SOURCE_NODES)
+}
+
+/// [`tree_reading`] with its node limit as a parameter, so a test can reach
+/// the limit with a small body.
+fn tree_reading_within(
+    code: &str,
+    language: ScriptLanguage,
+    python2: bool,
+    strings: bool,
+    max_nodes: usize,
+) -> Result<DynamicSourceReading, MatchError> {
     use ast_grep_core::AstGrep;
     use ast_grep_language::SupportLang;
 
@@ -272,7 +303,7 @@ fn tree_reading(
     let root = ast.root();
     let mut reading = DynamicSourceReading::default();
     for (index, node) in root.dfs().enumerate() {
-        if index >= MAX_DYNAMIC_SOURCE_NODES {
+        if index >= max_nodes {
             return Err(reading_error(language, "AST node limit"));
         }
         match language {
@@ -280,14 +311,19 @@ fn tree_reading(
             ScriptLanguage::Ruby => read_ruby_node(&node, &root, &mut reading),
             _ => read_javascript_node(&node, &root, language, &mut reading)?,
         }
-        if strings {
+        if strings && !reading.site_limit_exceeded {
             reading.strings.extend(constant_string(&node, language));
         }
-        if reading.sites.len() > MAX_DYNAMIC_SOURCE_SITES
-            || reading.strings.len() > MAX_DYNAMIC_SOURCE_SITES
+        if (reading.site_limit_exceeded
+            || reading.sites.len() > MAX_DYNAMIC_SOURCE_SITES
+            || reading.strings.len() > MAX_DYNAMIC_SOURCE_SITES)
+            && let Some(limited) = past_site_limit(&mut reading)
         {
-            return Err(reading_error(language, "call site limit"));
+            return Ok(limited);
         }
+    }
+    if reading.site_limit_exceeded {
+        return Err(reading_error(language, "call site limit"));
     }
     // A call in text the grammar could not finish may have no node. A site that
     // already denies needs no more; anything else would end in allow unread.
@@ -1071,8 +1107,11 @@ fn perl_reading(code: &str) -> Result<DynamicSourceReading, MatchError> {
                 let word_end = index + 4;
                 if let Some(site) = perl_eval_site(code, index, word_end) {
                     reading.sites.push(site);
-                    if reading.sites.len() > MAX_DYNAMIC_SOURCE_SITES {
-                        return Err(reading_error(ScriptLanguage::Perl, "call site limit"));
+                    if (reading.site_limit_exceeded
+                        || reading.sites.len() > MAX_DYNAMIC_SOURCE_SITES)
+                        && let Some(limited) = past_site_limit(&mut reading)
+                    {
+                        return Ok(limited);
                     }
                 }
                 index = word_end;
@@ -1082,6 +1121,9 @@ fn perl_reading(code: &str) -> Result<DynamicSourceReading, MatchError> {
                 index += 1;
             }
         }
+    }
+    if reading.site_limit_exceeded {
+        return Err(reading_error(ScriptLanguage::Perl, "call site limit"));
     }
     Ok(reading)
 }
@@ -2008,6 +2050,113 @@ mod tests {
             dynamic_source_reading(&code, ScriptLanguage::Python, false, Duration::from_secs(5))
                 .is_err()
         );
+    }
+
+    /// One reading judges at most 128 calls. Past that, a call whose source
+    /// cannot be read is still found wherever it is, because it denies by
+    /// itself; a body of literal calls alone stays an error.
+    #[test]
+    fn past_the_call_site_limit_only_unreadable_source_is_kept() {
+        let lines = |parts: &[(&str, usize)]| -> String {
+            let mut text = String::new();
+            for (line, count) in parts {
+                for _ in 0..*count {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+            }
+            text
+        };
+        for (language, harmless, variable) in [
+            (ScriptLanguage::Perl, "eval \"1\";", "eval $x;"),
+            (ScriptLanguage::Python, "exec(\"1\")", "exec(x)"),
+            (ScriptLanguage::JavaScript, "eval(\"1\");", "eval(x);"),
+            (ScriptLanguage::Ruby, "eval(\"1\")", "eval(x)"),
+        ] {
+            let at_limit = read(&lines(&[(harmless, 127), (variable, 1)]), language);
+            assert!(!at_limit.site_limit_exceeded, "{language:?}");
+            assert_eq!(at_limit.sites.len(), 128, "{language:?}");
+            for body in [
+                lines(&[(harmless, 128), (variable, 1)]),
+                lines(&[(variable, 1), (harmless, 200)]),
+                lines(&[(harmless, 200), (variable, 1)]),
+                lines(&[(variable, 200)]),
+            ] {
+                let reading = read(&body, language);
+                assert!(reading.site_limit_exceeded, "{language:?}");
+                assert!(!reading.sites.is_empty(), "{language:?}");
+                assert!(
+                    reading
+                        .sites
+                        .iter()
+                        .all(|site| site.source == DynamicSource::Unverified),
+                    "{language:?}"
+                );
+            }
+            let literals = lines(&[(harmless, 200)]);
+            assert!(
+                dynamic_source_reading(&literals, language, false, Duration::from_secs(5)).is_err(),
+                "{language:?}"
+            );
+        }
+
+        let strings = lines(&[("'a'", 200)]);
+        let budget = Duration::from_secs(5);
+        assert!(literal_source_reading(&strings, ScriptLanguage::Python, budget).is_err());
+        let reading = literal_source_reading(
+            &format!("{strings}exec(x)\n"),
+            ScriptLanguage::Python,
+            budget,
+        )
+        .unwrap();
+        assert!(reading.site_limit_exceeded);
+        assert!(reading.strings.is_empty());
+        assert_eq!(sources_of(&reading), unverified("exec"));
+    }
+
+    /// The walk past the call-site limit is the walk any body gets, under the
+    /// same bounds. Cut short by the node limit or the clock before it reaches
+    /// a call whose source cannot be read, it is an error, never a clean
+    /// reading, so the caller records the body as unread.
+    #[test]
+    fn a_walk_past_the_call_site_limit_that_is_cut_short_is_an_error() {
+        let filler = format!("x = [{}]\n", "0, ".repeat(10_000));
+        for (language, harmless, variable) in [
+            (ScriptLanguage::Python, "exec(\"1\")", "exec(y)"),
+            (ScriptLanguage::JavaScript, "eval(\"1\");", "eval(y);"),
+            (ScriptLanguage::Ruby, "eval(\"1\")", "eval(y)"),
+        ] {
+            let code = format!(
+                "{}{filler}{variable}\n",
+                format!("{harmless}\n").repeat(200)
+            );
+            let whole =
+                tree_reading_within(&code, language, false, false, MAX_DYNAMIC_SOURCE_NODES)
+                    .unwrap();
+            assert!(whole.site_limit_exceeded, "{language:?}");
+            assert_eq!(whole.sites.len(), 1, "{language:?}");
+            // The node limit falls past the 129th call, in the filler, before
+            // the call on a variable.
+            let cut = tree_reading_within(&code, language, false, false, 5_000);
+            assert!(cut.is_err(), "{language:?}: {cut:?}");
+            assert!(
+                dynamic_source_reading(&code, language, false, Duration::ZERO).is_err(),
+                "{language:?}"
+            );
+        }
+        // Perl's walk counts no nodes. Text it cannot place past the limit, a
+        // `'` in a pattern before the call on a variable, is an error there.
+        let perl = format!("{}$y =~ /'/;\neval $x;\n", "eval \"1\";\n".repeat(200));
+        let budget = Duration::from_secs(5);
+        assert!(dynamic_source_reading(&perl, ScriptLanguage::Perl, false, budget).is_err());
+    }
+
+    fn sources_of(reading: &DynamicSourceReading) -> Vec<(String, DynamicSource)> {
+        reading
+            .sites
+            .iter()
+            .map(|site| (site.callee.clone(), site.source.clone()))
+            .collect()
     }
 
     #[test]

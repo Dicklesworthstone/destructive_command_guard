@@ -35479,7 +35479,8 @@ fn receiver_may_be_python2(content: &crate::heredoc::ExtractedContent) -> bool {
 /// allowlist. A literal is judged as the source it is, one level deep. A
 /// reading that cannot finish is recorded like the interpreter literal
 /// analysis, so a positive finding still denies and an allow becomes
-/// Indeterminate.
+/// Indeterminate. So is a reading past its call-site limit, once the sites it
+/// kept, whose source cannot be read, have had their say.
 fn dynamic_source_verdict(
     command: &str,
     content: &crate::heredoc::ExtractedContent,
@@ -35502,29 +35503,39 @@ fn dynamic_source_verdict(
         Ok(reading) => reading,
         Err(decided) => return decided.map(|result| *result),
     };
+    // Past the limit the rest of the body was not read, so an allowlist entry
+    // for the kept sites' rule grants nothing here.
+    let mut unread_body_hit = None;
+    let allowlist_hit = if reading.site_limit_exceeded {
+        &mut unread_body_hit
+    } else {
+        first_allowlist_hit
+    };
     for site in &reading.sites {
         if deadline_exceeded(context.deadline) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
         }
         let blocked = match &site.source {
-            crate::ast_matcher::DynamicSource::Unverified => unverified_dynamic_source_verdict(
-                command,
-                content,
-                site,
-                context,
-                first_allowlist_hit,
-            ),
+            crate::ast_matcher::DynamicSource::Unverified => {
+                unverified_dynamic_source_verdict(command, content, site, context, allowlist_hit)
+            }
             crate::ast_matcher::DynamicSource::Literal(source) => literal_dynamic_source_verdict(
                 command,
                 content,
                 site,
                 source,
                 context,
-                first_allowlist_hit,
+                allowlist_hit,
             ),
         };
         if blocked.is_some() {
             return blocked;
+        }
+    }
+    if reading.site_limit_exceeded {
+        let unread = dynamic_source_site_limit_verdict(context);
+        if unread.is_some() {
+            return unread;
         }
     }
     if reading.python2_backticks
@@ -35777,7 +35788,37 @@ fn literal_dynamic_source_verdict(
     if reading.sites.is_empty() {
         return None;
     }
-    unverified_dynamic_source_verdict(command, content, site, context, first_allowlist_hit)
+    if !reading.site_limit_exceeded {
+        return unverified_dynamic_source_verdict(
+            command,
+            content,
+            site,
+            context,
+            first_allowlist_hit,
+        );
+    }
+    // The literal was not read to its end, so an allowlist entry for this rule
+    // grants nothing here.
+    let blocked = unverified_dynamic_source_verdict(command, content, site, context, &mut None);
+    if blocked.is_some() {
+        return blocked;
+    }
+    dynamic_source_site_limit_verdict(context)
+}
+
+/// A reading past its call-site limit kept only the calls whose source it
+/// cannot read, and none of them denied. The rest was not read, which is
+/// recorded like a reading that could not finish: a positive finding elsewhere
+/// still denies, and an allow becomes Indeterminate.
+fn dynamic_source_site_limit_verdict(
+    context: HeredocEvaluationContext<'_>,
+) -> Option<EvaluationResult> {
+    (deadline_exceeded(context.deadline)
+        || !crate::packs::regex_engine::record_incomplete_analysis(
+            "dynamic_source_analysis",
+            &"dynamic source analysis exceeded or could not verify call site limit",
+        ))
+    .then(EvaluationResult::indeterminate_due_to_budget)
 }
 
 /// Explicit language/content exemptions apply to every executable-source
@@ -53679,6 +53720,43 @@ mod tests {
         let info = sibling.pattern_info.expect("independent Git denial");
         assert_eq!(info.pack_id.as_deref(), Some("core.git"));
         assert_eq!(info.pattern_name.as_deref(), Some("reset-hard"));
+    }
+
+    /// Past the call-site limit a call whose source cannot be read denies as it
+    /// does below it. An allowlist entry for that rule grants it below the
+    /// limit; past it the rest of the body was not read, so the entry grants
+    /// nothing and the body stays undecided.
+    #[test]
+    fn an_allowlisted_dynamic_source_rule_grants_nothing_past_the_call_site_limit() {
+        let config = default_config();
+        let pack_ids: Vec<String> = config.enabled_pack_ids().into_iter().collect();
+        let pack_ids: Vec<&str> = pack_ids.iter().map(String::as_str).collect();
+        let below = "perl - <<'EOF'\neval $x;\nEOF".to_string();
+        let past = format!(
+            "perl - <<'EOF'\n{}eval $x;\nEOF",
+            "eval \"1\";\n".repeat(200)
+        );
+        for command in [&below, &past] {
+            let denied = evaluate_with_pack_ids_and_allowlists_at_path(
+                command,
+                &pack_ids,
+                &default_allowlists(),
+                None,
+            );
+            assert!(denied.is_denied(), "{command:?}: {denied:?}");
+            let info = denied.pattern_info.expect("an owning rule");
+            assert_eq!(info.pack_id.as_deref(), Some("heredoc.perl"));
+            assert_eq!(info.pattern_name.as_deref(), Some("dynamic_source"));
+        }
+
+        let allowlists =
+            project_allowlists_for_rule("heredoc.perl:dynamic_source", "reviewed eval");
+        let granted =
+            evaluate_with_pack_ids_and_allowlists_at_path(&below, &pack_ids, &allowlists, None);
+        assert!(granted.is_allowed(), "{granted:?}");
+        let unread =
+            evaluate_with_pack_ids_and_allowlists_at_path(&past, &pack_ids, &allowlists, None);
+        assert!(unread.is_indeterminate(), "{unread:?}");
     }
 
     /// A shell `-c` script that is wholly an expansion or substitution runs
