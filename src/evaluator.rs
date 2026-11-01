@@ -35666,6 +35666,26 @@ fn fallback_pattern_hit(command: &str) -> bool {
             r"os\.remove",
             r"os\.rmdir",
             r"os\.unlink",
+            // #626: a bound method or an imported deletion can be called under
+            // any name. The completed Python pass resolves those bindings; an
+            // incomplete pass cannot prove that the capability is unused.
+            // Preserve that signal even without a call immediately after the
+            // member, e.g. `erase = p.unlink; erase()`. Match import SOURCE
+            // names, so `from os import stat as unlink` is not a deletion.
+            r"\.(?:\s|\\\r?\n)*(?:unlink|rmdir)\b",
+            r"(?x)
+                \bfrom (?:\s|\\\r?\n)+ os (?:\s|\\\r?\n)+ import
+                (?:\s|\\\r?\n)+ \(?
+                (?:\s|\\\r?\n|\#[^\r\n]*)*
+                (?:
+                    \w+ (?:
+                        (?:\s|\\\r?\n|\#[^\r\n]*)+ as
+                        (?:\s|\\\r?\n|\#[^\r\n]*)+ \w+
+                    )?
+                    (?:\s|\\\r?\n|\#[^\r\n]*)* ,
+                    (?:\s|\\\r?\n|\#[^\r\n]*)*
+                )*
+                (?: remove\b | unlink\b | rmdir\b | \* )",
             // Node deletions anchor on the CALL, not on an `fs.` receiver.
             // `fs\.rmSync` only ever matched the bound spelling
             // (`const fs = require('fs'); fs.rmSync(…)`), and missed the
@@ -35754,7 +35774,30 @@ fn fallback_pattern_hit(command: &str) -> bool {
     let sanitized = sanitize_for_pattern_matching(masked.as_ref());
     let check_target = sanitized.as_ref();
 
-    FALLBACK_PATTERNS.is_match(check_target)
+    if FALLBACK_PATTERNS.is_match(check_target) {
+        return true;
+    }
+
+    // Module aliases also hide `os.remove`, including a captured function.
+    // `remove` alone is common on lists and sets, so require an os import as
+    // well. This is only a conservative capability signal after analysis was
+    // incomplete; the authoritative Python pass still checks actual bindings
+    // and targets before this fallback is considered.
+    static PYTHON_OS_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?x)\bimport (?:\s|\\\r?\n)+
+                (?:
+                    \w+(?:\.\w+)*
+                    (?: (?:\s|\\\r?\n)+ as (?:\s|\\\r?\n)+ \w+ )?
+                    (?:\s|\\\r?\n)* , (?:\s|\\\r?\n)*
+                )* os\b",
+        )
+        .expect("Python os-import fallback compiles")
+    });
+    static PYTHON_REMOVE_MEMBER: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\.(?:\s|\\\r?\n)*remove\b").expect("Python remove-member fallback compiles")
+    });
+    PYTHON_REMOVE_MEMBER.is_match(check_target) && PYTHON_OS_IMPORT.is_match(check_target)
 }
 
 /// [`check_fallback_patterns`] over the whole command, whose denial yields to
@@ -55805,6 +55848,75 @@ mod tests {
                 assert!(
                     eval_with_heredoc(command, &settings).is_allowed(),
                     "the imported-delete signal must not classify unrelated imports or inert data as a delete: {command:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn python_path_deletion_aliases_survive_incomplete_extraction_626() {
+            for (max_body_bytes, max_body_lines) in [(1024 * 1024, 1), (1, 10_000)] {
+                let settings = heredoc_config_with_limits(crate::heredoc::ExtractionLimits {
+                    max_body_bytes,
+                    max_body_lines,
+                    max_heredocs: 10,
+                    timeout_ms: 5_000,
+                });
+                for body in [
+                    "from pathlib import Path\np = Path('/etc/hosts')\nerase = p.unlink\nerase()",
+                    "erase = unknown.unlink\nerase()",
+                    "erase = unknown . \\\n rmdir\nerase()",
+                    "from os import unlink as erase\nerase('/etc/hosts')",
+                    "from os import stat, remove as erase\nerase('/etc/hosts')",
+                    "from os import (\n    stat, # another imported name\n    rmdir as erase,\n)\nerase('/tmp')",
+                    "from os \\\nimport unlink as erase\nerase('/etc/hosts')",
+                    "from os import *\nerase = remove\nerase('/etc/hosts')",
+                    "import os as operating_system\nerase = operating_system.remove\nerase('/etc/hosts')",
+                    "import sys, os as operating_system\noperating_system.remove('/etc/hosts')",
+                    "import sys as system, \\\n os as operating_system\nerase = operating_system . \\\n remove\nerase('/etc/hosts')",
+                    "def cleanup(p):\n    operating_system.remove(p)\nimport os as operating_system\ncleanup('/etc/hosts')",
+                ] {
+                    assert!(
+                        fallback_pattern_hit(body),
+                        "the fallback must retain a captured deletion capability: {body:?}"
+                    );
+                    let command = format!("python3 - <<'PY'\n{body}\nPY");
+                    assert!(
+                        eval_with_heredoc(&command, &settings).is_denied(),
+                        "bounded extraction must not hide a Python deletion alias: {command:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn python_path_alias_fallback_preserves_unrelated_operations_and_data_626() {
+            let settings = heredoc_config_with_limits(crate::heredoc::ExtractionLimits {
+                max_body_bytes: 1024 * 1024,
+                max_body_lines: 1,
+                max_heredocs: 10,
+                timeout_ms: 5_000,
+            });
+            for command in [
+                "cat <<'PY'\nfrom os import unlink as erase\nerase('/etc/hosts')\nPY",
+                "cat <<'PY'\nerase = unknown.unlink\nerase()\nPY",
+                "git commit -m 'guard captured p.unlink and os deletion imports'",
+                "python3 - <<'PY'\nfrom os import stat as unlink\nprint('ok')\nPY",
+                "python3 - <<'PY'\nfrom os import (stat as remove, getcwd)\nprint('ok')\nPY",
+                "python3 - <<'PY'\nfrom project_helpers import remove as erase\nprint('ok')\nPY",
+                "python3 - <<'PY'\n# from os import unlink as erase\nprint('ok')\nPY",
+                "python3 - <<'PY'\nitems = [1, 2]\nitems.remove(1)\nPY",
+                "python3 - <<'PY'\nimport os as operating_system\nprint('ok')\nPY",
+                "python3 - <<'PY'\nimport nose as os\nitems.remove(1)\nPY",
+                "python3 - <<'PY'\nimport os as operating_system\n# captured = p.remove\nprint('ok')\nPY",
+                "bash <<'SH'\nmkdir -p build/tmp\nrmdir build/tmp\nSH",
+            ] {
+                assert!(
+                    !fallback_pattern_hit(command),
+                    "a mention or unrelated import must not establish a deletion capability: {command:?}"
+                );
+                assert!(
+                    eval_with_heredoc(command, &settings).is_allowed(),
+                    "the conservative alias backstop must preserve unrelated operations: {command:?}"
                 );
             }
         }

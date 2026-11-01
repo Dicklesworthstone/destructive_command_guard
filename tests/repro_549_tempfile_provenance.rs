@@ -1,4 +1,4 @@
-//! #549 follow-up: a name is not proof of a fresh temporary directory.
+//! #549 / #626: temporary ownership and path bindings are proof obligations.
 //! Only DCG receives the candidate commands; no Python fixture is executed.
 
 use std::io::Write;
@@ -9,6 +9,8 @@ struct Case {
     id: String,
     decision: String,
     source: String,
+    #[serde(default)]
+    rule_id: Option<String>,
 }
 
 fn assert_verdict(case: &Case, command: &str, hook: bool) {
@@ -72,6 +74,22 @@ fn assert_verdict(case: &Case, command: &str, hook: bool) {
         case.id,
         String::from_utf8_lossy(&output.stderr),
     );
+    if let Some(expected_rule) = &case.rule_id {
+        let actual_rule = if hook {
+            verdict["rule_id"].as_str().unwrap_or_default().to_string()
+        } else {
+            format!(
+                "{}:{}",
+                verdict["pack_id"].as_str().unwrap_or_default(),
+                verdict["pattern_name"].as_str().unwrap_or_default(),
+            )
+        };
+        assert_eq!(
+            &actual_rule, expected_rule,
+            "{} hook={hook}: {command:?}; verdict={verdict}",
+            case.id,
+        );
+    }
 }
 
 fn check_cases(hook: bool) {

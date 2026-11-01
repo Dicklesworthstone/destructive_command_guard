@@ -163,11 +163,11 @@ what is matched and what the reported span covers.
 | Rule ID | Pattern | Reason |
 | --- | --- | --- |
 | `heredoc.python.shutil_rmtree` | `$M.rmtree($$$)` | recursively deletes directories |
-| `heredoc.python.os_remove` | `os.remove($$$)` | deletes files |
-| `heredoc.python.os_rmdir` | `os.rmdir($$$)` | deletes directories |
-| `heredoc.python.os_unlink` | `os.unlink($$$)` | deletes files |
-| `heredoc.python.pathlib_unlink` | `pathlib.Path($$$).unlink($$$)` and `Path($$$).unlink($$$)` | deletes files |
-| `heredoc.python.pathlib_rmdir` | `pathlib.Path($$$).rmdir($$$)` and `Path($$$).rmdir($$$)` | deletes directories |
+| `heredoc.python.os_remove` | `os.remove($$$)`, including resolved module and callable aliases | deletes files |
+| `heredoc.python.os_rmdir` | `os.rmdir($$$)`, including resolved module and callable aliases | deletes directories |
+| `heredoc.python.os_unlink` | `os.unlink($$$)`, including resolved module and callable aliases | deletes files |
+| `heredoc.python.pathlib_unlink` | `receiver.unlink($$$)`, including `Path(...)`, path variables, and captured methods | deletes files |
+| `heredoc.python.pathlib_rmdir` | `receiver.rmdir($$$)`, including `Path(...)`, path variables, and captured methods | deletes directories |
 | `heredoc.python.subprocess_run` | `subprocess.run($$$)` | executes shell commands |
 | `heredoc.python.subprocess_call` | `subprocess.call($$$)` | executes shell commands |
 | `heredoc.python.subprocess_popen` | `subprocess.Popen($$$)` | spawns shell processes |
@@ -175,6 +175,47 @@ what is matched and what the reported span covers.
 | `heredoc.python.subprocess_check_output` | `subprocess.check_output($$$)` | executes shell commands |
 | `heredoc.python.os_system` | `os.system($$$)` | executes shell commands |
 | `heredoc.python.os_popen` | `os.popen($$$)` | executes shell commands |
+
+#### Python deletion targets and temporary ownership
+
+Python file-deletion calls use bounded, scope-aware path analysis on the same
+parsed source as the rules above. Assigning a path to a variable does not evade
+the deletion rule: both `Path('/etc/hosts').unlink()` and
+`p = Path('/etc/hosts'); p.unlink()` are denied. A receiver whose identity cannot
+be resolved, such as `p.unlink()` without a proven binding, is also denied.
+
+The analysis follows assignments in statement order, copied path values,
+imported aliases, captured deletion methods, `str(path)`, `Path` construction,
+`/`, `joinpath`, and `os.path.join`. Reassignment replaces a variable's current
+value; a copied immutable path or captured method retains its earlier value.
+Conditional branches preserve a safety fact only when every reaching binding
+proves it. Loop assignments, shadowed parameters, and deferred function access
+to mutable outer paths cannot inherit a stale temporary-path allowance.
+
+Cleanup is permitted for a proven descendant of the shared literal temporary
+directories described below, or of a fresh directory obtained from an
+unmodified standard-library `tempfile.mkdtemp()` or `TemporaryDirectory()`
+binding. For example:
+
+```python
+import os, tempfile
+from pathlib import Path
+p = Path(tempfile.mkdtemp()) / 'leaked.lock'
+os.unlink(str(p))
+```
+
+The same proof applies to `os.remove(p)` and `p.unlink()`, and to descendants
+built inside `with tempfile.TemporaryDirectory() as directory:`. It grants
+only the individual deletion whose target was proved. Other operations in the
+script retain their own checks.
+
+The shared temporary root itself, a fresh producer root without a descendant,
+unknown directories or join components, `..` traversal, and protected
+destinations do not receive this allowance. Absolute join components replace
+the prior base: `Path(tempfile.mkdtemp()) / '/etc/hosts'` remains denied.
+Replaced factories, modified dependencies, reflective binding mutation, and
+unsupported path transformations cannot establish temporary ownership.
+Analysis limits or an incomplete proof never establish a safe target.
 
 ### Ruby
 
@@ -350,8 +391,10 @@ construction; Go has no equivalent because `os.MkdirTemp` returns
 `(string, error)` and so cannot be nested inside the delete call. The Go idiom
 that splits it across two statements (`dir, _ := os.MkdirTemp(…)` then
 `defer os.RemoveAll(dir)`) is denied, exactly as Python's two-statement
-`d = tempfile.mkdtemp(); shutil.rmtree(d)` is — proving `dir` still holds that
-value needs taint analysis this scanner does not do.
+`d = tempfile.mkdtemp(); shutil.rmtree(d)` is. This recursive-deletion rule does
+not resolve those two-statement producer bindings. The bounded Python path
+analysis described above applies to `unlink`, `remove`, and `rmdir`; it does
+not broaden the existing `shutil.rmtree` producer exemptions.
 
 The reason it is one policy is that the thing choosing the spelling is usually
 an agent. An agent refused `rm -rf ./build` must not get the same effect from a

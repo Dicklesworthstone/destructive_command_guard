@@ -45,6 +45,9 @@ use std::sync::{Arc, LazyLock, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "ast_matcher/python_paths.rs"]
+mod python_paths;
+
 /// Hard timeout for AST operations (20ms as per ADR).
 ///
 /// Tests use a much more generous budget because the full suite runs thousands
@@ -1887,7 +1890,44 @@ fn find_matches_ast(
             cancel,
             remaining_nodes: MAX_PYTHON_DELETE_NODES,
         }
-        .visit(root, &mut HashMap::new(), None, 0)?;
+        .visit(root.clone(), &mut HashMap::new(), None, 0)?;
+    }
+
+    // Resolve single-file deletion targets on this same parsed tree. Keep
+    // explicitly configured corpora authoritative: only registered rule IDs
+    // participate, and the analysis shares the worker's remaining deadline.
+    if language == ScriptLanguage::Python
+        && ["unlink", "remove", "rmdir"]
+            .iter()
+            .any(|name| code.contains(name))
+    {
+        let rules: Vec<_> = patterns
+            .patterns
+            .iter()
+            .map(|pattern| &pattern.meta)
+            .filter(|meta| {
+                matches!(
+                    meta.rule_id.as_str(),
+                    "heredoc.python.os_unlink"
+                        | "heredoc.python.os_remove"
+                        | "heredoc.python.os_rmdir"
+                        | "heredoc.python.pathlib_unlink"
+                        | "heredoc.python.pathlib_rmdir"
+                )
+            })
+            .collect();
+        if !rules.is_empty() {
+            python_paths::Scan::new(
+                rules,
+                &mut matches,
+                &newline_positions,
+                start_time,
+                timeout,
+                budget_ms,
+                cancel,
+            )
+            .run(root)?;
+        }
     }
 
     check_ast_timeout(start_time, timeout, budget_ms, cancel)?;
