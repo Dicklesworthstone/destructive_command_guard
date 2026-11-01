@@ -1,5 +1,13 @@
 # Agent-Specific Profiles
 
+## Permanent CI and automation policy: DSR only
+
+**Never use GitHub Actions for any purpose in this project.** This includes CI, tests, builds, releases, deployments, scheduled jobs, and other automation, on GitHub-hosted runners or self-hosted runners registered with Actions. Do not enable, dispatch, rerun, or wait for Actions, and do not treat Actions results as verification or release gates.
+
+Use **DSR ([Dicklesworthstone/doodlestein_self_releaser](https://github.com/Dicklesworthstone/doodlestein_self_releaser))** directly on its configured hosts instead. DSR is the primary execution path, not a fallback after an Actions outage. If DSR configuration or capacity is missing, report or repair that path within the authorized scope; never fall back to Actions or change its budget to get work running.
+
+Workflow YAML may be retained as input to local DSR/`act` execution where this project's existing rules allow it; that does not authorize execution by the GitHub Actions service. Preserve required checks, artifact/signing contracts, and unrelated instructions. This permanent policy supersedes any historical Actions, re-enable-after-billing, or Actions-first fallback guidance below.
+
 dcg can detect which AI coding agent is invoking it and apply agent-specific
 trust levels and configuration overrides. This allows you to grant higher
 trust to well-behaved agents while maintaining strict controls for unknown ones.
