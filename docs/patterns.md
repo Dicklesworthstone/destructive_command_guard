@@ -192,6 +192,20 @@ Conditional branches preserve a safety fact only when every reaching binding
 proves it. Loop assignments, shadowed parameters, and deferred function access
 to mutable outer paths cannot inherit a stale temporary-path allowance.
 
+Normal completion, `break`, `continue`, `return`, and exceptions retain separate
+path states. Unreachable assignments after an exit cannot replace the state
+that actually reaches a later deletion. Loop `else` clauses apply only on
+exhaustion, and `finally` blocks apply to every incoming exit. Implicit
+exceptions can occur before a later assignment, so exception handlers and
+finalizers cannot assume that the entire protected body completed.
+
+List, set, and dictionary comprehensions analyze paths across repeated
+iterations, including filter side effects and empty inner iterators. Their
+effects reach the enclosing scope, while iteration variables remain local.
+Generator bodies use deferred proofs that are revoked by subsequent opaque
+operations; the leftmost iterable is evaluated immediately in the enclosing
+scope. These passes share the existing traversal budget and deadline.
+
 Cleanup is permitted for a proven descendant of the shared literal temporary
 directories described below, or of a fresh directory obtained from an
 unmodified standard-library `tempfile.mkdtemp()` or `TemporaryDirectory()`

@@ -226,6 +226,100 @@ impl Env {
     }
 }
 
+// A completed statement can leave by only one of these routes. Keep their
+// facts separate: a break cannot reach the next statement or the loop's else,
+// and a return still has to run a surrounding finally suite.
+#[derive(Clone, Copy)]
+enum Exit {
+    Normal,
+    Break,
+    Continue,
+    Return,
+    Raise,
+}
+
+const EXITS: [Exit; 5] = [
+    Exit::Normal,
+    Exit::Break,
+    Exit::Continue,
+    Exit::Return,
+    Exit::Raise,
+];
+
+#[derive(Default)]
+struct Flow {
+    normal: Option<Env>,
+    breaks: Option<Env>,
+    continues: Option<Env>,
+    returns: Option<Env>,
+    raises: Option<Env>,
+}
+
+impl Flow {
+    fn normal(env: Env) -> Self {
+        Self {
+            normal: Some(env),
+            ..Self::default()
+        }
+    }
+
+    fn slot(&mut self, exit: Exit) -> &mut Option<Env> {
+        match exit {
+            Exit::Normal => &mut self.normal,
+            Exit::Break => &mut self.breaks,
+            Exit::Continue => &mut self.continues,
+            Exit::Return => &mut self.returns,
+            Exit::Raise => &mut self.raises,
+        }
+    }
+
+    fn add(&mut self, exit: Exit, env: Env) {
+        let slot = self.slot(exit);
+        *slot = Some(match slot.take() {
+            Some(old) => old.merge(&env),
+            None => env,
+        });
+    }
+
+    fn merge(&mut self, mut other: Self) {
+        for exit in EXITS {
+            if let Some(env) = other.slot(exit).take() {
+                self.add(exit, env);
+            }
+        }
+    }
+
+    fn environments(&self) -> impl Iterator<Item = &Env> {
+        [
+            &self.normal,
+            &self.breaks,
+            &self.continues,
+            &self.returns,
+            &self.raises,
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    fn environments_mut(&mut self) -> impl Iterator<Item = &mut Env> {
+        [
+            &mut self.normal,
+            &mut self.breaks,
+            &mut self.continues,
+            &mut self.returns,
+            &mut self.raises,
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    fn joined(&self) -> Option<Env> {
+        self.environments()
+            .cloned()
+            .reduce(|left, right| left.merge(&right))
+    }
+}
+
 #[derive(Default)]
 struct Args {
     positional: Vec<Value>,
@@ -748,13 +842,208 @@ impl<'a> Scan<'a> {
         Ok(defaults)
     }
 
+    fn sequence<'tree, D: Doc>(
+        &mut self,
+        nodes: impl Iterator<Item = Node<'tree, D>>,
+        env: &Env,
+        depth: usize,
+    ) -> Result<Flow, MatchError> {
+        let mut flow = Flow::normal(env.clone());
+        for node in nodes {
+            let Some(mut incoming) = flow.normal.take() else {
+                break;
+            };
+            flow.merge(self.visit(node, &mut incoming, depth + 1)?);
+        }
+        Ok(flow)
+    }
+
+    fn loop_flow<D: Doc>(
+        &mut self,
+        node: &Node<'_, D>,
+        env: &mut Env,
+        depth: usize,
+    ) -> Result<Flow, MatchError> {
+        if let Some(iterable) = node.field("right") {
+            self.eval(&iterable, env, depth + 1)?;
+        }
+        let mut header = env.clone();
+        let mut exits = Flow::default();
+        let mut exhausted = loop {
+            self.check(node, depth)?;
+            let mut iteration = header.clone();
+            if let Some(condition) = node.field("condition") {
+                self.eval(&condition, &mut iteration, depth + 1)?;
+            }
+            // The condition also runs on the false exit. For a for-loop this
+            // is the exhausted-iterator path, including zero iterations.
+            let exhausted = iteration.clone();
+            if let Some(target) = node.field("left") {
+                self.assign(&target, Value::Unknown, &mut iteration, depth + 1)?;
+            }
+            let mut body = if let Some(body) = node.field("body") {
+                self.visit(body, &mut iteration, depth + 1)?
+            } else {
+                Flow::normal(iteration)
+            };
+            if let Some(env) = body.breaks.take() {
+                exits.add(Exit::Normal, env);
+            }
+            if let Some(env) = body.returns.take() {
+                exits.add(Exit::Return, env);
+            }
+            if let Some(env) = body.raises.take() {
+                exits.add(Exit::Raise, env);
+            }
+            // Only normal completion and continue reach the next iteration.
+            // A break must never be overwritten by a later body statement.
+            let mut next = header.clone();
+            for backedge in [body.normal.take(), body.continues.take()]
+                .into_iter()
+                .flatten()
+            {
+                next = next.merge(&backedge);
+            }
+            if next == header {
+                break exhausted;
+            }
+            header = next;
+        };
+        if let Some(alternative) = node.field("alternative") {
+            exits.merge(self.visit(alternative, &mut exhausted, depth + 1)?);
+        } else {
+            exits.add(Exit::Normal, exhausted);
+        }
+        Ok(exits)
+    }
+
+    fn exceptional_prefix(&self, entry: &Env, body: &Flow) -> Env {
+        // Any evaluated expression can raise before a later assignment. A
+        // finalizer/handler therefore cannot inherit the normal end-state's
+        // path proofs. Keep only dominating immutable imports when no path
+        // through the protected suite has invalidated their identities.
+        let mut exceptional = body
+            .joined()
+            .map_or_else(|| entry.clone(), |body| entry.merge(&body));
+        exceptional.forget();
+        if exceptional.trusted {
+            for (name, value) in &entry.values {
+                if self.immutable.get(name) == Some(value) && value.immutable_import() {
+                    exceptional.values.insert(name.clone(), value.clone());
+                }
+            }
+        }
+        exceptional
+    }
+
+    fn finally_flow<D: Doc>(
+        &mut self,
+        mut incoming: Flow,
+        finalizer: Node<'_, D>,
+        depth: usize,
+    ) -> Result<Flow, MatchError> {
+        let Some(mut combined) = incoming.joined() else {
+            return Ok(incoming);
+        };
+        // Scan once from a conservative join instead of multiplying visits
+        // for every nested exit reason. Normal finalizer completion preserves
+        // the original reason; an abrupt finalizer replaces it.
+        let mut completed = self.visit(finalizer, &mut combined, depth + 1)?;
+        if let Some(normal) = completed.normal.take() {
+            for exit in EXITS {
+                if incoming.slot(exit).take().is_some() {
+                    completed.add(exit, normal.clone());
+                }
+            }
+        }
+        Ok(completed)
+    }
+
+    fn try_flow<D: Doc>(
+        &mut self,
+        node: &Node<'_, D>,
+        env: &mut Env,
+        depth: usize,
+    ) -> Result<Flow, MatchError> {
+        let entry = env.clone();
+        let mut exits = if let Some(body) = node.field("body") {
+            self.visit(body, env, depth + 1)?
+        } else {
+            Flow::normal(entry.clone())
+        };
+        let exceptional = self.exceptional_prefix(&entry, &exits);
+        exits.raises = None;
+        if let Some(mut normal) = exits.normal.take() {
+            if let Some(alternative) = named(node).find(|child| child.kind() == "else_clause") {
+                exits.merge(self.visit(alternative, &mut normal, depth + 1)?);
+            } else {
+                exits.add(Exit::Normal, normal);
+            }
+        }
+        // Handler selection and implicit exception sites are deliberately
+        // unresolved. Every handler may run; an exception may also escape.
+        // None of those paths receives the protected suite's last assignment.
+        exits.add(Exit::Raise, exceptional.clone());
+        let mut handler_entry = exceptional;
+        for handler in named(node).filter(|child| child.kind() == "except_clause") {
+            let mut handler_env = handler_entry.clone();
+            let handled = self.visit(handler, &mut handler_env, depth + 1)?;
+            // Except* handlers can run sequentially. Even ordinary handlers
+            // may evaluate an earlier type expression before selecting a
+            // later handler. Neither may restore an invalidated identity.
+            handler_entry = self.exceptional_prefix(&handler_entry, &handled);
+            exits.merge(handled);
+        }
+        if let Some(finalizer) = named(node).find(|child| child.kind() == "finally_clause") {
+            exits = self.finally_flow(exits, finalizer, depth + 1)?;
+        }
+        Ok(exits)
+    }
+
+    fn match_flow<D: Doc>(
+        &mut self,
+        node: &Node<'_, D>,
+        env: &mut Env,
+        depth: usize,
+    ) -> Result<Flow, MatchError> {
+        for subject in named(node).filter(|child| child.kind() != "block") {
+            self.eval(&subject, env, depth + 1)?;
+        }
+        // Pattern dispatch can invoke user hooks, and a failed guard can
+        // mutate shared modules before a later case. Unsupported matching
+        // cannot preserve positive identities across those paths.
+        self.invalidate(env);
+        let base = env.clone();
+        let mut exits = Flow::normal(base.clone());
+        for block in named(node).filter(|child| child.kind() == "block") {
+            for case in named(&block) {
+                let mut branch = base.clone();
+                exits.merge(self.visit(case, &mut branch, depth + 1)?);
+            }
+        }
+        Ok(exits)
+    }
+
     fn visit<D: Doc>(
         &mut self,
         node: Node<'_, D>,
         env: &mut Env,
         depth: usize,
-    ) -> Result<(), MatchError> {
+    ) -> Result<Flow, MatchError> {
         self.check(&node, depth)?;
+        let flow = self.visit_statement(node, env, depth)?;
+        if let Some(normal) = &flow.normal {
+            *env = normal.clone();
+        }
+        Ok(flow)
+    }
+
+    fn visit_statement<D: Doc>(
+        &mut self,
+        node: Node<'_, D>,
+        env: &mut Env,
+        depth: usize,
+    ) -> Result<Flow, MatchError> {
         match node.kind().as_ref() {
             "import_statement" | "import_from_statement" => {
                 for (name, value) in import_values(&node) {
@@ -790,7 +1079,7 @@ impl<'a> Scan<'a> {
                 if let Some(parameters) = node.field("parameters") {
                     self.bind(&parameters, Value::Unknown, &mut local, depth + 1)?;
                 }
-                if let Some(body) = body {
+                let preserves = if let Some(body) = body {
                     self.locals(&body, &mut local, depth + 1)?;
                     for (name, possible) in defaults {
                         local
@@ -802,15 +1091,15 @@ impl<'a> Scan<'a> {
                     self.deferred_depth += 1;
                     let visited = self.visit(body, &mut local, depth + 1);
                     self.deferred_depth -= 1;
-                    visited?;
-                }
+                    visited?.environments().all(|exit| exit.trusted)
+                } else {
+                    local.trusted
+                };
                 if let Some(name) = node.field("name") {
                     env.values.insert(
                         name.text().into_owned(),
                         if is_function {
-                            Value::LocalFunction {
-                                preserves: local.trusted,
-                            }
+                            Value::LocalFunction { preserves }
                         } else {
                             Value::Unknown
                         },
@@ -822,11 +1111,10 @@ impl<'a> Scan<'a> {
                     self.eval(&condition, env, depth + 1)?;
                 }
                 let base = env.clone();
-                let mut branches = Vec::new();
+                let mut exits = Flow::default();
                 if let Some(body) = node.field("consequence") {
                     let mut branch = base.clone();
-                    self.visit(body, &mut branch, depth + 1)?;
-                    branches.push(branch);
+                    exits.merge(self.visit(body, &mut branch, depth + 1)?);
                 }
                 let mut exhaustive = false;
                 let mut fallthrough = base;
@@ -836,63 +1124,26 @@ impl<'a> Scan<'a> {
                     if let Some(condition) = alternative.field("condition") {
                         self.eval(&condition, &mut fallthrough, depth + 1)?;
                     }
-                    let mut branch = fallthrough.clone();
-                    for body in named(&alternative).filter(|child| child.kind() == "block") {
-                        self.visit(body, &mut branch, depth + 1)?;
-                    }
-                    branches.push(branch);
+                    let branch = fallthrough.clone();
+                    exits.merge(self.sequence(
+                        named(&alternative).filter(|child| child.kind() == "block"),
+                        &branch,
+                        depth + 1,
+                    )?);
                 }
                 if !exhaustive {
-                    branches.push(fallthrough);
+                    exits.add(Exit::Normal, fallthrough);
                 }
-                if let Some(mut merged) = branches.pop() {
-                    for branch in branches {
-                        merged = merged.merge(&branch);
-                    }
-                    *env = merged;
-                }
+                return Ok(exits);
             }
             "for_statement" | "while_statement" => {
-                if let Some(iterable) = node.field("right") {
-                    self.eval(&iterable, env, depth + 1)?;
-                }
-                let mut entry = env.clone();
-                loop {
-                    let mut branch = entry.clone();
-                    if let Some(condition) = node.field("condition") {
-                        self.eval(&condition, &mut branch, depth + 1)?;
-                    }
-                    if let Some(target) = node.field("left") {
-                        self.assign(&target, Value::Unknown, &mut branch, depth + 1)?;
-                    }
-                    if let Some(body) = node.field("body") {
-                        self.visit(body, &mut branch, depth + 1)?;
-                    }
-                    let merged = entry.merge(&branch);
-                    if merged == entry {
-                        break;
-                    }
-                    entry = merged;
-                }
-                if let Some(alternative) = node.field("alternative") {
-                    let mut branch = entry.clone();
-                    self.visit(alternative, &mut branch, depth + 1)?;
-                    entry = entry.merge(&branch);
-                }
-                *env = entry;
+                return self.loop_flow(&node, env, depth);
             }
-            "try_statement" | "match_statement" => {
-                // Exceptional edges and pattern captures can bind at many
-                // points. Unsupported edges cannot carry positive facts.
-                env.forget();
-                let base = env.clone();
-                let mut merged = base.clone();
-                for child in named(&node) {
-                    let mut branch = base.clone();
-                    self.visit(child, &mut branch, depth + 1)?;
-                    merged = merged.merge(&branch);
-                }
-                *env = merged;
+            "try_statement" => {
+                return self.try_flow(&node, env, depth);
+            }
+            "match_statement" => {
+                return self.match_flow(&node, env, depth);
             }
             "with_statement" => {
                 let mut managed = HashSet::new();
@@ -915,38 +1166,70 @@ impl<'a> Scan<'a> {
                         }
                     }
                 }
-                if let Some(body) = node.field("body") {
-                    self.visit(body, env, depth + 1)?;
-                }
-                for value in env.values.values_mut() {
-                    let path = match value {
-                        Value::Directory(path) => Some(&*path),
-                        Value::Delete(call) => call.receiver.as_ref(),
-                        _ => value.path(),
-                    };
-                    if path
-                        .and_then(Path::origin)
-                        .is_some_and(|origin| managed.contains(&origin))
-                    {
-                        *value = value.lost();
+                let mut exits = if let Some(body) = node.field("body") {
+                    self.visit(body, env, depth + 1)?
+                } else {
+                    Flow::normal(env.clone())
+                };
+                for exit in exits.environments_mut() {
+                    for value in exit.values.values_mut() {
+                        let path = match value {
+                            Value::Directory(path) => Some(&*path),
+                            Value::Delete(call) => call.receiver.as_ref(),
+                            _ => value.path(),
+                        };
+                        if path
+                            .and_then(Path::origin)
+                            .is_some_and(|origin| managed.contains(&origin))
+                        {
+                            *value = value.lost();
+                        }
+                    }
+                    if opaque {
+                        // __exit__ runs for normal and abrupt completion.
+                        self.invalidate(exit);
                     }
                 }
-                if opaque {
-                    // __exit__ has the same opaque-code boundary.
-                    self.invalidate(env);
+                if opaque && let Some(suppressed) = exits.raises.clone() {
+                    // Only exceptions can be suppressed by __exit__.
+                    exits.add(Exit::Normal, suppressed);
                 }
+                return Ok(exits);
             }
             "decorated_definition" => {
                 // Applying the decorator happens before a deferred body can
                 // run. Do not grant that body a pre-decoration factory proof.
                 self.invalidate(env);
-                for child in named(&node) {
-                    self.visit(child, env, depth + 1)?;
-                }
+                let mut exits = self.sequence(named(&node), env, depth + 1)?;
                 // Applying a decorator invokes arbitrary code even when its
                 // source is just a name. The following statement cannot rely
                 // on the preceding path or factory bindings.
-                self.invalidate(env);
+                for exit in exits.environments_mut() {
+                    self.invalidate(exit);
+                }
+                return Ok(exits);
+            }
+            "break_statement" | "continue_statement" | "return_statement" | "raise_statement" => {
+                for child in named(&node) {
+                    let value = self.eval(&child, env, depth + 1)?;
+                    if node.kind() == "raise_statement"
+                        && child.kind() != "call"
+                        && value == Value::Unknown
+                    {
+                        // Raising a class constructs it even without a call
+                        // expression. An unknown exception can run code.
+                        self.invalidate(env);
+                    }
+                }
+                let exit = match node.kind().as_ref() {
+                    "break_statement" => Exit::Break,
+                    "continue_statement" => Exit::Continue,
+                    "return_statement" => Exit::Return,
+                    _ => Exit::Raise,
+                };
+                let mut exits = Flow::default();
+                exits.add(exit, env.clone());
+                return Ok(exits);
             }
             "delete_statement" => {
                 for target in named(&node) {
@@ -954,19 +1237,17 @@ impl<'a> Scan<'a> {
                 }
             }
             "module" | "block" | "else_clause" | "elif_clause" | "finally_clause"
-            | "except_clause" => {
+            | "except_clause" | "case_clause" => {
                 if let Some(alias) = node.field("alias") {
                     self.assign(&alias, Value::Unknown, env, depth + 1)?;
                 }
-                for child in named(&node) {
-                    self.visit(child, env, depth + 1)?;
-                }
+                return self.sequence(named(&node), env, depth + 1);
             }
             _ => {
                 self.eval(&node, env, depth + 1)?;
             }
         }
-        Ok(())
+        Ok(Flow::normal(env.clone()))
     }
 
     fn eval<D: Doc>(
@@ -1114,37 +1395,7 @@ impl<'a> Scan<'a> {
             | "set_comprehension"
             | "dictionary_comprehension"
             | "generator_expression" => {
-                let mut local = if node.kind() == "generator_expression" {
-                    self.deferred(env)
-                } else {
-                    env.clone()
-                };
-                for child in named(node) {
-                    if child.kind() == "for_in_clause" {
-                        for right in child.field_children("right") {
-                            self.eval(&right, &mut local, depth + 1)?;
-                        }
-                        if let Some(left) = child.field("left") {
-                            self.assign(&left, Value::Unknown, &mut local, depth + 1)?;
-                        }
-                    } else if child.kind() == "if_clause" {
-                        self.eval(&child, &mut local, depth + 1)?;
-                    }
-                }
-                if let Some(body) = node.field("body") {
-                    self.eval(&body, &mut local, depth + 1)?;
-                }
-                // Walrus targets belong to the outer scope, including in a
-                // deferred generator. Their previous values are no proof.
-                for child in node
-                    .dfs()
-                    .filter(|child| child.kind() == "named_expression")
-                {
-                    self.check(&child, depth + 1)?;
-                    if let Some(name) = child.field("name") {
-                        self.assign(&name, Value::Unknown, env, depth + 1)?;
-                    }
-                }
+                self.comprehension(node, env, depth + 1)?;
                 Value::Unknown
             }
             "function_definition" | "class_definition" | "lambda" => {
@@ -1160,6 +1411,99 @@ impl<'a> Scan<'a> {
             }
         };
         Ok(value)
+    }
+
+    fn comprehension<D: Doc>(
+        &mut self,
+        node: &Node<'_, D>,
+        env: &mut Env,
+        depth: usize,
+    ) -> Result<(), MatchError> {
+        self.check(node, depth)?;
+        let clauses: Vec<_> = named(node)
+            .filter(|child| matches!(child.kind().as_ref(), "for_in_clause" | "if_clause"))
+            .collect();
+        let first = clauses
+            .iter()
+            .position(|clause| clause.kind() == "for_in_clause");
+        let mut targets = HashSet::new();
+        for clause in &clauses {
+            if let Some(left) = clause.field("left") {
+                self.names(&left, &mut targets, depth + 1)?;
+            }
+        }
+        // Python evaluates the leftmost iterable immediately in the enclosing
+        // scope, even for a generator. Later iterables execute in its body.
+        if let Some(first) = first {
+            for right in clauses[first].field_children("right") {
+                self.eval(&right, env, depth + 1)?;
+            }
+        }
+        let deferred = node.kind() == "generator_expression";
+        let mut entry = if deferred {
+            self.deferred(env)
+        } else {
+            env.clone()
+        };
+        if deferred {
+            self.deferred_depth += 1;
+        }
+        let visited: Result<(), MatchError> = (|| {
+            loop {
+                self.check(node, depth)?;
+                let mut iteration = entry.clone();
+                let mut skipped = entry.clone();
+                for (index, clause) in clauses.iter().enumerate() {
+                    self.check(clause, depth + 1)?;
+                    if clause.kind() == "for_in_clause" {
+                        if Some(index) != first {
+                            for right in clause.field_children("right") {
+                                self.eval(&right, &mut iteration, depth + 1)?;
+                            }
+                        }
+                        // An inner iterator can be empty. Effects before it
+                        // still reach the next outer iteration.
+                        skipped = skipped.merge(&iteration);
+                        if let Some(left) = clause.field("left") {
+                            self.assign(&left, Value::Unknown, &mut iteration, depth + 1)?;
+                        }
+                    } else {
+                        self.eval(clause, &mut iteration, depth + 1)?;
+                        // A false filter skips the body without undoing a
+                        // walrus assignment or another condition side effect.
+                        skipped = skipped.merge(&iteration);
+                    }
+                }
+                if let Some(body) = node.field("body") {
+                    self.eval(&body, &mut iteration, depth + 1)?;
+                }
+                let merged = entry.merge(&skipped).merge(&iteration);
+                if merged == entry {
+                    break;
+                }
+                entry = merged;
+            }
+            Ok(())
+        })();
+        if deferred {
+            self.deferred_depth -= 1;
+        }
+        visited?;
+        if deferred {
+            // A generator may later change its enclosing walrus bindings.
+            // Its iteration variables remain local, and its body has not run.
+            self.walrus_locals(node, env, depth + 1)?;
+        } else {
+            // Eager comprehensions execute now. Preserve their effects while
+            // keeping iteration targets out of the enclosing namespace.
+            env.trusted &= entry.trusted;
+            for (name, value) in entry.values {
+                if !targets.contains(&name) {
+                    env.values.insert(name, value);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn arguments<D: Doc>(
@@ -1520,6 +1864,66 @@ mod tests {
     use super::*;
     use ast_grep_core::AstGrep;
     use ast_grep_language::SupportLang;
+
+    fn assert_blocked(source: &str, expected: bool) {
+        let matcher = super::super::AstMatcher::with_patterns(super::super::default_patterns());
+        let matches = matcher
+            .find_matches(source, ScriptLanguage::Python)
+            .expect("valid Python must complete bounded analysis");
+        assert_eq!(
+            matches.iter().any(|hit| hit.severity.blocks_by_default()),
+            expected,
+            "source: {source}\nfindings: {matches:?}"
+        );
+    }
+
+    #[test]
+    fn break_exits_ignore_unreachable_assignments_and_loop_else() {
+        assert_blocked(
+            "from pathlib import Path\np = Path('/tmp/first')\nfor i in (0,):\n    p = Path('/etc/hosts')\n    break\n    p = Path('/tmp/first')\nelse:\n    p = Path('/tmp/first')\np.unlink()",
+            true,
+        );
+    }
+
+    #[test]
+    fn continue_carries_unsafe_paths_to_the_next_iteration() {
+        assert_blocked(
+            "from pathlib import Path\np = Path('/tmp/first')\nfor i in (0, 1):\n    p.unlink(missing_ok=True)\n    p = Path('/etc/hosts')\n    continue\n    p = Path('/tmp/first')",
+            true,
+        );
+    }
+
+    #[test]
+    fn finally_runs_on_implicit_exceptions_and_returns() {
+        assert_blocked(
+            "from pathlib import Path\np = Path('/etc/hosts')\ntry:\n    Path('/tmp/missing').read_text()\n    p = Path('/tmp/safe')\nfinally:\n    p.unlink()",
+            true,
+        );
+        assert_blocked(
+            "def cleanup():\n    from pathlib import Path\n    p = Path('/etc/hosts')\n    try:\n        return\n    finally:\n        p.unlink()\ncleanup()",
+            true,
+        );
+    }
+
+    #[test]
+    fn finally_can_repair_paths_or_replace_pending_breaks() {
+        assert_blocked(
+            "from pathlib import Path\np = Path('/tmp/first')\nfor i in (0,):\n    try:\n        p = Path('/etc/hosts')\n        break\n    finally:\n        p = Path('/tmp/first')\np.unlink(missing_ok=True)",
+            false,
+        );
+        assert_blocked(
+            "def cleanup():\n    from pathlib import Path\n    p = Path('/tmp/first')\n    for i in (0,):\n        try:\n            p = Path('/etc/hosts')\n            break\n        finally:\n            return\n    p.unlink(missing_ok=True)\ncleanup()",
+            false,
+        );
+    }
+
+    #[test]
+    fn temporary_context_ownership_is_revoked_on_break() {
+        assert_blocked(
+            "import tempfile\nfrom pathlib import Path\nfor i in (0,):\n    with tempfile.TemporaryDirectory() as directory:\n        p = Path(directory) / 'child'\n        break\np.unlink()",
+            true,
+        );
+    }
 
     #[test]
     fn exhausted_path_proof_is_incomplete_not_an_empty_success() {
