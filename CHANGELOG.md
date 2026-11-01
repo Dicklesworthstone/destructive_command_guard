@@ -871,6 +871,12 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   the start of a line, which also blocked harmless code such as
   `eval("1 + 2")`, and the same call anywhere else on a line was always
   allowed.
+- **More than 128 `eval` calls on literals in one quoted interpreter heredoc
+  come back `indeterminate`.** A Perl, Python, JavaScript or Ruby body with
+  more than 128 calls such as `eval "1"` is more than dcg reads, so it asks or
+  blocks. 0.15.3 denied these in Perl, JavaScript and Ruby, and allowed them
+  in Python. A call whose source dcg cannot read still denies, wherever it is
+  in the body.
 - **The word `copy` in a script, with the opt-in guardrails pack.** With
   `careful_company_running_windows.guardrails` on, a harmless script that uses
   the word `copy`, such as `copy.deepcopy` in a Python heredoc, can come back
@@ -885,6 +891,24 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   allow-once code is offered for an `indeterminate`, and raising
   `hook_timeout_ms`, which the message suggests, does not help: this is a work
   limit, not a clock.
+- **A long heredoc of one repeated harmless line can come back
+  `indeterminate`.** On a body of about 60 KB, such as 7,875 lines of
+  `"nope";` given to `perl -`, the default fork-bomb rule can use up its regex
+  work limit. dcg treats an unfinished check as unverified: a client with a
+  review prompt asks, any other client blocks, and
+  `general.unverified_decision = "deny"` denies. 0.15.3 counted an exhausted
+  search as no match and was slower on these bodies: it asked from about 30 to
+  40 KB, when its 1000 ms clock ran out. The limit is unchanged from 0.15.3.
+  The message suggests raising `hook_timeout_ms`, which does not help: this is
+  a work limit, not a clock (553263f1, 1475a05f).
+- **A quoted interpreter heredoc near the 64 KiB command limit takes longer to
+  check.** A body of about 60 KB, such as 6,000 lines of `eval "1";` given to
+  `perl -`, takes about 0.4 to 0.9 s, against about 0.05 s in 0.15.3. 0.16.0
+  reads a quoted Perl, JavaScript or Ruby body as its own language (63ca20f0,
+  #544, #560) and runs its full pattern pass over it. 0.15.3 read the body as
+  shell and stopped at its first match, which is why it denied harmless bodies
+  such as 100 lines of `eval "1";`. A command over 64 KiB is not evaluated by
+  either version: it asks or blocks at once.
 - **A heredoc with no terminator beside one that runs unproven code.** A
   closed `python3 <<'A'` heredoc whose body is `exec(x)`, followed in the same
   command by an interpreter heredoc that never ends, comes back
