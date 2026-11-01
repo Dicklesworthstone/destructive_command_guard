@@ -2337,7 +2337,15 @@ fn extract_content_with_scan_view(
                 skip_count = skip_reasons.len(),
                 "tier2_complete: partial extraction with skips"
             );
-            if skip_reasons.iter().any(SkipReason::stopped_early) {
+            //
+            // One shape observation is unread source: a quoted heredoc to an
+            // interpreter, with no terminator line and a candidate in it. The
+            // evaluator answers that from these reasons, so they must reach it.
+            if skip_reasons.iter().any(|reason| {
+                reason.stopped_early()
+                    || (matches!(reason, SkipReason::UnterminatedHeredoc { .. })
+                        && unterminated_stdin_has_dynamic_source(command))
+            }) {
                 ExtractionResult::Partial {
                     extracted,
                     skipped: skip_reasons,
@@ -9327,6 +9335,122 @@ fn inert_interpreter_stdin_body(command: &str, heredoc: &ActiveHeredoc) -> Optio
 /// destructive-pattern scan, including opaque or aliased execution sinks.
 #[must_use]
 pub(crate) fn mask_inert_interpreter_stdin(command: &str) -> Cow<'_, str> {
+    mask_interpreter_stdin_bodies(command, |_| true)
+}
+
+/// The view for the POSIX `eval` reading alone. A body leaves that reading only
+/// when a reader for its language answers in its place, so `php` and `go` bodies
+/// stay visible here, and every other consumer keeps the full mask.
+#[must_use]
+pub(crate) fn mask_dynamic_source_read_stdin(command: &str) -> Cow<'_, str> {
+    mask_interpreter_stdin_bodies(command, |target| {
+        let name = target.rsplit(['/', '\\']).next().unwrap_or(target);
+        crate::ast_matcher::reads_dynamic_source(ScriptLanguage::from_command(name))
+    })
+}
+
+/// Whether a quoted heredoc with no terminator line gives a non-shell
+/// interpreter a dynamic execution candidate. Bash runs that text to end of
+/// input, and extraction skips it, so no reader sees it. The answer only moves
+/// an allow to Indeterminate, so it asks for less proof than an exemption does.
+#[must_use]
+pub(crate) fn unterminated_stdin_has_dynamic_source(command: &str) -> bool {
+    quoted_stdin_has_dynamic_source(command, &ExtractionLimits::structural_scan(), |body| {
+        matches!(body, Some(SkipReason::UnterminatedHeredoc { .. }))
+    })
+}
+
+/// Whether a quoted heredoc to a non-shell interpreter whose body extraction
+/// did not read gives that interpreter a dynamic execution candidate.
+///
+/// Such a body is masked from the outer shell's POSIX `eval` reading as inert
+/// interpreter input (#544), and its own reader never ran, so nothing judged it:
+/// `perl - <<'EOF'` with 10,000 lines of `1;` and then `eval $x;` was ALLOWED,
+/// where 0.15.3 denied it through that shell reading. A body is unread when
+/// extracting it under the evaluation's own `limits` stops early: past the line
+/// or byte cap, or malformed. A reason that names no body, the heredoc count cap
+/// or the clock, counts every such heredoc (`any_body`). The candidates are the
+/// reader's own pre-check, so this and the reader cannot drift apart. Like the
+/// unterminated case, the answer only moves an allow to Indeterminate.
+#[must_use]
+pub(crate) fn unread_stdin_has_dynamic_source(
+    command: &str,
+    limits: &ExtractionLimits,
+    any_body: bool,
+) -> bool {
+    let limits = ExtractionLimits {
+        timeout_ms: limits
+            .timeout_ms
+            .max(ExtractionLimits::structural_scan().timeout_ms),
+        ..*limits
+    };
+    quoted_stdin_has_dynamic_source(command, &limits, |body| {
+        any_body || body.is_some_and(SkipReason::stopped_early)
+    })
+}
+
+/// The quoted heredocs to a non-shell interpreter whose extraction under
+/// `limits` gives `unread` (`None` for a body that was extracted, else the
+/// reason it was not), checked for a dynamic execution candidate in the text
+/// from the body to the end of the command.
+fn quoted_stdin_has_dynamic_source(
+    command: &str,
+    limits: &ExtractionLimits,
+    unread: impl Fn(Option<&SkipReason>) -> bool,
+) -> bool {
+    let timeout = Duration::from_millis(limits.timeout_ms);
+    HEREDOC_EXTRACTOR.captures_iter(command).any(|cap| {
+        let (Some(operator), Some(word)) = (cap.get(0), cap.get(2)) else {
+            return false;
+        };
+        let words = shell_words::split(word.as_str()).unwrap_or_default();
+        let [delimiter] = words.as_slice() else {
+            return false;
+        };
+        let Some(line_end) = command[operator.end()..]
+            .find('\n')
+            .map(|rel| operator.end() + rel)
+        else {
+            return false;
+        };
+        let heredoc_type = match cap.get(1).map(|variant| variant.as_str()) {
+            Some("-") => HeredocType::TabStripped,
+            Some("~") => HeredocType::IndentStripped,
+            _ => HeredocType::Standard,
+        };
+        if !word.as_str().contains(['\'', '"', '\\'])
+            || command.as_bytes()[..operator.start()].last() == Some(&b'<')
+            || !unread(
+                extract_heredoc_body(
+                    command,
+                    line_end,
+                    delimiter,
+                    heredoc_type,
+                    false,
+                    limits,
+                    Instant::now(),
+                    timeout,
+                )
+                .err()
+                .as_ref(),
+            )
+        {
+            return false;
+        }
+        let Some(target) = extract_heredoc_target_command(command, operator.start()) else {
+            return false;
+        };
+        let name = target.rsplit(['/', '\\']).next().unwrap_or(&target);
+        is_non_shell_interpreter_stdin_command(&target)
+            && crate::ast_matcher::has_dynamic_source_candidates(
+                &command[line_end..],
+                ScriptLanguage::from_command(name),
+                name == "python" || name.starts_with("python2"),
+            )
+    })
+}
+
+fn mask_interpreter_stdin_bodies(command: &str, blank: impl Fn(&str) -> bool) -> Cow<'_, str> {
     if !command.contains("<<") {
         return Cow::Borrowed(command);
     }
@@ -9341,6 +9465,10 @@ pub(crate) fn mask_inert_interpreter_stdin(command: &str) -> Cow<'_, str> {
     }
     let bodies: Vec<_> = heredocs
         .iter()
+        .filter(|heredoc| {
+            extract_heredoc_target_command(command, heredoc.operator_start)
+                .is_some_and(|target| blank(&target))
+        })
         .filter_map(|heredoc| inert_interpreter_stdin_body(command, heredoc))
         .collect();
     if bodies.is_empty() {

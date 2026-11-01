@@ -13019,12 +13019,14 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
         // JavaScript's `eval` does not invoke POSIX `eval`. The two existing
         // ownership masks remove only those bodies from this syntax view;
         // interpreter source still reaches its language and raw-pattern scans.
+        // A language with no dynamic source reader keeps this reading: without
+        // it, PHP's `eval` of decoded text reaches no layer at all.
         //
         // An eval that is real stays visible either way: outside any heredoc it is
         // untouched, and inside a body a pipeline hands to a shell the pipeline
         // collector recursively evaluates that body, where the eval is seen again.
         let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
-        let eval_view = crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
+        let eval_view = crate::heredoc::mask_dynamic_source_read_stdin(data_view.as_ref());
         collect_posix_eval_sinks(eval_view.as_ref(), &mut sinks);
         let mut interpreter_heredocs = Vec::new();
         collect_posix_pipeline_executable_sinks(command, &mut sinks, &mut interpreter_heredocs);
@@ -13987,6 +13989,20 @@ fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>
     Some((name.to_string(), token.byte_range, quoted))
 }
 
+/// A literal non-shell interpreter such as `/usr/bin/python3` is the same word
+/// quoted or bare. Render it bare: the quoted spelling reads as an obfuscated
+/// interpreter whose inline source never reaches the language-aware
+/// extractor, so `PY=/usr/bin/python3; $PY -c "print(1)"` denied while the
+/// literal command is judged by its program (#608). Only bytes that no POSIX
+/// shell treats specially qualify, and none of the names is a reserved word.
+fn posix_literal_interpreter_field_is_plain(field: &str) -> bool {
+    !field.starts_with('-')
+        && field.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+')
+        })
+        && non_shell_inline_interpreter_name(field.rsplit('/').next().unwrap_or(field))
+}
+
 /// Render the argv fields produced by one variable expansion. Quotes and
 /// operators in the value are data: parameter expansion never reparses them
 /// as shell source. Only an unquoted expansion performs IFS splitting and
@@ -14027,7 +14043,14 @@ fn render_posix_executable_expansion(
     }
     let rendered_fields: Vec<String> = fields
         .iter()
-        .map(|field| posix_single_quote_argument(field))
+        .enumerate()
+        .map(|(index, field)| {
+            if index == 0 && posix_literal_interpreter_field_is_plain(field) {
+                (*field).to_string()
+            } else {
+                posix_single_quote_argument(field)
+            }
+        })
         .collect();
     // A split value that introduces interpreter options remains a bounded
     // launcher proof, not flowctl receipt data (#540). Evaluate its concrete
@@ -34311,8 +34334,8 @@ fn evaluate_heredoc(
         });
     }
 
-    let (contents, fallback_needed) = match extraction {
-        ExtractionResult::Extracted(contents) => (contents, false),
+    let (contents, fallback_needed, skipped) = match extraction {
+        ExtractionResult::Extracted(contents) => (contents, false, Vec::new()),
         ExtractionResult::NoContent => return None,
         ExtractionResult::Skipped(reasons) => {
             let is_timeout = reasons
@@ -34336,6 +34359,9 @@ fn evaluate_heredoc(
             }
             if let Some(blocked) = check_exec_sink_fallback(command, context, first_allowlist_hit) {
                 return Some(blocked);
+            }
+            if let Some(undecided) = unterminated_stdin_verdict(command, &reasons) {
+                return Some(undecided);
             }
 
             let strict_timeout = is_timeout && !context.heredoc_settings.fallback_on_timeout;
@@ -34365,6 +34391,14 @@ fn evaluate_heredoc(
                 .any(|reason| matches!(reason, SkipReason::BinaryContent { .. }))
             {
                 return unreadable_embedded_code_verdict(context, first_allowlist_hit);
+            }
+
+            // Asked after every deny above, so a caller with no evaluation
+            // scope still sees those first.
+            if let Some(undecided) =
+                unread_stdin_verdict(command, &reasons, &context.heredoc_settings.limits)
+            {
+                return Some(undecided);
             }
 
             return None;
@@ -34402,7 +34436,7 @@ fn evaluate_heredoc(
             // any source was skipped.
             let fallback_needed = !skipped.is_empty();
 
-            (extracted, fallback_needed)
+            (extracted, fallback_needed, skipped)
         }
         ExtractionResult::Failed(err) => {
             if let Some(blocked) =
@@ -34999,6 +35033,13 @@ fn evaluate_heredoc(
         if let Some(blocked) = exec_sink_pack_verdict(command, &content, context) {
             return Some(blocked);
         }
+        // Source the body builds and runs in its own language, which no
+        // layer above reads.
+        if let Some(blocked) =
+            dynamic_source_verdict(command, &content, context, first_allowlist_hit)
+        {
+            return Some(blocked);
+        }
     }
 
     if fallback_needed {
@@ -35015,6 +35056,20 @@ fn evaluate_heredoc(
         if let Some(blocked) = check_exec_sink_fallback(command, context, first_allowlist_hit) {
             return Some(blocked);
         }
+    }
+
+    // No row pins this order; it is kept late as defence. Under the
+    // evaluator's regex scope this call only records the incomplete analysis
+    // and returns `None`, so a deny in what was extracted stands wherever it
+    // is asked. Only a caller with no scope gets `Some` here, and asked last,
+    // that caller still sees such a deny first.
+    if let Some(undecided) = unterminated_stdin_verdict(command, &skipped) {
+        return Some(undecided);
+    }
+    if let Some(undecided) =
+        unread_stdin_verdict(command, &skipped, &context.heredoc_settings.limits)
+    {
+        return Some(undecided);
     }
 
     // Every backstop has had its say and none proved a deny, but a body the
@@ -35393,8 +35448,417 @@ fn check_exec_sink_fallback(
         if let Some(blocked) = exec_sink_pack_verdict(command, &item, context) {
             return Some(blocked);
         }
+        if let Some(blocked) = dynamic_source_verdict(command, &item, context, first_allowlist_hit)
+        {
+            return Some(blocked);
+        }
     }
     None
+}
+
+/// A quoted interpreter heredoc with no terminator line has no reader, so it
+/// is recorded like a reading that could not finish: a positive finding still
+/// denies, and an allow becomes Indeterminate.
+fn unterminated_stdin_verdict(command: &str, reasons: &[SkipReason]) -> Option<EvaluationResult> {
+    (reasons
+        .iter()
+        .any(|reason| matches!(reason, SkipReason::UnterminatedHeredoc { .. }))
+        && crate::heredoc::unterminated_stdin_has_dynamic_source(command)
+        && !crate::packs::regex_engine::record_incomplete_analysis(
+            "unterminated_interpreter_stdin",
+            &"a quoted interpreter heredoc with no terminator line",
+        ))
+    .then(EvaluationResult::indeterminate_due_to_budget)
+}
+
+/// A quoted interpreter heredoc that extraction stopped short of reading, past
+/// a size, line or count cap, the clock, or malformed, has no reader, and its
+/// outer shell reading is masked as interpreter input. If it can run dynamic
+/// source it is recorded like a reading that could not finish: a positive
+/// finding still denies, and an allow becomes Indeterminate. Before this, such
+/// a body failed open: 10,000 lines of `1;` and then `eval $x;` was allowed.
+fn unread_stdin_verdict(
+    command: &str,
+    reasons: &[SkipReason],
+    limits: &crate::heredoc::ExtractionLimits,
+) -> Option<EvaluationResult> {
+    // The count cap and the clock do not say which body went unread.
+    let any_body = reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            SkipReason::ExceededHeredocLimit { .. } | SkipReason::Timeout { .. }
+        )
+    });
+    (reasons.iter().any(SkipReason::stopped_early)
+        && crate::heredoc::unread_stdin_has_dynamic_source(command, limits, any_body)
+        && !crate::packs::regex_engine::record_incomplete_analysis(
+            "unread_interpreter_stdin",
+            &"a quoted interpreter heredoc that extraction did not read",
+        ))
+    .then(EvaluationResult::indeterminate_due_to_budget)
+}
+
+/// Whether `content` goes to an interpreter that may be Python 2, whose
+/// backticks evaluate. `python3` cannot run them: they are a syntax error.
+fn receiver_may_be_python2(content: &crate::heredoc::ExtractedContent) -> bool {
+    content.language == crate::heredoc::ScriptLanguage::Python
+        && content.execution_target().is_some_and(|target| {
+            let name = target.rsplit(['/', '\\']).next().unwrap_or(target);
+            name == "python" || name.starts_with("python2")
+        })
+}
+
+/// Dynamic execution in a quoted interpreter body's own language.
+///
+/// The bodies [`crate::heredoc::mask_inert_interpreter_stdin`] blanks for
+/// outer-shell consumers are the ones this judges: with no POSIX `eval` to
+/// answer for them, `eval(atob(x))` would reach no layer at all. Any other
+/// body keeps its outer-shell reading, so nothing here applies to it.
+///
+/// A site whose source cannot be read denies, under a rule an operator can
+/// allowlist. A literal is judged as the source it is, one level deep. A
+/// reading that cannot finish is recorded like the interpreter literal
+/// analysis, so a positive finding still denies and an allow becomes
+/// Indeterminate. So is a reading past its call-site limit, once the sites it
+/// kept, whose source cannot be read, have had their say.
+fn dynamic_source_verdict(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    let python2 = receiver_may_be_python2(content);
+    if !crate::ast_matcher::has_dynamic_source_candidates(
+        &content.content,
+        content.language,
+        python2,
+    ) || !content
+        .content_range
+        .as_ref()
+        .is_some_and(|range| crate::heredoc::range_is_inert_interpreter_stdin(command, range))
+    {
+        return None;
+    }
+    let reading = match dynamic_source_reading_within_deadline(content, Some(python2), context) {
+        Ok(reading) => reading,
+        Err(decided) => return decided.map(|result| *result),
+    };
+    // Past the limit the rest of the body was not read, so an allowlist entry
+    // for the kept sites' rule grants nothing here.
+    let mut unread_body_hit = None;
+    let allowlist_hit = if reading.site_limit_exceeded {
+        &mut unread_body_hit
+    } else {
+        first_allowlist_hit
+    };
+    for site in &reading.sites {
+        if deadline_exceeded(context.deadline) {
+            return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+        let blocked = match &site.source {
+            crate::ast_matcher::DynamicSource::Unverified => {
+                unverified_dynamic_source_verdict(command, content, site, context, allowlist_hit)
+            }
+            crate::ast_matcher::DynamicSource::Literal(source) => literal_dynamic_source_verdict(
+                command,
+                content,
+                site,
+                source,
+                context,
+                allowlist_hit,
+            ),
+        };
+        if blocked.is_some() {
+            return blocked;
+        }
+    }
+    if reading.site_limit_exceeded {
+        let unread = dynamic_source_site_limit_verdict(context);
+        if unread.is_some() {
+            return unread;
+        }
+    }
+    if reading.python2_backticks
+        && (deadline_exceeded(context.deadline)
+            || !crate::packs::regex_engine::record_incomplete_analysis(
+                "python2_backticks",
+                &"a backtick expression that only Python 2 can run",
+            ))
+    {
+        return Some(EvaluationResult::indeterminate_due_to_budget());
+    }
+    None
+}
+
+/// How long to wait for one reading on its worker thread. The parse takes far
+/// less than the scan budget, so under load what runs out is the wall clock
+/// while that thread waits to be scheduled, and a harmless program comes back
+/// unverified. A quarter of what remains of the deadline covers that wait, and
+/// the deadline still bounds it.
+fn dynamic_source_wait(
+    scan_budget: std::time::Duration,
+    remaining: std::time::Duration,
+) -> std::time::Duration {
+    scan_budget.max(remaining / 4).min(remaining)
+}
+
+/// Run the reading on its worker thread:
+/// of a body with `python2` set, of a literal without it.
+/// `Err(None)` carries on with the failure recorded for this request.
+fn dynamic_source_reading_within_deadline(
+    content: &crate::heredoc::ExtractedContent,
+    python2: Option<bool>,
+    context: HeredocEvaluationContext<'_>,
+) -> Result<crate::ast_matcher::DynamicSourceReading, Option<Box<EvaluationResult>>> {
+    let mut budget = crate::ast_matcher::protected_scan_budget_for(content.content.len());
+    if let Some(deadline) = context.deadline {
+        let Some(remaining) = deadline.remaining() else {
+            return Err(Some(Box::new(
+                EvaluationResult::indeterminate_due_to_budget(),
+            )));
+        };
+        budget = dynamic_source_wait(budget, remaining);
+    }
+    let reading = if let Some(python2) = python2 {
+        crate::ast_matcher::dynamic_source_reading(
+            &content.content,
+            content.language,
+            python2,
+            budget,
+        )
+    } else {
+        crate::ast_matcher::literal_source_reading(&content.content, content.language, budget)
+    };
+    reading.map_err(|error| {
+        tracing::debug!(%error, "dynamic source analysis did not complete");
+        if deadline_exceeded(context.deadline)
+            || !crate::packs::regex_engine::record_incomplete_analysis(
+                "dynamic_source_analysis",
+                &error,
+            )
+        {
+            Some(Box::new(EvaluationResult::indeterminate_due_to_budget()))
+        } else {
+            None
+        }
+    })
+}
+
+/// One AST-level finding, weighed the way the exec-sink backstop weighs each
+/// of its matches.
+fn dynamic_source_finding_verdict(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    site: &crate::ast_matcher::DynamicSourceSite,
+    finding: &crate::ast_matcher::PatternMatch,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    let (pack_id, pattern_name) = split_ast_rule_id(&finding.rule_id);
+    let allow_hit =
+        context
+            .allowlists
+            .match_rule_at_path(&pack_id, &pattern_name, context.project_path);
+    let pattern_match = PatternMatch {
+        reason: format_heredoc_denial_reason(content, finding, &pack_id, &pattern_name),
+        pack_id: Some(pack_id),
+        pattern_name: Some(pattern_name),
+        severity: Some(ast_severity_to_pack_severity(finding.severity)),
+        source: MatchSource::HeredocAst,
+        matched_span: map_heredoc_span(command, content, site.start, site.end),
+        matched_text_preview: Some(finding.matched_text_preview.clone()),
+        explanation: None,
+        suggestions: &[],
+    };
+    if let Some(hit) = allow_hit {
+        if first_allowlist_hit.is_none() {
+            *first_allowlist_hit = Some((pattern_match, hit.layer, hit.entry.reason.clone()));
+        }
+        return None;
+    }
+    Some(EvaluationResult {
+        decision: EvaluationDecision::Deny,
+        pattern_info: Some(pattern_match),
+        allowlist_override: None,
+        effective_mode: Some(crate::packs::DecisionMode::Deny),
+        skipped_due_to_budget: false,
+        quick_rejected: false,
+        regex_evaluation_incomplete: false,
+        branch_context: None,
+        session_occurrence: None,
+        graduated_response: None,
+        bypass_method: None,
+    })
+}
+
+fn unverified_dynamic_source_verdict(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    site: &crate::ast_matcher::DynamicSourceSite,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    use crate::heredoc::ScriptLanguage;
+
+    let language = match content.language {
+        ScriptLanguage::Python => "python",
+        ScriptLanguage::JavaScript => "javascript",
+        ScriptLanguage::TypeScript => "typescript",
+        ScriptLanguage::Ruby => "ruby",
+        ScriptLanguage::Perl => "perl",
+        _ => "unknown",
+    };
+    let line_number = content.content.get(..site.start).map_or(1, |prefix| {
+        prefix.bytes().filter(|byte| *byte == b'\n').count() + 1
+    });
+    let finding = crate::ast_matcher::PatternMatch {
+        rule_id: format!("heredoc.{language}.dynamic_source"),
+        reason: format!(
+            "{}() runs source that dcg cannot statically verify",
+            site.callee
+        ),
+        matched_text_preview: content
+            .content
+            .get(site.start..site.end)
+            .map_or_else(String::new, |text| text.chars().take(60).collect()),
+        start: site.start,
+        end: site.end,
+        line_number,
+        severity: crate::ast_matcher::Severity::High,
+        suggestion: None,
+    };
+    dynamic_source_finding_verdict(
+        command,
+        content,
+        site,
+        &finding,
+        context,
+        first_allowlist_hit,
+    )
+}
+
+/// Judge a literal handed to `eval` and its kin as the source it is, with the
+/// same layers a body gets. One level: a further dynamic call inside the
+/// literal is source this will not chase, so it counts as unverified.
+fn literal_dynamic_source_verdict(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    site: &crate::ast_matcher::DynamicSourceSite,
+    source: &str,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    let mut literal = content.clone();
+    literal.content = source.to_string();
+    literal.content_range = None;
+    literal.word_range = None;
+    literal.additional_execution_target = None;
+
+    for finding in crate::ast_matcher::scan_filesystem_sink_fallback(source, literal.language) {
+        if finding.severity.blocks_by_default() {
+            let blocked = dynamic_source_finding_verdict(
+                command,
+                &literal,
+                site,
+                &finding,
+                context,
+                first_allowlist_hit,
+            );
+            if blocked.is_some() {
+                return blocked;
+            }
+        }
+    }
+    let matches = DEFAULT_MATCHER
+        .find_matches(source, literal.language)
+        .or_else(|err| retry_transient_ast_failure(err, &literal, context));
+    let Ok(matches) = matches else {
+        return unverified_dynamic_source_verdict(
+            command,
+            content,
+            site,
+            context,
+            first_allowlist_hit,
+        );
+    };
+    for finding in matches {
+        if finding.severity.blocks_by_default() {
+            let blocked = dynamic_source_finding_verdict(
+                command,
+                &literal,
+                site,
+                &finding,
+                context,
+                first_allowlist_hit,
+            );
+            if blocked.is_some() {
+                return blocked;
+            }
+        }
+    }
+    if let Some(blocked) =
+        exec_sink_backstop_verdict(command, &literal, context, first_allowlist_hit)
+    {
+        return Some(blocked);
+    }
+    if let Some(blocked) = exec_sink_pack_verdict(command, &literal, context) {
+        return Some(blocked);
+    }
+    let reading = match dynamic_source_reading_within_deadline(&literal, None, context) {
+        Ok(reading) => reading,
+        Err(decided) => return decided.map(|result| *result),
+    };
+    // A call reaches a shell by more spellings than the sink table lists
+    // (`getattr(__import__('os'), 'system')`), and no other layer reads this
+    // text as shell, so a string in the literal is judged wherever it sits.
+    let strings = reading
+        .strings
+        .into_iter()
+        .map(|command| crate::ast_matcher::ReconstructedCommand {
+            command,
+            start: site.start,
+            end: site.end,
+        })
+        .collect();
+    if let Some(blocked) =
+        reconstructed_interpreter_commands_verdict(command, content, context, strings)
+    {
+        return Some(blocked);
+    }
+    if reading.sites.is_empty() {
+        return None;
+    }
+    if !reading.site_limit_exceeded {
+        return unverified_dynamic_source_verdict(
+            command,
+            content,
+            site,
+            context,
+            first_allowlist_hit,
+        );
+    }
+    // The literal was not read to its end, so an allowlist entry for this rule
+    // grants nothing here.
+    let blocked = unverified_dynamic_source_verdict(command, content, site, context, &mut None);
+    if blocked.is_some() {
+        return blocked;
+    }
+    dynamic_source_site_limit_verdict(context)
+}
+
+/// A reading past its call-site limit kept only the calls whose source it
+/// cannot read, and none of them denied. The rest was not read, which is
+/// recorded like a reading that could not finish: a positive finding elsewhere
+/// still denies, and an allow becomes Indeterminate.
+fn dynamic_source_site_limit_verdict(
+    context: HeredocEvaluationContext<'_>,
+) -> Option<EvaluationResult> {
+    (deadline_exceeded(context.deadline)
+        || !crate::packs::regex_engine::record_incomplete_analysis(
+            "dynamic_source_analysis",
+            &"dynamic source analysis exceeded or could not verify call site limit",
+        ))
+    .then(EvaluationResult::indeterminate_due_to_budget)
 }
 
 /// Explicit language/content exemptions apply to every executable-source
@@ -36779,6 +37243,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_dynamic_source_wait_outlasts_a_scheduling_delay_inside_the_deadline() {
+        let ms = std::time::Duration::from_millis;
+        // A loaded host can hold the worker thread past the 20 ms scan budget.
+        assert_eq!(dynamic_source_wait(ms(20), ms(1000)), ms(250));
+        // A large body keeps the scan budget its size earned.
+        assert_eq!(dynamic_source_wait(ms(320), ms(1000)), ms(320));
+        // Nothing waits past the deadline.
+        assert_eq!(dynamic_source_wait(ms(320), ms(40)), ms(40));
+        assert_eq!(dynamic_source_wait(ms(20), ms(10)), ms(10));
+    }
+
+    #[test]
     fn issue_598_legacy_safe_patterns_keep_the_original_command_spelling() {
         let config = default_config();
         let overrides = default_compiled_overrides();
@@ -36949,6 +37425,47 @@ mod tests {
                 ShellDialect::Posix,
             );
             assert!(result.is_allowed(), "{command}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn issue_598_helm_previews_survive_wrappers_the_shell_strips() {
+        // Helm's exemptions are anchored at the executable (#435), so reading
+        // only the raw segment withdrew a real preview behind a wrapper or a
+        // leading assignment, while the same wrapper still left the real
+        // uninstall denied.
+        for command in [
+            "sudo helm uninstall reviewed --dry-run",
+            "sudo -u deploy helm uninstall reviewed --dry-run",
+            "env KUBECONFIG=/k helm uninstall reviewed --dry-run",
+            "KUBECONFIG=/k helm uninstall reviewed --dry-run",
+            "nice helm rollback reviewed 1 --dry-run",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["kubernetes.helm"],
+                ShellDialect::Posix,
+            );
+            assert!(result.is_allowed(), "{command}: {result:?}");
+        }
+        for command in [
+            "sudo helm uninstall reviewed",
+            "sudo -u deploy helm uninstall reviewed",
+            "env KUBECONFIG=/k helm uninstall reviewed",
+            "sudo helm uninstall reviewed --dry-run=false",
+            "sudo helm uninstall reviewed --dry-run --dry-run=false",
+            "sudo helm uninstall reviewed --description --dry-run",
+            "sudo helm uninstall reviewed --description=--dry-run",
+            "sudo helm uninstall reviewed; echo --dry-run",
+            "sudo helm uninstall reviewed | grep -- --dry-run",
+            "sudo helm uninstall reviewed --dry-run; helm uninstall other",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["kubernetes.helm"],
+                ShellDialect::Posix,
+            );
+            assert!(result.is_denied(), "{command}: {result:?}");
         }
     }
 
@@ -47978,6 +48495,57 @@ mod tests {
         );
     }
 
+    /// A straight-line literal binding of a non-shell interpreter resolves to
+    /// the same command as the literal spelling, so its inline program is read
+    /// and judged in its own language instead of refused as obfuscated (#608).
+    #[test]
+    fn literal_interpreter_bindings_are_judged_by_their_program_608() {
+        for command in [
+            "PY=/usr/bin/python3; $PY -c \"print(1)\"",
+            "PY=/usr/bin/python3; \"$PY\" -c \"print(1)\"",
+            "D=/tmp/x; PY=/usr/bin/python3; $PY -c \"print(1)\"",
+            "PY=python3.12; ${PY} -c 'x = 1'",
+            "PL=/usr/bin/perl; $PL -e 'print 1'",
+            "N=/usr/bin/node; $N -e 'console.log(1)'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "literal interpreter binding: {command:?}: {result:?}"
+            );
+        }
+
+        let result = evaluate_with_pack_ids_in_dialect(
+            "PY=/usr/bin/python3; $PY -c \"import shutil; shutil.rmtree('/home/user')\"",
+            &["core.git"],
+            ShellDialect::Posix,
+        );
+        assert!(result.is_denied(), "the bound program is read: {result:?}");
+        let info = result.pattern_info.expect("Python AST denial has a rule");
+        assert_eq!(info.pack_id.as_deref(), Some("heredoc.python"));
+        assert_eq!(info.pattern_name.as_deref(), Some("shutil_rmtree"));
+
+        for command in [
+            "$PY -c \"print(1)\"",
+            "PY='python3 -c'; $PY 'print(1)'",
+            "PY=\"$(command -v python3)\"; $PY -c 'print(1)'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "unproven interpreter launcher: {command:?}: {result:?}"
+            );
+        }
+    }
+
     /// `core.filesystem:credential-file-write` runs ahead of the redirect
     /// rules and the #390 carve-out: a credential, key, login-shell startup,
     /// or system authentication file is denied by that rule for every writer,
@@ -53277,6 +53845,43 @@ mod tests {
         let info = sibling.pattern_info.expect("independent Git denial");
         assert_eq!(info.pack_id.as_deref(), Some("core.git"));
         assert_eq!(info.pattern_name.as_deref(), Some("reset-hard"));
+    }
+
+    /// Past the call-site limit a call whose source cannot be read denies as it
+    /// does below it. An allowlist entry for that rule grants it below the
+    /// limit; past it the rest of the body was not read, so the entry grants
+    /// nothing and the body stays undecided.
+    #[test]
+    fn an_allowlisted_dynamic_source_rule_grants_nothing_past_the_call_site_limit() {
+        let config = default_config();
+        let pack_ids: Vec<String> = config.enabled_pack_ids().into_iter().collect();
+        let pack_ids: Vec<&str> = pack_ids.iter().map(String::as_str).collect();
+        let below = "perl - <<'EOF'\neval $x;\nEOF".to_string();
+        let past = format!(
+            "perl - <<'EOF'\n{}eval $x;\nEOF",
+            "eval \"1\";\n".repeat(200)
+        );
+        for command in [&below, &past] {
+            let denied = evaluate_with_pack_ids_and_allowlists_at_path(
+                command,
+                &pack_ids,
+                &default_allowlists(),
+                None,
+            );
+            assert!(denied.is_denied(), "{command:?}: {denied:?}");
+            let info = denied.pattern_info.expect("an owning rule");
+            assert_eq!(info.pack_id.as_deref(), Some("heredoc.perl"));
+            assert_eq!(info.pattern_name.as_deref(), Some("dynamic_source"));
+        }
+
+        let allowlists =
+            project_allowlists_for_rule("heredoc.perl:dynamic_source", "reviewed eval");
+        let granted =
+            evaluate_with_pack_ids_and_allowlists_at_path(&below, &pack_ids, &allowlists, None);
+        assert!(granted.is_allowed(), "{granted:?}");
+        let unread =
+            evaluate_with_pack_ids_and_allowlists_at_path(&past, &pack_ids, &allowlists, None);
+        assert!(unread.is_indeterminate(), "{unread:?}");
     }
 
     /// A shell `-c` script that is wholly an expansion or substitution runs

@@ -287,6 +287,18 @@ Commands containing these keywords are checked against this pack:
 - `DCG_BYPASS`
 - `dcg`
 - `DCG`
+- `>`
+- `cp`
+- `mv`
+- `install`
+- `tee`
+- `truncate`
+- `sed`
+- `dd`
+- `rm`
+- `touch`
+- `allow_once.jsonl`
+- `pending_exceptions.jsonl`
 - `uninstall.ps1`
 - `settings.json`
 - `hooks.json`
@@ -340,7 +352,7 @@ These patterns match potentially destructive commands:
 | `set-execution-policy-bypass` | Set-ExecutionPolicy Bypass persistently allows any script to run on this machine. | high |
 | `disable-powershell-logging` | Disabling PowerShell script-block logging removes the record of what scripts ran. | high |
 | `dcg-bypass-or-uninstall` | Bypassing or uninstalling dcg removes the guard that is supervising this session. | critical |
-| `dcg-policy-self-weakening` | Granting an allowlist exception or overriding pack/policy config lets the agent clear its own path. | critical |
+| `dcg-policy-self-weakening` | Granting an exception, writing an authorization store, or overriding policy config lets the agent clear its own path. | critical |
 | `agent-hook-config-tamper` | Editing or deleting the agent's hook configuration can silently remove dcg's protection. | high |
 | `agent-hook-config-overwrite` | Copying a file ONTO the agent's hook configuration replaces it and can silently remove dcg's protection. | high |
 | `download-and-execute` | Fetching code and piping it straight into Invoke-Expression runs unreviewed remote code. | critical |

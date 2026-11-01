@@ -1004,11 +1004,17 @@ attacker-controlled malformed payloads.
 
 Even under the fail-open default, an unparseable, oversized or non-UTF-8
 payload is not allowed blind: dcg scans the raw text for a shell tool's
-`"command"` value and evaluates it. A command that would be denied (or asked
-about) gets that answer; only a payload with no evaluable shell command, or one
-whose command is allowed, falls through to the fail-open allow. Unpaired UTF-16
-surrogate escapes (`\ud800`), which JavaScript hosts can emit, are replaced
-with U+FFFD before parsing rather than failing it.
+`"command"` value and evaluates it. A command that this scan finds denied (or
+asked about) gets that answer; only a payload with no evaluable shell command,
+or one whose command the scan allows, falls through to the fail-open allow. The
+scan is a best effort and can allow what the full evaluation would not: hook
+input larger than `max_hook_input_bytes` (256 KiB by default) that holds a
+quoted Python, JavaScript or Ruby heredoc calling `eval` or `exec` on a string
+dcg cannot read is allowed, although the same command asks when the limit is
+raised. To deny oversized input instead, set `general.fail_closed = true` (or
+`DCG_FAIL_CLOSED=1`). Unpaired UTF-16 surrogate escapes (`\ud800`), which
+JavaScript hosts can emit, are replaced with U+FFFD before parsing rather than
+failing it.
 
 > A leading UTF-8 BOM (`EF BB BF`) is stripped before parsing in all hook
 > paths, so a BOM-prefixed but otherwise-valid command is correctly evaluated

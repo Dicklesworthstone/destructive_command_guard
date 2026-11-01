@@ -24,15 +24,24 @@ fn dcg_binary() -> std::path::PathBuf {
 /// otherwise running the test suite registers `target/release/dcg` as a global
 /// Claude Code PreToolUse hook on the developer's machine, and every shell
 /// command they run afterwards is screened by an unreviewed dev build.
-fn dcg_command() -> Command {
+///
+/// `home` stands in for the caller's profile for the same reason: a hook deny
+/// records its allow-once code in the user's pending-exception store, and the
+/// user's config would otherwise decide what the tests observe.
+fn dcg_command(home: &std::path::Path) -> Command {
     let mut command = Command::new(dcg_binary());
-    command.env("DCG_SELF_HEAL_HOOK", "0");
+    command
+        .env("DCG_SELF_HEAL_HOOK", "0")
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"));
     command
 }
 
 /// Run dcg in hook mode with JSON input.
 fn run_hook_mode_raw(input: &str) -> (String, String, i32) {
-    let mut child = dcg_command()
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut child = dcg_command(home.path())
         // These tests validate hook protocol and exit-code semantics, not the
         // production latency budget. Give loaded CI hosts enough scheduling
         // headroom while leaving DCG's fail-closed production default intact.
@@ -267,7 +276,8 @@ fn test_exit_on_missing_command() {
 
 #[test]
 fn test_test_command_exit_0() {
-    let output = dcg_command()
+    let home = tempfile::tempdir().expect("tempdir");
+    let output = dcg_command(home.path())
         .args(["test", "git status"])
         .output()
         .expect("failed to run dcg test");
@@ -277,7 +287,8 @@ fn test_test_command_exit_0() {
 
 #[test]
 fn test_test_command_deny_exit_1() {
-    let output = dcg_command()
+    let home = tempfile::tempdir().expect("tempdir");
+    let output = dcg_command(home.path())
         .args(["test", "git reset --hard"])
         .output()
         .expect("failed to run dcg test");
@@ -292,7 +303,8 @@ fn test_test_command_deny_exit_1() {
 
 #[test]
 fn test_explain_command_exit_0() {
-    let output = dcg_command()
+    let home = tempfile::tempdir().expect("tempdir");
+    let output = dcg_command(home.path())
         .args(["explain", "git reset --hard"])
         .output()
         .expect("failed to run dcg explain");
@@ -302,7 +314,8 @@ fn test_explain_command_exit_0() {
 
 #[test]
 fn test_packs_command_exit_0() {
-    let output = dcg_command()
+    let home = tempfile::tempdir().expect("tempdir");
+    let output = dcg_command(home.path())
         .args(["packs"])
         .output()
         .expect("failed to run dcg packs");
@@ -312,7 +325,8 @@ fn test_packs_command_exit_0() {
 
 #[test]
 fn test_version_exit_0() {
-    let output = dcg_command()
+    let home = tempfile::tempdir().expect("tempdir");
+    let output = dcg_command(home.path())
         .args(["--version"])
         .output()
         .expect("failed to run dcg --version");
@@ -322,7 +336,8 @@ fn test_version_exit_0() {
 
 #[test]
 fn test_help_exit_0() {
-    let output = dcg_command()
+    let home = tempfile::tempdir().expect("tempdir");
+    let output = dcg_command(home.path())
         .args(["--help"])
         .output()
         .expect("failed to run dcg --help");

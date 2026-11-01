@@ -197,6 +197,18 @@ fn build_claude_payload(command: &str) -> String {
     )
 }
 
+/// Point a payload's `cwd` at a directory that exists.
+///
+/// Allow-once codes and pending records are scoped to the payload `cwd`, and
+/// dcg fails closed (a deny with no code and no record) when that `cwd` is not
+/// a real directory (#387). Tests of the allow-once flow therefore cannot use
+/// the builders' fixed `/tmp/test-workdir`, which exists only by accident.
+fn with_payload_cwd(payload: &str, cwd: &std::path::Path) -> String {
+    let mut payload: serde_json::Value = serde_json::from_str(payload).expect("hook payload");
+    payload["cwd"] = serde_json::json!(cwd);
+    payload.to_string()
+}
+
 /// Build a complete Gemini CLI `BeforeTool` payload for `run_shell_command`.
 fn build_gemini_payload(command: &str) -> String {
     let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
@@ -1149,7 +1161,12 @@ fn claude_deny_matrix_multiple_destructive_commands() {
     ];
 
     for (cmd, expected_pack_fragment) in commands {
-        let outcome = run_claude_hook(cmd);
+        let workdir = tempfile::tempdir().expect("tempdir");
+        let payload = with_payload_cwd(&build_claude_payload(cmd), workdir.path());
+        let outcome = run_hook_raw(
+            payload.as_bytes(),
+            &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+        );
         assert_eq!(
             outcome.exit_code, 0,
             "Claude deny must exit 0 for '{cmd}'\n{outcome}"
@@ -1579,7 +1596,8 @@ fn claude_allow_once_round_trip() {
     let home_path = home.path().to_path_buf();
     let system_path = std::env::var("PATH").unwrap_or_default();
 
-    let deny_payload = build_claude_payload("git reset --hard HEAD~1");
+    let deny_payload =
+        with_payload_cwd(&build_claude_payload("git reset --hard HEAD~1"), &home_path);
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
         .env("PATH", &system_path)
@@ -1646,7 +1664,8 @@ fn claude_allow_once_round_trip() {
     );
 
     // Step 3: Retry the same command — should now be allowed
-    let retry_payload = build_claude_payload("git reset --hard HEAD~1");
+    let retry_payload =
+        with_payload_cwd(&build_claude_payload("git reset --hard HEAD~1"), &home_path);
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
         .env("PATH", &system_path)
@@ -3215,7 +3234,13 @@ fn redirected_home_receives_every_hook_write() {
         .stdin
         .as_mut()
         .unwrap()
-        .write_all(build_claude_payload("git reset --hard HEAD~1").as_bytes())
+        .write_all(
+            with_payload_cwd(
+                &build_claude_payload("git reset --hard HEAD~1"),
+                home.path(),
+            )
+            .as_bytes(),
+        )
         .unwrap();
     let output = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);

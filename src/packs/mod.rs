@@ -731,6 +731,9 @@ impl Pack {
             "kubernetes.kubectl" => {
                 crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd).then_some(true)
             }
+            "kubernetes.helm" => {
+                crate::packs::kubernetes::helm::dry_run_is_effectively_safe(cmd).then_some(true)
+            }
             "cloud.aws" => crate::packs::cloud::aws::ec2_dry_run_decision(cmd),
             "careful_company_running_windows.transfer" => {
                 crate::packs::careful_company_running_windows::transfer::direct_safe_decision(cmd)

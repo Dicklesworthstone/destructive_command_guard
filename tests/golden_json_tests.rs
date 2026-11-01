@@ -442,7 +442,12 @@ fn run_robot_mode(command: &str) -> Option<Value> {
     for marker in AGENT_ENV_MARKERS {
         cmd.env_remove(marker);
     }
+    // Likewise the developer's own config must not shape the recorded output.
+    let home = tempfile::tempdir().expect("tempdir");
     let output = cmd
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
         .args(["--robot", "test", command])
         .output()
         .expect("Failed to run dcg");
