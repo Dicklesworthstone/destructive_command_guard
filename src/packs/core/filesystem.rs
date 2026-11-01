@@ -794,6 +794,18 @@ pub(crate) fn unlink_command_for_pattern_matching(
         return None;
     }
 
+    // A word boundary in the lexer is not necessarily an argv boundary.
+    // `unlink('hello')` in an interpreter body ends the first token at `(`,
+    // but it is a call expression, not the shell command `unlink ('hello')`.
+    // Inserting a space in the matching view below invented a shell operand
+    // and denied harmless Python helpers whose `unlink` parameter was print
+    // (#626). Decline that executable proof; language analysis and the normal
+    // fallback still judge the source. Real arguments, including quoted
+    // parentheses and redirects attached to argv0, keep their existing path.
+    if source.as_bytes().get(executable_end) == Some(&b'(') {
+        return None;
+    }
+
     let arguments: Vec<&str> = tokens
         .iter()
         .skip(1)
@@ -7002,6 +7014,47 @@ mod tests {
             "command -- 'unlink' /etc/passwd",
             "u'n'l'i'n'k'>/tmp/unlink.log /etc/passwd",
             ">/tmp/unlink.log u'n'l'i'n'k' /etc/passwd",
+        ] {
+            assert_blocks(&pack, command, "unlink");
+        }
+    }
+
+    #[test]
+    fn unlink_call_syntax_is_not_a_shell_argument_boundary_issue_626() {
+        let pack = create_pack();
+        for command in [
+            "unlink('hello')",
+            "unlink('/etc/hosts')",
+            "unlink()",
+            "'unlink'('/etc/hosts')",
+            "u'n'link('/etc/hosts')",
+            "/usr/bin/unlink('/etc/hosts')",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                assert!(
+                    unlink_command_for_pattern_matching(command, dialect).is_none(),
+                    "a glued parenthesis must not manufacture shell argv: {command:?} ({dialect:?})"
+                );
+            }
+            assert_no_match(&pack, command);
+        }
+
+        // This is an identity-boundary correction, not an exemption for
+        // unlink or for parentheses in its actual argument.
+        for command in [
+            "unlink /etc/hosts",
+            "unlink\t/etc/hosts",
+            "u'n'link /etc/hosts",
+            r"un\link /etc/hosts",
+            "'/usr/bin/unlink' '/etc/hosts'",
+            "sudo unlink /etc/hosts",
+            "env FOO=bar unlink /etc/hosts",
+            "command unlink /etc/hosts",
+            "unlink</dev/null /etc/hosts",
+            "unlink>/tmp/unlink.log /etc/hosts",
+            "unlink '(hello)'",
+            "(unlink /etc/hosts)",
+            "xargs unlink",
         ] {
             assert_blocks(&pack, command, "unlink");
         }

@@ -900,6 +900,36 @@ mod tests {
         id: String,
         decision: String,
         source: String,
+        #[serde(default)]
+        analysis_error: Option<String>,
+    }
+
+    fn checked_case_matches(
+        case: &Case,
+        result: Result<Vec<PatternMatch>, super::super::MatchError>,
+    ) -> Option<Vec<PatternMatch>> {
+        if let Some(expected) = &case.analysis_error {
+            assert_eq!(
+                case.decision, "deny",
+                "{}: incomplete work cannot allow",
+                case.id
+            );
+            match result {
+                Err(super::super::MatchError::Unavailable { language, detail }) => {
+                    assert_eq!(language, ScriptLanguage::Python, "{}", case.id);
+                    assert_eq!(&detail, expected, "{}", case.id);
+                }
+                other => panic!(
+                    "{}: expected explicit incomplete analysis, got {other:?}",
+                    case.id
+                ),
+            }
+            // CLI/hook fixtures separately require a blocking wire verdict.
+            // Incomplete analysis supplies no completed proof candidates.
+            None
+        } else {
+            Some(result.unwrap_or_else(|error| panic!("{}: {error:?}", case.id)))
+        }
     }
 
     #[test]
@@ -1040,13 +1070,14 @@ mod tests {
         .expect("valid shared verdict fixtures");
         assert!(!cases.is_empty());
         for case in cases {
-            let matches = super::super::DEFAULT_MATCHER
-                .find_matches_with_timeout(
-                    &case.source,
-                    ScriptLanguage::Python,
-                    Duration::from_secs(5),
-                )
-                .unwrap_or_else(|error| panic!("{}: {error:?}", case.id));
+            let result = super::super::DEFAULT_MATCHER.find_matches_with_timeout(
+                &case.source,
+                ScriptLanguage::Python,
+                Duration::from_secs(5),
+            );
+            let Some(matches) = checked_case_matches(&case, result) else {
+                continue;
+            };
             assert_eq!(
                 matches.iter().any(|hit| hit.severity.blocks_by_default()),
                 case.decision == "deny",
@@ -1185,7 +1216,19 @@ mod tests {
         .expect("valid shared verdict fixtures");
         let mut compared_candidates = 0;
         for case in cases {
-            let candidates = candidate_spans(&case.source);
+            let result = super::super::source_analysis::DEFAULT_MATCHER.find_matches_with_timeout(
+                &case.source,
+                ScriptLanguage::Python,
+                Duration::from_secs(60),
+            );
+            let Some(matches) = checked_case_matches(&case, result) else {
+                continue;
+            };
+            let candidates: HashSet<_> = matches
+                .iter()
+                .filter(|hit| needs_proof(&case.source, hit))
+                .map(|hit| (hit.start, hit.end))
+                .collect();
             compared_candidates += candidates.len();
             compare_proof_strategies(&case.source, &candidates);
         }

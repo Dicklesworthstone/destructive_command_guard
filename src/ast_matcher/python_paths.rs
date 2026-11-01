@@ -35,12 +35,14 @@ const MAY_EXTEND: u16 = 1 << 11;
 const MAY_UPDATE: u16 = 1 << 12;
 const MAY_LIST: u16 = 1 << 13;
 const MAY_DICT: u16 = 1 << 14;
+const MAY_LOCAL: u16 = 1 << 15;
 const MAY_SELECT: u16 = MAY_GET | MAY_POP;
 const MAY_MUTATE: u16 = MAY_POP | MAY_APPEND | MAY_EXTEND | MAY_UPDATE;
 const MAY_CONTAINER: u16 = MAY_LIST | MAY_DICT;
 const MAX_CONTAINER_ITEMS: usize = 32;
 const MAX_CONTAINER_DEPTH: usize = 32;
 const MAX_KEY_BYTES: usize = 1024;
+const MAX_LOCAL_CALLS: usize = 16;
 
 fn rule(kind: u8) -> &'static str {
     match kind {
@@ -152,6 +154,7 @@ struct Capabilities {
     // callback. This fixed ladder bounds nested selectors without recursively
     // expanding the shared container graph.
     returned: [u16; MAX_CONTAINER_DEPTH],
+    returned_contained: [u16; MAX_CONTAINER_DEPTH],
     returned_overflow: bool,
 }
 
@@ -163,6 +166,7 @@ impl Capabilities {
         let mut index = 0;
         while index < MAX_CONTAINER_DEPTH {
             self.returned[index] |= other.returned[index];
+            self.returned_contained[index] |= other.returned_contained[index];
             index += 1;
         }
         self
@@ -174,7 +178,7 @@ impl Capabilities {
         }
         let mut index = 0;
         while index < MAX_CONTAINER_DEPTH {
-            if self.returned[index] != 0 {
+            if self.returned[index] != 0 || self.returned_contained[index] != 0 {
                 return true;
             }
             index += 1;
@@ -187,6 +191,7 @@ impl Capabilities {
             direct: 0,
             contained: self.direct | self.contained,
             returned: self.returned,
+            returned_contained: self.returned_contained,
             returned_overflow: self.returned_overflow,
         }
     }
@@ -198,6 +203,7 @@ impl Capabilities {
             // subscription cannot hide a nested deletion.
             contained: self.contained,
             returned: self.returned,
+            returned_contained: self.returned_contained,
             returned_overflow: self.returned_overflow,
         }
     }
@@ -211,9 +217,11 @@ impl Capabilities {
             result.returned[0] = self.contained;
             for index in 1..MAX_CONTAINER_DEPTH {
                 result.returned[index] = self.returned[index - 1];
+                result.returned_contained[index] = self.returned_contained[index - 1];
             }
-            result.returned_overflow =
-                self.returned_overflow || self.returned[MAX_CONTAINER_DEPTH - 1] != 0;
+            result.returned_overflow = self.returned_overflow
+                || self.returned[MAX_CONTAINER_DEPTH - 1] != 0
+                || self.returned_contained[MAX_CONTAINER_DEPTH - 1] != 0;
         }
         result
     }
@@ -221,12 +229,30 @@ impl Capabilities {
     fn called(self) -> Self {
         let mut result = Self {
             direct: self.returned[0],
-            contained: self.returned[0],
+            contained: self.returned[0] | self.returned_contained[0],
             returned_overflow: self.returned_overflow,
             ..Self::default()
         };
         for index in 0..MAX_CONTAINER_DEPTH - 1 {
             result.returned[index] = self.returned[index + 1];
+            result.returned_contained[index] = self.returned_contained[index + 1];
+        }
+        result
+    }
+
+    fn returning(self, direct: u16) -> Self {
+        let mut result = Self {
+            direct,
+            returned_overflow: self.returned_overflow
+                || self.returned[MAX_CONTAINER_DEPTH - 1] != 0
+                || self.returned_contained[MAX_CONTAINER_DEPTH - 1] != 0,
+            ..Self::default()
+        };
+        result.returned[0] = self.direct;
+        result.returned_contained[0] = self.contained;
+        for index in 1..MAX_CONTAINER_DEPTH {
+            result.returned[index] = self.returned[index - 1];
+            result.returned_contained[index] = self.returned_contained[index - 1];
         }
         result
     }
@@ -301,6 +327,45 @@ impl PartialEq for Container {
 
 impl Eq for Container {}
 
+// A function identity is a source location on the worker's existing tree.
+// Defaults are evaluated once, while closure facts are deliberately may-only:
+// Python closes over mutable cells, not definition-time path snapshots.
+struct LocalFunction {
+    source: usize,
+    owner: Option<usize>,
+    defaults: HashMap<String, Value>,
+    closure: HashMap<String, Value>,
+    preserves: bool,
+    deferred: bool,
+    complete: bool,
+    depth: usize,
+    called: u8,
+    returned: Capabilities,
+    origins: Vec<usize>,
+    unknown_origins: bool,
+}
+
+impl std::fmt::Debug for LocalFunction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalFunction")
+            .field("source", &self.source)
+            .field("defaults", &self.defaults.len())
+            .field("closure", &self.closure.len())
+            .field("preserves", &self.preserves)
+            .field("deferred", &self.deferred)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for LocalFunction {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for LocalFunction {}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum Value {
     #[default]
@@ -324,9 +389,7 @@ enum Value {
     Delete(Delete),
     Join(Path),
     PathRead,
-    LocalFunction {
-        preserves: bool,
-    },
+    LocalFunction(Arc<LocalFunction>),
 }
 
 impl Value {
@@ -395,6 +458,14 @@ impl Value {
             } => Self::Container(receiver.clone())
                 .capabilities()
                 .selector(*operation),
+            Self::LocalFunction(function) => function.returned.returning(
+                MAY_LOCAL
+                    | if function.deferred {
+                        0
+                    } else {
+                        u16::from(function.called)
+                    },
+            ),
             _ => Capabilities::default(),
         }
     }
@@ -429,7 +500,11 @@ impl Value {
     fn captured(&self) -> Self {
         if matches!(
             self,
-            Self::Scalar | Self::None | Self::Inert | Self::Delete(Delete { trusted: true, .. })
+            Self::Scalar
+                | Self::None
+                | Self::Inert
+                | Self::Delete(Delete { trusted: true, .. })
+                | Self::LocalFunction(_)
         ) {
             self.clone()
         } else if matches!(self, Self::Text(_) | Self::Path(_)) {
@@ -515,6 +590,7 @@ struct Env {
     values: HashMap<String, Value>,
     trusted: bool,
     containers: ContainerEffects,
+    returned: Value,
 }
 
 impl Env {
@@ -527,6 +603,7 @@ impl Env {
             values: HashMap::new(),
             trusted: self.trusted && other.trusted,
             containers: self.containers.merge(&other.containers),
+            returned: self.returned.merge(&other.returned),
         };
         for name in self.values.keys().chain(other.values.keys()) {
             merged
@@ -592,6 +669,7 @@ impl Env {
     }
 
     fn forget(&mut self) {
+        self.returned = self.returned.lost();
         self.containers.all_changed = true;
         self.containers.changed.clear();
         let values = std::mem::take(&mut self.values);
@@ -696,11 +774,19 @@ impl Flow {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Args {
     positional: Vec<Value>,
     keywords: HashMap<String, Value>,
     uncertain: bool,
+    expanded: Option<Box<Self>>,
+}
+
+struct Parameter {
+    name: String,
+    positional: bool,
+    keyword: bool,
+    variadic: u8,
 }
 
 impl Args {
@@ -733,6 +819,15 @@ pub(super) struct Scan<'a> {
     deferred_findings: HashSet<(usize, usize, u8)>,
     outer_invalidated: bool,
     container_writes: bool,
+    active_calls: Vec<usize>,
+    call_globals: Option<Env>,
+    call_scopes: Vec<HashSet<String>>,
+    lexical_scopes: Vec<HashSet<String>>,
+    global_scopes: Vec<HashSet<String>>,
+    call_frames: Vec<usize>,
+    next_frame: usize,
+    global_writes: HashSet<String>,
+    call_summaries: Vec<u8>,
     seen: HashMap<(usize, usize, u8), bool>,
     existing: HashMap<(usize, usize, u8), usize>,
 }
@@ -770,6 +865,15 @@ impl<'a> Scan<'a> {
             deferred_findings: HashSet::new(),
             outer_invalidated: false,
             container_writes: false,
+            active_calls: Vec::new(),
+            call_globals: None,
+            call_scopes: Vec::new(),
+            lexical_scopes: Vec::new(),
+            global_scopes: Vec::new(),
+            call_frames: Vec::new(),
+            next_frame: 0,
+            global_writes: HashSet::new(),
+            call_summaries: Vec::new(),
             seen: HashMap::new(),
             existing,
         }
@@ -925,6 +1029,7 @@ impl<'a> Scan<'a> {
             values: HashMap::new(),
             trusted,
             containers: ContainerEffects::default(),
+            returned: Value::Unknown,
         };
         env.values
             .insert("getattr".to_string(), Value::Symbol(Symbol::Getattr).lost());
@@ -1457,6 +1562,17 @@ impl<'a> Scan<'a> {
         depth: usize,
     ) -> Result<(), MatchError> {
         self.target_effects(target, env, depth)?;
+        if target.kind() == "subscript" {
+            let receiver = target.field("value").and_then(|receiver| {
+                (receiver.kind() == "identifier").then(|| env.get(receiver.text().as_ref()))
+            });
+            let source = if let Some(Value::Container(container)) = receiver {
+                Some(container.source)
+            } else {
+                None
+            };
+            env.containers.mark(source, value.capabilities());
+        }
         self.bind(target, value, env, depth)
     }
 
@@ -1534,16 +1650,21 @@ impl<'a> Scan<'a> {
         let scalar = matches!(target.kind().as_ref(), "identifier" | "list_splat_pattern");
         for name in names {
             let old = env.get(&name);
-            env.values.insert(
-                name,
-                if value == Value::Unknown {
-                    old.lost()
-                } else if scalar {
-                    value.clone()
-                } else {
-                    Value::Unknown
-                },
-            );
+            let bound = if value == Value::Unknown {
+                old.lost()
+            } else if scalar {
+                value.clone()
+            } else {
+                Value::Unknown
+            };
+            env.values.insert(name.clone(), bound.clone());
+            if self
+                .global_scopes
+                .last()
+                .is_some_and(|scope| scope.contains(&name))
+            {
+                self.global_effect(&name, bound.lost(), env);
+            }
         }
         Ok(())
     }
@@ -1553,6 +1674,7 @@ impl<'a> Scan<'a> {
             values: self.possible.clone(),
             trusted: env.trusted,
             containers: ContainerEffects::default(),
+            returned: Value::Unknown,
         };
         for (name, value) in &env.values {
             if self.immutable.get(name) == Some(value) && value.immutable_import() {
@@ -1652,20 +1774,187 @@ impl<'a> Scan<'a> {
             .flatten();
             for child in named(&parameter) {
                 // Capture in definition order: a later default may rebind a
-                // name used by an earlier one. No default proves the actual
-                // argument a caller will pass, so retain only may-call facts.
+                // name used by an earlier one. Actual calls may use these
+                // values; the independent deferred scan keeps may-facts only.
                 let value = self.eval(&child, env, depth + 1)?;
                 if default
                     .as_ref()
                     .is_some_and(|default| default.range() == child.range())
-                    && value.has_capability()
                     && let Some(name) = parameter.field("name")
                 {
-                    defaults.insert(name.text().into_owned(), value.lost());
+                    defaults.insert(name.text().into_owned(), value);
                 }
             }
         }
         Ok(defaults)
+    }
+
+    fn has_yield<D: Doc>(&mut self, node: &Node<'_, D>, depth: usize) -> Result<bool, MatchError> {
+        self.check(node, depth)?;
+        if node.kind() == "yield" {
+            return Ok(true);
+        }
+        if matches!(
+            node.kind().as_ref(),
+            "function_definition" | "class_definition" | "lambda"
+        ) {
+            return Ok(false);
+        }
+        for child in named(node) {
+            if self.has_yield(&child, depth + 1)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn definition<D: Doc>(
+        &mut self,
+        node: &Node<'_, D>,
+        env: &mut Env,
+        depth: usize,
+    ) -> Result<Value, MatchError> {
+        let is_class = node.kind() == "class_definition";
+        if is_class {
+            self.invalidate(env);
+        }
+        let body = node.field("body");
+        let parameters = node.field("parameters");
+        let mut defaults = HashMap::new();
+        for child in named(node) {
+            if body
+                .as_ref()
+                .is_some_and(|body| body.range() == child.range())
+            {
+                continue;
+            }
+            if parameters
+                .as_ref()
+                .is_some_and(|parameters| parameters.range() == child.range())
+            {
+                defaults = self.parameter_defaults(&child, env, depth + 1)?;
+            } else {
+                self.eval(&child, env, depth + 1)?;
+            }
+        }
+        let deferred = node.children().any(|child| child.kind() == "async")
+            || if let Some(body) = &body {
+                self.has_yield(body, depth + 1)?
+            } else {
+                false
+            };
+        let mut local = self.deferred(env);
+        let mut scope_names = HashSet::new();
+        if let Some(parameters) = &parameters {
+            self.names(parameters, &mut scope_names, depth + 1)?;
+            for name in &scope_names {
+                local.values.insert(name.clone(), Value::Unknown);
+            }
+        }
+        // Defining a closure during an actual call does not invoke its body.
+        // The independent scan has already inspected its source with unknown
+        // parameters; actual callback values belong to the later invocation.
+        let mut called = 0;
+        let mut returned = Capabilities::default();
+        let preserves = if self.active_calls.is_empty() || is_class {
+            if let Some(body) = &body {
+                self.locals(body, &mut local, depth + 1)?;
+                let mut globals = HashSet::new();
+                let mut nonlocals = HashSet::new();
+                self.function_scope(
+                    body,
+                    &mut scope_names,
+                    &mut globals,
+                    &mut nonlocals,
+                    depth + 1,
+                )?;
+                for name in globals.iter().chain(&nonlocals) {
+                    scope_names.remove(name);
+                }
+                for (name, possible) in &defaults {
+                    if possible.has_capability() {
+                        local.values.insert(name.clone(), possible.lost());
+                    }
+                }
+                self.lexical_scopes.push(scope_names.clone());
+                if is_class {
+                    self.global_scopes.push(globals.clone());
+                } else {
+                    self.call_summaries.push(0);
+                }
+                self.deferred_depth += 1;
+                let visited = self.visit(body.clone(), &mut local, depth + 1);
+                self.deferred_depth -= 1;
+                self.lexical_scopes.pop();
+                if is_class {
+                    self.global_scopes.pop();
+                } else {
+                    called = self.call_summaries.pop().unwrap_or_default();
+                }
+                let visited = visited?;
+                if let Some(exit) = &visited.returns {
+                    returned = exit.returned.capabilities();
+                }
+                if is_class && let Some(joined) = visited.joined() {
+                    for name in globals {
+                        self.global_effect(&name, joined.get(&name).lost(), env);
+                    }
+                    for name in nonlocals {
+                        env.values.insert(name.clone(), joined.get(&name).lost());
+                    }
+                    env.containers = env.containers.merge(&joined.containers);
+                }
+                visited
+                    .environments()
+                    .all(|exit| exit.trusted && !exit.containers.performed)
+            } else {
+                local.trusted
+            }
+        } else {
+            false
+        };
+        if is_class {
+            return Ok(Value::Unknown);
+        }
+        let mut closure = HashMap::new();
+        let mut complete = defaults.len() <= MAX_CONTAINER_ITEMS;
+        if !complete {
+            defaults.clear();
+        }
+        if !self.active_calls.is_empty() {
+            for (name, value) in &env.values {
+                self.check(node, depth)?;
+                if closure.len() == MAX_CONTAINER_ITEMS {
+                    complete = false;
+                    break;
+                }
+                // Unknown locals still shadow equally named module globals.
+                closure.insert(name.clone(), value.lost());
+            }
+        }
+        let mut summary = empty_container(node.range().start, false, false);
+        for value in defaults.values().chain(closure.values()) {
+            note_origins(&mut summary, value);
+        }
+        if summary.depth >= MAX_CONTAINER_DEPTH {
+            complete = false;
+            defaults.clear();
+            closure.clear();
+        }
+        Ok(Value::LocalFunction(Arc::new(LocalFunction {
+            source: node.range().start,
+            owner: self.call_frames.last().copied(),
+            defaults,
+            closure,
+            preserves,
+            deferred,
+            complete,
+            depth: summary.depth + 1,
+            called,
+            returned,
+            origins: summary.origins,
+            unknown_origins: summary.unknown_origins,
+        })))
     }
 
     fn sequence<'tree, D: Doc>(
@@ -1877,61 +2166,9 @@ impl<'a> Scan<'a> {
                 }
             }
             "function_definition" | "class_definition" | "lambda" => {
-                let is_function = node.kind() == "function_definition";
-                if node.kind() == "class_definition" {
-                    // Class construction may invoke a metaclass or a base's
-                    // __init_subclass__ without an explicit call expression.
-                    self.invalidate(env);
-                }
-                let body = node.field("body");
-                let parameters = node.field("parameters");
-                let mut defaults = HashMap::new();
-                for child in named(&node) {
-                    if body
-                        .as_ref()
-                        .is_none_or(|body| body.range() != child.range())
-                    {
-                        if parameters
-                            .as_ref()
-                            .is_some_and(|parameters| parameters.range() == child.range())
-                        {
-                            defaults = self.parameter_defaults(&child, env, depth + 1)?;
-                        } else {
-                            self.eval(&child, env, depth + 1)?;
-                        }
-                    }
-                }
-                let mut local = self.deferred(env);
-                if let Some(parameters) = node.field("parameters") {
-                    self.bind(&parameters, Value::Unknown, &mut local, depth + 1)?;
-                }
-                let preserves = if let Some(body) = body {
-                    self.locals(&body, &mut local, depth + 1)?;
-                    for (name, possible) in defaults {
-                        local
-                            .values
-                            .entry(name)
-                            .and_modify(|old| *old = old.merge(&possible))
-                            .or_insert(possible);
-                    }
-                    self.deferred_depth += 1;
-                    let visited = self.visit(body, &mut local, depth + 1);
-                    self.deferred_depth -= 1;
-                    visited?
-                        .environments()
-                        .all(|exit| exit.trusted && !exit.containers.performed)
-                } else {
-                    local.trusted
-                };
+                let value = self.definition(&node, env, depth + 1)?;
                 if let Some(name) = node.field("name") {
-                    env.values.insert(
-                        name.text().into_owned(),
-                        if is_function {
-                            Value::LocalFunction { preserves }
-                        } else {
-                            Value::Unknown
-                        },
-                    );
+                    env.values.insert(name.text().into_owned(), value);
                 }
             }
             "if_statement" => {
@@ -2000,9 +2237,13 @@ impl<'a> Scan<'a> {
                     Flow::normal(env.clone())
                 };
                 for exit in exits.environments_mut() {
-                    for value in exit.values.values_mut() {
+                    for value in exit
+                        .values
+                        .values_mut()
+                        .chain(std::iter::once(&mut exit.returned))
+                    {
                         let path = match &*value {
-                            Value::Directory(path) => Some(path),
+                            Value::Directory(path) | Value::Join(path) => Some(path),
                             Value::Delete(call) => call.receiver.as_ref(),
                             _ => value.path(),
                         };
@@ -2016,7 +2257,15 @@ impl<'a> Scan<'a> {
                                     && (container.unknown_origins
                                         || container.origins.iter().any(|origin| managed.contains(origin)))
                         );
+                        let expired_function = matches!(
+                            &*value,
+                            Value::LocalFunction(function)
+                                if !managed.is_empty()
+                                    && (function.unknown_origins
+                                        || function.origins.iter().any(|origin| managed.contains(origin)))
+                        );
                         if expired_container
+                            || expired_function
                             || path
                                 .and_then(Path::origin)
                                 .is_some_and(|origin| managed.contains(&origin))
@@ -2049,8 +2298,14 @@ impl<'a> Scan<'a> {
                 return Ok(exits);
             }
             "break_statement" | "continue_statement" | "return_statement" | "raise_statement" => {
+                if node.kind() == "return_statement" {
+                    env.returned = Value::None;
+                }
                 for child in named(&node) {
                     let value = self.eval(&child, env, depth + 1)?;
+                    if node.kind() == "return_statement" {
+                        env.returned = value.clone();
+                    }
                     if node.kind() == "raise_statement"
                         && child.kind() != "call"
                         && value == Value::Unknown
@@ -2275,8 +2530,7 @@ impl<'a> Scan<'a> {
                 Value::Unknown
             }
             "function_definition" | "class_definition" | "lambda" => {
-                self.visit(node.clone(), env, depth + 1)?;
-                Value::Unknown
+                self.definition(node, env, depth + 1)?
             }
             "call" => self.call(node, env, depth + 1)?,
             _ => {
@@ -2316,6 +2570,11 @@ impl<'a> Scan<'a> {
             }
         }
         let deferred = node.kind() == "generator_expression";
+        if deferred && !self.active_calls.is_empty() {
+            // The leftmost iterable above executes now; this newly created
+            // generator's callback body does not.
+            return self.walrus_locals(node, env, depth + 1);
+        }
         let mut entry = if deferred {
             self.deferred(env)
         } else {
@@ -2323,6 +2582,10 @@ impl<'a> Scan<'a> {
         };
         if deferred {
             self.deferred_depth += 1;
+            // The leftmost iterable above belongs to the enclosing call.
+            // The delayed generator body does not: keep its independent
+            // findings without adding them to that call's owned summary.
+            self.call_summaries.push(0);
         }
         let visited: Result<(), MatchError> = (|| {
             loop {
@@ -2363,6 +2626,7 @@ impl<'a> Scan<'a> {
         })();
         if deferred {
             self.deferred_depth -= 1;
+            self.call_summaries.pop();
         }
         visited?;
         if deferred {
@@ -2390,6 +2654,7 @@ impl<'a> Scan<'a> {
         depth: usize,
     ) -> Result<Args, MatchError> {
         let mut args = Args::default();
+        let mut expanded = Args::default();
         if let Some(arguments) = node.field("arguments") {
             for argument in named(&arguments) {
                 self.check(&argument, depth)?;
@@ -2398,22 +2663,64 @@ impl<'a> Scan<'a> {
                         (argument.field("name"), argument.field("value"))
                     {
                         let value = self.eval(&value, env, depth + 1)?;
+                        expanded.uncertain |= expanded
+                            .keywords
+                            .insert(name.text().into_owned(), value.clone())
+                            .is_some();
                         args.uncertain |= args
                             .keywords
                             .insert(name.text().into_owned(), value)
                             .is_some();
                     } else {
                         args.uncertain = true;
+                        expanded.uncertain = true;
+                    }
+                } else if matches!(argument.kind().as_ref(), "list_splat" | "dictionary_splat") {
+                    let mut value = Value::Unknown;
+                    for child in named(&argument) {
+                        value = self.eval(&child, env, depth + 1)?;
+                    }
+                    args.uncertain = true;
+                    args.positional.push(Value::possible(
+                        env.container_capabilities(&value).selected(),
+                    ));
+                    if let Value::Container(container) = &value
+                        && env.exact_container(container)
+                        && (argument.kind() == "list_splat") == container.sequence
+                    {
+                        for (key, value) in &container.entries {
+                            if argument.kind() == "list_splat" {
+                                expanded.positional.push(value.clone());
+                            } else if let ContainerKey::Text(name) = key {
+                                expanded.uncertain |= expanded
+                                    .keywords
+                                    .insert(name.to_string(), value.clone())
+                                    .is_some();
+                            } else {
+                                expanded.uncertain = true;
+                            }
+                        }
+                    } else {
+                        expanded.uncertain = true;
+                        expanded.positional.push(Value::possible(
+                            env.container_capabilities(&value).selected(),
+                        ));
+                        // Unpacking executes iteration/mapping protocols
+                        // before the callee runs, even when that call merely
+                        // creates an unstarted generator or coroutine.
+                        self.invalidate(env);
                     }
                 } else {
-                    args.uncertain |=
-                        matches!(argument.kind().as_ref(), "list_splat" | "dictionary_splat");
-                    args.positional.push(self.eval(&argument, env, depth + 1)?);
+                    let value = self.eval(&argument, env, depth + 1)?;
+                    args.positional.push(value.clone());
+                    expanded.positional.push(value);
                 }
             }
         } else {
             args.uncertain = true;
+            expanded.uncertain = true;
         }
+        args.expanded = Some(Box::new(expanded));
         Ok(args)
     }
 
@@ -2510,6 +2817,396 @@ impl<'a> Scan<'a> {
         Ok(Value::None)
     }
 
+    fn function_scope<D: Doc>(
+        &mut self,
+        node: &Node<'_, D>,
+        locals: &mut HashSet<String>,
+        globals: &mut HashSet<String>,
+        nonlocals: &mut HashSet<String>,
+        depth: usize,
+    ) -> Result<(), MatchError> {
+        self.check(node, depth)?;
+        if matches!(
+            node.kind().as_ref(),
+            "global_statement" | "nonlocal_statement"
+        ) {
+            for child in named(node).filter(|child| child.kind() == "identifier") {
+                if node.kind() == "nonlocal_statement" {
+                    nonlocals.insert(child.text().into_owned());
+                } else {
+                    globals.insert(child.text().into_owned());
+                }
+            }
+            return Ok(());
+        }
+        if let Some(target) = binding_target(node) {
+            self.names(&target, locals, depth + 1)?;
+        }
+        if matches!(
+            node.kind().as_ref(),
+            "function_definition" | "class_definition" | "lambda"
+        ) {
+            return Ok(());
+        }
+        if matches!(
+            node.kind().as_ref(),
+            "import_statement" | "import_from_statement"
+        ) {
+            locals.extend(import_values(node).into_iter().map(|(name, _)| name));
+        }
+        if matches!(
+            node.kind().as_ref(),
+            "list_comprehension"
+                | "set_comprehension"
+                | "dictionary_comprehension"
+                | "generator_expression"
+        ) {
+            // Iteration variables belong to the comprehension. Its walrus
+            // targets alone bind in the surrounding function.
+            for descendant in node.dfs() {
+                self.check(&descendant, depth + 1)?;
+                if descendant.kind() == "named_expression"
+                    && let Some(name) = descendant.field("name")
+                {
+                    self.names(&name, locals, depth + 1)?;
+                }
+            }
+            return Ok(());
+        }
+        for child in named(node) {
+            self.function_scope(&child, locals, globals, nonlocals, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    fn parameters<D: Doc>(
+        &mut self,
+        node: &Node<'_, D>,
+        depth: usize,
+    ) -> Result<Vec<Parameter>, MatchError> {
+        let mut result: Vec<Parameter> = Vec::new();
+        let Some(parameters) = node.field("parameters") else {
+            return Ok(result);
+        };
+        let mut keyword_only = false;
+        for parameter in named(&parameters) {
+            self.check(&parameter, depth)?;
+            if parameter.text() == "/" {
+                for previous in &mut result {
+                    previous.keyword = false;
+                }
+                continue;
+            }
+            if parameter.text() == "*" {
+                keyword_only = true;
+                continue;
+            }
+            let mut names = HashSet::new();
+            self.names(&parameter, &mut names, depth + 1)?;
+            if names.len() != 1 || result.len() == MAX_CONTAINER_ITEMS {
+                return Err(local_call_error("unsupported or excessive parameter list"));
+            }
+            let mut variadic = 0;
+            for child in parameter.dfs() {
+                self.check(&child, depth + 1)?;
+                if child.kind() == "list_splat_pattern" {
+                    variadic = 1;
+                } else if child.kind() == "dictionary_splat_pattern" {
+                    variadic = 2;
+                }
+            }
+            let name = names.into_iter().next().unwrap_or_default();
+            result.push(Parameter {
+                name,
+                positional: !keyword_only && variadic == 0,
+                keyword: variadic == 0,
+                variadic,
+            });
+            keyword_only |= variadic != 0;
+        }
+        Ok(result)
+    }
+
+    fn bind_arguments<D: Doc>(
+        &mut self,
+        node: &Node<'_, D>,
+        function: &LocalFunction,
+        args: &Args,
+        env: &mut Env,
+        depth: usize,
+    ) -> Result<HashSet<String>, MatchError> {
+        let parameters = self.parameters(node, depth + 1)?;
+        let args = args.expanded.as_deref().unwrap_or(args);
+        let names: HashSet<_> = parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect();
+        let mut bound = HashMap::new();
+        let mut position = 0;
+        let mut keywords = args.keywords.clone();
+        let mut uncertain = args.uncertain;
+        for parameter in &parameters {
+            self.check(node, depth)?;
+            let value = if parameter.variadic == 1 {
+                let mut container = empty_container(node.range().start, true, false);
+                for (index, value) in args.positional[position..].iter().enumerate() {
+                    self.check(node, depth)?;
+                    container.members = container.members.union(value.capabilities());
+                    note_origins(&mut container, value);
+                    if index < MAX_CONTAINER_ITEMS {
+                        container.entries.push((
+                            ContainerKey::Integer(i64::try_from(index).unwrap_or_default()),
+                            value.captured(),
+                        ));
+                    } else {
+                        container.precise = false;
+                    }
+                }
+                position = args.positional.len();
+                bounded_container(container)
+            } else if parameter.variadic == 2 {
+                let mut container = empty_container(node.range().start, false, false);
+                for (name, value) in &keywords {
+                    self.check(node, depth)?;
+                    container.members = container.members.union(value.capabilities());
+                    note_origins(&mut container, value);
+                    if container.entries.len() < MAX_CONTAINER_ITEMS {
+                        container
+                            .entries
+                            .push((ContainerKey::Text(name.clone().into()), value.captured()));
+                    } else {
+                        container.precise = false;
+                    }
+                }
+                keywords.clear();
+                bounded_container(container)
+            } else if parameter.positional && position < args.positional.len() {
+                uncertain |= parameter.keyword && keywords.remove(&parameter.name).is_some();
+                let value = args.positional[position].clone();
+                position += 1;
+                value
+            } else if parameter.keyword && keywords.contains_key(&parameter.name) {
+                keywords.remove(&parameter.name).unwrap_or_default()
+            } else if let Some(default) = function.defaults.get(&parameter.name) {
+                default.clone()
+            } else {
+                uncertain = true;
+                Value::Unknown
+            };
+            bound.insert(parameter.name.clone(), value);
+        }
+        uncertain |= position != args.positional.len() || !keywords.is_empty();
+        if uncertain {
+            // Unknown unpacking can bind any formal, but cannot prove arity,
+            // identity, or a safe receiver. Keep only possible callables.
+            let mut possible = Capabilities::default();
+            for value in args
+                .positional
+                .iter()
+                .chain(args.keywords.values())
+                .chain(function.defaults.values())
+            {
+                self.check(node, depth)?;
+                possible = possible.union(value.capabilities());
+            }
+            possible = possible.union(possible.selected());
+            for value in bound.values_mut() {
+                *value = Value::possible(possible);
+            }
+            env.trusted = false;
+        }
+        for (name, value) in bound {
+            // An unknown actual argument cannot erase the inherited may-call
+            // clue associated with this formal. A proved replacement such as
+            // print still shadows it. These are capabilities, never paths.
+            let value = if value == Value::Unknown || uncertain {
+                let inherited = self
+                    .call_globals
+                    .as_ref()
+                    .map_or_else(Value::default, |globals| globals.get(&name));
+                value.merge(&inherited.lost())
+            } else {
+                value
+            };
+            env.values.insert(name, value);
+        }
+        Ok(names)
+    }
+
+    fn global_effect(&mut self, name: &str, value: Value, env: &mut Env) {
+        if let Some(globals) = &mut self.call_globals {
+            // Different visited branches can write different globals. These
+            // may-facts accumulate rather than select the last visitor.
+            globals
+                .values
+                .entry(name.to_string())
+                .and_modify(|old| *old = old.merge(&value))
+                .or_insert_with(|| value.clone());
+        }
+        if self
+            .call_scopes
+            .last()
+            .is_none_or(|scope| !scope.contains(name))
+        {
+            env.values.insert(name.to_string(), value);
+        }
+        self.global_writes.insert(name.to_string());
+    }
+
+    fn local_call<D: Doc>(
+        &mut self,
+        call: &Node<'_, D>,
+        function: &LocalFunction,
+        args: &Args,
+        env: &mut Env,
+        depth: usize,
+    ) -> Result<Value, MatchError> {
+        // Async/generator creation is not body execution. Their consumers are
+        // outside this synchronous source-visible call analysis.
+        if function.deferred {
+            return Ok(Value::Unknown);
+        }
+        if self.deferred_depth > 0 && self.active_calls.is_empty() {
+            if let Some(summary) = self.call_summaries.last_mut() {
+                *summary |= function.called;
+            }
+            if !function.preserves {
+                self.invalidate(env);
+            }
+            return Ok(Value::possible(function.returned));
+        }
+        if !function.complete
+            || self.active_calls.len() == MAX_LOCAL_CALLS
+            || self.active_calls.contains(&function.source)
+        {
+            return Err(local_call_error("recursive or exhausted local invocation"));
+        }
+        if function.owner.is_some() && function.owner != self.call_frames.last().copied() {
+            return Err(local_call_error(
+                "escaped closure cell ownership is unresolved",
+            ));
+        }
+        let mut root = call.clone();
+        while let Some(parent) = root.parent() {
+            self.check(&parent, depth)?;
+            root = parent;
+        }
+        let mut definition = None;
+        for candidate in root.dfs() {
+            self.check(&candidate, depth)?;
+            if candidate.range().start == function.source
+                && matches!(candidate.kind().as_ref(), "function_definition" | "lambda")
+            {
+                definition = Some(candidate);
+                break;
+            }
+        }
+        let Some(definition) = definition else {
+            return Err(local_call_error("local function source is unavailable"));
+        };
+        let Some(body) = definition.field("body") else {
+            return Err(local_call_error("local function has no body"));
+        };
+        let outermost = self.active_calls.is_empty();
+        if outermost {
+            self.call_globals = Some(env.clone());
+            self.global_writes.clear();
+        }
+        let globals = self.call_globals.take();
+        let mut local = Env {
+            values: HashMap::new(),
+            trusted: env.trusted,
+            containers: env.containers.clone(),
+            returned: Value::Unknown,
+        };
+        if let Some(globals) = &globals {
+            for (name, value) in &globals.values {
+                self.check(call, depth)?;
+                local.values.insert(name.clone(), value.clone());
+            }
+        }
+        self.call_globals = globals;
+        for (name, value) in &function.closure {
+            self.check(call, depth)?;
+            local.values.insert(
+                name.clone(),
+                if function.owner.is_some() {
+                    env.get(name).lost()
+                } else {
+                    value.clone()
+                },
+            );
+        }
+        let mut locals = HashSet::new();
+        let mut written = HashSet::new();
+        let mut nonlocals = HashSet::new();
+        self.function_scope(&body, &mut locals, &mut written, &mut nonlocals, depth + 1)?;
+        for name in written.iter().chain(&nonlocals) {
+            locals.remove(name);
+        }
+        if !nonlocals.is_empty() && function.owner.is_none() {
+            return Err(local_call_error("nonlocal binding ownership is unresolved"));
+        }
+        for name in &locals {
+            local.values.insert(name.clone(), Value::Unknown);
+        }
+        locals.extend(self.bind_arguments(&definition, function, args, &mut local, depth + 1)?);
+        self.active_calls.push(function.source);
+        self.call_scopes.push(locals.clone());
+        self.lexical_scopes.push(locals);
+        self.global_scopes.push(written.clone());
+        self.next_frame += 1;
+        self.call_frames.push(self.next_frame);
+        let visited = if definition.kind() == "lambda" {
+            self.eval(&body, &mut local, depth + 1).map(|value| {
+                local.returned = value;
+                let mut flow = Flow::default();
+                flow.add(Exit::Return, local);
+                flow
+            })
+        } else {
+            self.visit(body, &mut local, depth + 1)
+        };
+        self.active_calls.pop();
+        self.call_scopes.pop();
+        self.lexical_scopes.pop();
+        self.global_scopes.pop();
+        self.call_frames.pop();
+        let flow = visited?;
+        let mut returned = flow
+            .returns
+            .as_ref()
+            .map_or(Value::None, |exit| exit.returned.clone());
+        if flow.normal.is_some() && flow.returns.is_some() {
+            returned = returned.merge(&Value::None);
+        }
+        if let Some(joined) = flow.joined() {
+            env.containers = env.containers.merge(&joined.containers);
+            if !joined.trusted {
+                self.invalidate(env);
+                returned = returned.lost();
+            }
+            for name in written {
+                let value = joined.get(&name).lost();
+                self.global_effect(&name, value, env);
+            }
+            for name in nonlocals {
+                // The owner check above proves this is the active caller's
+                // cell, not an equally named module or unrelated local.
+                env.values.insert(name.clone(), joined.get(&name).lost());
+            }
+        }
+        if outermost {
+            if let Some(globals) = self.call_globals.take() {
+                for name in &self.global_writes {
+                    env.values.insert(name.clone(), globals.get(name).lost());
+                }
+            }
+            self.global_writes.clear();
+        }
+        Ok(returned)
+    }
+
     fn call<D: Doc>(
         &mut self,
         node: &Node<'_, D>,
@@ -2522,8 +3219,18 @@ impl<'a> Scan<'a> {
                 // A source-visible helper may install a global alias only at
                 // runtime. Lost reaching facts cannot erase that capability.
                 // This fallback supplies only untrusted may-call identities.
-                let possible = std::mem::take(&mut self.possible);
+                let mut possible = std::mem::take(&mut self.possible);
+                let mut shadowed = Vec::new();
+                if let Some(scope) = self.lexical_scopes.last().cloned() {
+                    for name in scope {
+                        self.check(&function, depth)?;
+                        if let Some(value) = possible.remove(&name) {
+                            shadowed.push((name, value));
+                        }
+                    }
+                }
                 let value = self.capability(&function, &possible, depth + 1);
+                possible.extend(shadowed);
                 self.possible = possible;
                 value?
             } else {
@@ -2557,7 +3264,30 @@ impl<'a> Scan<'a> {
                 operation,
             } => self.container_call(node, receiver, operation, &args, env, depth + 1)?,
             Value::Possible(possible) => {
-                if possible.direct & MAY_SELECT != 0 && possible.returned_overflow {
+                let kinds = u8::try_from(possible.direct & DELETE_KINDS).unwrap_or_default();
+                let relevant_return = possible.contained != 0
+                    || possible.returned_overflow
+                    || possible
+                        .returned
+                        .iter()
+                        .chain(&possible.returned_contained)
+                        .any(|returned| *returned != 0);
+                let relevant_arguments = args
+                    .positional
+                    .iter()
+                    .chain(args.keywords.values())
+                    .any(Value::has_capability);
+                if possible.direct & MAY_LOCAL != 0
+                    && kinds == 0
+                    && (relevant_return || relevant_arguments)
+                    && (self.deferred_depth == 0 || !self.active_calls.is_empty())
+                {
+                    return Err(local_call_error("local callable identity is unresolved"));
+                }
+                if possible.direct & (MAY_SELECT | MAY_LOCAL) != 0 && possible.returned_overflow {
+                    if possible.direct & MAY_LOCAL != 0 {
+                        return Err(local_call_error("exhausted local return-depth summary"));
+                    }
                     return Err(MatchError::Unavailable {
                         language: ScriptLanguage::Python,
                         detail:
@@ -2565,7 +3295,6 @@ impl<'a> Scan<'a> {
                                 .to_string(),
                     });
                 }
-                let kinds = u8::try_from(possible.direct & DELETE_KINDS).unwrap_or_default();
                 if kinds != 0 {
                     self.record(node, kinds, false);
                 }
@@ -2574,6 +3303,21 @@ impl<'a> Scan<'a> {
                 } else {
                     Value::Unknown
                 };
+                if possible.direct & MAY_LOCAL != 0 {
+                    let mut returned = possible.called();
+                    // After identity loss, arguments can still escape through
+                    // a helper's return or a selection from an argument. These
+                    // are may-values only; passing them is not invoking them.
+                    for value in args.positional.iter().chain(args.keywords.values()) {
+                        self.check(node, depth)?;
+                        let argument = value.capabilities();
+                        returned = returned
+                            .union(argument)
+                            .union(argument.stored())
+                            .union(argument.selected());
+                    }
+                    result = result.merge(&Value::possible(returned));
+                }
                 if possible.direct & MAY_SELECT != 0 {
                     let returned = env
                         .container_capabilities(&Value::Possible(possible))
@@ -2644,7 +3388,9 @@ impl<'a> Scan<'a> {
                 }
             }
             Value::PathRead | Value::Symbol(Symbol::Print) => Value::Unknown,
-            Value::LocalFunction { preserves: true } => Value::Unknown,
+            Value::LocalFunction(function) => {
+                self.local_call(node, &function, &args, env, depth + 1)?
+            }
             _ => {
                 // Opaque code can replace bindings or expose module objects.
                 // Later grants cannot rely on the old identities.
@@ -2664,6 +3410,9 @@ impl<'a> Scan<'a> {
             let Some(meta) = self.rules.iter().find(|meta| meta.rule_id == rule(kind)) else {
                 continue;
             };
+            if let Some(summary) = self.call_summaries.last_mut() {
+                *summary |= kind;
+            }
             // Preserve a direct os pattern's canonical attribution instead of
             // appending an unresolved receiver's duplicate pathlib finding.
             if matches!(kind, PATH_UNLINK | PATH_RMDIR)
@@ -2802,6 +3551,38 @@ fn deletion(kinds: u8, receiver: Option<Path>, bound: bool, trusted: bool) -> Va
     })
 }
 
+fn empty_container(source: usize, sequence: bool, mutable_sequence: bool) -> Container {
+    Container {
+        entries: Vec::new(),
+        source,
+        sequence,
+        mutable_sequence,
+        precise: true,
+        members: Capabilities::default(),
+        depth: 0,
+        origins: Vec::new(),
+        unknown_origins: false,
+    }
+}
+
+fn bounded_container(container: Container) -> Value {
+    if container.depth > MAX_CONTAINER_DEPTH {
+        Value::possible(Capabilities {
+            direct: if container.sequence { 0 } else { MAY_DICT },
+            ..container.members.stored()
+        })
+    } else {
+        Value::Container(Arc::new(container))
+    }
+}
+
+fn local_call_error(detail: &str) -> MatchError {
+    MatchError::Unavailable {
+        language: ScriptLanguage::Python,
+        detail: format!("Python local-call analysis incomplete: {detail}"),
+    }
+}
+
 fn note_origins(container: &mut Container, value: &Value) {
     let (origins, unknown): (&[usize], bool) = match value {
         Value::Container(nested) => {
@@ -2814,6 +3595,10 @@ fn note_origins(container: &mut Container, value: &Value) {
             container.depth = container.depth.max(nested.depth + 2);
             (&nested.origins, nested.unknown_origins)
         }
+        Value::LocalFunction(function) => {
+            container.depth = container.depth.max(function.depth + 1);
+            (&function.origins, function.unknown_origins)
+        }
         Value::Delete(call) => {
             if let Some(origin) = call.receiver.as_ref().and_then(Path::origin) {
                 if !container.origins.contains(&origin) {
@@ -2822,6 +3607,18 @@ fn note_origins(container: &mut Container, value: &Value) {
                     } else {
                         container.unknown_origins = true;
                     }
+                }
+            }
+            return;
+        }
+        Value::Text(path) | Value::Path(path) | Value::Directory(path) | Value::Join(path) => {
+            if let Some(origin) = path.origin()
+                && !container.origins.contains(&origin)
+            {
+                if container.origins.len() < MAX_CONTAINER_ITEMS {
+                    container.origins.push(origin);
+                } else {
+                    container.unknown_origins = true;
                 }
             }
             return;
@@ -3121,6 +3918,326 @@ mod tests {
             matches.iter().any(|hit| hit.severity.blocks_by_default()),
             expected,
             "source: {source}\nfindings: {matches:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_actual_formals_retain_only_inherited_may_call_clues() {
+        let prefix = "from os import unlink as erase\nimport tempfile\nfrom pathlib import Path\ndef cleanup(erase):\n    p = Path(tempfile.mkdtemp()) / 'lock'\n    erase(p)\n";
+        let matcher = super::super::AstMatcher::with_patterns(super::super::default_patterns());
+        let matches = matcher
+            .find_matches(
+                &format!("{prefix}cleanup(replacement)"),
+                ScriptLanguage::Python,
+            )
+            .expect("unknown actual argument must retain a completed inherited deletion finding");
+        assert!(
+            matches
+                .iter()
+                .any(|hit| hit.rule_id == rule(OS_UNLINK) && hit.severity.blocks_by_default()),
+            "inherited deletion clue disappeared: {matches:?}"
+        );
+        assert_blocked(&format!("{prefix}cleanup(print)"), false);
+    }
+
+    #[test]
+    fn pure_lost_helpers_preserve_completed_reflective_rmtree_findings() {
+        let source = "import shutil\ndef mkdtemp():\n    return '/tmp'\ngetattr(shutil, 'rmtree')(mkdtemp())";
+        let matches = crate::ast_matcher::DEFAULT_MATCHER
+            .find_matches(source, ScriptLanguage::Python)
+            .expect("an irrelevant opaque helper cannot replace completed default-policy findings");
+        assert!(
+            matches
+                .iter()
+                .any(|hit| hit.rule_id == "heredoc.python.shutil_rmtree"
+                    && hit.severity.blocks_by_default()),
+            "canonical recursive-deletion finding disappeared: {matches:?}"
+        );
+    }
+
+    #[test]
+    fn local_calls_bind_callbacks_and_returned_values() {
+        for source in [
+            "import os\ndef invoke(callback, target):\n    callback(target)\ninvoke(os.unlink, '/etc/hosts')",
+            "from pathlib import Path\ndef identity(callback):\n    return callback\nidentity(Path('/etc/hosts').unlink)()",
+            "import os\ndef invoke(callback, /, *, target):\n    callback(target)\ninvoke(os.remove, target='/etc/hosts')",
+            "from pathlib import Path\ndef invoke(*callbacks):\n    callbacks[0]()\ninvoke(Path('/etc/hosts').unlink)",
+            "from pathlib import Path\ndef invoke(**callbacks):\n    callbacks['erase']()\ninvoke(erase=Path('/etc/hosts').unlink)",
+            "from pathlib import Path\n(lambda callback: callback())(Path('/etc/hosts').unlink)",
+        ] {
+            assert_blocked(source, true);
+        }
+    }
+
+    #[test]
+    fn local_calls_do_not_confuse_other_formals_or_caller_locals() {
+        for source in [
+            "import os\ndef invoke(callback):\n    callback('hello')\ndef keep(callback):\n    return callback\ninvoke(print)\nkeep(os.unlink)",
+            "import os\ndef invoke(callback):\n    callback = print\n    callback('/etc/hosts')\ninvoke(os.unlink)",
+            "import os\ncallback = print\ndef invoke():\n    callback('hello')\ndef outer(callback):\n    invoke()\nouter(os.unlink)",
+        ] {
+            assert_blocked(source, false);
+        }
+        assert_blocked(
+            "import os\ndef invoke(callback):\n    callback('/etc/hosts')\nsaved = invoke\ninvoke = print\nsaved(os.unlink)",
+            true,
+        );
+    }
+
+    #[test]
+    fn local_returns_keep_evaluation_order_and_finally_replacement() {
+        assert_blocked(
+            "import os\ndef choose(callback):\n    try:\n        return callback\n    finally:\n        callback = print\nchoose(os.unlink)('/etc/hosts')",
+            true,
+        );
+        assert_blocked(
+            "import os\ndef choose(callback):\n    try:\n        return callback\n    finally:\n        return print\nchoose(os.unlink)('hello')",
+            false,
+        );
+        assert_blocked(
+            "import os\ncallback = os.unlink\ndef choose(saved=callback):\n    return saved\ncallback = print\nchoose()('/etc/hosts')",
+            true,
+        );
+    }
+
+    #[test]
+    fn local_temporary_callbacks_require_live_ownership() {
+        assert_blocked(
+            "import tempfile\nfrom pathlib import Path\ndef identity(callback):\n    return callback\nwith tempfile.TemporaryDirectory() as directory:\n    identity((Path(directory) / 'child').unlink)()",
+            false,
+        );
+        assert_blocked(
+            "import tempfile\nfrom pathlib import Path\ndef make():\n    with tempfile.TemporaryDirectory() as directory:\n        return (Path(directory) / 'child').unlink\nmake()()",
+            true,
+        );
+        assert_blocked(
+            "import tempfile\nfrom pathlib import Path\nfrom helpers import mutate\ndef invoke(callback, ignored):\n    callback()\np = Path(tempfile.mkdtemp()) / 'child'\ninvoke(p.unlink, mutate())",
+            true,
+        );
+    }
+
+    #[test]
+    fn local_deferred_values_are_not_invoked_by_creation() {
+        for source in [
+            "import os\ndef wrap(callback):\n    def invoke():\n        callback('/etc/hosts')\n    return invoke\npending = wrap(os.unlink)",
+            "import os\ndef jobs(callback):\n    yield callback('/etc/hosts')\npending = jobs(os.unlink)",
+            "import os\nasync def job(callback):\n    callback('/etc/hosts')\npending = job(os.unlink)",
+            "import os\ndef jobs(callback):\n    return (callback('/etc/hosts') for _ in [1])\npending = jobs(os.unlink)",
+            "import os\ndef first(callback):\n    return second(callback)\ndef second(callback):\n    return first(callback)\npending = first\nunused = os.unlink",
+        ] {
+            assert_blocked(source, false);
+        }
+    }
+
+    #[test]
+    fn recursive_and_escaped_local_calls_report_incomplete_analysis() {
+        for (source, reason) in [
+            (
+                "import os\ndef recurse(callback):\n    return recurse(callback)\nrecurse(os.unlink)",
+                "recursive or exhausted local invocation",
+            ),
+            (
+                "import os\ndef wrap(callback):\n    def invoke():\n        callback('/etc/hosts')\n    return invoke\nwrap(os.unlink)()",
+                "escaped closure cell ownership is unresolved",
+            ),
+        ] {
+            let ast = AstGrep::new(source, SupportLang::Python);
+            let cancel = AtomicBool::new(false);
+            let mut matches = Vec::new();
+            let rules = super::super::default_patterns()
+                .remove(&ScriptLanguage::Python)
+                .expect("registered Python rules");
+            let error = Scan::new(
+                rules.iter().collect(),
+                &mut matches,
+                &[],
+                Instant::now(),
+                Duration::from_secs(5),
+                5_000,
+                &cancel,
+            )
+            .run(ast.root())
+            .expect_err("unresolved invocation cannot establish completion");
+            assert!(
+                matches!(
+                    error,
+                    MatchError::Unavailable { language: ScriptLanguage::Python, ref detail }
+                        if detail == &format!("Python local-call analysis incomplete: {reason}")
+                ),
+                "unexpected analysis error: {error}"
+            );
+            assert!(
+                matches.is_empty(),
+                "incompleteness is not a fabricated deletion call"
+            );
+        }
+    }
+
+    #[test]
+    fn local_class_bodies_and_owned_nonlocal_stores_execute() {
+        assert_blocked(
+            "import os\ndef invoke(callback):\n    class Execute:\n        callback('/etc/hosts')\ninvoke(os.unlink)",
+            true,
+        );
+        assert_blocked(
+            "import os\ndef outer(callback):\n    erase = print\n    def store():\n        nonlocal erase\n        erase = callback\n    store()\n    erase('/etc/hosts')\nouter(os.unlink)",
+            true,
+        );
+    }
+
+    #[test]
+    fn local_default_graphs_have_bounded_snapshots_without_invoking_them() {
+        let mut source = "import os\nprevious = os.unlink\n".to_string();
+        for _ in 0..64 {
+            source.push_str("def current(value=previous):\n    return value\nprevious = current\n");
+        }
+        assert_blocked(&source, false);
+        source.push_str("previous()('/etc/hosts')\n");
+        let ast = AstGrep::new(&source, SupportLang::Python);
+        let cancel = AtomicBool::new(false);
+        let mut matches = Vec::new();
+        let rules = super::super::default_patterns()
+            .remove(&ScriptLanguage::Python)
+            .expect("registered Python rules");
+        let error = Scan::new(
+            rules.iter().collect(),
+            &mut matches,
+            &[],
+            Instant::now(),
+            Duration::from_secs(5),
+            5_000,
+            &cancel,
+        )
+        .run(ast.root())
+        .expect_err("invoking an exhausted function graph cannot establish completion");
+        assert!(
+            matches!(
+                error,
+                MatchError::Unavailable { language: ScriptLanguage::Python, ref detail }
+                    if detail == "Python local-call analysis incomplete: recursive or exhausted local invocation"
+            ),
+            "unexpected analysis error: {error}"
+        );
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn lost_local_helpers_keep_called_and_returned_capabilities() {
+        let prefix = "import os\nfrom pathlib import Path\nfrom helpers import mutate\n";
+        for body in [
+            "def cleanup():\n    Path('/tmp/child').unlink()\n    return os.unlink\nmutate()\ncleanup()('/etc/hosts')",
+            "def cleanup():\n    Path('/tmp/child').unlink()\n    return {'erase': os.unlink}\nmutate()\ncleanup()['erase']('/etc/hosts')",
+            "def cleanup(callback):\n    Path('/tmp/child').unlink()\n    return callback\nmutate()\ncleanup(os.unlink)('/etc/hosts')",
+            "def cleanup(callback):\n    Path('/tmp/child').unlink()\n    return {'erase': callback}\nmutate()\ncleanup(os.unlink)['erase']('/etc/hosts')",
+        ] {
+            let matcher = super::super::AstMatcher::with_patterns(super::super::default_patterns());
+            let matches = matcher
+                .find_matches(&format!("{prefix}{body}"), ScriptLanguage::Python)
+                .expect("known may-call summary must preserve completed findings");
+            assert!(
+                matches
+                    .iter()
+                    .any(|hit| hit.rule_id == rule(OS_UNLINK) && hit.severity.blocks_by_default()),
+                "returned deletion disappeared: {body}\n{matches:?}"
+            );
+        }
+        let matcher = super::super::AstMatcher::with_patterns(super::super::default_patterns());
+        for suffix in ["cleanup()", "cleanup()()"] {
+            let source = format!(
+                "{prefix}def cleanup():\n    Path('/tmp/child').unlink()\n    return [os.unlink]\nmutate()\n{suffix}"
+            );
+            let matches = matcher
+                .find_matches(&source, ScriptLanguage::Python)
+                .expect("known container return keeps its contained capabilities");
+            assert!(
+                !matches.iter().any(|hit| hit.rule_id == rule(OS_UNLINK)),
+                "returning or calling a container is not invoking its stored callback"
+            );
+        }
+    }
+
+    #[test]
+    fn local_call_summaries_exclude_nested_and_delayed_bodies() {
+        for (body, returns_callable) in [
+            (
+                "def factory():\n    def inner():\n        Path('/tmp/child').unlink()\n    return inner",
+                true,
+            ),
+            (
+                "def factory():\n    return (Path('/tmp/child').unlink() for item in [1])",
+                false,
+            ),
+        ] {
+            let source = format!(
+                "from pathlib import Path\nfrom helpers import mutate\n{body}\nmutate()\nfactory()"
+            );
+            let invocation = source.rfind("factory()").expect("final helper invocation");
+            let ast = AstGrep::new(&source, SupportLang::Python);
+            let cancel = AtomicBool::new(false);
+            let rules = super::super::default_patterns()
+                .remove(&ScriptLanguage::Python)
+                .expect("registered Python rules");
+            let mut matches = Vec::new();
+            let result = Scan::new(
+                rules.iter().collect(),
+                &mut matches,
+                &[],
+                Instant::now(),
+                Duration::from_secs(5),
+                5_000,
+                &cancel,
+            )
+            .run(ast.root());
+            if returns_callable {
+                let error = result
+                    .expect_err("a returned local callable must retain its unresolved identity");
+                assert!(matches!(error, MatchError::Unavailable { ref detail, .. }
+                    if detail == "Python local-call analysis incomplete: local callable identity is unresolved"));
+            } else {
+                result.expect(
+                    "an opaque factory with no synchronous call or return capabilities completes",
+                );
+            }
+            assert!(
+                matches.iter().all(|hit| hit.start < invocation),
+                "nested source findings cannot be attributed to the outer invocation"
+            );
+        }
+        assert_blocked(
+            "from pathlib import Path\nfrom helpers import mutate\ndef factory():\n    return (value for value in [Path('/tmp/child').unlink()])\nmutate()\nfactory()",
+            true,
+        );
+    }
+
+    #[test]
+    fn lost_local_return_summaries_enforce_their_depth_bound() {
+        let mut source = "import os\nfrom pathlib import Path\nfrom helpers import mutate\nprevious = os.unlink\n".to_string();
+        for _ in 0..64 {
+            source.push_str("def current(value=previous):\n    Path('/tmp/child').unlink()\n    return value\nprevious = current\n");
+        }
+        assert_blocked(&source, false);
+        source.push_str("mutate()\nprevious()\n");
+        let ast = AstGrep::new(&source, SupportLang::Python);
+        let cancel = AtomicBool::new(false);
+        let rules = super::super::default_patterns()
+            .remove(&ScriptLanguage::Python)
+            .expect("registered Python rules");
+        let mut matches = Vec::new();
+        let error = Scan::new(
+            rules.iter().collect(),
+            &mut matches,
+            &[],
+            Instant::now(),
+            Duration::from_secs(5),
+            5_000,
+            &cancel,
+        )
+        .run(ast.root())
+        .expect_err("invocation cannot consume a truncated return summary");
+        assert!(
+            matches!(error, MatchError::Unavailable { ref detail, .. }
+            if detail == "Python local-call analysis incomplete: exhausted local return-depth summary"),
+            "unexpected analysis error: {error}"
         );
     }
 

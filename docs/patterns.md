@@ -216,6 +216,26 @@ uncertain arguments cannot establish a cleanup allowance. Selector-return
 depth is bounded separately from deletion invocation: exceeding that bound
 reports incomplete analysis instead of inventing a destructive call.
 
+Supported calls to source-visible synchronous local helpers bind arguments in
+a fresh function scope and track returned callbacks. A callback invoked through
+a parameter receives the same deletion and target checks as a direct call.
+Passing, storing, or returning that callback alone does not invoke it. Function
+aliases retain their definition identity; reassignment replaces the current
+binding. Definition-time defaults and supported literal argument unpacking
+participate in argument binding without turning unknown values into path proofs.
+
+Only proved live values can carry a temporary-child allowance across a supported
+call. Mutable outer bindings and closure captures do not inherit a stale safe
+path. A supported closure invocation reads its still-active lexical owner's
+current bindings as possible identities only. An escaped closure or unidentified
+owner reports incomplete analysis instead of reusing definition-time cell values.
+Returned values follow return/finally control flow and lose temporary ownership
+when their context ends. Recursive calls, unresolved helper identities, and
+exhausted call-analysis bounds cannot establish an allowance. Calls share the
+existing AST, traversal budget, and deadline. Generator and coroutine creation
+is not treated as synchronous execution of their bodies; this helper analysis
+does not model their later consumption.
+
 If extraction or analysis is incomplete, captured deletion names remain a
 blocking signal, including static `getattr` member names written with string
 escapes. This fallback does not assert that an unused capture was invoked;
