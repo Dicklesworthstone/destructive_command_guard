@@ -35624,6 +35624,45 @@ fn check_credential_write_fallback(
     None
 }
 
+/// Conservatively retain static reflective deletion names after analysis failed.
+///
+/// The caller has already masked comments, quoted data and non-executing
+/// heredocs. A completed Python scan still requires an actual invocation;
+/// this fallback cannot prove that a captured capability remains unused.
+fn python_reflective_deletion_fallback_hit(code: &str, has_os_import: bool) -> bool {
+    static GETTER: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\bgetattr\b").expect("getattr signal compiles"));
+    if !GETTER.is_match(code) {
+        return false;
+    }
+    static MEMBERS: LazyLock<RegexSet> = LazyLock::new(|| {
+        let member = |name: &str| {
+            // Match the same ASCII names when a static Python string uses
+            // hex, Unicode or octal escapes, or adjacent/added literals.
+            let letters: Vec<_> = name
+                .bytes()
+                .map(|byte| {
+                    format!(
+                        r"(?:{}|\\x(?i:{byte:02x})|\\u(?i:{byte:04x})|\\U(?i:{byte:08x})|\\{byte:03o})",
+                        char::from(byte)
+                    )
+                })
+                .collect();
+            format!(
+                r#"["']{}["']"#,
+                letters.join(r#"(?:["'](?:\s|\\\r?\n)*\+?(?:\s|\\\r?\n)*[rRuUfF]{0,2}["'])?"#)
+            )
+        };
+        RegexSet::new([
+            format!("(?:{}|{})", member("unlink"), member("rmdir")),
+            member("remove"),
+        ])
+        .expect("reflective Python deletion names compile")
+    });
+    let members = MEMBERS.matches(code);
+    members.matched(0) || has_os_import && members.matched(1)
+}
+
 fn fallback_pattern_hit(command: &str) -> bool {
     // Critical destructive patterns checked whenever high-fidelity embedded
     // code analysis is incomplete (timeout, parse failure, or bounded input
@@ -35798,7 +35837,9 @@ fn fallback_pattern_hit(command: &str) -> bool {
         regex::Regex::new(r"\.(?:\s|\\\r?\n)*remove\b")
             .expect("Python remove-member fallback compiles")
     });
-    PYTHON_REMOVE_MEMBER.is_match(check_target) && PYTHON_OS_IMPORT.is_match(check_target)
+    let has_os_import = PYTHON_OS_IMPORT.is_match(check_target);
+    PYTHON_REMOVE_MEMBER.is_match(check_target) && has_os_import
+        || python_reflective_deletion_fallback_hit(check_target, has_os_import)
 }
 
 /// [`check_fallback_patterns`] over the whole command, whose denial yields to
@@ -55865,6 +55906,9 @@ mod tests {
                 for body in [
                     "from pathlib import Path\np = Path('/etc/hosts')\nerase = p.unlink\nerase()",
                     "erase = unknown.unlink\nerase()",
+                    "from pathlib import Path\np = Path('/etc/hosts')\ngetattr(p, 'unlink')()",
+                    "from pathlib import Path\np = Path('/etc/hosts')\nerase = getattr(p, 'unl\\x69nk')\nerase()",
+                    "import os as operating_system\ngetattr(operating_system, 'remove')('/etc/hosts')",
                     "erase = unknown . \\\n rmdir\nerase()",
                     "from os import unlink as erase\nerase('/etc/hosts')",
                     "from os import stat, remove as erase\nerase('/etc/hosts')",
@@ -55890,6 +55934,43 @@ mod tests {
         }
 
         #[test]
+        fn python_reflective_fallback_tracks_static_names_without_broad_getter_denial() {
+            for code in [
+                "getattr(p, 'unlink')()",
+                "erase = getattr(p, 'rmdir')\nerase()",
+                r"getattr(p, 'unl\x69nk')()",
+                r"getattr(p, '\165\156\154\151\156\153')()",
+                r"getattr(p, '\u0075\u006e\u006c\u0069\u006e\u006b')()",
+                r"getattr(p, '\U00000075nlink')()",
+                "getter = getattr\nmember = 'unlink'\nerase = getter(p, member)\nerase()",
+                "getattr(p, 'un' 'link')()",
+                "getattr(p, 'un' + 'link')()",
+            ] {
+                assert!(
+                    python_reflective_deletion_fallback_hit(code, false),
+                    "reflective deletion must retain its incomplete-analysis signal: {code}"
+                );
+            }
+            for code in [
+                "getattr(p, 'name')",
+                "getattr(p, 'UNLINK')",
+                "getattribute(p, 'unlink')()",
+                "my_getattr(p, 'unlink')()",
+                "print('unlink')",
+                "getattr(items, 'remove')(item)",
+            ] {
+                assert!(
+                    !python_reflective_deletion_fallback_hit(code, false),
+                    "unrelated lookup must not acquire a deletion identity: {code}"
+                );
+            }
+            assert!(python_reflective_deletion_fallback_hit(
+                "getattr(operating_system, 'remove')(path)",
+                true
+            ));
+        }
+
+        #[test]
         fn python_path_alias_fallback_preserves_unrelated_operations_and_data_626() {
             let settings = heredoc_config_with_limits(crate::heredoc::ExtractionLimits {
                 max_body_bytes: 1024 * 1024,
@@ -55900,7 +55981,11 @@ mod tests {
             for command in [
                 "cat <<'PY'\nfrom os import unlink as erase\nerase('/etc/hosts')\nPY",
                 "cat <<'PY'\nerase = unknown.unlink\nerase()\nPY",
+                "cat <<'PY'\ngetattr(p, 'unlink')()\nPY",
                 "git commit -m 'guard captured p.unlink and os deletion imports'",
+                "git commit -m \"guard getattr(p, 'unlink') without running Python\"",
+                "python3 - <<'PY'\ngetattr(p, 'name')\nprint('ok')\nPY",
+                "python3 - <<'PY'\nitems = [1, 2]\ngetattr(items, 'remove')(1)\nPY",
                 "python3 - <<'PY'\nfrom os import stat as unlink\nprint('ok')\nPY",
                 "python3 - <<'PY'\nfrom os import (stat as remove, getcwd)\nprint('ok')\nPY",
                 "python3 - <<'PY'\nfrom project_helpers import remove as erase\nprint('ok')\nPY",

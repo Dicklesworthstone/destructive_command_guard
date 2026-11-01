@@ -1897,7 +1897,7 @@ fn find_matches_ast(
     // explicitly configured corpora authoritative: only registered rule IDs
     // participate, and the analysis shares the worker's remaining deadline.
     if language == ScriptLanguage::Python
-        && ["unlink", "remove", "rmdir"]
+        && ["unlink", "remove", "rmdir", "getattr"]
             .iter()
             .any(|name| code.contains(name))
     {

@@ -192,6 +192,20 @@ Conditional branches preserve a safety fact only when every reaching binding
 proves it. Loop assignments, shadowed parameters, and deferred function access
 to mutable outer paths cannot inherit a stale temporary-path allowance.
 
+Captured deletion functions also retain their identity through literal lists,
+tuples, dictionary values, and builtin `getattr` with a static deletion member.
+A finding requires an invocation: storing `p.unlink` or retrieving it alone
+does not delete a file. Exact literal selection can preserve a trusted captured
+method or function; unknown selection, merged identities, or mutation cannot
+provide a temporary-path allowance. A supported builtin `getattr` lookup on a
+known `Path` instance or `os` module follows the same target checks as direct
+attribute access. Other reflective access remains conservative.
+
+If extraction or analysis is incomplete, captured deletion names remain a
+blocking signal, including static `getattr` member names written with string
+escapes. This fallback does not assert that an unused capture was invoked;
+it cannot complete the proof that would establish that it stays unused.
+
 Normal completion, `break`, `continue`, `return`, and exceptions retain separate
 path states. Unreachable assignments after an exit cannot replace the state
 that actually reaches a later deletion. Loop `else` clauses apply only on

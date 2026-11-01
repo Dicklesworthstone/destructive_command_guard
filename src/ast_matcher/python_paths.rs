@@ -24,6 +24,13 @@ const OS_REMOVE: u8 = 2;
 const OS_RMDIR: u8 = 4;
 const PATH_UNLINK: u8 = 8;
 const PATH_RMDIR: u8 = 16;
+const DELETE_KINDS: u16 = 31;
+const MAY_OS: u16 = 1 << 5;
+const MAY_GETATTR: u16 = 1 << 6;
+const MAY_BUILTINS: u16 = 1 << 7;
+const MAX_CONTAINER_ITEMS: usize = 32;
+const MAX_CONTAINER_DEPTH: usize = 32;
+const MAX_KEY_BYTES: usize = 1024;
 
 fn rule(kind: u8) -> &'static str {
     match kind {
@@ -112,6 +119,8 @@ enum Symbol {
     TemporaryDirectory,
     Str,
     Print,
+    Getattr,
+    Builtins,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +130,79 @@ struct Delete {
     bound: bool,
     trusted: bool,
 }
+
+// Direct and contained capabilities are separate: storing a deletion does not
+// invoke it, and a container's own remove method is not os.remove. Joins only
+// union these finite masks; none of them carries a safe path or trusted object.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Capabilities {
+    direct: u16,
+    contained: u16,
+}
+
+impl Capabilities {
+    const fn union(self, other: Self) -> Self {
+        Self {
+            direct: self.direct | other.direct,
+            contained: self.contained | other.contained,
+        }
+    }
+
+    const fn any(self) -> bool {
+        self.direct != 0 || self.contained != 0
+    }
+
+    const fn selected(self) -> Self {
+        Self {
+            direct: self.contained,
+            // Retain descendants after an unresolved selection so another
+            // subscription cannot hide a nested deletion.
+            contained: self.contained,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ContainerKey {
+    Integer(i64),
+    Text(Arc<str>),
+}
+
+struct Container {
+    entries: Vec<(ContainerKey, Value)>,
+    sequence: bool,
+    precise: bool,
+    members: Capabilities,
+    depth: usize,
+    origins: Vec<usize>,
+    unknown_origins: bool,
+}
+
+impl std::fmt::Debug for Container {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Container")
+            .field("entries", &self.entries.len())
+            .field("precise", &self.precise)
+            .field("members", &self.members)
+            .field("depth", &self.depth)
+            .field("origins", &self.origins.len())
+            .field("unknown_origins", &self.unknown_origins)
+            .finish_non_exhaustive()
+    }
+}
+
+// Snapshots are shared by Arc and compare only by identity. Recursive
+// comparison of independently built shared graphs can amplify a short source
+// exponentially outside the AST budget. Distinct snapshots instead join to
+// their finite may-call summaries.
+impl PartialEq for Container {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for Container {}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum Value {
@@ -132,7 +214,8 @@ enum Value {
     Path(Path),
     Directory(Path),
     Symbol(Symbol),
-    PossibleOs,
+    Possible(Capabilities),
+    Container(Arc<Container>),
     Delete(Delete),
     Join(Path),
     PathRead,
@@ -162,35 +245,74 @@ impl Value {
         }
     }
 
-    fn lost(&self) -> Self {
+    fn capabilities(&self) -> Capabilities {
         match self {
-            Self::Delete(call) => Self::Delete(Delete {
-                kinds: call.kinds,
-                receiver: None,
-                bound: call.bound,
-                trusted: false,
-            }),
-            Self::Symbol(Symbol::Os) | Self::PossibleOs => Self::PossibleOs,
-            _ => Self::Unknown,
+            Self::Delete(call) => Capabilities {
+                direct: u16::from(call.kinds),
+                contained: 0,
+            },
+            Self::Symbol(symbol) => Capabilities {
+                direct: match symbol {
+                    Symbol::Os => MAY_OS,
+                    Symbol::Getattr => MAY_GETATTR,
+                    Symbol::Builtins => MAY_BUILTINS,
+                    _ => 0,
+                },
+                contained: 0,
+            },
+            Self::Possible(possible) => *possible,
+            Self::Container(container) => Capabilities {
+                direct: 0,
+                contained: container.members.direct | container.members.contained,
+            },
+            _ => Capabilities::default(),
+        }
+    }
+
+    fn possible(possible: Capabilities) -> Self {
+        if possible.any() {
+            Self::Possible(possible)
+        } else {
+            Self::Unknown
+        }
+    }
+
+    fn has_capability(&self) -> bool {
+        self.capabilities().any()
+    }
+
+    fn lost(&self) -> Self {
+        Self::possible(self.capabilities())
+    }
+
+    // Literal snapshots retain exact selections until an opaque effect or a
+    // join loses their identity. Only captured deletion functions may carry
+    // receiver proofs; paths and module objects do not gain one by storage.
+    fn indirect(&self) -> Self {
+        if let Self::Container(_) = self {
+            self.clone()
+        } else {
+            self.lost()
+        }
+    }
+
+    fn captured(&self) -> Self {
+        if matches!(self, Self::Delete(Delete { trusted: true, .. })) {
+            self.clone()
+        } else if *self != Self::Unknown && !self.has_capability() {
+            // A precise harmless slot must not fall back to another slot's
+            // possible deletion after the whole-body alias map coarsens.
+            Self::Scalar
+        } else {
+            self.indirect()
         }
     }
 
     fn merge(&self, other: &Self) -> Self {
         if self == other {
-            return self.clone();
-        }
-        match (self, other) {
-            (Self::Delete(left), Self::Delete(right)) => Self::Delete(Delete {
-                kinds: left.kinds | right.kinds,
-                receiver: None,
-                bound: left.bound && right.bound,
-                trusted: false,
-            }),
-            (Self::Delete(_), _) => self.lost(),
-            (_, Self::Delete(_)) => other.lost(),
-            (Self::Symbol(Symbol::Os) | Self::PossibleOs, _)
-            | (_, Self::Symbol(Symbol::Os) | Self::PossibleOs) => Self::PossibleOs,
-            _ => Self::Unknown,
+            self.clone()
+        } else {
+            Self::possible(self.capabilities().union(other.capabilities()))
         }
     }
 }
@@ -356,6 +478,7 @@ pub(super) struct Scan<'a> {
     deferred_depth: usize,
     deferred_findings: HashSet<(usize, usize, u8)>,
     outer_invalidated: bool,
+    container_writes: bool,
     seen: HashMap<(usize, usize, u8), bool>,
     existing: HashMap<(usize, usize, u8), usize>,
 }
@@ -392,6 +515,7 @@ impl<'a> Scan<'a> {
             deferred_depth: 0,
             deferred_findings: HashSet::new(),
             outer_invalidated: false,
+            container_writes: false,
             seen: HashMap::new(),
             existing,
         }
@@ -420,6 +544,7 @@ impl<'a> Scan<'a> {
         let mut imported = HashMap::new();
         let mut aliases = Vec::new();
         let mut trusted = true;
+        self.possible_binding("getattr", Value::Symbol(Symbol::Getattr).lost());
         // Whole-body identity proof includes later loop mutations and helper
         // bodies. Reflection/NFKC and shared-object writes revoke grants.
         for node in root.dfs() {
@@ -427,7 +552,8 @@ impl<'a> Scan<'a> {
             let kind = node.kind();
             if kind == "identifier"
                 && (!node.text().is_ascii()
-                    || super::python_reflective_name(node.text().as_ref())
+                    || node.text() != "getattr"
+                        && super::python_reflective_name(node.text().as_ref())
                     || matches!(node.text().as_ref(), "setattr" | "delattr" | "__import__"))
                 || matches!(
                     kind.as_ref(),
@@ -471,6 +597,7 @@ impl<'a> Scan<'a> {
                     .any(|part| matches!(part.kind().as_ref(), "attribute" | "subscript"))
                 {
                     trusted = false;
+                    self.container_writes = true;
                 }
             }
             if matches!(kind.as_ref(), "parameters" | "lambda_parameters") {
@@ -484,6 +611,7 @@ impl<'a> Scan<'a> {
                         .any(|part| matches!(part.kind().as_ref(), "attribute" | "subscript"))
                     {
                         trusted = false;
+                        self.container_writes = true;
                     }
                 }
             }
@@ -495,13 +623,27 @@ impl<'a> Scan<'a> {
         loop {
             let previous = self.possible.clone();
             for (target, value) in &aliases {
-                let value = self.capability(value, &previous, 0)?;
-                if matches!(value, Value::Delete(_) | Value::PossibleOs) {
-                    let mut names = HashSet::new();
-                    self.names(target, &mut names, 0)?;
-                    for name in names {
-                        self.possible_binding(&name, value.clone());
+                if target.kind() == "identifier"
+                    && value.kind() == "identifier"
+                    && let Some(alias) = previous.get(target.text().as_ref())
+                {
+                    // An item store through either name can change their
+                    // shared container. Propagate only contained may-facts;
+                    // this cannot establish a callable or a safe receiver.
+                    let contained = alias.capabilities().contained;
+                    if contained != 0 {
+                        self.possible_binding(
+                            value.text().as_ref(),
+                            Value::possible(Capabilities {
+                                direct: 0,
+                                contained,
+                            }),
+                        );
                     }
+                }
+                let value = self.capability(value, &previous, 0)?;
+                if value.has_capability() {
+                    self.possible_target(target, value, 0)?;
                 }
             }
             if self.possible == previous {
@@ -510,7 +652,11 @@ impl<'a> Scan<'a> {
         }
         let imported_names: HashSet<_> = imported.keys().cloned().collect();
         imported.retain(|name, value| !writes.contains(name) && value.immutable_import());
-        for (name, symbol) in [("str", Symbol::Str), ("print", Symbol::Print)] {
+        for (name, symbol) in [
+            ("str", Symbol::Str),
+            ("print", Symbol::Print),
+            ("getattr", Symbol::Getattr),
+        ] {
             if !writes.contains(name) && !imported_names.contains(name) {
                 imported.insert(name.to_string(), Value::Symbol(symbol));
             }
@@ -520,7 +666,9 @@ impl<'a> Scan<'a> {
             values: HashMap::new(),
             trusted,
         };
-        for name in ["str", "print"] {
+        env.values
+            .insert("getattr".to_string(), Value::Symbol(Symbol::Getattr).lost());
+        for name in ["str", "print", "getattr"] {
             if let Some(value) = self.immutable.get(name) {
                 env.values.insert(name.to_string(), value.clone());
             }
@@ -555,12 +703,76 @@ impl<'a> Scan<'a> {
     }
 
     fn possible_binding(&mut self, name: &str, value: Value) {
-        if matches!(value, Value::Delete(_) | Value::PossibleOs) {
+        if value.has_capability() {
             self.possible
                 .entry(name.to_string())
                 .and_modify(|old| *old = old.merge(&value))
                 .or_insert(value);
         }
+    }
+
+    fn possible_target<D: Doc>(
+        &mut self,
+        target: &Node<'_, D>,
+        value: Value,
+        depth: usize,
+    ) -> Result<(), MatchError> {
+        self.check(target, depth)?;
+        if target.kind() == "identifier" {
+            self.possible_binding(target.text().as_ref(), value);
+        } else if matches!(
+            target.kind().as_ref(),
+            "as_pattern_target" | "parenthesized_expression"
+        ) {
+            for child in named(target) {
+                self.possible_target(&child, value.clone(), depth + 1)?;
+            }
+        } else if destructuring(target.kind().as_ref()) {
+            let children: Vec<_> = named(target).collect();
+            let starred = children
+                .iter()
+                .any(|child| child.kind() == "list_splat_pattern");
+            for (index, child) in children.iter().enumerate() {
+                let value = if child.kind() == "list_splat_pattern" {
+                    value.lost()
+                } else {
+                    selected(
+                        value.clone(),
+                        (!starred)
+                            .then(|| i64::try_from(index).ok())
+                            .flatten()
+                            .map(ContainerKey::Integer),
+                        false,
+                    )
+                };
+                self.possible_target(child, value, depth + 1)?;
+            }
+        } else if target.kind() == "list_splat_pattern" {
+            for child in named(target) {
+                self.possible_target(&child, value.clone(), depth + 1)?;
+            }
+        } else if target.kind() == "subscript" {
+            // An explicit item store can introduce a capability absent from
+            // the original literal. Attribute/index effects are still visited
+            // by the normal assignment evaluator.
+            let mut base = target.field("value");
+            while let Some(node) = base {
+                self.check(&node, depth + 1)?;
+                if node.kind() == "identifier" {
+                    let possible = value.capabilities();
+                    self.possible_binding(
+                        node.text().as_ref(),
+                        Value::possible(Capabilities {
+                            direct: 0,
+                            contained: possible.direct | possible.contained,
+                        }),
+                    );
+                    break;
+                }
+                base = node.field("value").or_else(|| node.field("object"));
+            }
+        }
+        Ok(())
     }
 
     fn capability<D: Doc>(
@@ -591,12 +803,23 @@ impl<'a> Scan<'a> {
                     Value::Unknown
                 }
             }
-            "parenthesized_expression"
-            | "conditional_expression"
-            | "boolean_operator"
-            | "tuple"
-            | "list"
-            | "expression_list" => {
+            "list" | "tuple" | "expression_list" | "dictionary" => {
+                self.container(node, depth + 1, |scan, child, depth| {
+                    scan.capability(child, known, depth)
+                })?
+            }
+            "subscript" => self.subscription(node, depth + 1, |scan, child, depth| {
+                scan.capability(child, known, depth)
+            })?,
+            "call" => self.getattr_capability(node, known, depth + 1)?,
+            "parenthesized_expression" => {
+                let mut value = Value::Unknown;
+                for child in named(node) {
+                    value = self.capability(&child, known, depth + 1)?;
+                }
+                value
+            }
+            "conditional_expression" | "boolean_operator" => {
                 let mut value = Value::Unknown;
                 for child in named(node) {
                     value = value.merge(&self.capability(&child, known, depth + 1)?);
@@ -605,7 +828,154 @@ impl<'a> Scan<'a> {
             }
             _ => Value::Unknown,
         };
-        Ok(value.lost())
+        Ok(value.indirect())
+    }
+
+    fn container<'tree, D: Doc>(
+        &mut self,
+        node: &Node<'tree, D>,
+        depth: usize,
+        mut evaluate: impl FnMut(&mut Self, &Node<'tree, D>, usize) -> Result<Value, MatchError>,
+    ) -> Result<Value, MatchError> {
+        self.check(node, depth)?;
+        let sequence = node.kind() != "dictionary";
+        let mut container = Container {
+            entries: Vec::new(),
+            sequence,
+            precise: !self.container_writes,
+            members: Capabilities::default(),
+            depth: 1,
+            origins: Vec::new(),
+            unknown_origins: false,
+        };
+        let mut index = 0_i64;
+        for child in named(node) {
+            self.check(&child, depth + 1)?;
+            let (key, value) = if child.kind() == "pair" {
+                let key = if let Some(key) = child.field("key") {
+                    evaluate(self, &key, depth + 1)?;
+                    container_key(&key)
+                } else {
+                    None
+                };
+                let value = if let Some(value) = child.field("value") {
+                    evaluate(self, &value, depth + 1)?
+                } else {
+                    Value::Unknown
+                };
+                (key, value)
+            } else if matches!(child.kind().as_ref(), "list_splat" | "dictionary_splat") {
+                container.precise = false;
+                let mut value = Value::Unknown;
+                for operand in named(&child) {
+                    value = value.merge(&evaluate(self, &operand, depth + 1)?);
+                }
+                (None, value)
+            } else {
+                let value = evaluate(self, &child, depth + 1)?;
+                let key = sequence.then_some(ContainerKey::Integer(index));
+                index += 1;
+                (key, value)
+            };
+            let value = value.captured();
+            note_origins(&mut container, &value);
+            container.members = container.members.union(value.capabilities());
+            if let Some(key) = key {
+                if let Some((_, previous)) =
+                    container.entries.iter_mut().find(|(old, _)| *old == key)
+                {
+                    *previous = value;
+                } else if container.entries.len() < MAX_CONTAINER_ITEMS {
+                    container.entries.push((key, value));
+                } else {
+                    container.precise = false;
+                }
+            } else {
+                container.precise = false;
+            }
+        }
+        if container.depth > MAX_CONTAINER_DEPTH {
+            // A flat sequence of assignments can build a deep value graph
+            // without deep syntax. Keep its finite capability summary, while
+            // bounding snapshot destruction and retaining every element's effects.
+            return Ok(Value::possible(Capabilities {
+                direct: 0,
+                contained: container.members.direct | container.members.contained,
+            }));
+        }
+        Ok(Value::Container(Arc::new(container)))
+    }
+
+    fn subscription<'tree, D: Doc>(
+        &mut self,
+        node: &Node<'tree, D>,
+        depth: usize,
+        mut evaluate: impl FnMut(&mut Self, &Node<'tree, D>, usize) -> Result<Value, MatchError>,
+    ) -> Result<Value, MatchError> {
+        self.check(node, depth)?;
+        let object = if let Some(object) = node.field("value") {
+            evaluate(self, &object, depth + 1)?
+        } else {
+            Value::Unknown
+        };
+        let mut key = None;
+        let mut count = 0;
+        let mut slice = false;
+        for index in node.field_children("subscript") {
+            evaluate(self, &index, depth + 1)?;
+            count += 1;
+            key = container_key(&index);
+            slice = index.kind() == "slice";
+        }
+        Ok(selected(
+            object,
+            if count == 1 { key } else { None },
+            count == 1 && slice,
+        ))
+    }
+
+    fn getattr_capability<D: Doc>(
+        &mut self,
+        node: &Node<'_, D>,
+        known: &HashMap<String, Value>,
+        depth: usize,
+    ) -> Result<Value, MatchError> {
+        self.check(node, depth)?;
+        let Some(function) = node.field("function") else {
+            return Ok(Value::Unknown);
+        };
+        if self
+            .capability(&function, known, depth + 1)?
+            .capabilities()
+            .direct
+            & MAY_GETATTR
+            == 0
+        {
+            return Ok(Value::Unknown);
+        }
+        let Some(arguments) = node.field("arguments") else {
+            return Ok(Value::Unknown);
+        };
+        let arguments: Vec<_> = named(&arguments).collect();
+        if !(2..=3).contains(&arguments.len())
+            || arguments.iter().any(|argument| {
+                matches!(
+                    argument.kind().as_ref(),
+                    "keyword_argument" | "list_splat" | "dictionary_splat"
+                )
+            })
+        {
+            return Ok(Value::Unknown);
+        }
+        let object = self.capability(&arguments[0], known, depth + 1)?;
+        let member =
+            super::super::static_interpreter_literal(&arguments[1], ScriptLanguage::Python, 0);
+        let default = if let Some(default) = arguments.get(2) {
+            self.capability(default, known, depth + 1)?
+        } else {
+            Value::Unknown
+        };
+        Ok(reflected(object, member.as_deref(), default))
     }
 
     fn names<D: Doc>(
@@ -704,9 +1074,31 @@ impl<'a> Scan<'a> {
                 return self.bind(&children[0], value, env, depth + 1);
             }
         }
+        if destructuring(target.kind().as_ref()) {
+            let children: Vec<_> = named(target).collect();
+            let starred = children
+                .iter()
+                .any(|child| child.kind() == "list_splat_pattern");
+            for (index, child) in children.iter().enumerate() {
+                let value = if child.kind() == "list_splat_pattern" {
+                    value.lost()
+                } else {
+                    selected(
+                        value.clone(),
+                        (!starred)
+                            .then(|| i64::try_from(index).ok())
+                            .flatten()
+                            .map(ContainerKey::Integer),
+                        false,
+                    )
+                };
+                self.bind(child, value, env, depth + 1)?;
+            }
+            return Ok(());
+        }
         let mut names = HashSet::new();
         self.names(target, &mut names, depth)?;
-        let scalar = target.kind() == "identifier";
+        let scalar = matches!(target.kind().as_ref(), "identifier" | "list_splat_pattern");
         for name in names {
             let old = env.get(&name);
             env.values.insert(
@@ -731,7 +1123,7 @@ impl<'a> Scan<'a> {
         for (name, value) in &env.values {
             if self.immutable.get(name) == Some(value) && value.immutable_import() {
                 local.values.insert(name.clone(), value.clone());
-            } else if matches!(value, Value::Delete(_) | Value::PossibleOs) {
+            } else if value.has_capability() {
                 let possible = value.lost();
                 local
                     .values
@@ -832,7 +1224,7 @@ impl<'a> Scan<'a> {
                 if default
                     .as_ref()
                     .is_some_and(|default| default.range() == child.range())
-                    && matches!(value, Value::Delete(_) | Value::PossibleOs)
+                    && value.has_capability()
                     && let Some(name) = parameter.field("name")
                 {
                     defaults.insert(name.text().into_owned(), value.lost());
@@ -1173,14 +1565,22 @@ impl<'a> Scan<'a> {
                 };
                 for exit in exits.environments_mut() {
                     for value in exit.values.values_mut() {
-                        let path = match value {
-                            Value::Directory(path) => Some(&*path),
+                        let path = match &*value {
+                            Value::Directory(path) => Some(path),
                             Value::Delete(call) => call.receiver.as_ref(),
                             _ => value.path(),
                         };
-                        if path
-                            .and_then(Path::origin)
-                            .is_some_and(|origin| managed.contains(&origin))
+                        let expired_container = matches!(
+                            &*value,
+                            Value::Container(container)
+                                if !managed.is_empty()
+                                    && (container.unknown_origins
+                                        || container.origins.iter().any(|origin| managed.contains(origin)))
+                        );
+                        if expired_container
+                            || path
+                                .and_then(Path::origin)
+                                .is_some_and(|origin| managed.contains(&origin))
                         {
                             *value = value.lost();
                         }
@@ -1311,6 +1711,14 @@ impl<'a> Scan<'a> {
                     Value::Unknown
                 }
             }
+            "list" | "tuple" | "expression_list" | "dictionary" => {
+                self.container(node, depth + 1, |scan, child, depth| {
+                    scan.eval(child, env, depth)
+                })?
+            }
+            "subscript" => self.subscription(node, depth + 1, |scan, child, depth| {
+                scan.eval(child, env, depth)
+            })?,
             "attribute" => {
                 let object = if let Some(object) = node.field("object") {
                     self.eval(&object, env, depth + 1)?
@@ -1565,6 +1973,30 @@ impl<'a> Scan<'a> {
         let args = self.arguments(node, env, depth + 1)?;
         let plain = !args.uncertain && args.keywords.is_empty();
         let value = match function {
+            Value::Possible(possible) => {
+                let kinds = u8::try_from(possible.direct & DELETE_KINDS).unwrap_or_default();
+                if kinds != 0 {
+                    self.record(node, kinds, false);
+                }
+                let result = if possible.direct & MAY_GETATTR != 0 {
+                    reflected_arguments(&args)
+                } else {
+                    Value::Unknown
+                };
+                self.invalidate(env);
+                result
+            }
+            Value::Symbol(Symbol::Getattr) => {
+                if env.trusted
+                    && let Some(captured) = trusted_reflected_arguments(&args)
+                {
+                    captured
+                } else {
+                    let result = reflected_arguments(&args);
+                    self.invalidate(env);
+                    result
+                }
+            }
             Value::Delete(call) => {
                 let target = if call.bound {
                     call.receiver.as_ref()
@@ -1723,6 +2155,8 @@ fn import_values<D: Doc>(node: &Node<'_, D>) -> Vec<(String, Value)> {
                 (None, "os.path") | (Some("os"), "path") => Value::Symbol(Symbol::OsPath),
                 (None, "pathlib") => Value::Symbol(Symbol::Pathlib),
                 (None, "tempfile") => Value::Symbol(Symbol::Tempfile),
+                (None, "builtins") => Value::Symbol(Symbol::Builtins),
+                (Some("builtins"), "getattr") => Value::Symbol(Symbol::Getattr),
                 (Some("pathlib"), "Path" | "PosixPath") => Value::Symbol(Symbol::PathClass),
                 (Some("tempfile"), "mkdtemp") => Value::Symbol(Symbol::Mkdtemp),
                 (Some("tempfile"), "TemporaryDirectory") => {
@@ -1764,20 +2198,160 @@ fn deletion(kinds: u8, receiver: Option<Path>, bound: bool, trusted: bool) -> Va
     })
 }
 
+fn note_origins(container: &mut Container, value: &Value) {
+    let (origins, unknown): (&[usize], bool) = match value {
+        Value::Container(nested) => {
+            container.depth = container.depth.max(nested.depth + 1);
+            (&nested.origins, nested.unknown_origins)
+        }
+        Value::Delete(call) => {
+            if let Some(origin) = call.receiver.as_ref().and_then(Path::origin) {
+                if !container.origins.contains(&origin) {
+                    if container.origins.len() < MAX_CONTAINER_ITEMS {
+                        container.origins.push(origin);
+                    } else {
+                        container.unknown_origins = true;
+                    }
+                }
+            }
+            return;
+        }
+        _ => return,
+    };
+    container.unknown_origins |= unknown;
+    for origin in origins {
+        if !container.origins.contains(origin) {
+            if container.origins.len() < MAX_CONTAINER_ITEMS {
+                container.origins.push(*origin);
+            } else {
+                container.unknown_origins = true;
+            }
+        }
+    }
+}
+
+fn trusted_reflected_arguments(args: &Args) -> Option<Value> {
+    if args.uncertain || !args.keywords.is_empty() || !(2..=3).contains(&args.positional.len()) {
+        return None;
+    }
+    let Value::Text(Path::Literal(member)) = &args.positional[1] else {
+        return None;
+    };
+    let object = &args.positional[0];
+    if !matches!(
+        (object, member.as_ref()),
+        (Value::Path(_), "unlink" | "rmdir")
+            | (Value::Symbol(Symbol::Os), "unlink" | "remove" | "rmdir")
+    ) {
+        return None;
+    }
+    Some(attribute(object.clone(), member))
+}
+
+fn destructuring(kind: &str) -> bool {
+    matches!(
+        kind,
+        "tuple_pattern" | "list_pattern" | "pattern_list" | "tuple" | "list" | "expression_list"
+    )
+}
+
+fn container_key<D: Doc>(node: &Node<'_, D>) -> Option<ContainerKey> {
+    if node.text().len() > MAX_KEY_BYTES {
+        return None;
+    }
+    match node.kind().as_ref() {
+        "integer" | "unary_operator" => node
+            .text()
+            .replace('_', "")
+            .parse::<i64>()
+            .ok()
+            .map(ContainerKey::Integer),
+        "true" => Some(ContainerKey::Integer(1)),
+        "false" => Some(ContainerKey::Integer(0)),
+        "string" | "concatenated_string" => {
+            super::super::static_interpreter_literal(node, ScriptLanguage::Python, 0)
+                .map(|text| ContainerKey::Text(text.into()))
+        }
+        _ => None,
+    }
+}
+
+fn selected(object: Value, key: Option<ContainerKey>, slice: bool) -> Value {
+    let possible = object.capabilities();
+    if slice {
+        return Value::possible(Capabilities {
+            direct: 0,
+            contained: possible.contained,
+        });
+    }
+    if let Value::Container(container) = &object
+        && container.precise
+        && let Some(mut key) = key
+    {
+        if container.sequence
+            && let ContainerKey::Integer(index) = key
+            && index < 0
+        {
+            let Ok(length) = i64::try_from(container.entries.len()) else {
+                return Value::possible(possible.selected());
+            };
+            let Some(index) = length.checked_add(index) else {
+                return Value::Unknown;
+            };
+            key = ContainerKey::Integer(index);
+        }
+        return container
+            .entries
+            .iter()
+            .find(|(candidate, _)| *candidate == key)
+            .map_or(Value::Unknown, |(_, value)| value.captured());
+    }
+    Value::possible(possible.selected())
+}
+
+fn reflected(object: Value, member: Option<&str>, default: Value) -> Value {
+    let found = member.map_or(Value::Unknown, |member| attribute(object, member).lost());
+    found.merge(&default.indirect())
+}
+
+fn reflected_arguments(args: &Args) -> Value {
+    if args.uncertain || !args.keywords.is_empty() || !(2..=3).contains(&args.positional.len()) {
+        return Value::Unknown;
+    }
+    let member = match &args.positional[1] {
+        Value::Text(Path::Literal(member)) => Some(member.as_ref()),
+        _ => None,
+    };
+    reflected(
+        args.positional[0].clone(),
+        member,
+        args.positional.get(2).cloned().unwrap_or_default(),
+    )
+}
+
 fn attribute(object: Value, member: &str) -> Value {
     match (&object, member) {
-        // A control-flow join can contain either a module or a captured
-        // deletion. Losing the exact receiver must not erase os.remove's
-        // possible capability (unlike unlink/rmdir, remove is not a generic
-        // pathlib method and otherwise has no unresolved-receiver rule).
-        (Value::Delete(_), "remove") => deletion(OS_REMOVE, None, false, false),
-        (Value::Symbol(Symbol::Os) | Value::PossibleOs, "unlink" | "remove" | "rmdir") => {
+        (Value::Symbol(Symbol::Os), "unlink" | "remove" | "rmdir") => {
             let kind = match member {
                 "unlink" => OS_UNLINK,
                 "remove" => OS_REMOVE,
                 _ => OS_RMDIR,
             };
-            deletion(kind, None, false, object == Value::Symbol(Symbol::Os))
+            deletion(kind, None, false, true)
+        }
+        (Value::Possible(possible), "unlink" | "remove" | "rmdir")
+            if possible.direct & MAY_OS != 0 =>
+        {
+            let kind = match member {
+                "unlink" => OS_UNLINK,
+                "remove" => OS_REMOVE,
+                _ => OS_RMDIR,
+            };
+            deletion(kind, None, false, false)
+        }
+        (Value::Symbol(Symbol::Builtins), "getattr") => Value::Symbol(Symbol::Getattr),
+        (Value::Possible(possible), "getattr") if possible.direct & MAY_BUILTINS != 0 => {
+            Value::Symbol(Symbol::Getattr).lost()
         }
         (Value::Symbol(Symbol::Os), "path") => Value::Symbol(Symbol::OsPath),
         (Value::Symbol(Symbol::Os), "fspath") => Value::Symbol(Symbol::Str),
@@ -1875,6 +2449,24 @@ mod tests {
             expected,
             "source: {source}\nfindings: {matches:?}"
         );
+    }
+
+    #[test]
+    fn shared_container_graphs_keep_bounded_deletion_summaries() {
+        let mut source = String::from(
+            "from pathlib import Path\np = Path('/etc/hosts')\na = [p.unlink]\nb = [p.unlink]\n",
+        );
+        // The source remains linear although a recursive comparison of the
+        // two independently shared value graphs would expand exponentially.
+        for _ in 0..32 {
+            source.push_str("a = [a, a]\nb = [b, b]\n");
+        }
+        source.push_str("if choice:\n    selected = a\nelse:\n    selected = b\nselected");
+        for _ in 0..33 {
+            source.push_str("[0]");
+        }
+        source.push_str("()\n");
+        assert_blocked(&source, true);
     }
 
     #[test]
