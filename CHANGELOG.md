@@ -72,14 +72,19 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   loosens fail-closed behaviour. In a sample of the rows this change moved,
   160 went from deny to allow, 9 from allow to indeterminate and 2 from deny
   to indeterminate; those are counts from the sample, not totals. In a wider
-  synthetic comparison with 0.15.3, across about 40,000 heredoc forms, 851
-  that 0.15.3 denied are allowed here: 153 are the unquoted bodies in the next
-  entry, 76 hold commands that are allowed when typed plainly, and 622 cannot
-  run what they contain, because Python rejects the body or the text sits in
-  a JavaScript template literal with no `${}`. A `python` or `python2` body
-  with a backtick expression comes back `indeterminate`, because Python 2
-  evaluates it; 137 forms do. Dynamic execution in these bodies has a new
-  check, with limits; see Embedded code and heredocs (f9e87482).
+  synthetic comparison with 0.15.3, across about 40,000 heredoc forms, 847
+  that 0.15.3 denied are allowed here: 153 are 144 unquoted and 9 quoted
+  bodies whose 0.15.3 rule was `heredoc.shell:launcher-unverified` (the
+  unquoted ones are the next entry), 76 hold commands that are allowed when
+  typed plainly, and 618 cannot run what they contain, because Python rejects
+  the body or the text sits in a JavaScript template literal with no `${}`. A
+  `python` or `python2` body with a backtick expression comes back
+  `indeterminate`, because Python 2 evaluates it. Of the forms 0.15.3 denied,
+  138 come back `indeterminate`: 136 with a python receiver and 2 Node
+  bodies. Dynamic execution in these bodies has a new check, with limits; see
+  Embedded code and heredocs (f9e87482). The CHANGELOG.md in the v0.16.0 tag
+  gives the pre-final (o3s) counts; these are the counts for the released
+  build.
 - **A substitution in an unquoted heredoc body is judged as the command inside
   it.** In `git commit -F - <<EOF` or `cat <<EOF`, a `$(…)` in the body really
   runs. 0.15.3 denied every such body as `heredoc.shell:launcher-unverified`.
@@ -397,7 +402,7 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   an interpreter with no terminator line, when a candidate word is present. PHP
   and Go have no reader, so those bodies keep
   their 0.15.3 shell reading of `eval`. In the synthetic comparison above, this
-  denies again 180 forms that run and that the change to quoted heredocs would
+  denies again 181 forms that run and that the change to quoted heredocs would
   otherwise have allowed. It scans what it can reach and no more: it runs only
   on quoted heredocs dcg has proved go to the interpreter, not on unquoted
   heredocs and not on inline `node -e` or `python3 -c`. Of 657 synthetic forms
@@ -757,6 +762,11 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   From a POSIX shell these, with preceding host switches, are now read as
   `/c` and `/k` and the payload is judged as Cmd; native Cmd and PowerShell
   are unchanged, and unknown doubled switches still fail closed (0555a06f).
+- **No native ARM64 Windows build in this release.** v0.16.0 publishes no
+  `dcg-aarch64-pc-windows-msvc.zip`. ARM64 Windows gets the x64 build under
+  emulation until a release with a native ARM64 run: `install.ps1`, which
+  `dcg update` also runs on Windows, falls back to the x64 zip with a
+  warning. v0.15.3 had a native ARM64 zip.
 
 ### CLI
 
@@ -822,6 +832,11 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   them, and the fork-bomb rule no longer exhausts its search on long programs
   full of function calls. The 256 KiB source cap still bounds the work
   (fb60af11, ca1b3dcb, 50c3580d, eff12d30, b6f4a498, 1475a05f).
+- **The guardrails preset has a slower tail than in 0.15.3.** With the
+  careful_company guardrails preset, p99 hook latency rose about 12% (143 →
+  161 ms) and p95 about 9%. Median and total fell (median 54.5 → 48.8 ms).
+  The default packs are faster at every percentile; the slower tail is long
+  commands that are allowed anyway, mostly multi-line heredoc bodies.
 
 ### Command history and logs
 
@@ -864,6 +879,15 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   When GitHub's API returned minified JSON, `install.sh` took the release
   body for the version. It now extracts `tag_name` and requires a
   version-shaped tag (37874bd2).
+- **v0.16.0 ships Minisign signatures only (key 69B3955C8D2E62A8); there are
+  no `.sigstore.json` bundles this release.** The installers verify Minisign
+  when the `minisign` tool is on PATH (`--require-minisign` or
+  `-RequireMinisign` makes it required) and skip the missing bundle with a
+  warning. The SHA-256 check stays mandatory.
+- **Canary.** Before the fleet roll, v0.16.0 ran as the live hook on one busy
+  agent host for 60 min (80 commands): no hook errors, and replaying those
+  commands through 0.15.3 found no command that 0.15.3 denied and 0.16.0
+  allowed.
 
 ### Dependencies
 
