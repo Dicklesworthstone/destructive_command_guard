@@ -505,6 +505,27 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
 
 ### False positives fixed
 
+- **No longer blocked: the four replayed commands 0.15.3 denied.** The
+  replay of real agent commands (see Known issues) found four that 0.15.3
+  blocked and 0.16.0 allows. Each is a false positive fixed since 0.15.3,
+  and a destructive neighbour of each is still denied by both versions:
+  - A dynamic `-C` path followed by a literal subcommand other than
+    `branch`, such as `git -C $dir apply $S/x.patch`, was denied as
+    `core.git:branch-dynamic-token`. `git -C $dir branch -D $name` and
+    `git -C $dir reset --hard` stay denied (#597, 5c060064).
+  - An append to a dynamic path, such as `cargo test 2>>$S/test.err` or
+    `>>"$LOG"`, was read as a truncating redirect and denied as
+    `core.filesystem:redirect-truncate-dynamic-path`. `2>$S/test.err` stays
+    denied (#575, f6fdf447).
+  - A `python3 - <<'EOF'` body whose string literals hold Rust code, with
+    an apostrophe in a comment and a `collect::<Vec<_>>()` call, was read
+    with the shell's quoting once any pack keyword appeared in it, and the
+    `>(` was denied as `heredoc.posix:process-substitution`. The same body
+    given to `bash`, and a real `>(rm -rf …)`, stay denied (#560, #591,
+    db83e37a, 9b55141b).
+  - An `umount` with no `-f` whose mount path contains `-nfs`, seen as the
+    quoted argument of `dcg explain`, was denied as `system.disk:umount-force`.
+    `umount -f` stays denied (#548, f6fdf447, 644aa608).
 - **`unlink`, `mkfs`, `mkswap` and `wipefs` judge the program that runs
   (#550, #600).** These rules matched the tool's name anywhere on the line,
   so `ob sync-unlink`, `foo --unlink`, `find . -name unlink`,
@@ -856,13 +877,14 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
 
 - **Replay of real agent commands.** 8,000 recent shell commands from real
   agent sessions were replayed through `dcg test` against 0.15.3 and this
-  release on an idle host. 0.16.0 blocks 12 that 0.15.3 allowed (0.15%) and
-  allows 4 that 0.15.3 blocked; the candidates held back on 2026-10-14 and
-  2026-10-23 newly blocked 66 and 63 of 8,000. Of the 12, two are intended
-  (a PowerShell script block read from stdin over ssh, and
+  release on an idle host. 0.16.0 blocks 11 that 0.15.3 allowed (0.14%) and
+  allows 4 that 0.15.3 blocked, all four false positives fixed since 0.15.3
+  (listed under False positives fixed); the candidates held back on
+  2026-10-14 and 2026-10-23 newly blocked 66 and 63 of 8,000. Of the 11, two
+  are intended (a PowerShell script block read from stdin over ssh, and
   `-EncodedCommand` taken from a variable), one is arguable (a `>` with a
   dynamic target inside an ssh `bash -c` loop), one is an ssh script with an
-  unterminated backtick that the remote shell cannot parse either, and eight
+  unterminated backtick that the remote shell cannot parse either, and seven
   are false positives, listed below. On a heavily loaded host, slow
   evaluations can also come back `indeterminate`, which blocks.
 - **A Python heredoc that runs source it read at run time.** A body that
