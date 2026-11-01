@@ -9355,7 +9355,49 @@ pub(crate) fn mask_dynamic_source_read_stdin(command: &str) -> Cow<'_, str> {
 /// an allow to Indeterminate, so it asks for less proof than an exemption does.
 #[must_use]
 pub(crate) fn unterminated_stdin_has_dynamic_source(command: &str) -> bool {
-    let limits = ExtractionLimits::structural_scan();
+    quoted_stdin_has_dynamic_source(command, &ExtractionLimits::structural_scan(), |body| {
+        matches!(body, Some(SkipReason::UnterminatedHeredoc { .. }))
+    })
+}
+
+/// Whether a quoted heredoc to a non-shell interpreter whose body extraction
+/// did not read gives that interpreter a dynamic execution candidate.
+///
+/// Such a body is masked from the outer shell's POSIX `eval` reading as inert
+/// interpreter input (#544), and its own reader never ran, so nothing judged it:
+/// `perl - <<'EOF'` with 10,000 lines of `1;` and then `eval $x;` was ALLOWED,
+/// where 0.15.3 denied it through that shell reading. A body is unread when
+/// extracting it under the evaluation's own `limits` stops early: past the line
+/// or byte cap, or malformed. A reason that names no body, the heredoc count cap
+/// or the clock, counts every such heredoc (`any_body`). The candidates are the
+/// reader's own pre-check, so this and the reader cannot drift apart. Like the
+/// unterminated case, the answer only moves an allow to Indeterminate.
+#[must_use]
+pub(crate) fn unread_stdin_has_dynamic_source(
+    command: &str,
+    limits: &ExtractionLimits,
+    any_body: bool,
+) -> bool {
+    let limits = ExtractionLimits {
+        timeout_ms: limits
+            .timeout_ms
+            .max(ExtractionLimits::structural_scan().timeout_ms),
+        ..*limits
+    };
+    quoted_stdin_has_dynamic_source(command, &limits, |body| {
+        any_body || body.is_some_and(SkipReason::stopped_early)
+    })
+}
+
+/// The quoted heredocs to a non-shell interpreter whose extraction under
+/// `limits` gives `unread` (`None` for a body that was extracted, else the
+/// reason it was not), checked for a dynamic execution candidate in the text
+/// from the body to the end of the command.
+fn quoted_stdin_has_dynamic_source(
+    command: &str,
+    limits: &ExtractionLimits,
+    unread: impl Fn(Option<&SkipReason>) -> bool,
+) -> bool {
     let timeout = Duration::from_millis(limits.timeout_ms);
     HEREDOC_EXTRACTOR.captures_iter(command).any(|cap| {
         let (Some(operator), Some(word)) = (cap.get(0), cap.get(2)) else {
@@ -9378,18 +9420,19 @@ pub(crate) fn unterminated_stdin_has_dynamic_source(command: &str) -> bool {
         };
         if !word.as_str().contains(['\'', '"', '\\'])
             || command.as_bytes()[..operator.start()].last() == Some(&b'<')
-            || !matches!(
+            || !unread(
                 extract_heredoc_body(
                     command,
                     line_end,
                     delimiter,
                     heredoc_type,
                     false,
-                    &limits,
+                    limits,
                     Instant::now(),
                     timeout,
-                ),
-                Err(SkipReason::UnterminatedHeredoc { .. })
+                )
+                .err()
+                .as_ref(),
             )
         {
             return false;

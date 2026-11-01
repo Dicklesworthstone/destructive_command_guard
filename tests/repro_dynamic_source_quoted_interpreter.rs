@@ -339,6 +339,252 @@ fn a_heredoc_with_no_terminator_is_undecided_if_it_can_run_dynamic_source() {
     }
 }
 
+/// The verdict a hook client gets: hook JSON on stdin, a fresh HOME whose dcg
+/// config is `config`, and `allow` when dcg prints nothing. A deny is reported
+/// by its rule id. The hook clock is raised because these rows assert
+/// semantics; the 1000 ms default is measured by the timing harness.
+fn hook_verdict(command: &str, config: &str) -> String {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(home.join(".config/dcg")).unwrap();
+    std::fs::write(
+        home.join(".config/dcg/config.toml"),
+        format!("[general]\nhook_timeout_ms = 10000\n{config}"),
+    )
+    .unwrap();
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dcg"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("TMPDIR", temp.path())
+        .env("DCG_HISTORY_DISABLED", "1")
+        .env("DCG_AST_TIMEOUT_MS", "5000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("dcg starts");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    if text.trim().is_empty() {
+        return "allow".to_string();
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(text.trim()).unwrap_or_else(|error| panic!("{error}: {output:?}"));
+    let spec = &value["hookSpecificOutput"];
+    match spec["permissionDecision"].as_str() {
+        Some("deny") => spec["permissionDecisionReason"]
+            .as_str()
+            .unwrap_or_default()
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Rule: "))
+            .unwrap_or("deny")
+            .to_string(),
+        other => other.unwrap_or("?").to_string(),
+    }
+}
+
+/// A body extraction does not read, past the line cap (`max_body_lines`, 10,000
+/// by default) or the heredoc count cap, is masked from the shell's `eval`
+/// reading as interpreter input and has no reader of its own. A call on
+/// unreadable source there used to be allowed: pad the body to 10,001 lines,
+/// then `eval $x`. It is now undecided, which a hook client with a review
+/// prompt asks about. A body there with no dynamic source candidate stays
+/// allowed, and the same call within the caps is still read and denied. Where
+/// the call sits does not matter: the check reads the whole raw body, so a
+/// call on line 10,001 and a call on line 1 are both caught. Past the count
+/// cap the mask is off, so the shell's `eval` reading still denies the Perl
+/// and JavaScript calls. The byte cap (`max_body_bytes`) is checked on the
+/// whole command, and past it the bounded fallback still reads the body, so a
+/// call there is denied wherever it is. A body inside both caps but past the
+/// reader's own 256 KiB limit (the hook's envelope and command limits raised
+/// so it gets that far) is never allowed either. Every row is checked before
+/// the assertion, so a failure lists all the rows that moved.
+#[test]
+fn a_call_on_unreadable_source_in_a_body_past_a_size_cap_is_never_allowed() {
+    const BYTE_CAP: &str = "[heredoc]\nmax_body_bytes = 4096\n";
+    const LARGE_INPUT: &str = "max_hook_input_bytes = 4194304\nmax_command_bytes = 4194304\n";
+    const NOT_ALLOW: &str = "anything but allow";
+    const SHELL_EVAL: &str = "heredoc.posix:eval-dynamic";
+    let mut moved = Vec::new();
+    for (receiver, call, rule, comment, past_count_cap) in [
+        (
+            "perl -",
+            "eval $x;",
+            "heredoc.perl:dynamic_source",
+            "#",
+            SHELL_EVAL,
+        ),
+        (
+            "python3 -",
+            "exec(x)",
+            "heredoc.python:dynamic_source",
+            "#",
+            "ask",
+        ),
+        (
+            "node -",
+            "eval(x);",
+            "heredoc.javascript:dynamic_source",
+            "//",
+            SHELL_EVAL,
+        ),
+        (
+            "ruby -",
+            "eval x",
+            "heredoc.ruby:dynamic_source",
+            "#",
+            "ask",
+        ),
+    ] {
+        let filler = |lines: usize| vec!["1;"; lines].join("\n");
+        // 5,000 lines of about 64 bytes: past 256 KiB, inside 1 MiB and 10,000 lines.
+        let wide_line = format!("1; {comment} {}", "a".repeat(58));
+        let wide = |lines: usize| vec![wide_line.as_str(); lines].join("\n");
+        let pads = (0..10).fold(String::new(), |pads, n| {
+            pads + &format!("cat <<'P{n}'\nx\nP{n}\n")
+        });
+        for (row, command, config, expected) in [
+            (
+                "at the line cap, call at the start of a line",
+                heredoc(receiver, &format!("{}\n{call}", filler(9_999))),
+                "",
+                rule,
+            ),
+            (
+                "at the line cap, call after `1; `",
+                heredoc(receiver, &format!("{}\n1; {call}", filler(9_999))),
+                "",
+                rule,
+            ),
+            (
+                "past the line cap, call at the start of a line",
+                heredoc(receiver, &format!("{}\n{call}", filler(10_000))),
+                "",
+                "ask",
+            ),
+            (
+                "past the line cap, call after `1; `",
+                heredoc(receiver, &format!("{}\n1; {call}", filler(10_000))),
+                "",
+                "ask",
+            ),
+            (
+                "past the line cap, call on line 1",
+                heredoc(receiver, &format!("{call}\n{}", filler(10_000))),
+                "",
+                "ask",
+            ),
+            (
+                "past the line cap, call after `1; ` on line 1",
+                heredoc(receiver, &format!("1; {call}\n{}", filler(10_000))),
+                "",
+                "ask",
+            ),
+            (
+                "past the line cap, no call",
+                heredoc(receiver, &filler(10_001)),
+                "",
+                "allow",
+            ),
+            (
+                "at the byte cap, call at the start of a line",
+                heredoc(receiver, &format!("{}\n{call}", filler(1_300))),
+                BYTE_CAP,
+                rule,
+            ),
+            (
+                "at the byte cap, call after `1; `",
+                heredoc(receiver, &format!("{}\n1; {call}", filler(1_300))),
+                BYTE_CAP,
+                rule,
+            ),
+            (
+                "past the byte cap, call at the start of a line",
+                heredoc(receiver, &format!("{}\n{call}", filler(2_000))),
+                BYTE_CAP,
+                rule,
+            ),
+            (
+                "past the byte cap, call after `1; `",
+                heredoc(receiver, &format!("{}\n1; {call}", filler(2_000))),
+                BYTE_CAP,
+                rule,
+            ),
+            (
+                "past the byte cap, call on line 1",
+                heredoc(receiver, &format!("{call}\n{}", filler(2_000))),
+                BYTE_CAP,
+                rule,
+            ),
+            (
+                "past the byte cap, call after `1; ` on line 1",
+                heredoc(receiver, &format!("1; {call}\n{}", filler(2_000))),
+                BYTE_CAP,
+                rule,
+            ),
+            (
+                "past the byte cap, no call",
+                heredoc(receiver, &filler(2_000)),
+                BYTE_CAP,
+                "allow",
+            ),
+            (
+                "past the reader's limit, call on the last line",
+                heredoc(receiver, &format!("{}\n{call}", wide(5_000))),
+                LARGE_INPUT,
+                NOT_ALLOW,
+            ),
+            (
+                "past the reader's limit, call after `1; ` on the last line",
+                heredoc(receiver, &format!("{}\n1; {call}", wide(5_000))),
+                LARGE_INPUT,
+                NOT_ALLOW,
+            ),
+            (
+                "past the reader's limit, call on line 1",
+                heredoc(receiver, &format!("{call}\n{}", wide(5_000))),
+                LARGE_INPUT,
+                NOT_ALLOW,
+            ),
+            (
+                "past the heredoc count cap, call",
+                format!("{pads}{}", heredoc(receiver, call)),
+                "",
+                past_count_cap,
+            ),
+            (
+                "past the heredoc count cap, no call",
+                format!("{pads}{}", heredoc(receiver, "1;")),
+                "",
+                "allow",
+            ),
+        ] {
+            let got = hook_verdict(&command, config);
+            let held = if expected == NOT_ALLOW {
+                got != "allow"
+            } else {
+                got == expected
+            };
+            if !held {
+                moved.push(format!("{receiver}: {row}: {got}, expected {expected}"));
+            }
+        }
+    }
+    assert_eq!(moved, Vec::<String>::new());
+}
+
 #[test]
 fn nesting_at_any_depth_ends_in_a_verdict() {
     let open = "(".repeat(30_000);

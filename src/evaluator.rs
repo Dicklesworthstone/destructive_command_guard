@@ -34393,6 +34393,14 @@ fn evaluate_heredoc(
                 return unreadable_embedded_code_verdict(context, first_allowlist_hit);
             }
 
+            // Asked after every deny above, so a caller with no evaluation
+            // scope still sees those first.
+            if let Some(undecided) =
+                unread_stdin_verdict(command, &reasons, &context.heredoc_settings.limits)
+            {
+                return Some(undecided);
+            }
+
             return None;
         }
         ExtractionResult::Partial { extracted, skipped } => {
@@ -35058,6 +35066,11 @@ fn evaluate_heredoc(
     if let Some(undecided) = unterminated_stdin_verdict(command, &skipped) {
         return Some(undecided);
     }
+    if let Some(undecided) =
+        unread_stdin_verdict(command, &skipped, &context.heredoc_settings.limits)
+    {
+        return Some(undecided);
+    }
 
     // Every backstop has had its say and none proved a deny, but a body the
     // AST matcher never finished reading is not a clean body: answering `None`
@@ -35454,6 +35467,33 @@ fn unterminated_stdin_verdict(command: &str, reasons: &[SkipReason]) -> Option<E
         && !crate::packs::regex_engine::record_incomplete_analysis(
             "unterminated_interpreter_stdin",
             &"a quoted interpreter heredoc with no terminator line",
+        ))
+    .then(EvaluationResult::indeterminate_due_to_budget)
+}
+
+/// A quoted interpreter heredoc that extraction stopped short of reading, past
+/// a size, line or count cap, the clock, or malformed, has no reader, and its
+/// outer shell reading is masked as interpreter input. If it can run dynamic
+/// source it is recorded like a reading that could not finish: a positive
+/// finding still denies, and an allow becomes Indeterminate. Before this, such
+/// a body failed open: 10,000 lines of `1;` and then `eval $x;` was allowed.
+fn unread_stdin_verdict(
+    command: &str,
+    reasons: &[SkipReason],
+    limits: &crate::heredoc::ExtractionLimits,
+) -> Option<EvaluationResult> {
+    // The count cap and the clock do not say which body went unread.
+    let any_body = reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            SkipReason::ExceededHeredocLimit { .. } | SkipReason::Timeout { .. }
+        )
+    });
+    (reasons.iter().any(SkipReason::stopped_early)
+        && crate::heredoc::unread_stdin_has_dynamic_source(command, limits, any_body)
+        && !crate::packs::regex_engine::record_incomplete_analysis(
+            "unread_interpreter_stdin",
+            &"a quoted interpreter heredoc that extraction did not read",
         ))
     .then(EvaluationResult::indeterminate_due_to_budget)
 }
