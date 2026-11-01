@@ -1,5 +1,13 @@
 # AGENTS.md — dcg (Destructive Command Guard)
 
+## Permanent CI and automation policy: DSR only
+
+**Never use GitHub Actions for any purpose in this project.** This includes CI, tests, builds, releases, deployments, scheduled jobs, and other automation, on GitHub-hosted runners or self-hosted runners registered with Actions. Do not enable, dispatch, rerun, or wait for Actions, and do not treat Actions results as verification or release gates.
+
+Use **DSR ([Dicklesworthstone/doodlestein_self_releaser](https://github.com/Dicklesworthstone/doodlestein_self_releaser))** directly on its configured hosts instead. DSR is the primary execution path, not a fallback after an Actions outage. If DSR configuration or capacity is missing, report or repair that path within the authorized scope; never fall back to Actions or change its budget to get work running.
+
+Workflow YAML may be retained as input to local DSR/`act` execution where this project's existing rules allow it; that does not authorize execution by the GitHub Actions service. Preserve required checks, artifact/signing contracts, and unrelated instructions. This permanent policy supersedes any historical Actions, re-enable-after-billing, or Actions-first fallback guidance below.
+
 > Guidelines for AI coding agents working in this Rust codebase.
 
 ---
@@ -790,6 +798,8 @@ Use these schemas for:
 
 ## CI/CD Pipeline
 
+Execute these verification lanes through DSR. Trigger labels below describe the legacy workload mapping, not permission to run the GitHub Actions service.
+
 ### Jobs Overview
 
 | Job | Trigger | Purpose | Blocking |
@@ -892,10 +902,8 @@ Automated dependency updates configured in `.github/dependabot.yml`:
 
 When fixes are ready for release, follow this process:
 
-The steps below describe the normal GitHub Actions path. If Actions cannot run
-or a native Windows artifact must be built locally, the more detailed
-**Local/DSR Release and Windows Deployment Runbook** near the end of this file
-is authoritative.
+The **Local/DSR Release and Windows Deployment Runbook** near the end of this file
+is the authoritative release path for every release. Never use GitHub Actions.
 
 ### 1. Verify CI Passes Locally
 
@@ -929,24 +937,19 @@ patch version instead of moving the tag or replacing signed assets.
 - **Minor** (0.2.x -> 0.3.0): New features, backward compatible
 - **Major** (0.x -> 1.0): Breaking changes
 
-### 4. Push and Trigger Release
+### 4. Push and Release Through DSR
 
 ```bash
 git push origin main
 git push origin main:master  # Keep master in sync
 ```
 
-The `release-automation.yml` workflow will:
-1. Detect version change in `Cargo.toml`
-2. Create an annotated git tag (e.g., `v0.2.13`)
-3. Push the tag, which triggers `dist.yml`
-
-The `dist.yml` workflow will:
-1. Run tests and clippy
-2. Build binaries for all platforms (Linux x86/ARM, macOS Intel/Apple Silicon, Windows)
-3. Create `.tar.xz` archives with SHA256 checksums
-4. Sign artifacts with Sigstore (cosign) - creates `.sigstore.json` bundles
-5. Upload everything to GitHub Releases
+Use DSR's direct build and authorized release stages to create the version tag,
+build the complete target matrix, package archives, generate SHA256 checksums,
+produce the required signatures, and publish to GitHub Releases. Preserve the
+artifact and signing contracts below; never use Actions OIDC or dispatch Actions.
+If the DSR signing path cannot meet a contract, report that blocker rather than
+weakening verification or using GitHub Actions.
 
 ### 5. Verify Release
 
@@ -966,8 +969,8 @@ Expected assets per release:
 ### Troubleshooting Failed Releases
 
 If CI fails:
-1. Check workflow run: `gh run list --workflow=dist.yml --limit=5`
-2. View failed job: `gh run view <run-id>`
+1. Inspect DSR status and the failed quality/build receipt.
+2. Read the corresponding DSR host/job logs; do not inspect Actions as the verification gate.
 3. Fix issues locally, commit, and push again
 4. If no public tag or release exists yet, retry the same version; otherwise
    create a new patch release. Never force-move a public release tag.
@@ -1421,9 +1424,7 @@ Treat cass as a way to avoid re-solving problems other agents already handled.
 
 ## Local/DSR Release and Windows Deployment Runbook
 
-Use this fallback only when GitHub Actions cannot perform the release, when a
-native-host build is explicitly required, or when the user directs you to use
-DSR. It refines the shorter release checklist above. Do not jump straight to
+Use this DSR path for every release. It refines the shorter release checklist above. Do not jump straight to
 `dsr fallback`: keep source freezing, build, packaging, signing, publication,
 and public verification as separately inspectable stages.
 
@@ -1438,8 +1439,8 @@ and public verification as separately inspectable stages.
    requires regenerating and reverifying it.
 3. **Integrity is not authenticity.** SHA256 is mandatory, but it does not
    authenticate the publisher. Manual releases require the DSR minisign trust
-   path and the pinned local-release cosign trust path. Workflow releases use
-   GitHub Actions OIDC for Sigstore.
+   path and the pinned local-release cosign trust path. Do not use GitHub
+   Actions OIDC; preserve the pinned local signing and verification contract.
 4. **No destructive synchronization or cleanup.** Assume an automatic source
    mirror may delete files until its dry-run proves otherwise. Never bypass dcg
    to clean a checkout, output directory, key copy, or failed release. Rule 1
@@ -1451,14 +1452,14 @@ and public verification as separately inspectable stages.
 
 ### 1. Decide the Path and Freeze the Source
 
-First inspect Actions rather than waiting blindly:
+Inspect DSR status and host readiness, not Actions:
 
 ```bash
-gh run list --limit 20
-dsr check Dicklesworthstone/destructive_command_guard
+dsr status
+dsr health all
 ```
 
-If the manual path is justified, run all release gates *before* tagging:
+Run all release gates through the DSR/local path *before* tagging:
 
 ```bash
 cargo fmt --check
@@ -1718,9 +1719,9 @@ asset and never replace an asset behind an existing public URL. If published
 bytes are wrong, withdraw the bad release as directed by the user and issue a
 new patch version.
 
-If a local release is now authoritative, inspect queued GitHub workflows. Cancel
-only `dist` / release-automation runs that could race to create or replace the
-same release. Do not cancel unrelated CI, coverage, or benchmark runs.
+DSR is always the authoritative release path. Do not start GitHub workflows.
+If an existing Actions run could race with publication, report it and obtain
+specific authorization before changing or cancelling remote runs.
 
 ### 7. Verify the Published Release From Scratch
 
