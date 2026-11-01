@@ -201,6 +201,21 @@ provide a temporary-path allowance. A supported builtin `getattr` lookup on a
 known `Path` instance or `os` module follows the same target checks as direct
 attribute access. Other reflective access remains conservative.
 
+Literal-container `get` and `pop` operations can return captured deletion
+functions; calling the lookup itself is not a deletion invocation.
+`append`, `extend`, and `update` preserve possible stored callbacks through
+aliases, captured methods, and supported literal argument unpacking.
+A proved lookup can retain the selected immutable callback's path proof.
+A `pop` also invalidates the receiver's earlier contents, so later reads
+through aliases, captured selectors, subscriptions, or unpacking cannot reuse
+a stale safe selection. Mutation effects merge across branches and executed
+comprehensions; unused deferred bodies do not mutate the caller's facts.
+
+Unknown keys, potentially active hashing or equality, unknown iterables, and
+uncertain arguments cannot establish a cleanup allowance. Selector-return
+depth is bounded separately from deletion invocation: exceeding that bound
+reports incomplete analysis instead of inventing a destructive call.
+
 If extraction or analysis is incomplete, captured deletion names remain a
 blocking signal, including static `getattr` member names written with string
 escapes. This fallback does not assert that an unused capture was invoked;

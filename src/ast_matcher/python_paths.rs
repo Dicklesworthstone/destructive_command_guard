@@ -28,6 +28,16 @@ const DELETE_KINDS: u16 = 31;
 const MAY_OS: u16 = 1 << 5;
 const MAY_GETATTR: u16 = 1 << 6;
 const MAY_BUILTINS: u16 = 1 << 7;
+const MAY_GET: u16 = 1 << 8;
+const MAY_POP: u16 = 1 << 9;
+const MAY_APPEND: u16 = 1 << 10;
+const MAY_EXTEND: u16 = 1 << 11;
+const MAY_UPDATE: u16 = 1 << 12;
+const MAY_LIST: u16 = 1 << 13;
+const MAY_DICT: u16 = 1 << 14;
+const MAY_SELECT: u16 = MAY_GET | MAY_POP;
+const MAY_MUTATE: u16 = MAY_POP | MAY_APPEND | MAY_EXTEND | MAY_UPDATE;
+const MAY_CONTAINER: u16 = MAY_LIST | MAY_DICT;
 const MAX_CONTAINER_ITEMS: usize = 32;
 const MAX_CONTAINER_DEPTH: usize = 32;
 const MAX_KEY_BYTES: usize = 1024;
@@ -138,18 +148,47 @@ struct Delete {
 struct Capabilities {
     direct: u16,
     contained: u16,
+    // Keep each selector invocation distinct from invocation of the selected
+    // callback. This fixed ladder bounds nested selectors without recursively
+    // expanding the shared container graph.
+    returned: [u16; MAX_CONTAINER_DEPTH],
+    returned_overflow: bool,
 }
 
 impl Capabilities {
-    const fn union(self, other: Self) -> Self {
-        Self {
-            direct: self.direct | other.direct,
-            contained: self.contained | other.contained,
+    const fn union(mut self, other: Self) -> Self {
+        self.direct |= other.direct;
+        self.contained |= other.contained;
+        self.returned_overflow |= other.returned_overflow;
+        let mut index = 0;
+        while index < MAX_CONTAINER_DEPTH {
+            self.returned[index] |= other.returned[index];
+            index += 1;
         }
+        self
     }
 
     const fn any(self) -> bool {
-        self.direct != 0 || self.contained != 0
+        if self.direct != 0 || self.contained != 0 || self.returned_overflow {
+            return true;
+        }
+        let mut index = 0;
+        while index < MAX_CONTAINER_DEPTH {
+            if self.returned[index] != 0 {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    const fn stored(self) -> Self {
+        Self {
+            direct: 0,
+            contained: self.direct | self.contained,
+            returned: self.returned,
+            returned_overflow: self.returned_overflow,
+        }
     }
 
     const fn selected(self) -> Self {
@@ -158,7 +197,63 @@ impl Capabilities {
             // Retain descendants after an unresolved selection so another
             // subscription cannot hide a nested deletion.
             contained: self.contained,
+            returned: self.returned,
+            returned_overflow: self.returned_overflow,
         }
+    }
+
+    fn selector(self, operation: ContainerOp) -> Self {
+        let mut result = Self {
+            direct: operation.capability(),
+            ..Self::default()
+        };
+        if operation.selects() {
+            result.returned[0] = self.contained;
+            for index in 1..MAX_CONTAINER_DEPTH {
+                result.returned[index] = self.returned[index - 1];
+            }
+            result.returned_overflow =
+                self.returned_overflow || self.returned[MAX_CONTAINER_DEPTH - 1] != 0;
+        }
+        result
+    }
+
+    fn called(self) -> Self {
+        let mut result = Self {
+            direct: self.returned[0],
+            contained: self.returned[0],
+            returned_overflow: self.returned_overflow,
+            ..Self::default()
+        };
+        for index in 0..MAX_CONTAINER_DEPTH - 1 {
+            result.returned[index] = self.returned[index + 1];
+        }
+        result
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContainerOp {
+    Get,
+    Pop,
+    Append,
+    Extend,
+    Update,
+}
+
+impl ContainerOp {
+    const fn capability(self) -> u16 {
+        match self {
+            Self::Get => MAY_GET,
+            Self::Pop => MAY_POP,
+            Self::Append => MAY_APPEND,
+            Self::Extend => MAY_EXTEND,
+            Self::Update => MAY_UPDATE,
+        }
+    }
+
+    const fn selects(self) -> bool {
+        matches!(self, Self::Get | Self::Pop)
     }
 }
 
@@ -170,7 +265,9 @@ enum ContainerKey {
 
 struct Container {
     entries: Vec<(ContainerKey, Value)>,
+    source: usize,
     sequence: bool,
+    mutable_sequence: bool,
     precise: bool,
     members: Capabilities,
     depth: usize,
@@ -220,6 +317,10 @@ enum Value {
     Symbol(Symbol),
     Possible(Capabilities),
     Container(Arc<Container>),
+    ContainerMethod {
+        receiver: Arc<Container>,
+        operation: ContainerOp,
+    },
     Delete(Delete),
     Join(Path),
     PathRead,
@@ -266,7 +367,7 @@ impl Value {
         match self {
             Self::Delete(call) => Capabilities {
                 direct: u16::from(call.kinds),
-                contained: 0,
+                ..Capabilities::default()
             },
             Self::Symbol(symbol) => Capabilities {
                 direct: match symbol {
@@ -275,13 +376,25 @@ impl Value {
                     Symbol::Builtins => MAY_BUILTINS,
                     _ => 0,
                 },
-                contained: 0,
+                ..Capabilities::default()
             },
             Self::Possible(possible) => *possible,
             Self::Container(container) => Capabilities {
-                direct: 0,
-                contained: container.members.direct | container.members.contained,
+                direct: if !container.sequence {
+                    MAY_DICT
+                } else if container.mutable_sequence {
+                    MAY_LIST
+                } else {
+                    0
+                },
+                ..container.members.stored()
             },
+            Self::ContainerMethod {
+                receiver,
+                operation,
+            } => Self::Container(receiver.clone())
+                .capabilities()
+                .selector(*operation),
             _ => Capabilities::default(),
         }
     }
@@ -306,7 +419,7 @@ impl Value {
     // join loses their identity. Only captured deletion functions may carry
     // receiver proofs; paths and module objects do not gain one by storage.
     fn indirect(&self) -> Self {
-        if let Self::Container(_) = self {
+        if matches!(self, Self::Container(_) | Self::ContainerMethod { .. }) {
             self.clone()
         } else {
             self.lost()
@@ -342,10 +455,66 @@ impl Value {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ContainerEffects {
+    changed: HashMap<usize, Capabilities>,
+    all_changed: bool,
+    added: Capabilities,
+    performed: bool,
+}
+
+impl ContainerEffects {
+    fn mark(&mut self, source: Option<usize>, added: Capabilities) {
+        self.performed = true;
+        self.added = self.added.union(added);
+        if self.all_changed {
+            return;
+        }
+        if let Some(source) = source {
+            if self.changed.len() < MAX_CONTAINER_ITEMS || self.changed.contains_key(&source) {
+                self.changed
+                    .entry(source)
+                    .and_modify(|old| *old = old.union(added))
+                    .or_insert(added);
+                return;
+            }
+        }
+        self.all_changed = true;
+        self.changed.clear();
+    }
+
+    fn merge(&self, other: &Self) -> Self {
+        let mut merged = self.clone();
+        merged.all_changed |= other.all_changed;
+        merged.added = merged.added.union(other.added);
+        merged.performed |= other.performed;
+        if !merged.all_changed {
+            for (source, added) in &other.changed {
+                if merged.changed.len() == MAX_CONTAINER_ITEMS
+                    && !merged.changed.contains_key(source)
+                {
+                    merged.all_changed = true;
+                    break;
+                }
+                merged
+                    .changed
+                    .entry(*source)
+                    .and_modify(|old| *old = old.union(*added))
+                    .or_insert(*added);
+            }
+        }
+        if merged.all_changed {
+            merged.changed.clear();
+        }
+        merged
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Env {
     values: HashMap<String, Value>,
     trusted: bool,
+    containers: ContainerEffects,
 }
 
 impl Env {
@@ -357,6 +526,7 @@ impl Env {
         let mut merged = Self {
             values: HashMap::new(),
             trusted: self.trusted && other.trusted,
+            containers: self.containers.merge(&other.containers),
         };
         for name in self.values.keys().chain(other.values.keys()) {
             merged
@@ -366,10 +536,69 @@ impl Env {
         merged
     }
 
-    fn forget(&mut self) {
-        for value in self.values.values_mut() {
-            *value = value.lost();
+    fn exact_container(&self, receiver: &Container) -> bool {
+        receiver.precise
+            && !self.containers.all_changed
+            && !self.containers.changed.contains_key(&receiver.source)
+    }
+
+    fn container_capabilities(&self, value: &Value) -> Capabilities {
+        let mut possible = value.capabilities();
+        let source = match value {
+            Value::Container(receiver) | Value::ContainerMethod { receiver, .. } => {
+                Some(receiver.source)
+            }
+            _ => None,
+        };
+        let added = if !self.containers.all_changed
+            && let Some(source) = source
+        {
+            self.containers
+                .changed
+                .get(&source)
+                .copied()
+                .unwrap_or_default()
+        } else {
+            self.containers.added
         }
+        .stored();
+        if (possible.direct | possible.contained) & MAY_CONTAINER != 0 {
+            possible = possible.union(added);
+        }
+        if possible.direct & MAY_SELECT != 0 {
+            let operation = if possible.direct & MAY_GET != 0 {
+                ContainerOp::Get
+            } else {
+                ContainerOp::Pop
+            };
+            possible = possible.union(added.selector(operation));
+        }
+        possible
+    }
+
+    fn container_value(&self, value: Value) -> Value {
+        if let Value::Container(receiver) = &value {
+            if self.exact_container(receiver) {
+                return value;
+            }
+        } else if !matches!(value, Value::Possible(_)) {
+            return value;
+        }
+        Value::possible(self.container_capabilities(&value))
+    }
+
+    fn select(&self, object: Value, key: Option<ContainerKey>, slice: bool) -> Value {
+        selected(self.container_value(object), key, slice)
+    }
+
+    fn forget(&mut self) {
+        self.containers.all_changed = true;
+        self.containers.changed.clear();
+        let values = std::mem::take(&mut self.values);
+        self.values = values
+            .into_iter()
+            .map(|(name, value)| (name, Value::possible(self.container_capabilities(&value))))
+            .collect();
     }
 }
 
@@ -568,6 +797,7 @@ impl<'a> Scan<'a> {
         let mut writes = HashSet::new();
         let mut imported = HashMap::new();
         let mut aliases = Vec::new();
+        let mut calls = Vec::new();
         let mut trusted = true;
         self.possible_binding("getattr", Value::Symbol(Symbol::Getattr).lost());
         // Whole-body identity proof includes later loop mutations and helper
@@ -615,6 +845,9 @@ impl<'a> Scan<'a> {
             {
                 aliases.push((target, value));
             }
+            if kind == "call" {
+                calls.push(node.clone());
+            }
             if let Some(target) = binding_target(&node) {
                 self.names(&target, &mut writes, 0)?;
                 if target
@@ -655,21 +888,22 @@ impl<'a> Scan<'a> {
                     // An item store through either name can change their
                     // shared container. Propagate only contained may-facts;
                     // this cannot establish a callable or a safe receiver.
-                    let contained = alias.capabilities().contained;
-                    if contained != 0 {
-                        self.possible_binding(
-                            value.text().as_ref(),
-                            Value::possible(Capabilities {
-                                direct: 0,
-                                contained,
-                            }),
-                        );
+                    let possible = alias.capabilities();
+                    let stored = Capabilities {
+                        direct: 0,
+                        ..possible
+                    };
+                    if stored.any() {
+                        self.possible_binding(value.text().as_ref(), Value::possible(stored));
                     }
                 }
                 let value = self.capability(value, &previous, 0)?;
                 if value.has_capability() {
                     self.possible_target(target, value, 0)?;
                 }
+            }
+            for call in &calls {
+                self.mutation_capability(call, &aliases, &previous, 0)?;
             }
             if self.possible == previous {
                 break;
@@ -690,6 +924,7 @@ impl<'a> Scan<'a> {
         let mut env = Env {
             values: HashMap::new(),
             trusted,
+            containers: ContainerEffects::default(),
         };
         env.values
             .insert("getattr".to_string(), Value::Symbol(Symbol::Getattr).lost());
@@ -722,6 +957,11 @@ impl<'a> Scan<'a> {
     fn invalidate(&mut self, env: &mut Env) {
         env.trusted = false;
         env.forget();
+        for (name, value) in &mut env.values {
+            if let Some(possible) = self.possible.get(name) {
+                *value = value.merge(&possible.lost());
+            }
+        }
         if self.deferred_depth == 0 {
             self.outer_invalidated = true;
         }
@@ -785,13 +1025,7 @@ impl<'a> Scan<'a> {
                 self.check(&node, depth + 1)?;
                 if node.kind() == "identifier" {
                     let possible = value.capabilities();
-                    self.possible_binding(
-                        node.text().as_ref(),
-                        Value::possible(Capabilities {
-                            direct: 0,
-                            contained: possible.direct | possible.contained,
-                        }),
-                    );
+                    self.possible_binding(node.text().as_ref(), Value::possible(possible.stored()));
                     break;
                 }
                 base = node.field("value").or_else(|| node.field("object"));
@@ -833,10 +1067,22 @@ impl<'a> Scan<'a> {
                     scan.capability(child, known, depth)
                 })?
             }
-            "subscript" => self.subscription(node, depth + 1, |scan, child, depth| {
-                scan.capability(child, known, depth)
-            })?,
-            "call" => self.getattr_capability(node, known, depth + 1)?,
+            "subscript" => {
+                let (object, key, slice) =
+                    self.subscription(node, depth + 1, |scan, child, depth| {
+                        scan.capability(child, known, depth)
+                    })?;
+                selected(object, key, slice)
+            }
+            "call" => self.call_capability(node, known, depth + 1)?,
+            "list_splat" | "dictionary_splat" => {
+                let mut possible = Capabilities::default();
+                for child in named(node) {
+                    possible =
+                        possible.union(self.capability(&child, known, depth + 1)?.capabilities());
+                }
+                Value::possible(possible.selected())
+            }
             "parenthesized_expression" => {
                 let mut value = Value::Unknown;
                 for child in named(node) {
@@ -866,7 +1112,9 @@ impl<'a> Scan<'a> {
         let sequence = node.kind() != "dictionary";
         let mut container = Container {
             entries: Vec::new(),
+            source: node.range().start,
             sequence,
+            mutable_sequence: node.kind() == "list",
             precise: !self.container_writes,
             members: Capabilities::default(),
             depth: 1,
@@ -924,8 +1172,14 @@ impl<'a> Scan<'a> {
             // without deep syntax. Keep its finite capability summary, while
             // bounding snapshot destruction and retaining every element's effects.
             return Ok(Value::possible(Capabilities {
-                direct: 0,
-                contained: container.members.direct | container.members.contained,
+                direct: if !container.sequence {
+                    MAY_DICT
+                } else if container.mutable_sequence {
+                    MAY_LIST
+                } else {
+                    0
+                },
+                ..container.members.stored()
             }));
         }
         Ok(Value::Container(Arc::new(container)))
@@ -936,7 +1190,7 @@ impl<'a> Scan<'a> {
         node: &Node<'tree, D>,
         depth: usize,
         mut evaluate: impl FnMut(&mut Self, &Node<'tree, D>, usize) -> Result<Value, MatchError>,
-    ) -> Result<Value, MatchError> {
+    ) -> Result<(Value, Option<ContainerKey>, bool), MatchError> {
         self.check(node, depth)?;
         let object = if let Some(object) = node.field("value") {
             evaluate(self, &object, depth + 1)?
@@ -952,14 +1206,14 @@ impl<'a> Scan<'a> {
             key = container_key(&index);
             slice = index.kind() == "slice";
         }
-        Ok(selected(
+        Ok((
             object,
             if count == 1 { key } else { None },
             count == 1 && slice,
         ))
     }
 
-    fn getattr_capability<D: Doc>(
+    fn call_capability<D: Doc>(
         &mut self,
         node: &Node<'_, D>,
         known: &HashMap<String, Value>,
@@ -969,38 +1223,192 @@ impl<'a> Scan<'a> {
         let Some(function) = node.field("function") else {
             return Ok(Value::Unknown);
         };
-        if self
-            .capability(&function, known, depth + 1)?
-            .capabilities()
-            .direct
-            & MAY_GETATTR
-            == 0
-        {
-            return Ok(Value::Unknown);
-        }
+        let function = self.capability(&function, known, depth + 1)?.capabilities();
         let Some(arguments) = node.field("arguments") else {
             return Ok(Value::Unknown);
         };
         let arguments: Vec<_> = named(&arguments).collect();
-        if !(2..=3).contains(&arguments.len())
-            || arguments.iter().any(|argument| {
+        let mut result = Value::Unknown;
+        if function.direct & MAY_SELECT != 0 {
+            result = Value::possible(function.called());
+            if let Some(default) = arguments.get(1) {
+                result = result.merge(&self.capability(default, known, depth + 1)?);
+            }
+        }
+        if function.direct & MAY_GETATTR != 0
+            && (2..=3).contains(&arguments.len())
+            && !arguments.iter().any(|argument| {
                 matches!(
                     argument.kind().as_ref(),
                     "keyword_argument" | "list_splat" | "dictionary_splat"
                 )
             })
         {
-            return Ok(Value::Unknown);
+            let object = self.capability(&arguments[0], known, depth + 1)?;
+            let member =
+                super::super::static_interpreter_literal(&arguments[1], ScriptLanguage::Python, 0);
+            let default = if let Some(default) = arguments.get(2) {
+                self.capability(default, known, depth + 1)?
+            } else {
+                Value::Unknown
+            };
+            result = result.merge(&reflected(object, member.as_deref(), default));
         }
-        let object = self.capability(&arguments[0], known, depth + 1)?;
-        let member =
-            super::super::static_interpreter_literal(&arguments[1], ScriptLanguage::Python, 0);
-        let default = if let Some(default) = arguments.get(2) {
-            self.capability(default, known, depth + 1)?
-        } else {
-            Value::Unknown
+        Ok(result)
+    }
+
+    // Source-visible stores must reach aliases even when a helper executes
+    // after its definition. These facts provide only may-identities.
+    fn mutation_capability<'tree, D: Doc>(
+        &mut self,
+        call: &Node<'tree, D>,
+        aliases: &[(Node<'tree, D>, Node<'tree, D>)],
+        known: &HashMap<String, Value>,
+        depth: usize,
+    ) -> Result<(), MatchError> {
+        self.check(call, depth)?;
+        let Some(function) = call.field("function") else {
+            return Ok(());
         };
-        Ok(reflected(object, member.as_deref(), default))
+        let mut targets = Vec::new();
+        let unresolved = self.mutation_targets(
+            &function,
+            aliases,
+            &mut HashSet::new(),
+            &mut targets,
+            depth + 1,
+        )?;
+        let unknown_methods = if unresolved {
+            self.capability(&function, known, depth + 1)?
+                .capabilities()
+                .direct
+                & (MAY_APPEND | MAY_EXTEND | MAY_UPDATE)
+        } else {
+            0
+        };
+        if targets.is_empty() && unknown_methods == 0 {
+            return Ok(());
+        }
+        let Some(arguments) = call.field("arguments") else {
+            return Ok(());
+        };
+        let mut args = Args::default();
+        for argument in named(&arguments) {
+            self.check(&argument, depth + 1)?;
+            if argument.kind() == "keyword_argument" {
+                if let (Some(name), Some(value)) = (argument.field("name"), argument.field("value"))
+                {
+                    args.keywords.insert(
+                        name.text().into_owned(),
+                        self.capability(&value, known, depth + 1)?,
+                    );
+                }
+            } else {
+                args.positional
+                    .push(self.capability(&argument, known, depth + 1)?);
+            }
+        }
+        let mut unknown_added = mutation_arguments(unknown_methods, &args);
+        for (target, operation) in targets {
+            let added = mutation_arguments(operation.capability(), &args);
+            let mut base = Some(target);
+            let mut resolved = false;
+            while let Some(node) = base {
+                self.check(&node, depth + 1)?;
+                if node.kind() == "identifier" {
+                    self.possible_binding(
+                        node.text().as_ref(),
+                        Value::possible(Capabilities {
+                            direct: if operation == ContainerOp::Update {
+                                MAY_DICT
+                            } else {
+                                MAY_LIST
+                            },
+                            ..added.stored()
+                        }),
+                    );
+                    resolved = true;
+                    break;
+                }
+                base = node.field("value").or_else(|| node.field("object"));
+            }
+            if !resolved {
+                unknown_added = unknown_added.union(added);
+            }
+        }
+        if unknown_added.any() {
+            // A source-visible captured mutator can be retrieved through a
+            // container in a deferred helper. Its receiver may then be lost,
+            // but the stored callback must still reach possible containers.
+            // These finite may-facts never establish a callable or safe path.
+            for (name, value) in known {
+                self.check(call, depth + 1)?;
+                let possible = value.capabilities();
+                if (possible.direct | possible.contained) & MAY_CONTAINER != 0 {
+                    self.possible_binding(
+                        name,
+                        Value::possible(possible.union(unknown_added.stored())),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn mutation_targets<'tree, D: Doc>(
+        &mut self,
+        function: &Node<'tree, D>,
+        aliases: &[(Node<'tree, D>, Node<'tree, D>)],
+        seen: &mut HashSet<String>,
+        targets: &mut Vec<(Node<'tree, D>, ContainerOp)>,
+        depth: usize,
+    ) -> Result<bool, MatchError> {
+        self.check(function, depth)?;
+        let mut unresolved = false;
+        match function.kind().as_ref() {
+            "attribute" => {
+                let operation =
+                    function
+                        .field("attribute")
+                        .and_then(|member| match member.text().as_ref() {
+                            "append" => Some(ContainerOp::Append),
+                            "extend" => Some(ContainerOp::Extend),
+                            "update" => Some(ContainerOp::Update),
+                            _ => None,
+                        });
+                if let Some(operation) = operation
+                    && let Some(receiver) = function.field("object")
+                {
+                    targets.push((receiver, operation));
+                }
+            }
+            "identifier" if seen.insert(function.text().into_owned()) => {
+                for (target, value) in aliases {
+                    self.check(target, depth + 1)?;
+                    if target.kind() == "identifier" && target.text() == function.text() {
+                        unresolved |=
+                            self.mutation_targets(value, aliases, seen, targets, depth + 1)?;
+                    } else if target.kind() != "identifier" {
+                        let mut bound = HashSet::new();
+                        self.names(target, &mut bound, depth + 1)?;
+                        // Destructuring can capture a mutator whose receiver
+                        // is absent from the simple assignment-alias graph.
+                        // Keep the finite method identity even when another
+                        // assignment to this name has a recoverable receiver.
+                        unresolved |= bound.contains(function.text().as_ref());
+                    }
+                }
+            }
+            "parenthesized_expression" | "conditional_expression" | "boolean_operator" => {
+                for child in named(function) {
+                    unresolved |=
+                        self.mutation_targets(&child, aliases, seen, targets, depth + 1)?;
+                }
+            }
+            "subscript" | "call" => unresolved = true,
+            _ => {}
+        }
+        Ok(unresolved)
     }
 
     fn names<D: Doc>(
@@ -1108,7 +1516,7 @@ impl<'a> Scan<'a> {
                 let value = if child.kind() == "list_splat_pattern" {
                     value.lost()
                 } else {
-                    selected(
+                    env.select(
                         value.clone(),
                         (!starred)
                             .then(|| i64::try_from(index).ok())
@@ -1144,6 +1552,7 @@ impl<'a> Scan<'a> {
         let mut local = Env {
             values: self.possible.clone(),
             trusted: env.trusted,
+            containers: ContainerEffects::default(),
         };
         for (name, value) in &env.values {
             if self.immutable.get(name) == Some(value) && value.immutable_import() {
@@ -1508,7 +1917,9 @@ impl<'a> Scan<'a> {
                     self.deferred_depth += 1;
                     let visited = self.visit(body, &mut local, depth + 1);
                     self.deferred_depth -= 1;
-                    visited?.environments().all(|exit| exit.trusted)
+                    visited?
+                        .environments()
+                        .all(|exit| exit.trusted && !exit.containers.performed)
                 } else {
                     local.trusted
                 };
@@ -1598,6 +2009,9 @@ impl<'a> Scan<'a> {
                         let expired_container = matches!(
                             &*value,
                             Value::Container(container)
+                                | Value::ContainerMethod {
+                                    receiver: container, ..
+                                }
                                 if !managed.is_empty()
                                     && (container.unknown_origins
                                         || container.origins.iter().any(|origin| managed.contains(origin)))
@@ -1741,9 +2155,23 @@ impl<'a> Scan<'a> {
                     scan.eval(child, env, depth)
                 })?
             }
-            "subscript" => self.subscription(node, depth + 1, |scan, child, depth| {
-                scan.eval(child, env, depth)
-            })?,
+            "subscript" => {
+                let (object, key, slice) =
+                    self.subscription(node, depth + 1, |scan, child, depth| {
+                        scan.eval(child, env, depth)
+                    })?;
+                env.select(object, key, slice)
+            }
+            "list_splat" | "dictionary_splat" => {
+                let mut possible = Capabilities::default();
+                for child in named(node) {
+                    let value = self.eval(&child, env, depth + 1)?;
+                    possible = possible.union(env.container_capabilities(&value));
+                }
+                // Expansion still has uncertain arity/keys. Preserve only
+                // possible values so it cannot erase a stored callback.
+                Value::possible(possible.selected())
+            }
             "attribute" => {
                 let object = if let Some(object) = node.field("object") {
                     self.eval(&object, env, depth + 1)?
@@ -1945,6 +2373,7 @@ impl<'a> Scan<'a> {
             // Eager comprehensions execute now. Preserve their effects while
             // keeping iteration targets out of the enclosing namespace.
             env.trusted &= entry.trusted;
+            env.containers = env.containers.merge(&entry.containers);
             for (name, value) in entry.values {
                 if !targets.contains(&name) {
                     env.values.insert(name, value);
@@ -1986,6 +2415,99 @@ impl<'a> Scan<'a> {
             args.uncertain = true;
         }
         Ok(args)
+    }
+
+    fn container_call<D: Doc>(
+        &mut self,
+        node: &Node<'_, D>,
+        receiver: Arc<Container>,
+        operation: ContainerOp,
+        args: &Args,
+        env: &mut Env,
+        depth: usize,
+    ) -> Result<Value, MatchError> {
+        self.check(node, depth)?;
+        let plain = !args.uncertain && args.keywords.is_empty();
+        if operation.selects() {
+            let valid = plain
+                && if receiver.sequence {
+                    args.positional.len() <= 1
+                } else {
+                    (1..=2).contains(&args.positional.len())
+                };
+            let mut key = args.positional.first().and_then(value_key);
+            if key.is_none() {
+                key = node
+                    .field("arguments")
+                    .and_then(|arguments| named(&arguments).next())
+                    .and_then(|argument| container_key(&argument));
+            }
+            if receiver.sequence && args.positional.is_empty() {
+                key = Some(ContainerKey::Integer(-1));
+            }
+            let passive_key = args.positional.first().is_none_or(passive_container_key);
+            if !valid || !passive_key || !receiver.precise {
+                // Unknown indexing/hash/equality hooks can mutate bindings or
+                // the receiver before a lookup returns. Arguments have already
+                // run, so a mutation in a default cannot reuse the old slot.
+                self.invalidate(env);
+            }
+            let default = if receiver.sequence {
+                Value::None
+            } else {
+                args.positional.get(1).cloned().unwrap_or(Value::None)
+            };
+            let result = if valid
+                && passive_key
+                && env.exact_container(&receiver)
+                && let Some(key) = key
+            {
+                container_entry(&receiver, key).map_or_else(|| default.captured(), Value::captured)
+            } else {
+                let possible = env
+                    .container_capabilities(&Value::Container(receiver.clone()))
+                    .selected();
+                Value::possible(possible).merge(&default.indirect())
+            };
+            if operation == ContainerOp::Pop {
+                // Return the selected immutable callback first. Every later
+                // selector, including captured methods, sees this mutation.
+                env.containers
+                    .mark(Some(receiver.source), Capabilities::default());
+            }
+            return Ok(result);
+        }
+
+        let valid = !args.uncertain
+            && if operation == ContainerOp::Update {
+                args.positional.len() <= 1
+            } else {
+                args.keywords.is_empty() && args.positional.len() == 1
+            };
+        let passive = match operation {
+            ContainerOp::Append => valid,
+            ContainerOp::Extend => {
+                valid
+                    && args.positional.first().is_some_and(|value| {
+                        matches!(value, Value::Container(source) if env.exact_container(source))
+                    })
+            }
+            ContainerOp::Update => {
+                valid
+                    && env.exact_container(&receiver)
+                    && args.positional.first().is_none_or(|value| {
+                        matches!(value, Value::Container(source)
+                            if !source.sequence && env.exact_container(source))
+                    })
+            }
+            ContainerOp::Get | ContainerOp::Pop => unreachable!("selectors returned above"),
+        };
+        let added = mutation_arguments(operation.capability(), args);
+        env.containers.mark(Some(receiver.source), added);
+        if !passive {
+            self.invalidate(env);
+        }
+        Ok(Value::None)
     }
 
     fn call<D: Doc>(
@@ -2030,16 +2552,41 @@ impl<'a> Scan<'a> {
             Value::Unknown
         };
         let value = match function {
+            Value::ContainerMethod {
+                receiver,
+                operation,
+            } => self.container_call(node, receiver, operation, &args, env, depth + 1)?,
             Value::Possible(possible) => {
+                if possible.direct & MAY_SELECT != 0 && possible.returned_overflow {
+                    return Err(MatchError::Unavailable {
+                        language: ScriptLanguage::Python,
+                        detail:
+                            "Python container selector analysis exhausted its return-depth limit"
+                                .to_string(),
+                    });
+                }
                 let kinds = u8::try_from(possible.direct & DELETE_KINDS).unwrap_or_default();
                 if kinds != 0 {
                     self.record(node, kinds, false);
                 }
-                let result = if possible.direct & MAY_GETATTR != 0 {
+                let mut result = if possible.direct & MAY_GETATTR != 0 {
                     reflected_arguments(&args)
                 } else {
                     Value::Unknown
                 };
+                if possible.direct & MAY_SELECT != 0 {
+                    let returned = env
+                        .container_capabilities(&Value::Possible(possible))
+                        .called();
+                    result = result.merge(&Value::possible(returned));
+                    if let Some(default) = args.positional.get(1) {
+                        result = result.merge(&default.indirect());
+                    }
+                }
+                if possible.direct & MAY_MUTATE != 0 {
+                    let added = mutation_arguments(possible.direct, &args);
+                    env.containers.mark(None, added);
+                }
                 self.invalidate(env);
                 result
             }
@@ -2261,6 +2808,12 @@ fn note_origins(container: &mut Container, value: &Value) {
             container.depth = container.depth.max(nested.depth + 1);
             (&nested.origins, nested.unknown_origins)
         }
+        Value::ContainerMethod {
+            receiver: nested, ..
+        } => {
+            container.depth = container.depth.max(nested.depth + 2);
+            (&nested.origins, nested.unknown_origins)
+        }
         Value::Delete(call) => {
             if let Some(origin) = call.receiver.as_ref().and_then(Path::origin) {
                 if !container.origins.contains(&origin) {
@@ -2333,37 +2886,90 @@ fn container_key<D: Doc>(node: &Node<'_, D>) -> Option<ContainerKey> {
     }
 }
 
+fn container_entry(container: &Container, mut key: ContainerKey) -> Option<&Value> {
+    if container.sequence
+        && let ContainerKey::Integer(index) = key
+        && index < 0
+    {
+        let length = i64::try_from(container.entries.len()).ok()?;
+        key = ContainerKey::Integer(length.checked_add(index)?);
+    }
+    container
+        .entries
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .map(|(_, value)| value)
+}
+
 fn selected(object: Value, key: Option<ContainerKey>, slice: bool) -> Value {
     let possible = object.capabilities();
     if slice {
         return Value::possible(Capabilities {
-            direct: 0,
-            contained: possible.contained,
+            direct: possible.direct & MAY_CONTAINER,
+            ..possible
         });
     }
     if let Value::Container(container) = &object
         && container.precise
-        && let Some(mut key) = key
+        && let Some(key) = key
     {
-        if container.sequence
-            && let ContainerKey::Integer(index) = key
-            && index < 0
-        {
-            let Ok(length) = i64::try_from(container.entries.len()) else {
-                return Value::possible(possible.selected());
-            };
-            let Some(index) = length.checked_add(index) else {
-                return Value::Unknown;
-            };
-            key = ContainerKey::Integer(index);
-        }
-        return container
-            .entries
-            .iter()
-            .find(|(candidate, _)| *candidate == key)
-            .map_or(Value::Unknown, |(_, value)| value.captured());
+        return container_entry(container, key).map_or(Value::Unknown, Value::captured);
     }
     Value::possible(possible.selected())
+}
+
+fn value_key(value: &Value) -> Option<ContainerKey> {
+    match value {
+        Value::Text(Path::Literal(text)) if text.len() <= MAX_KEY_BYTES => {
+            Some(ContainerKey::Text(text.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn passive_container_key(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Scalar | Value::None | Value::Text(Path::Literal(_))
+    )
+}
+
+fn container_operation(value: &Value, member: &str) -> Option<ContainerOp> {
+    let (list, dictionary) = match value {
+        Value::Container(container) => (container.mutable_sequence, !container.sequence),
+        Value::Possible(possible) => (
+            possible.direct & MAY_LIST != 0 || possible.contained != 0,
+            possible.direct & MAY_DICT != 0 || possible.contained != 0,
+        ),
+        _ => return None,
+    };
+    match member {
+        "get" if dictionary => Some(ContainerOp::Get),
+        "pop" if list || dictionary => Some(ContainerOp::Pop),
+        "append" if list => Some(ContainerOp::Append),
+        "extend" if list => Some(ContainerOp::Extend),
+        "update" if dictionary => Some(ContainerOp::Update),
+        _ => None,
+    }
+}
+
+fn mutation_arguments(methods: u16, args: &Args) -> Capabilities {
+    let mut added = Capabilities::default();
+    for value in &args.positional {
+        let possible = value.capabilities();
+        if methods & MAY_APPEND != 0 {
+            added = added.union(possible);
+        }
+        if methods & (MAY_EXTEND | MAY_UPDATE) != 0 {
+            added = added.union(possible.selected());
+        }
+    }
+    if methods & MAY_UPDATE != 0 {
+        for value in args.keywords.values() {
+            added = added.union(value.capabilities());
+        }
+    }
+    added
 }
 
 fn reflected(object: Value, member: Option<&str>, default: Value) -> Value {
@@ -2387,6 +2993,16 @@ fn reflected_arguments(args: &Args) -> Value {
 }
 
 fn attribute(object: Value, member: &str) -> Value {
+    if let Some(operation) = container_operation(&object, member) {
+        return if let Value::Container(receiver) = object {
+            Value::ContainerMethod {
+                receiver,
+                operation,
+            }
+        } else {
+            Value::possible(object.capabilities().selector(operation))
+        };
+    }
     match (&object, member) {
         (Value::Symbol(Symbol::Os), "unlink" | "remove" | "rmdir") => {
             let kind = match member {
@@ -2557,6 +3173,124 @@ mod tests {
             "import tempfile\nfrom pathlib import Path\nfrom helpers import value\ndef cleanup():\n    p = Path(tempfile.mkdtemp()) / 'child'\n    p.unlink()\nPath(value)\ncleanup()",
             true,
         );
+    }
+
+    #[test]
+    fn container_selectors_require_the_selected_callback_to_be_invoked() {
+        let prefix = "from pathlib import Path\np = Path('/etc/hosts')\n";
+        for suffix in [
+            "actions = {'erase': p.unlink}\nactions.get('erase')",
+            "actions = [p.unlink]\nactions.pop()",
+            "actions = {'erase': p.unlink}\nouter = {'step': actions.get}\nouter.get('step')('erase')",
+        ] {
+            assert_blocked(&format!("{prefix}{suffix}"), false);
+            assert_blocked(&format!("{prefix}{suffix}()"), true);
+        }
+        assert_blocked(
+            &format!("{prefix}actions = {{'show': print}}\nactions.get('show', p.unlink)('ok')"),
+            false,
+        );
+    }
+
+    #[test]
+    fn container_stores_retain_callbacks_through_aliases_and_helpers() {
+        let prefix = "from pathlib import Path\np = Path('/etc/hosts')\n";
+        for suffix in [
+            "actions = []\nactions.append(p.unlink)\nactions[0]()",
+            "actions = []\nactions.extend([p.unlink])\nactions[0]()",
+            "actions = {}\nactions.update({'erase': p.unlink})\nactions['erase']()",
+            "actions = {}\ninsert = actions.update\ninsert(erase=p.unlink)\nactions.get('erase')()",
+            "actions = []\ninsert = actions.append\nrelay = insert\nrelay(p.unlink)\nactions.pop()()",
+            "inner = []\nouter = [inner]\nalias = inner\nalias.append(p.unlink)\nouter[0][0]()",
+            "actions = []\ninsert = actions.append\ndef populate():\n    insert(p.unlink)\npopulate()\nactions.pop()()",
+            "actions = []\nqueue = {'put': actions.append}\ndef populate():\n    queue.get('put')(p.unlink)\npopulate()\nactions[0]()",
+            "actions = []\n(put,) = [actions.append]\ndef populate():\n    put(p.unlink)\npopulate()\nactions[0]()",
+            "actions = []\nother = []\nput = other.append\n(put,) = [actions.append]\ndef populate():\n    put(p.unlink)\npopulate()\nactions[0]()",
+            "actions = []\nactions.append(*[p.unlink])\nactions[0]()",
+            "actions = {}\nactions.update(**{'erase': p.unlink})\nactions.get('erase')()",
+        ] {
+            assert_blocked(&format!("{prefix}{suffix}"), true);
+        }
+        for suffix in [
+            "actions = []\nactions.append(p.unlink)",
+            "actions = {}\nactions.update(erase=p.unlink)",
+            "actions = []\nactions.append(*[p.unlink])",
+            "actions = {}\nactions.update(**{'erase': p.unlink})",
+            "pending = p.unlink\nitems = [1, 2]\nitems.remove(1)\nitems.append(3)\nitems.extend([4, 5])\nitems.pop()",
+        ] {
+            assert_blocked(&format!("{prefix}{suffix}"), false);
+        }
+    }
+
+    #[test]
+    fn container_mutations_revoke_all_aliases_of_the_old_snapshot() {
+        let prefix =
+            "from pathlib import Path\nsafe = Path('/tmp/child')\np = Path('/etc/hosts')\n";
+        for suffix in [
+            "actions = [safe.unlink, p.unlink]\nactions.pop(0)()\nactions.pop(0)()",
+            "actions = [safe.unlink, p.unlink]\nextract = actions.pop\nextract(0)()\nactions[0]()",
+            "actions = [print, p.unlink]\nactions.pop(0)\n(erase,) = actions\nerase()",
+            "actions = [print]\n[actions.append(p.unlink) for _ in [0]]\nactions[-1]()",
+            "actions = [print]\nif choice:\n    actions.append(p.unlink)\nactions[-1]()",
+            "actions = {'erase': print}\nlookup = actions.get\nlookup('erase', actions.update({'erase': p.unlink}))()",
+        ] {
+            assert_blocked(&format!("{prefix}{suffix}"), true);
+        }
+        assert_blocked(
+            &format!("{prefix}actions = [safe.unlink, p.unlink]\nfirst = actions.pop(0)\nfirst()"),
+            false,
+        );
+    }
+
+    #[test]
+    fn temporary_container_callbacks_keep_only_live_scoped_proofs() {
+        let prefix =
+            "import tempfile\nfrom pathlib import Path\np = Path(tempfile.mkdtemp()) / 'child'\n";
+        for suffix in [
+            "actions = {'erase': p.unlink}\nactions.get('erase')()",
+            "actions = [p.unlink]\nactions.pop()()",
+            "actions = [p.unlink]\ndef unused():\n    actions.append(Path('/etc/hosts').unlink)\nactions.pop()()",
+            "actions = []\ngenerator = (actions.append(Path('/etc/hosts').unlink) for _ in [0])\np.unlink()",
+        ] {
+            assert_blocked(&format!("{prefix}{suffix}"), false);
+        }
+        assert_blocked(
+            "import tempfile\nfrom pathlib import Path\nwith tempfile.TemporaryDirectory() as temp:\n    actions = {'erase': (Path(temp) / 'child').unlink}\n    lookup = actions.get\n    lookup('erase')()",
+            false,
+        );
+        assert_blocked(
+            "import tempfile\nfrom pathlib import Path\nwith tempfile.TemporaryDirectory() as temp:\n    actions = [(Path(temp) / 'child').unlink]\n    extract = actions.pop\nextract()()",
+            true,
+        );
+        assert_blocked(
+            &format!(
+                "{prefix}from helpers import key\nactions = {{}}\nactions.get(key)\np.unlink()"
+            ),
+            true,
+        );
+        assert_blocked(
+            "from helpers import value\nimport tempfile\nfrom pathlib import Path\nactions = {value: print}\np = Path(tempfile.mkdtemp()) / 'child'\nactions.update({'known': print})\np.unlink()",
+            true,
+        );
+    }
+
+    #[test]
+    fn excessive_selector_depth_is_incomplete_only_when_invoked() {
+        let mut source = String::from(
+            "from pathlib import Path\np = Path('/etc/hosts')\nactions = {'step': p.unlink}\n",
+        );
+        for _ in 0..=MAX_CONTAINER_DEPTH {
+            source.push_str("actions = {'step': actions.get}\n");
+        }
+        source.push_str("lookup = actions.get\n");
+        assert_blocked(&source, false);
+        source.push_str("lookup('step')\n");
+        let matcher = super::super::AstMatcher::with_patterns(super::super::default_patterns());
+        assert!(matches!(
+            matcher.find_matches(&source, ScriptLanguage::Python),
+            Err(MatchError::Unavailable { detail, .. })
+                if detail.contains("selector") && detail.contains("return-depth")
+        ));
     }
 
     #[test]
