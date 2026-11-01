@@ -526,6 +526,12 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   - An `umount` with no `-f` whose mount path contains `-nfs`, seen as the
     quoted argument of `dcg explain`, was denied as `system.disk:umount-force`.
     `umount -f` stays denied (#548, f6fdf447, 644aa608).
+- **The quoted command given to `dcg explain` or `dcg test` stays data with
+  `2>&1`.** dcg only analyses that argument and never runs it. 0.15.3
+  already allowed `dcg explain "sudo umount -f /mnt/x"`, but adding `2>&1`,
+  alone or before a pipe, made it judge the argument as the command being
+  run, and deny it. It is now allowed with the redirect too; the same
+  command run directly, or piped into `sh`, stays denied.
 - **`unlink`, `mkfs`, `mkswap` and `wipefs` judge the program that runs
   (#550, #600).** These rules matched the tool's name anywhere on the line,
   so `ob sync-unlink`, `foo --unlink`, `find . -name unlink`,
