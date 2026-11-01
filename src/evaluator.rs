@@ -35783,8 +35783,8 @@ fn fallback_pattern_hit(command: &str) -> bool {
     // well. This is only a conservative capability signal after analysis was
     // incomplete; the authoritative Python pass still checks actual bindings
     // and targets before this fallback is considered.
-    static PYTHON_OS_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
+    static PYTHON_OS_IMPORT: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
             r"(?x)\bimport (?:\s|\\\r?\n)+
                 (?:
                     \w+(?:\.\w+)*
@@ -35794,8 +35794,9 @@ fn fallback_pattern_hit(command: &str) -> bool {
         )
         .expect("Python os-import fallback compiles")
     });
-    static PYTHON_REMOVE_MEMBER: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\.(?:\s|\\\r?\n)*remove\b").expect("Python remove-member fallback compiles")
+    static PYTHON_REMOVE_MEMBER: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\.(?:\s|\\\r?\n)*remove\b")
+            .expect("Python remove-member fallback compiles")
     });
     PYTHON_REMOVE_MEMBER.is_match(check_target) && PYTHON_OS_IMPORT.is_match(check_target)
 }
