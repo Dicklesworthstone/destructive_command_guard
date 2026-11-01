@@ -11,7 +11,7 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## [v0.16.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.16.0) -- 2026-10-31 [Release]
+## [v0.16.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.16.0) -- 2026-11-01 [Release]
 
 This release closes commands that ran unguarded (writes hidden by `IFS`
 splitting, by shell variables or by `git rev-parse` paths, redirections
@@ -164,6 +164,12 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   denied as `redirect-truncate-dynamic-path`. Templates with escapes
   (`String.raw` with escaped backticks) keep their earlier treatment
   (fce07096).
+- **A harmless Perl heredoc too large for the hook input is asked about.** A
+  quoted heredoc of about 320 KB given to `perl -`, with no dynamic code in
+  it, makes the hook input larger than `general.max_hook_input_bytes` (256 KiB
+  by default). With the default configuration, 0.15.3 allowed it with an audit
+  warning; this release answers `ask`. The same body given to `python3 -`,
+  `node -` or `ruby -` is still allowed; see Known issues.
 
 ### Agent integrations
 
@@ -865,18 +871,28 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   8,000 replayed commands did this, to reuse a helper script, and it was
   harmless. dcg cannot tell that from an attack: the source is not in the
   command, so there is nothing to read.
-- **An `eval` of a string built at run time, at the start of a line.** Some of
-  these calls in a quoted Python, JavaScript or Ruby heredoc are no longer
-  denied. 0.15.3 denied them only because of a shell-word match on `eval` at
-  the start of a line, which also blocked harmless code such as
-  `eval("1 + 2")`, and the same call anywhere else on a line was always
-  allowed.
+- **An `eval` of a string built at run time, in a body dcg does not read.** In
+  a quoted Perl, Python, JavaScript or Ruby heredoc of more than 10,000 lines
+  (`heredoc.max_body_lines`), and in a quoted Python or Ruby heredoc past the
+  tenth heredoc in one command, dcg does not read the body, and such a call
+  comes back `indeterminate`, wherever it is in the body: a client with a
+  review prompt asks, any other client blocks, and
+  `general.unverified_decision = "deny"` denies. For a body of more than
+  10,000 lines, with the default configuration, 0.15.3 denied such a call in
+  Perl and JavaScript only because of a shell-word match on an `eval` that
+  starts a shell command, at the start of a line or after a `;`, which also
+  blocked harmless code such as `eval("1 + 2")`. In Python and Ruby it asked
+  only because its 1000 ms clock ran out on such a body. Past
+  `heredoc.max_body_bytes` such a call is still denied in all four languages,
+  and past the tenth heredoc in Perl and JavaScript. In a body dcg reads, such
+  a call is denied as `heredoc.<language>:dynamic_source`.
 - **More than 128 `eval` calls on literals in one quoted interpreter heredoc
   come back `indeterminate`.** A Perl, Python, JavaScript or Ruby body with
   more than 128 calls such as `eval "1"` is more than dcg reads, so it asks or
   blocks. 0.15.3 denied these in Perl, JavaScript and Ruby, and allowed them
   in Python. A call whose source dcg cannot read still denies, wherever it is
-  in the body.
+  in a body dcg reads. Past a body limit, where dcg does not read the body, it
+  comes back `indeterminate`.
 - **The word `copy` in a script, with the opt-in guardrails pack.** With
   `careful_company_running_windows.guardrails` on, a harmless script that uses
   the word `copy`, such as `copy.deepcopy` in a Python heredoc, can come back
@@ -902,13 +918,22 @@ See Behaviour changes and Known issues below (f9e87482, e4e06296).
   The message suggests raising `hook_timeout_ms`, which does not help: this is
   a work limit, not a clock (553263f1, 1475a05f).
 - **A quoted interpreter heredoc near the 64 KiB command limit takes longer to
-  check.** A body of about 60 KB, such as 6,000 lines of `eval "1";` given to
-  `perl -`, takes about 0.4 to 0.9 s, against about 0.05 s in 0.15.3. 0.16.0
-  reads a quoted Perl, JavaScript or Ruby body as its own language (63ca20f0,
-  #544, #560) and runs its full pattern pass over it. 0.15.3 read the body as
-  shell and stopped at its first match, which is why it denied harmless bodies
-  such as 100 lines of `eval "1";`. A command over 64 KiB is not evaluated by
-  either version: it asks or blocks at once.
+  check.** A body of about 60 KB takes about 0.3 to 0.5 s on one test host,
+  against about 0.04 s in 0.15.3: 0.3 s for 6,000 lines of `eval "1";` given
+  to `perl -`, and 0.5 s for 5,500 lines of `eval("1");` given to `node -`.
+  0.16.0 reads a quoted Perl, JavaScript or Ruby body as its own language
+  (63ca20f0, #544, #560) and runs its full pattern pass over it. 0.15.3 read
+  the body as shell and stopped at its first match, which is why it denied
+  harmless bodies such as 100 lines of `eval "1";`. A command over 64 KiB is
+  not evaluated by either version: it asks or blocks at once.
+- **Hook input over `max_hook_input_bytes` is allowed, as in earlier
+  versions.** Hook input larger than `general.max_hook_input_bytes` (256 KiB
+  by default) is allowed with an audit warning unless dcg finds a command in
+  it that it denies or asks about. A quoted Python, JavaScript or Ruby heredoc
+  of 320 KB that calls `eval` or `exec` on a string dcg cannot read makes the
+  hook input that large, so it is allowed this way wherever the call is, by
+  0.15.3 as well; with the limit raised, the same command asks.
+  `general.fail_closed = true` (or `DCG_FAIL_CLOSED=1`) denies such input.
 - **A heredoc with no terminator beside one that runs unproven code.** A
   closed `python3 <<'A'` heredoc whose body is `exec(x)`, followed in the same
   command by an interpreter heredoc that never ends, comes back
