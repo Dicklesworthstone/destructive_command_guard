@@ -243,6 +243,12 @@ destinations do not receive this allowance. Absolute join components replace
 the prior base: `Path(tempfile.mkdtemp()) / '/etc/hosts'` remains denied.
 Replaced factories, modified dependencies, reflective binding mutation, and
 unsupported path transformations cannot establish temporary ownership.
+Unresolved operands to path/string conversions and overloaded `+` or `/`
+operations can execute Python hooks such as `__fspath__` or `__str__`; these
+operations revoke later factory and receiver proofs. Conversions of known standard values
+preserve unrelated cleanup proofs even when the result's exact path is unknown.
+Conversions alone do not produce deletion findings: an actual destructive
+invocation is still required.
 Analysis limits or an incomplete proof never establish a safe target.
 
 ### Ruby

@@ -210,6 +210,10 @@ enum Value {
     Unknown,
     Scalar,
     None,
+    // A selected standard text/path value without its path identity.
+    Inert,
+    // A non-deletion selection whose conversion behavior is unproved.
+    Other,
     Text(Path),
     Path(Path),
     Directory(Path),
@@ -243,6 +247,19 @@ impl Value {
             Self::Text(path) | Self::Path(path) => Some(path),
             _ => None,
         }
+    }
+
+    fn inert_conversion(&self) -> bool {
+        matches!(
+            self,
+            Self::Scalar | Self::None | Self::Inert | Self::Text(_) | Self::Path(_)
+        )
+    }
+
+    fn inert_binary_operand(&self) -> bool {
+        // Builtin container + and / dispatch does not convert its elements.
+        // In contrast, str(container) can invoke an unknown element's repr.
+        self.inert_conversion() || matches!(self, Self::Container(_))
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -297,12 +314,20 @@ impl Value {
     }
 
     fn captured(&self) -> Self {
-        if matches!(self, Self::Delete(Delete { trusted: true, .. })) {
+        if matches!(
+            self,
+            Self::Scalar | Self::None | Self::Inert | Self::Delete(Delete { trusted: true, .. })
+        ) {
             self.clone()
+        } else if matches!(self, Self::Text(_) | Self::Path(_)) {
+            // Preserve inert conversion without granting a path through an
+            // otherwise unsupported container value.
+            Self::Inert
         } else if *self != Self::Unknown && !self.has_capability() {
-            // A precise harmless slot must not fall back to another slot's
-            // possible deletion after the whole-body alias map coarsens.
-            Self::Scalar
+            // A precise non-deletion slot must not fall back to another slot's
+            // possible deletion. That fact alone does not prove its coercions
+            // are inert: a nested container can hold unknown repr hooks.
+            Self::Other
         } else {
             self.indirect()
         }
@@ -1746,17 +1771,32 @@ impl<'a> Scan<'a> {
                     .field("operator")
                     .map(|operator| operator.text().into_owned())
                     .unwrap_or_default();
+                let path_operator = matches!(operator.as_str(), "+" | "/");
+                let inert_result =
+                    path_operator && left.inert_conversion() && right.inert_conversion();
+                if path_operator && (!left.inert_binary_operand() || !right.inert_binary_operand())
+                {
+                    // Overloaded operators and pathlib's path conversion can
+                    // run user code. An unresolved result cannot preserve
+                    // trusted factory or receiver identities afterward.
+                    self.invalidate(env);
+                }
+                let unresolved = if inert_result {
+                    Value::Inert
+                } else {
+                    Value::Unknown
+                };
                 match (operator.as_str(), left, right) {
                     ("/", Value::Path(left), right) => right
                         .path()
                         .and_then(|right| left.join(right))
-                        .map_or(Value::Unknown, Value::Path),
+                        .map_or(unresolved, Value::Path),
                     ("+", Value::Text(Path::Literal(left)), Value::Text(Path::Literal(right)))
                         if left.len() + right.len() <= MAX_VALUE_BYTES =>
                     {
                         Value::Text(Path::Literal(format!("{left}{right}").into()))
                     }
-                    _ => Value::Unknown,
+                    _ => unresolved,
                 }
             }
             "conditional_expression" => {
@@ -1972,6 +2012,23 @@ impl<'a> Scan<'a> {
         };
         let args = self.arguments(node, env, depth + 1)?;
         let plain = !args.uncertain && args.keywords.is_empty();
+        let conversion = matches!(
+            &function,
+            Value::Symbol(Symbol::PathClass | Symbol::Str | Symbol::Join) | Value::Join(_)
+        );
+        let inert_conversion = conversion && args.positional.iter().all(Value::inert_conversion);
+        if conversion && !inert_conversion {
+            // Familiar constructors can dispatch unknown __fspath__/__str__
+            // hooks. Losing the result's path proof must also lose the
+            // identities that such hooks may have changed. Pure operands
+            // retain trust even when a literal join cannot be resolved.
+            self.invalidate(env);
+        }
+        let unresolved_conversion = if inert_conversion {
+            Value::Inert
+        } else {
+            Value::Unknown
+        };
         let value = match function {
             Value::Possible(possible) => {
                 let kinds = u8::try_from(possible.direct & DELETE_KINDS).unwrap_or_default();
@@ -2012,19 +2069,19 @@ impl<'a> Scan<'a> {
                 Value::Unknown
             }
             Value::Symbol(Symbol::PathClass) if plain && !args.positional.is_empty() => {
-                fold_paths(&args.positional).map_or(Value::Unknown, Value::Path)
+                fold_paths(&args.positional).map_or(unresolved_conversion, Value::Path)
             }
             Value::Symbol(Symbol::Str) if plain && args.positional.len() == 1 => args.positional[0]
                 .path()
                 .cloned()
-                .map_or(Value::Unknown, Value::Text),
+                .map_or(unresolved_conversion, Value::Text),
             Value::Symbol(Symbol::Join) if plain && !args.positional.is_empty() => {
-                fold_paths(&args.positional).map_or(Value::Unknown, Value::Text)
+                fold_paths(&args.positional).map_or(unresolved_conversion, Value::Text)
             }
             Value::Join(base) if plain => {
                 let mut values = vec![Value::Path(base)];
                 values.extend(args.positional);
-                fold_paths(&values).map_or(Value::Unknown, Value::Path)
+                fold_paths(&values).map_or(unresolved_conversion, Value::Path)
             }
             Value::Symbol(factory @ (Symbol::Mkdtemp | Symbol::TemporaryDirectory))
                 if env.trusted && factory_arguments(&args) =>
@@ -2448,6 +2505,57 @@ mod tests {
             matches.iter().any(|hit| hit.severity.blocks_by_default()),
             expected,
             "source: {source}\nfindings: {matches:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_conversions_revoke_temporary_receiver_proofs() {
+        for operation in [
+            "Path(value)",
+            "str(value)",
+            "os.fspath(value)",
+            "os.path.join('/tmp', value)",
+            "p.joinpath(value)",
+            "p / value",
+            "value + 1",
+            "1 / value",
+        ] {
+            let source = format!(
+                "import os, tempfile\nfrom pathlib import Path\nfrom helpers import value\np = Path(tempfile.mkdtemp()) / 'child'\n{operation}\np.unlink()",
+            );
+            assert_blocked(&source, true);
+        }
+    }
+
+    #[test]
+    fn known_conversions_preserve_temporary_receiver_proofs() {
+        assert_blocked(
+            "import os, tempfile\nfrom pathlib import Path\np = Path(tempfile.mkdtemp()) / 'child'\nPath('/tmp')\nstr(p)\nos.fspath(p)\nos.path.join('/tmp', 'child')\np.joinpath('sibling')\nos.path.join('/tmp', '..')\np.joinpath('..')\nstr(42)\nPath(str(42))\nstr(1 + 2)\nstr(p.joinpath('..'))\nstr(None)\nstr([42][0])\nstr(['literal'][0])\nstr([Path('/tmp/other')][0])\n['a'] + ['b']\n'a' + 'b'\n1 + 2\n1 / 2\np.unlink()",
+            false,
+        );
+    }
+
+    #[test]
+    fn non_deletion_slots_do_not_prove_conversion_is_inert() {
+        assert_blocked(
+            "import tempfile\nfrom pathlib import Path\nfrom helpers import value\np = Path(tempfile.mkdtemp()) / 'child'\nwrapped = [[value]]\nstr(wrapped[0])\np.unlink()",
+            true,
+        );
+    }
+
+    #[test]
+    fn coercions_without_deletion_invocations_stay_nonblocking() {
+        assert_blocked(
+            "from pathlib import Path\nfrom helpers import value\nunused = Path('/etc/hosts').unlink\nPath(value)\nstr(value)",
+            false,
+        );
+    }
+
+    #[test]
+    fn unknown_conversion_revokes_deferred_receiver_proofs() {
+        assert_blocked(
+            "import tempfile\nfrom pathlib import Path\nfrom helpers import value\ndef cleanup():\n    p = Path(tempfile.mkdtemp()) / 'child'\n    p.unlink()\nPath(value)\ncleanup()",
+            true,
         );
     }
 
