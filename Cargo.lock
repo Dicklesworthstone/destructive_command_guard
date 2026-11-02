@@ -3890,9 +3890,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.2",
  "errno",
@@ -4087,9 +4087,9 @@ dependencies = [
 
 [[package]]
 name = "self_update"
-version = "1.3.1"
+version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9253f1675d280b3e348d63a03ad6af3fa32d515b0959406758342561655c4aa0"
+checksum = "db894dc81dc2d26b41c4966e3e67ab2e0c21289912edd262012a07da9e4e0201"
 dependencies = [
  "http",
  "log",
