@@ -1046,6 +1046,13 @@ fn powershell_start_process_scp(command: &str) -> Option<PowerShellStartProcessS
     };
 
     let command = command.trim();
+    let command = command
+        .strip_prefix('&')
+        .or_else(|| command.strip_prefix('.'))
+        .filter(|tail| tail.chars().next().is_some_and(char::is_whitespace))
+        .map(str::trim_start)
+        .filter(|tail| !tail.is_empty())
+        .unwrap_or(command);
     let normalized_inline = normalize_powershell_inline_start_process_parameters(command);
     if let std::borrow::Cow::Owned(rewritten) = normalized_inline {
         return powershell_start_process_scp(&rewritten);
@@ -1311,7 +1318,9 @@ pub(crate) fn direct_scp_invocation_in_dialect(
     };
     let mut command = command.trim();
     if token_dialect == crate::normalize::ShellDialect::PowerShell
-        && let Some(tail) = command.strip_prefix('&')
+        && let Some(tail) = command
+            .strip_prefix('&')
+            .or_else(|| command.strip_prefix('.'))
     {
         if !tail.chars().next().is_some_and(char::is_whitespace) {
             return None;

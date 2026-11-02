@@ -1647,6 +1647,18 @@ fn decode_words(command: &str, dialect: ShellDialect) -> Option<DecodedWranglerW
     } else {
         dialect
     };
+    let command = if dialect == ShellDialect::PowerShell {
+        command
+            .trim_start()
+            .strip_prefix('&')
+            .or_else(|| command.trim_start().strip_prefix('.'))
+            .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+            .map(str::trim_start)
+            .filter(|rest| !rest.is_empty())
+            .unwrap_or(command)
+    } else {
+        command
+    };
     let tokens = tokenize_for_shell_dialect(command, dialect);
     if tokens
         .iter()

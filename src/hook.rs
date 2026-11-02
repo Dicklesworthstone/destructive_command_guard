@@ -2038,7 +2038,9 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
             | "monitor"
             | "launch-process"
             | "powershell"
+            | "powershell.exe"
             | "pwsh"
+            | "pwsh.exe"
             | "cmd"
             | "cmd.exe"
             | "shell"
@@ -2081,7 +2083,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         hook_event_name.is_empty() || hook_event_name.eq_ignore_ascii_case("pretooluse");
     let is_posit_assistant_shell_tool = matches!(
         tool_name.as_str(),
-        "bash" | "powershell" | "pwsh" | "cmd" | "cmd.exe"
+        "bash" | "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" | "cmd" | "cmd.exe"
     );
     if has_posit_assistant_env && is_posit_assistant_event && is_posit_assistant_shell_tool {
         return HookProtocol::ClaudeCompatible;
@@ -2100,7 +2102,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // legitimately uses those names.)
     let is_explicit_windows_shell = matches!(
         tool_name.as_str(),
-        "powershell" | "pwsh" | "cmd" | "cmd.exe"
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" | "cmd" | "cmd.exe"
     );
     // Claude Code on Windows DOES send `PowerShell` (dcg's own installer
     // registers its Claude hook for `Bash|PowerShell|Monitor`), and classifying those
@@ -2207,7 +2209,9 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             | "monitor"
             | "launch-process"
             | "powershell"
+            | "powershell.exe"
             | "pwsh"
+            | "pwsh.exe"
             | "cmd"
             | "cmd.exe"
             | "run_shell_command"
@@ -2339,7 +2343,7 @@ pub(crate) fn shell_dialect_for_tool_name(tool_name: Option<&str>) -> ShellDiale
 
     match tool_name.to_ascii_lowercase().as_str() {
         "bash" | "monitor" => ShellDialect::Posix,
-        "powershell" | "pwsh" => ShellDialect::PowerShell,
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => ShellDialect::PowerShell,
         "cmd" | "cmd.exe" => ShellDialect::Cmd,
         _ => ShellDialect::Unknown,
     }
@@ -5063,7 +5067,14 @@ mod tests {
                 ShellDialect::Posix
             );
         }
-        for tool_name in ["powershell", "PowerShell", "pwsh", "PWSH"] {
+        for tool_name in [
+            "powershell",
+            "PowerShell",
+            "powershell.exe",
+            "pwsh",
+            "PWSH",
+            "pwsh.exe",
+        ] {
             assert_eq!(
                 shell_dialect_for_tool_name(Some(tool_name)),
                 ShellDialect::PowerShell
@@ -5086,7 +5097,6 @@ mod tests {
             "terminal",
             "run_terminal_cmd",
             "run_command",
-            "powershell.exe",
             "shell",
             "Execute",
         ] {
@@ -10077,5 +10087,33 @@ mod tests {
         assert_eq!(contents.matches("Command: [REDACTED]").count(), 2);
         assert!(contents.contains("[budget]"), "{contents}");
         assert!(contents.contains("Budget: 1ms, Elapsed: 5ms"), "{contents}");
+    }
+
+    #[test]
+    fn powershell_exe_tool_names_are_recognized_and_mapped_to_powershell_dialect() {
+        for tool in [
+            "PowerShell",
+            "powershell",
+            "powershell.exe",
+            "pwsh",
+            "pwsh.exe",
+        ] {
+            assert!(
+                is_supported_shell_tool(Some(tool)),
+                "{tool} must be recognized as a supported shell tool"
+            );
+            assert_eq!(
+                shell_dialect_for_tool_name(Some(tool)),
+                ShellDialect::PowerShell,
+                "{tool} must map to ShellDialect::PowerShell"
+            );
+            let input_json = format!(
+                r#"{{"tool_name":"{tool}","tool_input":{{"command":"Set-Location C:\\repo; & 'C:\\Program Files\\Git\\cmd\\git.exe' reset --hard"}}}}"#
+            );
+            let parsed = parse_hook_input(&input_json).expect("valid hook input");
+            let extracted =
+                extract_command_with_context(&parsed).expect("command must be extracted");
+            assert_eq!(extracted.dialect, ShellDialect::PowerShell);
+        }
     }
 }

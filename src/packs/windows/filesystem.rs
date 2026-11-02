@@ -1171,6 +1171,16 @@ fn powershell_segment_semantic_decision(
     segment: &str,
     quoted_executable_is_command: bool,
 ) -> WindowsFilesystemSemanticDecision {
+    let stripped_call_operator = segment
+        .trim_start()
+        .strip_prefix('&')
+        .or_else(|| segment.trim_start().strip_prefix('.'))
+        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+        .map(str::trim_start)
+        .filter(|rest| !rest.is_empty());
+    let quoted_executable_is_command =
+        quoted_executable_is_command || stripped_call_operator.is_some();
+    let segment = stripped_call_operator.unwrap_or(segment);
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::PowerShell);
     let word_count = tokens
         .iter()
@@ -1600,7 +1610,8 @@ fn powershell_statement_with_masked_groups(command: &str, start: usize) -> Optio
                 // position (`$(producer) branch -d feature`) is a dynamic
                 // command, and replacing it with a literal data word would
                 // turn "unknown executable, fail closed" into a harmless name.
-                if out.trim().is_empty() {
+                let trimmed_prefix = out.trim();
+                if trimmed_prefix.is_empty() || matches!(trimmed_prefix, "&" | ".") {
                     return None;
                 }
                 out.push(' ');
@@ -1621,6 +1632,7 @@ fn powershell_statement_with_masked_groups(command: &str, start: usize) -> Optio
                 out.push(ch);
             }
             ')' => break,
+            '&' if depth == 0 && out.trim().is_empty() => out.push(ch),
             ';' | '|' | '&' | '\n' | '\r' if depth == 0 => break,
             _ => out.push(ch),
         }
@@ -1713,6 +1725,7 @@ fn powershell_static_call_postfix_preserves_executable(call: &str, tail: &str) -
     let Some(rest) = target
         .trim_start()
         .strip_prefix('&')
+        .or_else(|| target.trim_start().strip_prefix('.'))
         .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
         .map(str::trim_start)
     else {

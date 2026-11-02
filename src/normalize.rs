@@ -4297,6 +4297,14 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
             continue;
         }
 
+        if matches!(
+            dialect,
+            ShellDialect::PowerShell | ShellDialect::Posix | ShellDialect::Unknown
+        ) && current == "."
+        {
+            continue;
+        }
+
         // Found the segment's command word.
         segment_has_cmd = true;
 

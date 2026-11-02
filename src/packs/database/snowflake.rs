@@ -282,6 +282,23 @@ fn snow_args_from_segment(segment: &str, dialect: ShellDialect) -> Option<Vec<St
     let input = stripped
         .as_ref()
         .map_or(segment, |result| result.normalized.as_ref());
+    let has_powershell_call_operator = dialect == ShellDialect::PowerShell
+        && input
+            .trim_start()
+            .strip_prefix('&')
+            .or_else(|| input.trim_start().strip_prefix('.'))
+            .is_some_and(|rest| rest.chars().next().is_some_and(char::is_whitespace));
+    let input = if has_powershell_call_operator {
+        input
+            .trim_start()
+            .strip_prefix('&')
+            .or_else(|| input.trim_start().strip_prefix('.'))
+            .map(str::trim_start)
+            .filter(|rest| !rest.is_empty())
+            .unwrap_or(input)
+    } else {
+        input
+    };
     let tokens = tokenize_for_shell_dialect(input, dialect);
     if tokens.len() > MAX_SNOWFLAKE_CLI_TOKENS
         || tokens
@@ -325,9 +342,9 @@ fn snow_args_from_segment(segment: &str, dialect: ShellDialect) -> Option<Vec<St
     }
     if dialect == ShellDialect::PowerShell {
         let (raw, word) = words.get(index)?;
-        if word == "&" {
+        if word == "&" || word == "." {
             index += 1;
-        } else if raw.starts_with(['\'', '"']) {
+        } else if !has_powershell_call_operator && raw.starts_with(['\'', '"']) {
             // A bare quoted value is data in PowerShell. Only the call
             // operator can promote it to an executable command word.
             return None;

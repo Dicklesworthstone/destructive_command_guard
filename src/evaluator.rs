@@ -3855,6 +3855,14 @@ fn visible_powershell_scriptblock_assignment(
         return None;
     }
     let rhs = rhs.trim_start();
+    if is_static_powershell_script_block_expression(rhs) {
+        return Some((
+            name,
+            VisiblePowerShellScriptBlockSource::Static(
+                trim_powershell_script_block(rhs).to_string(),
+            ),
+        ));
+    }
     let Some((marker_start, marker_end)) = find_powershell_scriptblock_create(rhs, 0) else {
         return Some((name, VisiblePowerShellScriptBlockSource::Dynamic));
     };
@@ -4062,7 +4070,9 @@ fn evaluate_visible_powershell_scriptblock_invocations(
     deadline: Option<&Deadline>,
     inherited_automated_stdin: bool,
 ) -> Option<EvaluationResult> {
-    find_powershell_scriptblock_create(command, 0)?;
+    if find_powershell_scriptblock_create(command, 0).is_none() && !command.contains('{') {
+        return None;
+    }
     let statements = match split_top_level_powershell_statements(command) {
         Ok(statements) => statements,
         Err(()) => {
@@ -11729,15 +11739,15 @@ fn powershell_prefix_executes_scriptblock(prefix: &str) -> bool {
 }
 
 fn powershell_prefix_opens_executable_block(prefix: &str) -> bool {
-    let local = prefix
+    let local_raw = prefix
         .rsplit([';', '\r', '\n', '|', '{', '}'])
         .next()
-        .unwrap_or(prefix)
-        .trim();
+        .unwrap_or(prefix);
+    let local = local_raw.trim();
     if local.is_empty() {
         return false;
     }
-    if powershell_prefix_ends_with_execution_operator(local)
+    if powershell_prefix_ends_with_execution_operator(local_raw)
         || powershell_prefix_dot_sources_block(local)
         || powershell_prefix_executes_scriptblock(local)
     {
@@ -11769,6 +11779,17 @@ fn powershell_prefix_opens_executable_block(prefix: &str) -> bool {
     )
 }
 
+fn powershell_scriptblock_is_invoked_by_method(suffix: &str) -> bool {
+    let mut suffix = suffix.trim_start();
+    while let Some(rest) = suffix.strip_prefix(')') {
+        suffix = rest.trim_start();
+    }
+    let suffix = suffix.strip_prefix('?').unwrap_or(suffix);
+    powershell_method_invocation(suffix, ".invoke")
+        || powershell_method_invocation(suffix, ".invokereturnasis")
+        || powershell_method_invocation(suffix, ".invokewithcontext")
+}
+
 fn powershell_executable_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
     let mut bodies = Vec::new();
     let mut search_start = 0usize;
@@ -11779,7 +11800,11 @@ fn powershell_executable_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
         let Some(close) = find_powershell_script_block_close(command, open + 1) else {
             return Err(());
         };
-        if powershell_prefix_opens_executable_block(&command[..open]) {
+        if powershell_prefix_opens_executable_block(&command[..open])
+            || powershell_scriptblock_is_invoked_by_method(
+                command.get(close + 1..).unwrap_or_default(),
+            )
+        {
             if bodies.len() >= MAX_POWERSHELL_VISIBLE_STATEMENTS {
                 return Err(());
             }
@@ -11843,14 +11868,9 @@ fn powershell_scriptblock_create_is_executed(
     let local_prefix = local_powershell_prefix(&command[..marker_start]);
     let call_operator = powershell_prefix_ends_with_execution_operator(local_prefix);
     let named_or_positional_consumer = powershell_prefix_executes_scriptblock(local_prefix);
-
-    let mut suffix = command[argument_close + 1..].trim_start();
-    while let Some(rest) = suffix.strip_prefix(')') {
-        suffix = rest.trim_start();
-    }
-    let invoked_method = powershell_method_invocation(suffix, ".invoke")
-        || powershell_method_invocation(suffix, ".invokereturnasis")
-        || powershell_method_invocation(suffix, ".invokewithcontext");
+    let invoked_method = powershell_scriptblock_is_invoked_by_method(
+        command.get(argument_close + 1..).unwrap_or_default(),
+    );
     call_operator || named_or_positional_consumer || invoked_method
 }
 
@@ -60013,6 +60033,75 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn powershell_compound_call_and_dot_operator_git_bypasses() {
+        let packs = &["core.git", "core.filesystem", "windows.filesystem"];
+
+        // Repro (a) and (b): Set-Location followed by & '<path>\git.exe' reset --hard
+        // across PowerShell, Posix, and Unknown dialects.
+        for cmd in [
+            r#"Set-Location "C:\Users\example\AppData\Local\Temp\dcg-canary"; & 'C:\Program Files\Git\cmd\git.exe' reset --hard"#,
+            r#"Set-Location "C:\Users\example\AppData\Local\Temp\dcg-canary"; . 'C:\Program Files\Git\cmd\git.exe' reset --hard"#,
+            // Repro (c): & 'C:\...\git.exe' -C '<repo>' reset --hard followed by "; \"after: $(Get-Content ...)\""
+            r#"& 'C:\Program Files\Git\cmd\git.exe' -C 'C:\Users\example\AppData\Local\Temp\dcg-canary\fixture' reset --hard; "after: $(Get-Content 'C:\Users\example\AppData\Local\Temp\dcg-canary\fixture\tracked.txt')""#,
+            r#". 'C:\Program Files\Git\cmd\git.exe' -C 'C:\Users\example\AppData\Local\Temp\dcg-canary\fixture' reset --hard; "after: $(Get-Content 'C:\Users\example\AppData\Local\Temp\dcg-canary\fixture\tracked.txt')""#,
+            // Quoted path with call operator and pipeline / logical chaining / newlines
+            r#"Write-Host "checking"; & "C:\Program Files\Git\bin\git.exe" clean -fd"#,
+            "Set-Location C:\\repo\n& 'C:\\Program Files\\Git\\cmd\\git.exe' reset --hard",
+            r"Get-Location | Out-Null; & 'C:\Program Files\Git\cmd\git.exe' push --force origin main",
+            r"Set-Location C:\repo && & 'C:\Program Files\Git\cmd\git.exe' checkout -- .",
+            r"false || & 'C:\Program Files\Git\cmd\git.exe' restore .",
+            // Filesystem call/dot operator compound commands
+            r"Set-Location C:\repo; & Remove-Item -Recurse -Force C:\important",
+            r"Set-Location C:\repo; . Remove-Item -Recurse -Force C:\important",
+            r"Set-Location C:\repo; & 'Remove-Item' (Resolve-Path C:\important) -Recurse -Force",
+            // Subexpression $(...) and scriptblock { ... } invocations
+            r#"Write-Output "$(& 'C:\Program Files\Git\cmd\git.exe' reset --hard)""#,
+            r"& { & 'C:\Program Files\Git\cmd\git.exe' reset --hard }",
+            r". { & 'C:\Program Files\Git\cmd\git.exe' reset --hard }",
+            r"{ & 'C:\Program Files\Git\cmd\git.exe' reset --hard }.Invoke()",
+            r"({ & 'C:\Program Files\Git\cmd\git.exe' reset --hard }).InvokeReturnAsIs()",
+            r"$sb = { & 'C:\Program Files\Git\cmd\git.exe' reset --hard }; & $sb",
+            r"$sb = { & 'C:\Program Files\Git\cmd\git.exe' reset --hard }; $sb.Invoke()",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(cmd, packs, ShellDialect::PowerShell);
+            assert!(
+                result.is_denied(),
+                "expected PowerShell command to be rejected: {cmd:?}, got {result:?}"
+            );
+        }
+
+        // Also verify repro (a)/(b)/(c) across Posix and Unknown dialects (Bash / generic hook).
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for cmd in [
+                r#"Set-Location "C:\Users\example\AppData\Local\Temp\dcg-canary"; & 'C:\Program Files\Git\cmd\git.exe' reset --hard"#,
+                r#"& 'C:\Program Files\Git\cmd\git.exe' -C 'C:\Users\example\AppData\Local\Temp\dcg-canary\fixture' reset --hard; "after: $(Get-Content 'C:\Users\example\AppData\Local\Temp\dcg-canary\fixture\tracked.txt')""#,
+            ] {
+                let result = evaluate_with_pack_ids_in_dialect(cmd, packs, dialect);
+                assert!(
+                    result.is_denied(),
+                    "expected {dialect:?} command to be rejected: {cmd:?}, got {result:?}"
+                );
+            }
+        }
+
+        // Safe PowerShell commands with call operator and compound statements must remain allowed.
+        for safe_cmd in [
+            r#"Set-Location "C:\Users\example\AppData\Local\Temp\dcg-canary"; & 'C:\Program Files\Git\cmd\git.exe' status --short"#,
+            r". 'C:\Program Files\Git\cmd\git.exe' status",
+            r#"& 'C:\Program Files\Git\cmd\git.exe' -C 'C:\repo' diff; "done: $(Get-Date)""#,
+            r"& { & 'C:\Program Files\Git\cmd\git.exe' log -n 1 }",
+            r"{ & 'C:\Program Files\Git\cmd\git.exe' status }.Invoke()",
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(safe_cmd, packs, ShellDialect::PowerShell);
+            assert!(
+                result.is_allowed(),
+                "expected safe PowerShell command to be allowed: {safe_cmd:?}, got {result:?}"
+            );
+        }
     }
 }
 

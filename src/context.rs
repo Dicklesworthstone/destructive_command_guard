@@ -598,7 +598,9 @@ impl ContextClassifier {
                                     );
                                 }
                                 // After the first word, we're no longer in command position
-                                if in_command_position && !word.is_empty() {
+                                // unless the word is the dot-sourcing / call prefix `.`, which
+                                // leaves the following word in command position.
+                                if in_command_position && !word.is_empty() && word != "." {
                                     in_command_position = false;
                                 }
                             }

@@ -4279,6 +4279,16 @@ pub(crate) fn split_command_segments_in_dialect(
         {
             continue;
         }
+        if dialect == crate::normalize::ShellDialect::PowerShell
+            && token.text(cmd) == Some("&")
+            && cmd[segment_start..token.byte_range.start].trim().is_empty()
+        {
+            // PowerShell `&` at the start of a statement or pipeline stage is
+            // the call operator (`& 'C:\...\git.exe' ...`), not a command
+            // separator. Keep it attached to the segment so downstream
+            // command-position checks know the leading token is invoked.
+            continue;
+        }
         push_trimmed_segment(cmd, segment_start, token.byte_range.start, &mut segments);
         segment_start = token.byte_range.end;
     }

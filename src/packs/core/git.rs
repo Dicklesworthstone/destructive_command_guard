@@ -1906,16 +1906,22 @@ fn decode_git_semantic_words(command: &str, dialect: ShellDialect) -> Option<Dec
     Some(DecodedGitWords { words, over_limit })
 }
 
+fn strip_powershell_call_or_dot_operator(command: &str) -> Option<&str> {
+    let trimmed = command.trim_start();
+    trimmed
+        .strip_prefix('&')
+        .or_else(|| trimmed.strip_prefix('.'))
+        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+        .map(str::trim_start)
+        .filter(|rest| !rest.is_empty())
+}
+
 fn git_semantic_command(command: &str, dialect: ShellDialect) -> std::borrow::Cow<'_, str> {
     let command = command.trim();
     let (command, _) = command_after_posix_control_prefixes(command, dialect);
     let command = if dialect == ShellDialect::PowerShell {
         let command = crate::normalize::powershell_assignment_rhs(command).unwrap_or(command);
-        command
-            .strip_prefix('&')
-            .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
-            .map(str::trim_start)
-            .unwrap_or(command)
+        strip_powershell_call_or_dot_operator(command).unwrap_or(command)
     } else {
         command
     };
@@ -1927,14 +1933,9 @@ fn git_semantic_command(command: &str, dialect: ShellDialect) -> std::borrow::Co
 }
 
 fn powershell_call_expression(command: &str) -> bool {
-    command
-        .trim_start()
-        .strip_prefix('&')
-        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
-        .map(str::trim_start)
-        .is_some_and(|rest| {
-            rest.starts_with('(') || rest.starts_with("$(") || rest.starts_with("@(")
-        })
+    strip_powershell_call_or_dot_operator(command).is_some_and(|rest| {
+        rest.starts_with('(') || rest.starts_with("$(") || rest.starts_with("@(")
+    })
 }
 
 /// Return whether a caller-proven PowerShell statement is an expression
@@ -1957,14 +1958,9 @@ fn powershell_expression_statement_without_subexpression(statement: &str) -> boo
 }
 
 fn powershell_dynamic_call_operator(command: &str) -> bool {
-    command
-        .trim_start()
-        .strip_prefix('&')
-        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
-        .map(str::trim_start)
-        .is_some_and(|rest| {
-            rest.starts_with('$') || rest.starts_with("@(") || rest.starts_with('(')
-        })
+    strip_powershell_call_or_dot_operator(command).is_some_and(|rest| {
+        rest.starts_with('$') || rest.starts_with("@(") || rest.starts_with('(')
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2117,11 +2113,7 @@ impl<'a> PowerShellStaticExecutableParser<'a> {
 }
 
 fn powershell_call_expression_parts(command: &str) -> Option<(&str, &str)> {
-    let rest = command
-        .trim_start()
-        .strip_prefix('&')
-        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))?
-        .trim_start();
+    let rest = strip_powershell_call_or_dot_operator(command)?;
     let open = if rest.starts_with("$(") || rest.starts_with("@(") {
         1
     } else if rest.starts_with('(') {
@@ -4592,17 +4584,22 @@ fn command_executes_git_in_dialect_at(command: &str, dialect: ShellDialect, dept
         command
     };
     if dialect == ShellDialect::PowerShell
+        && strip_powershell_call_or_dot_operator(command).is_none()
         && powershell_expression_statement_without_subexpression(command)
     {
         // `"$X" …` / `$X …` is an expression statement; PowerShell refuses to
         // invoke it without the call operator, so it cannot execute Git (#273).
         return false;
     }
-    let command = command
-        .strip_prefix('&')
-        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
-        .map(str::trim_start)
-        .unwrap_or(command);
+    let command = if dialect == ShellDialect::PowerShell {
+        strip_powershell_call_or_dot_operator(command).unwrap_or(command)
+    } else {
+        command
+            .strip_prefix('&')
+            .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+            .map(str::trim_start)
+            .unwrap_or(command)
+    };
     let stripped =
         (dialect == ShellDialect::Posix).then(|| crate::normalize::strip_wrapper_prefixes(command));
     let command = stripped
@@ -4984,11 +4981,15 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
         };
         return Some(crate::normalize::normalize_command(&synthetic).into_owned());
     }
-    let command = command
-        .strip_prefix('&')
-        .map(str::trim_start)
-        .filter(|remainder| !remainder.is_empty())
-        .unwrap_or(command);
+    let command = if dialect == ShellDialect::PowerShell {
+        strip_powershell_call_or_dot_operator(command).unwrap_or(command)
+    } else {
+        command
+            .strip_prefix('&')
+            .map(str::trim_start)
+            .filter(|remainder| !remainder.is_empty())
+            .unwrap_or(command)
+    };
     let stripped =
         (dialect == ShellDialect::Posix).then(|| crate::normalize::strip_wrapper_prefixes(command));
     let command = stripped
@@ -5229,11 +5230,15 @@ pub(crate) fn branch_command_decision_in_dialect(
         command
     };
     let semantic_command = command;
-    let command = command
-        .strip_prefix('&')
-        .map(str::trim_start)
-        .filter(|remainder| !remainder.is_empty())
-        .unwrap_or(command);
+    let command = if dialect == ShellDialect::PowerShell {
+        strip_powershell_call_or_dot_operator(command).unwrap_or(command)
+    } else {
+        command
+            .strip_prefix('&')
+            .map(str::trim_start)
+            .filter(|remainder| !remainder.is_empty())
+            .unwrap_or(command)
+    };
     if dialect == ShellDialect::PowerShell
         && powershell_call_expression(semantic_command)
         && dynamic_git_branch_may_mutate(semantic_command, dialect)

@@ -2137,7 +2137,11 @@ const fn is_ascii_regex_word(byte: u8) -> bool {
 
 fn powershell_segment_requires_rm_semantic_scan(segment: &str) -> bool {
     let segment = segment.trim_start();
-    if segment.starts_with('&') {
+    if segment.starts_with('&')
+        || segment
+            .strip_prefix('.')
+            .is_some_and(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+    {
         return true;
     }
     // `… | ForEach-Object { Remove-Item $_ }`: the Remove-Item is inside the
@@ -2252,18 +2256,21 @@ fn parse_unverified_rm_command_segment(
     dialect: ShellDialect,
 ) -> RmParseDecision {
     let command = command.trim();
-    let powershell_call_operator = dialect == ShellDialect::PowerShell
-        && command
-            .strip_prefix('&')
-            .is_some_and(|suffix| !suffix.trim_start().is_empty());
-    let command = if powershell_call_operator {
-        command
-            .strip_prefix('&')
-            .map(str::trim_start)
-            .unwrap_or(command)
-    } else {
-        command
-    };
+    let stripped_call_operator = (dialect == ShellDialect::PowerShell)
+        .then(|| {
+            command
+                .strip_prefix('&')
+                .or_else(|| {
+                    command
+                        .strip_prefix('.')
+                        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+                })
+                .map(str::trim_start)
+                .filter(|suffix| !suffix.is_empty())
+        })
+        .flatten();
+    let powershell_call_operator = stripped_call_operator.is_some();
+    let command = stripped_call_operator.unwrap_or(command);
     let powershell_expression_argv = powershell_call_operator
         .then(|| powershell_call_expression_argv(command))
         .flatten();
@@ -2373,6 +2380,11 @@ fn parse_powershell_remove_item_segment(command: &str, automated_stdin: bool) ->
     let command = command.trim();
     let command = command
         .strip_prefix('&')
+        .or_else(|| {
+            command
+                .strip_prefix('.')
+                .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+        })
         .map(str::trim_start)
         .filter(|suffix| !suffix.is_empty())
         .unwrap_or(command);
