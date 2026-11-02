@@ -93,7 +93,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.11"
 hmac = "0.13"  # HMAC for optional short-code hardening (ksk.1.10)
 fs2 = "0.4"
-rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }  # Stable bundled SQLite for history telemetry
+rusqlite = { version = "0.41.1", default-features = false, features = ["bundled"] }  # Stable bundled SQLite for history telemetry
 ctrlc = "3.5.1"
 flate2 = "1.0"  # Gzip compression for history export
 
