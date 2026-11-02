@@ -294,3 +294,243 @@ fn a_live_payload_outside_a_data_heredoc_still_denies() {
         );
     }
 }
+
+// ===========================================================================
+// #628: the blanking retry re-entered itself and overflowed the stack
+//
+// The evaluator blanks the modeled assignment and its use in
+// `P=x; $P; python3 - <<'EOF'`. tree-sitter-bash rejects the empty statements
+// left behind, both before the heredoc and as a whole, and so the receiver
+// check for the heredoc fell back to the blanking retry above. A stray `)` or
+// an unclosed `{` gets there without any blanking. The retry extracted the command
+// again, and that extraction asked the receiver check again, until the stack
+// overflowed. The hook died with no output. An agent treats a hook that exits
+// without a verdict as a non-blocking error, so it ran the command.
+//
+// These run the hook as Claude Code does: no arguments and the payload on
+// stdin. They check what the agent reads. The process must exit 0 (a process
+// killed by a signal has no exit code). Stdout must be empty for an allow, or
+// a `PreToolUse` decision JSON. Every command below crashed the hook before
+// the fix, except the cat-data case and the ordinary heredocs, which guard
+// against over-blocking.
+// ===========================================================================
+
+/// Generous budgets: an expired budget answers `ask` under a loaded test run,
+/// which would say nothing about #628.
+const HOOK_TEST_TIMEOUT_MS: &str = "30000";
+
+/// The command from the #628 report, and the harmless twin it reported
+/// crashing the same way.
+const REPORTED_628: &str =
+    "P=x; $P; python3 - <<'EOF'\nimport shutil; shutil.rmtree('/Users/x/proj')\nEOF";
+const REPORTED_628_HARMLESS: &str = "P=x; $P; python3 - <<'EOF'\nprint(1)\nEOF";
+
+/// A complete Claude Code `PreToolUse` payload for `command`.
+fn claude_payload(command: &str, cwd: &std::path::Path) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": "sess-628",
+        "transcript_path": "/tmp/claude/transcript.jsonl",
+        "cwd": cwd,
+        "permission_mode": "default",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "tool_use_id": "toolu_628",
+    })
+}
+
+/// A complete Codex `PreToolUse` payload: `turn_id` selects Codex's protocol.
+fn codex_payload(command: &str, cwd: &std::path::Path) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": "019dd11d-b795-7261-a9cb-9b85a5dad628",
+        "turn_id": "turn-628",
+        "transcript_path": null,
+        "cwd": cwd,
+        "hook_event_name": "PreToolUse",
+        "model": "gpt-5.5",
+        "permission_mode": "default",
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "tool_use_id": "call_628",
+    })
+}
+
+/// Run the hook on the payload built for `command` and return what an agent
+/// reads: `("allow", None)` for empty stdout, else the `permissionDecision`
+/// and the `ruleId` when the protocol carries one. Panics unless the process
+/// exited 0 without a stack overflow. A hook that dies without a verdict is
+/// exactly the #628 failure.
+fn hook_verdict(
+    command: &str,
+    payload: fn(&str, &std::path::Path) -> serde_json::Value,
+) -> (String, Option<String>) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let payload = payload(command, temp.path()).to_string();
+
+    let mut child = Command::new(dcg_binary())
+        .env_clear()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_NO_SELF_HEAL", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", HOOK_TEST_TIMEOUT_MS)
+        .env("DCG_HEREDOC_TIMEOUT_MS", HOOK_TEST_TIMEOUT_MS)
+        .env("DCG_AST_TIMEOUT_MS", HOOK_TEST_TIMEOUT_MS)
+        .current_dir(temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dcg");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("write payload");
+    let out = child.wait_with_output().expect("wait");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !stderr.contains("overflowed its stack"),
+        "the hook overflowed its stack on {command:?}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the hook must exit with a verdict, not die ({:?}) on {command:?}\nstderr: {stderr}",
+        out.status
+    );
+    if stdout.trim().is_empty() {
+        return ("allow".to_string(), None);
+    }
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("hook stdout is not one JSON value ({e}): {stdout}"));
+    let output = &parsed["hookSpecificOutput"];
+    assert_eq!(output["hookEventName"], "PreToolUse", "{stdout}");
+    let decision = output["permissionDecision"]
+        .as_str()
+        .unwrap_or("<missing>")
+        .to_string();
+    let rule = output["ruleId"].as_str().map(str::to_string);
+    (decision, rule)
+}
+
+fn assert_hook_denies(commands: &[&str]) {
+    for command in commands {
+        let (decision, rule) = hook_verdict(command, claude_payload);
+        assert_eq!(decision, "deny", "{command:?} (rule {rule:?})");
+    }
+}
+
+fn assert_hook_allows(commands: &[&str]) {
+    for command in commands {
+        let (decision, rule) = hook_verdict(command, claude_payload);
+        assert_eq!(decision, "allow", "{command:?} (rule {rule:?})");
+    }
+}
+
+#[test]
+fn the_reported_628_command_is_denied_and_its_twin_allowed() {
+    assert_eq!(
+        hook_verdict(REPORTED_628, claude_payload),
+        (
+            "deny".to_string(),
+            Some("heredoc.python:shutil_rmtree".to_string())
+        ),
+        "the Python body is read as Python and its rmtree is named"
+    );
+    assert_eq!(
+        hook_verdict(REPORTED_628_HARMLESS, claude_payload),
+        ("allow".to_string(), None)
+    );
+}
+
+/// Codex parses hook output strictly. The same command must reach its deny
+/// shape too, which carries no rule id.
+#[test]
+fn the_reported_628_command_is_denied_under_codex() {
+    assert_eq!(
+        hook_verdict(REPORTED_628, codex_payload),
+        ("deny".to_string(), None)
+    );
+    assert_eq!(
+        hook_verdict(REPORTED_628_HARMLESS, codex_payload),
+        ("allow".to_string(), None)
+    );
+}
+
+#[test]
+fn dynamic_command_words_before_an_interpreter_heredoc_get_a_verdict_628() {
+    assert_hook_denies(&[
+        "P=x; ${P}; python3 - <<'EOF'\nimport shutil; shutil.rmtree('/Users/x/proj')\nEOF",
+        "P=x; \"$P\"; python3 - <<'EOF'\nimport shutil; shutil.rmtree('/Users/x/proj')\nEOF",
+        "P=x; $P; python3 - <<'EOF'\nimport os; os.system('rm -rf ~/x')\nEOF",
+        // No import line: nothing in the body says Python.
+        "P=x; $P; python3 - <<'EOF'\n__import__('shutil').rmtree('/Users/x/proj')\nEOF",
+        "F=true; $F; node - <<'JS'\nrequire('fs').rmSync('/Users/x/proj', {recursive: true})\nJS",
+        // The word can be `eval`, which can rebind `python3` to a shell that
+        // runs the body.
+        "P=eval; $P 'python3(){ bash; }'; python3 - <<'EOF'\nrm -rf ~/x\nEOF",
+    ]);
+    assert_hook_allows(&[
+        "P=x; ${P}; python3 - <<'EOF'\nprint(1)\nEOF",
+        "P=x; \"$P\"; python3 - <<'EOF'\nprint(1)\nEOF",
+        "F=true; $F; node - <<'JS'\nconsole.log(1)\nJS",
+    ]);
+}
+
+/// Malformed shell before the heredoc took the same path as a dynamic word.
+#[test]
+fn malformed_shell_before_an_interpreter_heredoc_gets_a_verdict_628() {
+    assert_hook_denies(&[
+        "echo hi ); python3 - <<'EOF'\nimport shutil; shutil.rmtree('/Users/x/proj')\nEOF",
+        "{ echo hi; python3 - <<'EOF'\nimport shutil; shutil.rmtree('/Users/x/proj')\nEOF",
+        "{ echo hi; ruby - <<'RB'\nrequire 'fileutils'; FileUtils.rm_rf('/Users/x/proj')\nRB",
+    ]);
+    assert_hook_allows(&[
+        "echo hi ); python3 - <<'EOF'\nprint(1)\nEOF",
+        "{ echo hi; python3 - <<'EOF'\nprint(1)\nEOF",
+    ]);
+}
+
+/// More than one interpreter heredoc, and one inside another heredoc's body.
+/// The receiver check inside the blanking retry runs once per heredoc, so
+/// these are the shapes a guard that cleared itself too early let through.
+#[test]
+fn nested_and_repeated_interpreter_heredocs_get_a_verdict_628() {
+    assert_hook_denies(&[
+        // A shell runs the outer body, so the inner heredoc runs as well.
+        // 0.15.3 allowed this one.
+        "bash <<'OUTER'\nP=x; $P; python3 - <<'EOF'\nimport shutil; shutil.rmtree('/Users/x/proj')\nEOF\nOUTER",
+        "P=x; $P; python3 - <<'A'\nimport shutil; shutil.rmtree('/Users/x/proj')\nA\nruby - <<'B'\nputs 1\nB",
+        "P=x; $P; python3 - <<'A'\nprint(1)\nA\nruby - <<'B'\nrequire 'fileutils'; FileUtils.rm_rf('/Users/x/proj')\nB",
+    ]);
+    assert_hook_allows(&[
+        "P=x; $P; python3 - <<'A'\nprint(1)\nA\nruby - <<'B'\nputs 1\nB",
+        // `cat` writes the same text to a file. It is data and does not run.
+        "cat > /tmp/notes/run.sh <<'OUTER'\nP=x; $P; python3 - <<'EOF'\nimport shutil; shutil.rmtree('/Users/x/proj')\nEOF\nOUTER",
+    ]);
+}
+
+/// The guard only acts on an extraction already running on the thread. Heredocs
+/// that never recursed keep their verdicts: no new denials, and no lost ones.
+#[test]
+fn ordinary_quoted_interpreter_heredocs_keep_their_verdicts_628() {
+    assert_hook_allows(&[
+        "python3 - <<'EOF'\nprint(1)\nEOF",
+        "cd /tmp && python3 - <<'EOF'\nprint(1)\nEOF",
+        // #560: an assignment before the interpreter is not a dynamic word.
+        "S=1; python3 - <<'EOF'\nx = \"rm -rf /\"\nprint(x)\nEOF",
+        "cat > /tmp/notes/notes.md <<'EOF'\nremember: never run rm -rf ~/x\nEOF",
+        REPORTED,
+    ]);
+    assert_hook_denies(&[
+        "python3 - <<'EOF'\nimport shutil; shutil.rmtree('/Users/x/proj')\nEOF",
+        "S=1; python3 - <<'EOF'\nimport shutil; shutil.rmtree('/Users/x/proj')\nEOF",
+        "node - <<'JS'\nrequire('fs').rmSync('/Users/x/proj', {recursive: true})\nJS",
+    ]);
+}

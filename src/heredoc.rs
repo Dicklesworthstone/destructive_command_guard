@@ -8265,6 +8265,10 @@ fn extract_heredoc_target_command(command: &str, heredoc_start: usize) -> Option
 /// wrapper, function, alias or untrusted path can stand in for it
 /// ([`stdin_data_sink_may_be_overridden`]). `None` leaves the caller's
 /// whole-command detection in place.
+///
+/// This runs inside extraction, and that override check can extract the same
+/// command again through [`quoted_heredoc_bodies_blanked`].
+/// [`StructuralExtractionScope`] allows one nested extraction (#628).
 fn heredoc_receiver_language(command: &str, heredoc_start: usize) -> Option<ScriptLanguage> {
     let (token, wrapped) = extract_heredoc_target_resolution(command, heredoc_start)?;
     if wrapped {
@@ -8689,6 +8693,63 @@ pub(crate) fn stdin_data_sink_may_be_overridden(
     overridden || parse_error
 }
 
+thread_local! {
+    /// Whether a structural extraction is running on this thread: see
+    /// [`StructuralExtractionScope`] (#628).
+    static STRUCTURAL_EXTRACTION_ACTIVE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// One structural extraction in progress on this thread (#628).
+///
+/// [`quoted_heredoc_bodies_blanked`] and [`active_single_heredoc_fallback`]
+/// each run [`extract_content_with_scan_view`] over the raw command, and that
+/// extraction asks the question the blanking exists to answer: every
+/// interpreter heredoc's receiver goes through
+/// [`stdin_data_sink_may_be_overridden`], and when neither the prefix nor the
+/// whole command parses, that check blanks the quoted bodies, which extracts
+/// the same command again. The same parses fail every time, so it never
+/// stopped. `P=x; $P; python3 - <<'EOF'` was reported: the evaluator blanks
+/// the modeled assignment and its use, and the empty statements left behind
+/// do not parse. A stray `)` or an unclosed `{` before the heredoc did the
+/// same. The stack overflowed, the hook exited without a verdict, and an
+/// agent treats that as permission to run the command.
+///
+/// Extraction is synchronous and stays on its thread, so a thread-local flag
+/// sees every re-entry. A structural extraction requested while one is
+/// already running answers `None`, the answer both callers already give when
+/// they cannot settle a question. The override check reads it as "may be
+/// overridden", which masks no body and does not vouch for the receiver's
+/// language. The single-heredoc fallback reads it as "no span", which leaves
+/// the command unmasked. Every such re-entry used to repeat until the stack
+/// ran out, so no command that got a verdict before gets a different one now. The outer extraction still finishes, and its
+/// callers read only the body spans, never the receiver language that the
+/// nested answer changes.
+#[must_use = "the scope ends when this value is dropped"]
+struct StructuralExtractionScope;
+
+impl StructuralExtractionScope {
+    /// Start a structural extraction, or `None` when one is already running
+    /// on this thread.
+    fn enter() -> Option<Self> {
+        if STRUCTURAL_EXTRACTION_ACTIVE.with(|active| active.replace(true)) {
+            // Not `then_some(Self)`: that builds a scope even here, and
+            // dropping it would clear the flag the running scope still holds.
+            // With two interpreter heredocs the flag was then clear for the
+            // second one, and the recursion went on.
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+impl Drop for StructuralExtractionScope {
+    fn drop(&mut self) {
+        STRUCTURAL_EXTRACTION_ACTIVE.with(|active| active.set(false));
+    }
+}
+
 /// The command with every *quoted-delimiter* heredoc body replaced by blanks,
 /// or `None` when there is no such body to blank (issue #412).
 ///
@@ -8705,6 +8766,9 @@ pub(crate) fn stdin_data_sink_may_be_overridden(
 /// deliberately left alone: the shell *does* evaluate `$(…)` inside them, so
 /// their bytes can carry a real override.
 fn quoted_heredoc_bodies_blanked(command: &str) -> Option<String> {
+    // The extraction below can reach this function again for the same
+    // command; the nested call answers `None` (#628).
+    let _scope = StructuralExtractionScope::enter()?;
     // Raw text, not the masked scan view. The masker calls
     // `stdin_data_sink_may_be_overridden`, which reaches this function, so
     // asking for the mask here would not terminate (#420). Using the raw text
@@ -13663,6 +13727,9 @@ fn active_single_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
         Some(_) => return None,
     }
 
+    // No span while another structural extraction runs on this thread, so a
+    // path from extraction back to here cannot recurse without end (#628).
+    let _scope = StructuralExtractionScope::enter()?;
     // Raw text, not the masked scan view: this function is reached *from* the
     // masker, so asking for the mask here would not terminate (#420). Scanning
     // the raw text in this one place is the conservative direction, and it is
@@ -18140,6 +18207,120 @@ mod tests {
             quoted_heredoc_bodies_blanked("cat <<EOF\n$(rm -rf /)\nEOF").is_none(),
             "an unquoted delimiter must not be blanked"
         );
+    }
+
+    /// Issue #628: commands that tree-sitter-bash rejects before an
+    /// interpreter heredoc and in the whole command. The receiver check then
+    /// blanked the quoted bodies, which extracted the command again, which
+    /// asked the receiver check again. Each of these overflowed the stack.
+    ///
+    /// The reported `P=x; $P; python3 - <<'EOF'` parses as written. The hook
+    /// overflowed on the evaluator's view of it:
+    /// `mask_modeled_posix_executable_assignments` blanks the modeled
+    /// assignment and its use, and the empty statements left behind do not
+    /// parse. The hook tests in `tests/repro_412_quoted_heredoc_commit_message.rs`
+    /// cover the command as written.
+    const UNPARSABLE_BEFORE_AN_INTERPRETER_HEREDOC_628: [(&str, &[&str]); 5] = [
+        // The reported command, as extraction receives it.
+        (
+            "   ;   ; python3 - <<'EOF'\nimport shutil; shutil.rmtree('/Users/x/proj')\nEOF",
+            &["import shutil; shutil.rmtree('/Users/x/proj')"],
+        ),
+        // Two interpreter heredocs: the nested receiver check runs for both.
+        (
+            "   ;   ; python3 - <<'A'\nprint(1)\nA\nruby - <<'B'\nputs 1\nB",
+            &["print(1)", "puts 1"],
+        ),
+        ("; node - <<'JS'\nconsole.log(1)\nJS", &["console.log(1)"]),
+        ("echo hi ); python3 - <<'EOF'\nprint(1)\nEOF", &["print(1)"]),
+        ("{ echo hi; ruby - <<'RB'\nputs 1\nRB", &["puts 1"]),
+    ];
+
+    /// A command from the #412 report that needs the blanking retry, and the
+    /// #393 shape whose body span only `active_single_heredoc_fallback` finds.
+    const NEEDS_BLANKING_412: &str =
+        "git commit -q -m \"$(cat <<'EOF'\n\u{201e}Messen\"\nRead-only\nEOF\n)\"";
+    const NEEDS_SINGLE_HEREDOC_FALLBACK_393: &str =
+        "cat <<'EOF'; echo done\nundo with git restore . later\nEOF";
+
+    #[test]
+    fn an_unparsable_prefix_before_an_interpreter_heredoc_terminates_628() {
+        for (command, expected) in UNPARSABLE_BEFORE_AN_INTERPRETER_HEREDOC_628 {
+            let receivers: Vec<(usize, String)> = command
+                .match_indices("<<")
+                .map(|(operator, _)| {
+                    let receiver = extract_heredoc_target_command(command, operator)
+                        .unwrap_or_else(|| panic!("receiver of {operator} in {command:?}"));
+                    (operator, receiver)
+                })
+                .collect();
+
+            // Inside an extraction that is already running, the check cannot
+            // blank again, so it keeps the fail-closed answer.
+            {
+                let _running = StructuralExtractionScope::enter().expect("nothing is running yet");
+                for (operator, receiver) in &receivers {
+                    assert!(
+                        stdin_data_sink_may_be_overridden(command, *operator, receiver),
+                        "a nested check must stay fail-closed: {receiver} in {command:?}"
+                    );
+                }
+            }
+
+            // From outside, the check runs its one blanking retry and returns.
+            // Each of these overflowed before. Asking twice gives the same
+            // answer: a scope left behind would turn the second into `true`.
+            for (operator, receiver) in &receivers {
+                let first = stdin_data_sink_may_be_overridden(command, *operator, receiver);
+                let second = stdin_data_sink_may_be_overridden(command, *operator, receiver);
+                assert_eq!(first, second, "{receiver} in {command:?}");
+            }
+
+            // Every body still reaches analysis, whole and quoted.
+            let result = extract_content(command, &ExtractionLimits::structural_scan());
+            let ExtractionResult::Extracted(contents) = result else {
+                panic!("expected a complete extraction of {command:?}, got {result:?}");
+            };
+            let bodies: Vec<&str> = contents
+                .iter()
+                .filter(|content| content.quoted && content.heredoc_type.is_some())
+                .map(|content| content.content.trim_end())
+                .collect();
+            assert_eq!(bodies, expected, "{command:?}");
+
+            // The scope was released: later recoveries run normally.
+            assert!(
+                quoted_heredoc_bodies_blanked(NEEDS_BLANKING_412).is_some(),
+                "blanking stays available after {command:?}"
+            );
+            assert!(
+                active_single_heredoc_fallback(NEEDS_SINGLE_HEREDOC_FALLBACK_393).is_some(),
+                "the single-heredoc fallback stays available after {command:?}"
+            );
+        }
+    }
+
+    /// The guard itself: while one structural extraction runs, every nested
+    /// request answers `None` (not just the first), and leaving the scope
+    /// gives both recoveries back (#628).
+    #[test]
+    fn a_nested_structural_extraction_answers_unknown_628() {
+        assert!(quoted_heredoc_bodies_blanked(NEEDS_BLANKING_412).is_some());
+        assert!(active_single_heredoc_fallback(NEEDS_SINGLE_HEREDOC_FALLBACK_393).is_some());
+        {
+            let _running = StructuralExtractionScope::enter().expect("nothing is running yet");
+            for _ in 0..2 {
+                // A refused entry must not clear the running scope's flag:
+                // the second round fails if it did.
+                assert!(StructuralExtractionScope::enter().is_none());
+                assert!(quoted_heredoc_bodies_blanked(NEEDS_BLANKING_412).is_none());
+                assert!(
+                    active_single_heredoc_fallback(NEEDS_SINGLE_HEREDOC_FALLBACK_393).is_none()
+                );
+            }
+        }
+        assert!(quoted_heredoc_bodies_blanked(NEEDS_BLANKING_412).is_some());
+        assert!(active_single_heredoc_fallback(NEEDS_SINGLE_HEREDOC_FALLBACK_393).is_some());
     }
 
     // ========================================================================
