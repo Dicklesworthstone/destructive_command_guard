@@ -8705,6 +8705,25 @@ pub(crate) fn stdin_data_sink_may_be_overridden(
 /// deliberately left alone: the shell *does* evaluate `$(…)` inside them, so
 /// their bytes can carry a real override.
 fn quoted_heredoc_bodies_blanked(command: &str) -> Option<String> {
+    thread_local! {
+        static BLANKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    struct Blanking;
+    impl Drop for Blanking {
+        fn drop(&mut self) {
+            BLANKING.with(|active| active.set(false));
+        }
+    }
+    // The extraction below resolves each heredoc's receiver, which asks
+    // `stdin_data_sink_may_be_overridden` again for the same command and, on
+    // the same parse error, reaches this function again (`P=x; $P; python3 -
+    // <<'EOF'`). Unbounded, that overflowed the stack and the hook exited
+    // without a verdict. A nested call answers `None`, so its caller keeps
+    // the fail-closed answer; only the outermost call blanks.
+    if BLANKING.with(|active| active.replace(true)) {
+        return None;
+    }
+    let _blanking = Blanking;
     // Raw text, not the masked scan view. The masker calls
     // `stdin_data_sink_may_be_overridden`, which reaches this function, so
     // asking for the mask here would not terminate (#420). Using the raw text

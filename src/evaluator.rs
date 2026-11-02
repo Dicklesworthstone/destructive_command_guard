@@ -49886,6 +49886,23 @@ mod tests {
         }
     }
 
+    /// A dynamic command word before a quoted interpreter heredoc made the
+    /// receiver check re-run extraction on the same command without end; the
+    /// stack overflowed and the hook exited with no verdict, so the agent ran
+    /// the command.
+    #[test]
+    fn dynamic_word_before_interpreter_heredoc_terminates() {
+        let rmtree = "P=x; $P; python3 - <<'EOF'\nimport shutil; shutil.rmtree('/home/user/proj')\nEOF";
+        let result =
+            evaluate_with_pack_ids_in_dialect(rmtree, &["core.filesystem"], ShellDialect::Posix);
+        assert!(result.is_denied(), "{rmtree:?}: {result:?}");
+
+        let print = "P=x; $P; python3 - <<'EOF'\nprint(1)\nEOF";
+        let result =
+            evaluate_with_pack_ids_in_dialect(print, &["core.filesystem"], ShellDialect::Posix);
+        assert!(result.is_allowed(), "{print:?}: {result:?}");
+    }
+
     #[test]
     fn launcher_unverified_denials_carry_stable_allowlistable_rule_ids() {
         // #316/bd-l9jf: the fail-closed launcher-verifier family previously
