@@ -11544,7 +11544,8 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     }
 
     // Check 3b2: Codex hook registration AND enablement (#368). Codex loads
-    // PreToolUse hooks from ~/.codex/hooks.json but only RUNS a hook the user
+    // PreToolUse hooks from ~/.codex/hooks.json and from the [hooks] table of
+    // ~/.codex/config.toml (#606), but only RUNS a hook the user
     // has approved: a `[hooks.state."<file>:pre_tool_use:<i>:<j>"]` entry in
     // ~/.codex/config.toml, not carrying `enabled = false`. A hook that is
     // registered but untrusted or disabled silently never runs — the gate
@@ -11600,8 +11601,10 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 println!("{}", "NOT REGISTERED".yellow());
                 issues += 1;
                 println!(
-                    "  Codex is in use but {} does not exist",
-                    codex_file_display("hooks.json")
+                    "  Codex is in use, but {} does not exist and the [hooks] table of {} \
+                     has no dcg hook",
+                    codex_file_display("hooks.json"),
+                    codex_file_display("config.toml")
                 );
                 println!(
                     "  → Re-run the dcg install script to register the hook, then start \
@@ -11613,8 +11616,10 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 println!("{}", "NOT REGISTERED".yellow());
                 issues += 1;
                 println!(
-                    "  {} loads, but has no dcg PreToolUse command hook that selects Bash",
-                    codex_file_display("hooks.json")
+                    "  Neither {} nor the [hooks] table of {} has a dcg PreToolUse command \
+                     hook that selects Bash",
+                    codex_file_display("hooks.json"),
+                    codex_file_display("config.toml")
                 );
                 println!(
                     "  → Re-run the dcg install script to register it, then start Codex \
@@ -11626,8 +11631,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 println!("{}", "MISPLACED".red());
                 issues += 1;
                 println!(
-                    "  A dcg hook is in {} but not where Codex runs it for shell commands:",
-                    codex_file_display("hooks.json")
+                    "  A dcg hook is registered, but not where Codex runs it for shell commands:"
                 );
                 println!("  {detail}");
                 println!(
@@ -11645,7 +11649,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 println!("  The dcg hook is registered ({state_key})");
                 println!("  but its command does not exist: {command}");
                 println!(
-                    "  → Re-run the dcg install script so hooks.json points at the installed \
+                    "  → Re-run the dcg install script so the hook points at the installed \
                      binary, or fix the path by hand"
                 );
                 println!(
@@ -13186,7 +13190,8 @@ fn collect_doctor_report(
 
     // Codex hook registration AND enablement (#368). Mirrored in
     // `doctor_pretty` — see the renderer-parity note above the Grok block. A
-    // hook that is registered in hooks.json but untrusted (no [hooks.state]
+    // hook that is registered (in hooks.json or the [hooks] table of
+    // config.toml, #606) but untrusted (no [hooks.state]
     // entry) or disabled (`enabled = false`) silently never runs.
     if codex_appears_in_use() {
         let mut codex_fixed = false;
@@ -13246,9 +13251,10 @@ fn collect_doctor_report(
                 (
                     DoctorCheckStatus::Error,
                     format!(
-                        "Codex is in use but {} does not exist — its shell commands are not \
-                         guarded",
-                        codex_file_display("hooks.json")
+                        "Codex is in use, but {} does not exist and the [hooks] table of {} \
+                         has no dcg hook — its shell commands are not guarded",
+                        codex_file_display("hooks.json"),
+                        codex_file_display("config.toml")
                     ),
                     Some(
                         "Re-run the dcg install script to register the hook, then start \
@@ -13262,9 +13268,10 @@ fn collect_doctor_report(
                 (
                     DoctorCheckStatus::Error,
                     format!(
-                        "{} loads, but has no dcg PreToolUse command hook that selects Bash — \
-                         Codex shell commands are not guarded",
-                        codex_file_display("hooks.json")
+                        "Neither {} nor the [hooks] table of {} has a dcg PreToolUse command \
+                         hook that selects Bash — Codex shell commands are not guarded",
+                        codex_file_display("hooks.json"),
+                        codex_file_display("config.toml")
                     ),
                     Some(
                         "Re-run the dcg install script to register it, then start Codex \
@@ -13278,9 +13285,8 @@ fn collect_doctor_report(
                 (
                     DoctorCheckStatus::Error,
                     format!(
-                        "A dcg hook is in {} but not where Codex runs it for shell commands: \
-                         {detail}",
-                        codex_file_display("hooks.json")
+                        "A dcg hook is registered, but not where Codex runs it for shell \
+                         commands: {detail}"
                     ),
                     Some(
                         "Register it under hooks.PreToolUse as {\"matcher\": \"Bash\", \
@@ -13300,7 +13306,7 @@ fn collect_doctor_report(
                          exist: {command}"
                     ),
                     Some(
-                        "Re-run the dcg install script so hooks.json points at the installed \
+                        "Re-run the dcg install script so the hook points at the installed \
                          binary, or fix the path by hand (a hook whose program is missing \
                          fails at run time, and Codex fails open)"
                             .to_string(),
@@ -17389,7 +17395,8 @@ enum CodexHookState {
 /// but untrusted" (#391).
 #[derive(Debug, PartialEq, Eq)]
 enum CodexHookProbe {
-    /// `~/.codex/hooks.json` does not exist (or cannot be read).
+    /// `~/.codex/hooks.json` does not exist (or cannot be read), and the
+    /// `[hooks]` table of `config.toml` registers no dcg hook either.
     HooksFileMissing,
     /// hooks.json exists but is not valid JSON.
     HooksFileInvalid(String),
@@ -17398,8 +17405,9 @@ enum CodexHookProbe {
     /// `deny_unknown_fields`). Codex logs "failed to parse hooks config" and
     /// loads NONE of the file's hooks.
     HooksFileRejected(String),
-    /// Loadable file, but no `type: "command"` dcg hook under `PreToolUse`
-    /// with a matcher that selects `Bash`.
+    /// Loadable hooks.json, but neither it nor config.toml's `[hooks]` table
+    /// has a `type: "command"` dcg hook under `PreToolUse` with a matcher that
+    /// selects `Bash`.
     NotRegistered,
     /// A dcg command hook exists, but not where Codex runs it for shell
     /// commands (under another event, or under a `PreToolUse` matcher that
@@ -17618,32 +17626,118 @@ fn probe_codex_dcg_hook() -> CodexHookProbe {
 
 /// Testable core of [`probe_codex_dcg_hook`]: explicit file locations and an
 /// injectable "does this hook command's program exist" check.
+///
+/// Codex reads `PreToolUse` hooks from BOTH files of a config layer: the
+/// layer's `hooks.json` and the `hooks` table of its `config.toml`
+/// (`codex-rs/hooks/src/engine/discovery.rs::discover_handlers` loads the JSON
+/// file, then the TOML table, and runs the handlers of both). A dcg hook in
+/// either file guards shell commands (#606). Each file keys its trust entry by
+/// its own path, so a `config.toml` registration is trusted under
+/// `<config.toml>:pre_tool_use:<i>:<j>`, not under the `hooks.json` path.
 fn probe_codex_dcg_hook_at(
     hooks_path: &std::path::Path,
     config_path: &std::path::Path,
     command_exists: impl Fn(&str) -> bool,
 ) -> CodexHookProbe {
-    let raw = match std::fs::read_to_string(hooks_path) {
-        Ok(raw) => raw,
-        Err(_) => return CodexHookProbe::HooksFileMissing,
-    };
-    // Two-stage parse so a syntax error and a schema rejection get different
-    // remedies: the first is a broken file, the second is a well-formed file
-    // Codex refuses to load.
-    let json = match parse_hook_settings_json(&raw) {
-        Ok(json) => json,
-        Err(err) => return CodexHookProbe::HooksFileInvalid(err.to_string()),
-    };
-    let parsed: CodexHooksFile = match serde_json::from_value(json) {
-        Ok(parsed) => parsed,
-        Err(err) => return CodexHookProbe::HooksFileRejected(err.to_string()),
+    // One read of config.toml serves both its `hooks` event lists and the
+    // `[hooks.state]` trust table.
+    let config = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Table>().ok());
+
+    let json = codex_hooks_json_events(hooks_path);
+    let mut misplaced = if let Ok(events) = &json {
+        let (found, detail) = find_codex_dcg_hook(events);
+        if let Some((entry_index, hook_index, command)) = found {
+            return codex_registered_probe(
+                hooks_path,
+                entry_index,
+                hook_index,
+                command,
+                config.as_ref(),
+                &command_exists,
+            );
+        }
+        detail.map(|detail| format!("in {}: {detail}", hooks_path.display()))
+    } else {
+        None
     };
 
+    // Codex's `HooksToml` flattens the event lists next to `state` and does
+    // not deny unknown keys, so `state` is simply ignored here. A table Codex
+    // cannot deserialize loads no TOML hooks at all (it logs a warning).
+    let toml_events = config
+        .as_ref()
+        .and_then(|config| config.get("hooks"))
+        .cloned()
+        .and_then(|hooks| hooks.try_into::<CodexHookEvents>().ok());
+    if let Some(events) = &toml_events {
+        let (found, detail) = find_codex_dcg_hook(events);
+        if let Some((entry_index, hook_index, command)) = found {
+            return codex_registered_probe(
+                config_path,
+                entry_index,
+                hook_index,
+                command,
+                config.as_ref(),
+                &command_exists,
+            );
+        }
+        if misplaced.is_none() {
+            misplaced = detail.map(|detail| {
+                format!(
+                    "in the [hooks] table of {}: {detail}",
+                    config_path.display()
+                )
+            });
+        }
+    }
+
+    // Neither file registers dcg. A broken hooks.json is reported first: it
+    // is the likeliest reason the installer's registration is not seen.
+    match (json, misplaced) {
+        (Err(CodexHooksJsonError::Invalid(err)), _) => CodexHookProbe::HooksFileInvalid(err),
+        (Err(CodexHooksJsonError::Rejected(err)), _) => CodexHookProbe::HooksFileRejected(err),
+        (_, Some(detail)) => CodexHookProbe::Misplaced(detail),
+        (Err(CodexHooksJsonError::Missing), None) => CodexHookProbe::HooksFileMissing,
+        (Ok(_), None) => CodexHookProbe::NotRegistered,
+    }
+}
+
+/// Why `hooks.json` contributed no hooks.
+enum CodexHooksJsonError {
+    /// The file does not exist (or cannot be read).
+    Missing,
+    /// Not valid JSON.
+    Invalid(String),
+    /// Valid JSON that Codex's `HooksFile` schema rejects.
+    Rejected(String),
+}
+
+/// Load the event lists of a Codex `hooks.json`, in the order Codex's own
+/// loader fails. Two-stage parse so a syntax error and a schema rejection get
+/// different remedies: the first is a broken file, the second is a
+/// well-formed file Codex refuses to load.
+fn codex_hooks_json_events(
+    hooks_path: &std::path::Path,
+) -> Result<CodexHookEvents, CodexHooksJsonError> {
+    let raw = std::fs::read_to_string(hooks_path).map_err(|_| CodexHooksJsonError::Missing)?;
+    let json = parse_hook_settings_json(&raw)
+        .map_err(|err| CodexHooksJsonError::Invalid(err.to_string()))?;
+    let parsed: CodexHooksFile = serde_json::from_value(json)
+        .map_err(|err| CodexHooksJsonError::Rejected(err.to_string()))?;
+    Ok(parsed.hooks)
+}
+
+/// Find the first dcg command hook under a `PreToolUse` matcher that selects
+/// `Bash`, as `(entry_index, hook_index, command)`. When there is none, the
+/// second value describes a dcg hook found somewhere Codex does not run it
+/// for shell commands.
+fn find_codex_dcg_hook(events: &CodexHookEvents) -> (Option<(usize, usize, &str)>, Option<String>) {
     // The state key indexes the PreToolUse array as loaded, so `entry_index`
     // counts EVERY element (including non-Bash matchers), not just Bash ones.
-    let mut found: Option<(usize, usize, &str)> = None;
     let mut misplaced: Option<String> = None;
-    'outer: for (entry_index, group) in parsed.hooks.pre_tool_use.iter().enumerate() {
+    for (entry_index, group) in events.pre_tool_use.iter().enumerate() {
         let selects_bash = codex_matcher_selects_bash(group.matcher.as_deref());
         for (hook_index, hook) in group.hooks.iter().enumerate() {
             let Some(command) = hook.effective_command() else {
@@ -17653,8 +17747,7 @@ fn probe_codex_dcg_hook_at(
                 continue;
             }
             if selects_bash {
-                found = Some((entry_index, hook_index, command));
-                break 'outer;
+                return (Some((entry_index, hook_index, command)), None);
             }
             misplaced.get_or_insert_with(|| {
                 format!(
@@ -17664,26 +17757,33 @@ fn probe_codex_dcg_hook_at(
             });
         }
     }
-    if found.is_none() {
-        for (event, groups) in parsed.hooks.other_events() {
-            for (entry_index, group) in groups.iter().enumerate() {
-                for hook in &group.hooks {
-                    if hook.effective_command().is_some_and(codex_command_is_dcg) {
-                        misplaced.get_or_insert_with(|| {
-                            format!("found under {event} entry {entry_index} instead of PreToolUse")
-                        });
-                    }
+    for (event, groups) in events.other_events() {
+        for (entry_index, group) in groups.iter().enumerate() {
+            for hook in &group.hooks {
+                if hook.effective_command().is_some_and(codex_command_is_dcg) {
+                    misplaced.get_or_insert_with(|| {
+                        format!("found under {event} entry {entry_index} instead of PreToolUse")
+                    });
                 }
             }
         }
     }
-    let Some((entry_index, hook_index, command)) = found else {
-        return misplaced.map_or(CodexHookProbe::NotRegistered, CodexHookProbe::Misplaced);
-    };
+    (None, misplaced)
+}
 
+/// The probe result for a dcg hook registered at `source_path` (the file that
+/// holds it, which is also the prefix of its `[hooks.state]` key).
+fn codex_registered_probe(
+    source_path: &std::path::Path,
+    entry_index: usize,
+    hook_index: usize,
+    command: &str,
+    config: Option<&toml::Table>,
+    command_exists: &dyn Fn(&str) -> bool,
+) -> CodexHookProbe {
     let state_key = format!(
         "{}:pre_tool_use:{entry_index}:{hook_index}",
-        hooks_path.display()
+        source_path.display()
     );
     if !command_exists(command) {
         return CodexHookProbe::CommandNotFound {
@@ -17692,10 +17792,7 @@ fn probe_codex_dcg_hook_at(
         };
     }
 
-    let state = match std::fs::read_to_string(config_path)
-        .ok()
-        .and_then(|raw| raw.parse::<toml::Table>().ok())
-    {
+    let state = match config {
         Some(config) => {
             let entry = config
                 .get("hooks")
@@ -28549,6 +28646,188 @@ if ($errors.Count -ne 0) {
         assert!(!codex_hook_command_exists(
             "definitely-not-a-real-program-name-dcg-391"
         ));
+    }
+
+    // ---- #606: hooks registered in config.toml's [hooks] table ------------
+
+    /// The reporter's fixture: dcg registered in config.toml alone.
+    const CODEX_TOML_DCG: &str = r#"[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "dcg"
+"#;
+
+    /// `[hooks.state."<key>"]` with a trust hash and optional `enabled`.
+    fn codex_state_table(key: &str, enabled: Option<bool>) -> String {
+        let key_toml = toml_edit::Key::new(key);
+        let enabled = enabled.map_or_else(String::new, |value| format!("enabled = {value}\n"));
+        format!("[hooks.state.{key_toml}]\ntrusted_hash = \"sha256:abc\"\n{enabled}")
+    }
+
+    #[test]
+    fn codex_probe_finds_a_config_toml_registration_606() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks_path = dir.path().join("hooks.json");
+        let config_path = dir.path().join("config.toml");
+        // Codex keys a config.toml hook's trust entry by the config.toml path.
+        let toml_key = format!("{}:pre_tool_use:0:0", config_path.display());
+        let json_key = format!("{}:pre_tool_use:0:0", hooks_path.display());
+        let probe = || probe_codex_dcg_hook_at(&hooks_path, &config_path, |_| true);
+
+        // No hooks.json at all: registered, awaiting trust.
+        std::fs::write(&config_path, CODEX_TOML_DCG).expect("write");
+        assert_eq!(
+            probe(),
+            CodexHookProbe::Registered {
+                state_key: toml_key.clone(),
+                state: CodexHookState::NoStateEntry,
+            }
+        );
+        // Trusted under its own key: enabled. Disabled: reported as such.
+        for (enabled, state) in [
+            (None, CodexHookState::Enabled),
+            (Some(true), CodexHookState::Enabled),
+            (Some(false), CodexHookState::Disabled),
+        ] {
+            std::fs::write(
+                &config_path,
+                format!(
+                    "{CODEX_TOML_DCG}\n{}",
+                    codex_state_table(&toml_key, enabled)
+                ),
+            )
+            .expect("write");
+            assert_eq!(
+                probe(),
+                CodexHookProbe::Registered {
+                    state_key: toml_key.clone(),
+                    state,
+                }
+            );
+        }
+        // A trust entry under the hooks.json key does not trust this hook.
+        std::fs::write(
+            &config_path,
+            format!("{CODEX_TOML_DCG}\n{}", codex_state_table(&json_key, None)),
+        )
+        .expect("write");
+        assert_eq!(
+            probe(),
+            CodexHookProbe::Registered {
+                state_key: toml_key.clone(),
+                state: CodexHookState::NoStateEntry,
+            }
+        );
+        // `--fix` re-enables the config.toml-keyed entry in place.
+        std::fs::write(
+            &config_path,
+            format!(
+                "{CODEX_TOML_DCG}\n{}",
+                codex_state_table(&toml_key, Some(false))
+            ),
+        )
+        .expect("write");
+        enable_codex_hook_state_at(&config_path, &toml_key).expect("re-enable");
+        assert_eq!(
+            probe(),
+            CodexHookProbe::Registered {
+                state_key: toml_key.clone(),
+                state: CodexHookState::Enabled,
+            }
+        );
+        // The registration still needs its program.
+        assert_eq!(
+            probe_codex_dcg_hook_at(&hooks_path, &config_path, |_| false),
+            CodexHookProbe::CommandNotFound {
+                state_key: toml_key,
+                command: "dcg".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn codex_probe_reads_both_files_in_codex_load_order_606() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks_path = dir.path().join("hooks.json");
+        let config_path = dir.path().join("config.toml");
+        let toml_key = format!("{}:pre_tool_use:0:0", config_path.display());
+        let json_key = format!("{}:pre_tool_use:0:0", hooks_path.display());
+        let probe = || probe_codex_dcg_hook_at(&hooks_path, &config_path, |_| true);
+        let registered_at = |probe: CodexHookProbe| match probe {
+            CodexHookProbe::Registered { state_key, .. } => state_key,
+            other => panic!("expected Registered, got {other:?}"),
+        };
+        let stub = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/bin/true"}]}]}}"#;
+
+        // hooks.json loads but holds no dcg hook; config.toml does.
+        std::fs::write(&hooks_path, stub).expect("write");
+        std::fs::write(&config_path, CODEX_TOML_DCG).expect("write");
+        assert_eq!(registered_at(probe()), toml_key);
+
+        // Both register dcg: Codex loads hooks.json first.
+        std::fs::write(&hooks_path, CODEX_HOOKS_DCG_FIRST).expect("write");
+        assert_eq!(registered_at(probe()), json_key);
+
+        // A broken hooks.json does not stop Codex from loading config.toml.
+        std::fs::write(&hooks_path, "{not json").expect("write");
+        assert_eq!(registered_at(probe()), toml_key);
+        std::fs::write(&hooks_path, r#"{"version":1,"hooks":{}}"#).expect("write");
+        assert_eq!(registered_at(probe()), toml_key);
+
+        // With neither file registering dcg, the hooks.json problem stays
+        // the reported one.
+        std::fs::write(&config_path, "[hooks.state]\n").expect("write");
+        assert!(matches!(probe(), CodexHookProbe::HooksFileRejected(_)));
+        std::fs::write(&hooks_path, "{not json").expect("write");
+        assert!(matches!(probe(), CodexHookProbe::HooksFileInvalid(_)));
+        std::fs::write(&hooks_path, stub).expect("write");
+        assert_eq!(probe(), CodexHookProbe::NotRegistered);
+    }
+
+    #[test]
+    fn codex_probe_config_toml_misplaced_and_unloadable_tables_606() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks_path = dir.path().join("hooks.json");
+        let config_path = dir.path().join("config.toml");
+        let probe = || probe_codex_dcg_hook_at(&hooks_path, &config_path, |_| true);
+
+        // A config.toml dcg hook whose matcher excludes Bash is misplaced,
+        // and the detail names config.toml.
+        std::fs::write(&config_path, CODEX_TOML_DCG.replace("^Bash$", "^Write$")).expect("write");
+        match probe() {
+            CodexHookProbe::Misplaced(detail) => {
+                assert!(detail.contains("config.toml"), "{detail}");
+                assert!(detail.contains("does not select Bash"), "{detail}");
+            }
+            other => panic!("expected Misplaced, got {other:?}"),
+        }
+        // Under another event: misplaced too.
+        std::fs::write(
+            &config_path,
+            CODEX_TOML_DCG.replace("PreToolUse", "PostToolUse"),
+        )
+        .expect("write");
+        match probe() {
+            CodexHookProbe::Misplaced(detail) => {
+                assert!(detail.contains("PostToolUse"), "{detail}");
+            }
+            other => panic!("expected Misplaced, got {other:?}"),
+        }
+        // A table Codex cannot deserialize loads no hooks: not registered.
+        std::fs::write(&config_path, "[hooks]\nPreToolUse = \"not a list\"\n").expect("write");
+        assert_eq!(probe(), CodexHookProbe::HooksFileMissing);
+        // Only a trust table, no hook lists: not registered.
+        std::fs::write(&config_path, "[hooks.state]\n").expect("write");
+        assert_eq!(probe(), CodexHookProbe::HooksFileMissing);
+        // A non-dcg command is not a registration.
+        std::fs::write(
+            &config_path,
+            CODEX_TOML_DCG.replace("\"dcg\"", "\"/bin/true\""),
+        )
+        .expect("write");
+        assert_eq!(probe(), CodexHookProbe::HooksFileMissing);
     }
 
     #[test]
