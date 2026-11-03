@@ -84,11 +84,12 @@ safe_patterns:                       # Patterns that explicitly allow
 ### Custom Denial Wording (redirect-style packs)
 
 By default a denial is titled "Destructive Command Detected", and the reason the
-agent reads ends with "ask the user for explicit permission and have them run the
-command manually". For a pack that *redirects*, where the command is fine but
-should go through a sanctioned route, both are wrong. The trailer is also
-actively misleading: it tells the agent to stop and ask a human instead of
-following your `explanation`.
+agent reads ends with a generic trailer: use a safer alternative if one reaches
+the same goal, do not reword the command to get past the guard, and otherwise ask
+the user to approve it (or run it by hand). For a pack that *redirects*, where the
+command is fine but should go through a sanctioned route, both are wrong. The
+generic trailer does not name your route, so the agent is likely to stop and ask
+a human instead of following your `explanation`.
 
 ```yaml
 id: example.hosted_ci

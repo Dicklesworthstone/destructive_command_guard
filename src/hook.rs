@@ -3578,6 +3578,19 @@ fn format_explanation_block(explanation: &str) -> String {
     output
 }
 
+/// Closing instruction of a built-in denial when no allow-once code was
+/// minted (#615).
+pub const BUILTIN_DENIAL_TRAILER: &str = "If a safer alternative reaches the same goal, use it instead. \
+     Do not reword, wrap, or split this command to get it past the guard. \
+     If no safer path reaches the goal, ask the user for explicit permission and have them run \
+     the command manually.";
+
+/// Closing instruction of a built-in denial when an allow-once code was
+/// minted; the `dcg allow-once <code>` line follows it (#615, GH#332).
+pub const BUILTIN_DENIAL_TRAILER_WITH_APPROVAL_CODE: &str = "If a safer alternative reaches the same goal, use it instead. \
+     Do not reword, wrap, or split this command to get it past the guard. \
+     If no safer path reaches the goal, ask the user to approve this command.";
+
 /// Format the denial message for the JSON output (plain text).
 ///
 /// When an allow-once code was minted for this denial, the message names the
@@ -3599,11 +3612,21 @@ pub fn format_denial_message(
     // An external pack may author the closing instruction (#416): for a
     // redirect-style rule, "have the user run it by hand" is the wrong
     // recovery. The `BLOCKED` header, rule and reason stay dcg's.
+    //
+    // The built-in trailer sends the agent to a safer path first (#615): most
+    // denials list an alternative that reaches the same goal, and the old
+    // "ask the user and have them run it" sent agents to the user even then.
+    // It forbids rewording the command to get past the guard, and the command
+    // itself still needs the user: with a code minted, the line after this
+    // names `dcg allow-once`; without one, the user runs it by hand.
+    let builtin = if allow_once_code.is_some() {
+        BUILTIN_DENIAL_TRAILER_WITH_APPROVAL_CODE
+    } else {
+        BUILTIN_DENIAL_TRAILER
+    };
     let trailer = pack
         .and_then(|pack_id| crate::packs::external_denial_trailer(pack_id, pattern))
-        .unwrap_or(
-            "If this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
-        );
+        .unwrap_or(builtin);
     let mut message = format_matched_message(
         "BLOCKED by dcg",
         command,
@@ -7006,6 +7029,60 @@ mod tests {
         assert!(
             !message.contains("allow-once"),
             "no code minted, so no allow-once mention: {message}"
+        );
+    }
+
+    /// GH#615: the built-in trailer points the agent at a safer path before
+    /// the user, forbids rewording the command past the guard, and leaves the
+    /// command itself to the user: approval when a code exists, a manual run
+    /// when it does not.
+    #[test]
+    fn builtin_denial_trailer_prefers_a_safer_path_issue_615() {
+        let without_code = format_denial_message(
+            "git reset --hard",
+            "destructive",
+            Some("Safer alternatives:\n- git stash"),
+            Some("core.git"),
+            Some("reset-hard"),
+            None,
+        );
+        let with_code = format_denial_message(
+            "git reset --hard",
+            "destructive",
+            Some("Safer alternatives:\n- git stash"),
+            Some("core.git"),
+            Some("reset-hard"),
+            Some("137527"),
+        );
+        for message in [&without_code, &with_code] {
+            assert!(
+                message.contains("If a safer alternative reaches the same goal, use it instead."),
+                "{message}"
+            );
+            assert!(
+                message.contains("Do not reword, wrap, or split this command"),
+                "{message}"
+            );
+            assert!(!message.contains("truly needed"), "{message}");
+        }
+        assert!(
+            without_code.ends_with(BUILTIN_DENIAL_TRAILER),
+            "{without_code}"
+        );
+        assert!(without_code.contains("have them run the command manually"));
+        let approval_at = with_code
+            .find(BUILTIN_DENIAL_TRAILER_WITH_APPROVAL_CODE)
+            .expect("approval trailer present");
+        let code_at = with_code
+            .find("dcg allow-once 137527")
+            .expect("allow-once line present");
+        assert!(
+            approval_at < code_at,
+            "the code follows the trailer: {with_code}"
+        );
+        assert!(
+            !with_code.contains("run the command manually"),
+            "{with_code}"
         );
     }
 
