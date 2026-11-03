@@ -6611,6 +6611,153 @@ fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeTo
     positions
 }
 
+/// Whether a shell script runs an expansion as a command word: the first word
+/// of any of its commands is nothing but parameter expansions or command
+/// substitutions (`$C x`, `cd /srv && $C`, `X=1 "$C" --force`) (#607).
+///
+/// An inline `-c` script or ssh remote command is expanded by the outer shell
+/// before the inner shell reads it, so the inner shell parses such a value as
+/// code, as `eval "$C x"` does: `C='rm -rf ~;'` runs the delete whatever
+/// literal text follows. A word that joins an expansion to literal text
+/// (`$HOME/bin/tool`) names a path and does not count, and neither does an
+/// expansion in argument position (`echo $C`). Arithmetic (`$((1+2))`) and
+/// the special parameters that hold a number or option letters (`$?`, `$#`,
+/// `$$`, `$!`, `$-`) cannot hold code.
+pub(crate) fn shell_script_runs_an_expansion_as_a_command(script: &str) -> bool {
+    use crate::normalize::NormalizeTokenKind;
+    let tokens = crate::normalize::tokenize_for_normalization(script);
+    let mut expect_command = true;
+    let mut redirect_target = false;
+    for (index, token) in tokens.iter().enumerate() {
+        if token.kind != NormalizeTokenKind::Word {
+            if splits_fd_duplication(script, &tokens, index) {
+                redirect_target = true;
+                continue;
+            }
+            expect_command = true;
+            redirect_target = false;
+            continue;
+        }
+        let Some(text) = token.text(script) else {
+            continue;
+        };
+        if redirect_target {
+            redirect_target = false;
+            continue;
+        }
+        if word_token_starts_local_redirect(text) {
+            redirect_target = redirect_operator_takes_next_word(text);
+            continue;
+        }
+        if !expect_command {
+            continue;
+        }
+        if matches!(
+            text,
+            "{" | "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until"
+        ) || crate::normalize::is_env_assignment(text)
+        {
+            continue;
+        }
+        if word_is_only_code_expansions(text) {
+            return true;
+        }
+        expect_command = false;
+    }
+    false
+}
+
+/// Whether `word` is one or more expansions that can carry code and nothing
+/// else, each bare or inside double quotes (`$C`, `"$C"`, `${C}"$D"`,
+/// `$(cat f)`). See [`shell_script_runs_an_expansion_as_a_command`].
+fn word_is_only_code_expansions(word: &str) -> bool {
+    let mut rest = word;
+    let mut seen = false;
+    while !rest.is_empty() {
+        let quoted = rest.strip_prefix('"');
+        let segment = quoted.unwrap_or(rest);
+        let Some(end) = code_expansion_len(segment) else {
+            return false;
+        };
+        seen = true;
+        rest = &segment[end..];
+        if quoted.is_some() {
+            // Further expansions may share the quotes (`"$A$B"`).
+            loop {
+                if let Some(after) = rest.strip_prefix('"') {
+                    rest = after;
+                    break;
+                }
+                // A raw ssh word spells several remote words: `"$C x" y`
+                // reaches the remote shell as `<C> x y`, so a blank or an
+                // operator inside the quotes ends the remote command word.
+                if rest.starts_with([' ', '\t', '\n', ';', '&', '|']) {
+                    return true;
+                }
+                let Some(end) = code_expansion_len(rest) else {
+                    return false;
+                };
+                rest = &rest[end..];
+            }
+        }
+    }
+    seen
+}
+
+/// The byte length of the expansion `text` starts with, when it is one that
+/// can carry code: `$NAME`, `${…}`, `$(…)`, a backquoted command, `$@`, `$*`
+/// or a positional parameter. `None` for anything else, including arithmetic,
+/// `$'…'` and `$"…"` strings, and an unterminated expansion.
+fn code_expansion_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    match bytes {
+        [b'`', ..] => {
+            let mut at = 1;
+            while let Some(&byte) = bytes.get(at) {
+                match byte {
+                    b'\\' => at += 2,
+                    b'`' => return Some(at + 1),
+                    _ => at += 1,
+                }
+            }
+            None
+        }
+        [b'$', b'(', b'(', ..] => None,
+        [b'$', open @ (b'(' | b'{'), ..] => {
+            let close = if *open == b'(' { b')' } else { b'}' };
+            let mut depth = 0usize;
+            let mut quote: Option<u8> = None;
+            let mut at = 1;
+            while let Some(&byte) = bytes.get(at) {
+                match (quote, byte) {
+                    (Some(b'\''), b'\'') | (Some(b'"'), b'"') => quote = None,
+                    (Some(b'"') | None, b'\\') => at += 1,
+                    (Some(_), _) => {}
+                    (None, b'\'' | b'"') => quote = Some(byte),
+                    (None, _) if byte == *open => depth += 1,
+                    (None, _) if byte == close => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(at + 1);
+                        }
+                    }
+                    (None, _) => {}
+                }
+                at += 1;
+            }
+            None
+        }
+        [b'$', b'@' | b'*' | b'0'..=b'9', ..] => Some(2),
+        [b'$', first, ..] if first.is_ascii_alphabetic() || *first == b'_' => Some(
+            1 + bytes[1..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+                .count(),
+        ),
+        _ => None,
+    }
+}
+
 /// Whether a bare redirect operator word takes the following word as its
 /// target: `2>` and `>&` do, while `2>&1`, `>&-` and `<&0` carry their target
 /// already, so the word after them is the command (`2>&1 watch '…'`).
@@ -24843,6 +24990,51 @@ mod issue_560_masking_tests {
         ] {
             let masked = mask_inert_interpreter_stdin(command);
             assert!(!masked.contains("it`s"), "{command}");
+        }
+    }
+
+    /// A command word made only of expansions that can carry code (#607).
+    #[test]
+    fn expansion_as_command_word_is_found_in_every_command_607() {
+        for script in [
+            "$C x",
+            "${C} x",
+            "$C",
+            "$C; echo done",
+            "$C&& echo done",
+            "$C|cat",
+            "  $C x",
+            "X=1 $C x",
+            "cd /srv && $C",
+            "echo hi; $C x",
+            "if $C; then :; fi",
+            "2>/dev/null $C x",
+            "\"$C\" x",
+            "\"$C x\" y",
+            "\"$A$B\" x",
+            "$(cat cmd.txt) x",
+            "`cat cmd.txt` x",
+            "\"$@\"",
+            "$1 x",
+        ] {
+            assert!(shell_script_runs_an_expansion_as_a_command(script), "{script}");
+        }
+        for script in [
+            "echo $C",
+            "echo hi",
+            "$HOME/bin/tool --flag",
+            "${HOME}/bin/tool --flag",
+            "\"$C\"x",
+            "'$C' x",
+            "cd $DIR && make",
+            ">$C cat",
+            "$((1+2)) x",
+            "$? x",
+            "$# x",
+            "$$ x",
+            "$",
+        ] {
+            assert!(!shell_script_runs_an_expansion_as_a_command(script), "{script}");
         }
     }
 }

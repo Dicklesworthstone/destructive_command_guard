@@ -35211,6 +35211,20 @@ fn inline_shell_script_is_wholly_dynamic(script: &str) -> bool {
     }
 }
 
+/// Whether the program an inline script was extracted for reads it as POSIX
+/// shell source: `sh -c`/`bash -c` and their kin, and ssh's remote command,
+/// which the remote login shell runs (#607). PowerShell and cmd payloads are
+/// re-read as shell too, but there `$x = 1` is an assignment, not a command.
+fn inline_script_target_parses_posix_shell(target: &str) -> bool {
+    let name = target.rsplit(['/', '\\']).next().unwrap_or(target);
+    let name = name.to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    matches!(
+        name,
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh" | "ash" | "ssh"
+    )
+}
+
 #[inline]
 fn nested_evaluation_incomplete(result: &EvaluationResult) -> bool {
     result.is_indeterminate() || result.skipped_due_to_budget
@@ -35680,6 +35694,38 @@ fn evaluate_heredoc(
                     POSIX_INLINE_LAUNCHER_UNVERIFIED_RULE,
                     "Inline shell script cannot be statically verified: its entire source is an \
                      expansion or command substitution",
+                    context.allowlists,
+                    context.project_path,
+                    first_allowlist_hit,
+                ) {
+                    return Some(denial);
+                }
+            }
+            // The same holds when literal text follows the expansion, or
+            // when the expansion opens a later command of the script:
+            // `bash -c "$C x"`, `ssh h "$C; echo done"`, `ssh h "$C" x`,
+            // `bash -c "cd /srv && $C"`. The outer shell substitutes the
+            // value into the script, and the shell running the script parses
+            // it as code, as `eval "$C x"` does; the literal text gives the
+            // analysis nothing to read (#607). A script that was one literal
+            // word (`bash -c '$1 x' _ y`) leaves the expansion to the inner
+            // shell, which splits the value into words without parsing it,
+            // as a top-level `$C x` does. An expansion in argument position
+            // (`bash -c "echo $C"`) or joined to a path (`"$HOME/bin/tool"`)
+            // keeps its analysis.
+            if content.heredoc_type.is_none()
+                && content.word_range.is_none()
+                && content.content_range.is_none()
+                && content
+                    .target_command
+                    .as_deref()
+                    .is_some_and(inline_script_target_parses_posix_shell)
+                && crate::heredoc::shell_script_runs_an_expansion_as_a_command(&content.content)
+            {
+                if let Some(denial) = launcher_unverified_denial(
+                    POSIX_INLINE_LAUNCHER_UNVERIFIED_RULE,
+                    "Inline shell script cannot be statically verified: an expansion or command \
+                     substitution is a command word, so its value is parsed as code",
                     context.allowlists,
                     context.project_path,
                     first_allowlist_hit,
@@ -55547,6 +55593,59 @@ mod tests {
             "$9x",
         ] {
             assert!(!inline_shell_script_is_wholly_dynamic(fixed), "{fixed}");
+        }
+    }
+
+    /// An expansion the outer shell substitutes into a command word of a
+    /// `-c` script or ssh remote command is parsed as code by the shell that
+    /// runs it, like `eval "$C x"`, so it is denied however much literal text
+    /// follows (#607). An expansion in argument position, joined to a path,
+    /// or left to the inner shell keeps its ordinary analysis.
+    #[test]
+    fn outer_expansion_in_inline_script_command_word_is_unverified_607() {
+        let config = default_config();
+        let pack_ids: Vec<String> = config.enabled_pack_ids().into_iter().collect();
+        let pack_ids: Vec<&str> = pack_ids.iter().map(String::as_str).collect();
+        let evaluate =
+            |cmd: &str| evaluate_with_pack_ids_in_dialect(cmd, &pack_ids, ShellDialect::Posix);
+        for cmd in [
+            "bash -c \"$C x\"",
+            "sh -c \"$C x\"",
+            "bash -c \"${C} x\"",
+            "bash -c \"$C; echo done\"",
+            "bash -c \"$C&& echo done\"",
+            "bash -c \"$C|cat\"",
+            "bash -c \"  $C x\"",
+            "bash -c \"cd /srv && $C\"",
+            "bash -c \"X=1 $C x\"",
+            "ssh h \"$C x\"",
+            "ssh h \"$C; echo done\"",
+            "ssh h \"$C\" x",
+            "ssh h \"$C\" --force",
+            "ssh h -- \"$C\" x",
+            "ssh -p 22 h \"$C\" x",
+            // Still denied as before.
+            "bash -c \"$C\"",
+            "ssh h \"$C\"",
+            "eval \"$C x\"",
+        ] {
+            let result = evaluate(cmd);
+            assert!(result.is_denied(), "{cmd:?} must be denied: {result:?}");
+        }
+        for cmd in [
+            "bash -c \"echo $C\"",
+            "ssh h echo \"$C\"",
+            "bash -c 'echo \"$1\"' _ \"$C\"",
+            "bash -c '$1 x' _ y",
+            "bash -c \"cd $HOME/p && make\"",
+            "ssh h \"cd $DIR && make\"",
+            "bash -c \"$HOME/bin/tool --flag\"",
+            "bash -c \"${HOME}/bin/tool --flag\"",
+            "bash -c \"$? x\"",
+            "$C x",
+        ] {
+            let result = evaluate(cmd);
+            assert!(result.is_allowed(), "{cmd:?} must be allowed: {result:?}");
         }
     }
 
