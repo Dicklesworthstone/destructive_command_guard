@@ -1050,6 +1050,67 @@ write_padded_mock_dcg() {
 }
 
 # ============================================================================
+# Shell completions (bd-qny3)
+# ============================================================================
+
+# A dcg whose `completions <shell>` output is one marked line.
+write_completing_mock_dcg() {
+    cat > "$1" <<'MOCKEOF'
+#!/bin/sh
+case "$1" in
+    --version) echo "dcg 1.0.0" ;;
+    completions)
+        [ "$2" = "--help" ] && exit 0
+        echo "#compdef dcg (generated for $2)" ;;
+esac
+MOCKEOF
+    chmod 0755 "$1"
+}
+
+setup_zsh_completion_fixture() {
+    DEST="$TEST_TMPDIR/completion-bin"
+    mkdir -p "$DEST"
+    write_completing_mock_dcg "$DEST/dcg"
+    export SHELL=/bin/zsh
+    export XDG_DATA_HOME="$HOME/.local/share"
+    ZSH_COMPLETIONS="$XDG_DATA_HOME/zsh/site-functions"
+    mkdir -p "$ZSH_COMPLETIONS"
+    printf '#compdef dcg (user edited)\n' > "$ZSH_COMPLETIONS/_dcg"
+    QUIET=0
+}
+
+@test "completions: --no-configure leaves the completion directories unchanged" {
+    setup_zsh_completion_fixture
+    NO_CONFIGURE=1
+
+    run maybe_install_completions
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Shell completions: skipped (--no-configure)"* ]]
+    [ "$(cat "$ZSH_COMPLETIONS/_dcg")" = "#compdef dcg (user edited)" ]
+    [ "$(ls -A "$ZSH_COMPLETIONS")" = "_dcg" ]
+}
+
+@test "completions: replacing a different file keeps a backup that compinit does not load" {
+    setup_zsh_completion_fixture
+    NO_CONFIGURE=0
+
+    run maybe_install_completions
+    [ "$status" -eq 0 ]
+    [ "$(cat "$ZSH_COMPLETIONS/_dcg")" = "#compdef dcg (generated for zsh)" ]
+    local backups=("$ZSH_COMPLETIONS"/._dcg.bak.*)
+    [ "${#backups[@]}" -eq 1 ]
+    [ "$(cat "${backups[0]}")" = "#compdef dcg (user edited)" ]
+    # compinit autoloads every `_*` file on fpath; `_dcg` must stay the only one.
+    [ "$(cd "$ZSH_COMPLETIONS" && printf '%s\n' _*)" = "_dcg" ]
+
+    # The same content again: nothing is rewritten and no second backup appears.
+    run maybe_install_completions
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"are current"* ]]
+    [ "$(ls -A "$ZSH_COMPLETIONS" | wc -l | tr -d ' ')" -eq 2 ]
+}
+
+# ============================================================================
 # Idempotency Tests
 # ============================================================================
 

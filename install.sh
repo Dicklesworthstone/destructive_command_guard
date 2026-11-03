@@ -17,7 +17,7 @@
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
-#   --no-configure     Skip AI agent hook configuration
+#   --no-configure     Skip AI agent hook configuration and shell completions
 #   --no-verify        Skip checksum + signature verification (for testing only)
 #   --require-minisign Require a valid release .minisig and the minisign tool
 #   --minisign-url URL Override the adjacent .minisig URL (including file://)
@@ -1352,6 +1352,22 @@ install_completions_for_shell() {
   # Generate and install completions
   local error_output
   if error_output=$("$bin" completions "$shell" 2>&1) && [ -n "$error_output" ]; then
+    if [ -f "$target" ] && printf '%s\n' "$error_output" | cmp -s - "$target"; then
+      ok "$shell completions at $target are current"
+      return 0
+    fi
+    # Keep a different existing file, as the agent-config steps do (bd-qny3).
+    # The backup is a dotfile: zsh's compinit loads every `_*` file on fpath,
+    # so `_dcg.bak.*` would register a second, older `#compdef dcg`.
+    if [ -f "$target" ]; then
+      local backup
+      backup="$(dirname "$target")/.$(basename "$target").bak.$(date +%Y%m%d%H%M%S)"
+      if ! cp -p "$target" "$backup"; then
+        warn "Could not back up $target; leaving the existing $shell completions unchanged"
+        return 1
+      fi
+      info "Backed up the previous $shell completions to $backup"
+    fi
     printf '%s\n' "$error_output" > "$target"
 
     # When the installer is running as root under sudo, the directory tree we
@@ -1385,6 +1401,12 @@ install_completions_for_shell() {
 
 maybe_install_completions() {
   local shell=""
+  # --no-configure (`dcg update --binary-only`) changes only the binary in
+  # --dest; completions live in the caller's home like the hook settings.
+  if [ "$NO_CONFIGURE" -eq 1 ]; then
+    info "Shell completions: skipped (--no-configure)"
+    return 0
+  fi
   if ! shell=$(detect_default_shell); then
     # Distinguish the "running as root with no caller to attribute" case
     # (e.g. logged in directly as root, no sudo) from "user has an exotic
@@ -1664,7 +1686,8 @@ Options:
   --quiet            Suppress non-error output
   --offline          Skip network preflight checks
   --no-gum           Disable gum formatting even if available
-  --no-configure     Skip AI agent hook configuration
+  --no-configure     Change only the binary: skip agent hook configuration,
+                     the shell startup check and shell completions
   --minisign-url URL Override the adjacent .minisig URL (supports file://)
   --require-minisign Require a valid .minisig and the minisign verifier
   --no-verify        Skip checksum + signature verification (for testing only)
