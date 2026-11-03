@@ -1532,23 +1532,32 @@ impl EnabledKeywordIndex {
             return true;
         }
 
-        if self.core_git_mask != 0
-            && crate::packs::core::git::contains_git_ascii_case_insensitive(decoded)
-            && !crate::packs::core::git::contains_git_ascii_case_insensitive(baseline)
-        {
+        // Occurrences are counted, not just looked for: one benign occurrence
+        // elsewhere in the baseline (`echo legit & gi^t reset --hard`, or a
+        // harmless `git status` before it) does not account for the one the
+        // decode created.
+        let git_count = |text: &str| {
+            text.as_bytes()
+                .windows(3)
+                .filter(|window| window.eq_ignore_ascii_case(b"git"))
+                .count()
+        };
+        if self.core_git_mask != 0 && git_count(decoded) > git_count(baseline) {
             return true;
         }
 
         if let Some(ac) = &self.keyword_matcher {
-            let baseline_hits: std::collections::BTreeSet<usize> = ac
-                .find_overlapping_iter(baseline)
-                .map(|m| m.pattern().as_usize())
-                .collect();
-            if ac
-                .find_overlapping_iter(decoded)
-                .any(|m| !baseline_hits.contains(&m.pattern().as_usize()))
-            {
-                return true;
+            let mut baseline_hits: std::collections::BTreeMap<usize, usize> =
+                std::collections::BTreeMap::new();
+            for hit in ac.find_overlapping_iter(baseline) {
+                *baseline_hits.entry(hit.pattern().as_usize()).or_default() += 1;
+            }
+            for hit in ac.find_overlapping_iter(decoded) {
+                let remaining = baseline_hits.entry(hit.pattern().as_usize()).or_default();
+                if *remaining == 0 {
+                    return true;
+                }
+                *remaining -= 1;
             }
         }
 
@@ -6347,6 +6356,12 @@ destructive_patterns:
         assert!(index.exposes_keyword_absent_from(
             "dd if=/dev/zero of=/dev/sda",
             "d^d if=/dev/zero of=/dev/sda"
+        ));
+
+        // A benign occurrence elsewhere does not account for the decoded one.
+        assert!(index.exposes_keyword_absent_from(
+            "dd if=a of=b & dd of=/dev/sda",
+            "dd if=a of=b & d^d of=/dev/sda"
         ));
 
         // Same keywords on both sides: nothing new, so no replay is warranted.

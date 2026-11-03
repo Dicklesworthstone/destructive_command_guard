@@ -7357,6 +7357,17 @@ fn collect_powershell_verbatim_here_string_substitution_bodies(
 }
 
 fn mask_powershell_block_comments(command: &str) -> Cow<'_, str> {
+    mask_powershell_comments_in(command, false)
+}
+
+/// `command` with every PowerShell comment blanked one byte for one: `<# … #>`
+/// and a `#` comment to the end of its line. The newline stays, as it ends
+/// the statement. A `#` that may be literal text (`a#b`, `=#`) stays too.
+fn mask_powershell_comments(command: &str) -> Cow<'_, str> {
+    mask_powershell_comments_in(command, true)
+}
+
+fn mask_powershell_comments_in(command: &str, line_comments: bool) -> Cow<'_, str> {
     let bytes = command.as_bytes();
     let mut index = 0usize;
     let mut masked: Option<Vec<u8>> = None;
@@ -7364,9 +7375,13 @@ fn mask_powershell_block_comments(command: &str) -> Cow<'_, str> {
         match bytes[index] {
             b'`' => index = escape_sequence_end(command, index),
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
-                index = command[index..]
+                let end = command[index..]
                     .find('\n')
-                    .map_or(bytes.len(), |newline| index + newline + 1);
+                    .map_or(bytes.len(), |newline| index + newline);
+                if line_comments {
+                    masked.get_or_insert_with(|| bytes.to_vec())[index..end].fill(b' ');
+                }
+                index = end;
             }
             b'\'' => index = skip_powershell_single_quote(command, index),
             b'"' => {
@@ -12002,6 +12017,48 @@ fn powershell_unescaped_redirect_suffix(word: &str) -> Option<(usize, bool)> {
     None
 }
 
+/// Whether the POSIX-sanitized view of `command` blanks a byte that PowerShell
+/// reads as a statement separator or grouping token, outside its own quotes
+/// and comments.
+///
+/// The sanitizer replaces masked bytes with spaces, one for one, so a token's
+/// range in `command` is its range in `sanitized` too. A view of another
+/// length cannot be checked, so it counts as blanking one.
+fn posix_mask_blanks_a_powershell_separator(command: &str, sanitized: &str) -> bool {
+    if sanitized == command {
+        return false;
+    }
+    if sanitized.len() != command.len() {
+        return true;
+    }
+    // The tokenizer has no comment syntax: in `echo hi # ; git reset --hard`
+    // it reads a `;` that PowerShell never sees.
+    tokenize_for_shell_dialect(&mask_powershell_comments(command), ShellDialect::PowerShell)
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Separator)
+        .any(|token| {
+            sanitized.get(token.byte_range.clone()) != command.get(token.byte_range.clone())
+        })
+}
+
+/// Whether a PowerShell statement of `normalized` holds a pack keyword where
+/// the span gate reads a command, when the gate passes over the whole text.
+///
+/// The span gate reads quotes the POSIX way, so in
+/// `echo "x\"; git reset --hard; \"y"` it finds one quoted `echo` argument.
+/// PowerShell ends `"x\"` at its second quote and runs the git command as a
+/// statement of its own, so each statement gets the gate by itself. Comments
+/// are blanked first, as the splitter does not know them.
+fn powershell_statement_reaches_pack_keyword(normalized: &str, enabled_keywords: &[&str]) -> bool {
+    let uncommented = mask_powershell_comments(normalized);
+    let statements =
+        crate::packs::split_command_segments_in_dialect(&uncommented, ShellDialect::PowerShell);
+    statements.len() > 1
+        && statements.iter().any(|statement| {
+            !crate::packs::pack_aware_quick_reject_normalized_view(statement, enabled_keywords)
+        })
+}
+
 fn mask_powershell_output_argument_data<'a>(
     command_for_match: &'a str,
     original_command: &str,
@@ -15077,7 +15134,7 @@ pub fn evaluate_command_with_pack_order_deadline_at_path_in_dialect(
 /// cross-segment false positives but can never expose a command the POSIX view
 /// masked. A `;` that is dialect-relevant because it sits next to quoting is
 /// already covered by the quote bytes.
-const DIALECT_DIVERGENT_BYTES: [u8; 7] = *b"'\"^`%&|";
+const DIALECT_DIVERGENT_BYTES: [u8; 8] = *b"'\"^`%!&|";
 
 /// Cheap pre-signal for the unknown-dialect fan-out (dcg#294).
 ///
@@ -15148,7 +15205,7 @@ fn view_decode_exposes_pack_keyword(
     keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
 ) -> bool {
     let escapes: &[char] = match view {
-        ShellDialect::Cmd => &['^', '%'],
+        ShellDialect::Cmd => &['^', '%', '!'],
         ShellDialect::PowerShell => &['`'],
         ShellDialect::Posix | ShellDialect::Unknown => return false,
     };
@@ -15163,7 +15220,14 @@ fn view_decode_exposes_pack_keyword(
     let view_escape_present = command.char_indices().any(|(offset, ch)| {
         escapes.contains(&ch) && !crate::context::offset_is_quoted_data(command, offset)
     });
-    if !view_escape_present {
+    // A cmd `%NAME%` or `!NAME!` is expanded inside double quotes as well, and
+    // cmd.exe has no single quotes, so `gi"%PATH:~0,0%"t` runs git wherever
+    // the POSIX quotes sit. A quoted one is evidence only for what removing
+    // the expansion itself reveals, not for the rest of cmd's decode: a quoted
+    // caret in `printf '%s\n' 'doc^ker system prune -af'` stays a string.
+    let cmd_expansion_present =
+        view == ShellDialect::Cmd && command.bytes().any(|byte| matches!(byte, b'%' | b'!'));
+    if !view_escape_present && !cmd_expansion_present {
         return false;
     }
     let view_normalized = crate::normalize::normalize_command_in_dialect(command, view);
@@ -15173,9 +15237,14 @@ fn view_decode_exposes_pack_keyword(
     // value can be empty (`%PATH:~0,0%` always is), so `gi%x%t reset --hard`
     // can run git while every other view reads one unknown program. The
     // normalized view keeps the expansion, so ask the view without it too.
+    // The expansion comes out of the raw text and the rest is normalized
+    // after, as cmd.exe does it: `gi"%x%"t` leaves `gi""t`, which is `git`.
     let elided = (view == ShellDialect::Cmd)
-        .then(|| elide_cmd_percent_expansions(view_normalized.as_ref()))
-        .flatten();
+        .then(|| elide_cmd_percent_expansions(command))
+        .flatten()
+        .map(|elided| {
+            crate::normalize::normalize_command_in_dialect(&elided, ShellDialect::Cmd).into_owned()
+        });
     // A decode that leaves the command where the POSIX view already had it
     // cannot have reconstructed an executable; that difference is the only
     // thing that could have.
@@ -15186,21 +15255,26 @@ fn view_decode_exposes_pack_keyword(
         // No index to ask, so fail closed exactly like the candidate gate's
         // keyword half does: the two views disagree, and only this view's
         // decode could have made them.
-        return true;
+        return view_escape_present || elided.is_some();
     };
-    index.exposes_keyword_absent_from(view_normalized.as_ref(), posix_normalized.as_ref())
+    // The elided view is measured against cmd's own view, so it answers only
+    // for what the expansions hid.
+    (view_escape_present
+        && index.exposes_keyword_absent_from(view_normalized.as_ref(), posix_normalized.as_ref()))
         || elided.is_some_and(|elided| {
-            index.exposes_keyword_absent_from(&elided, posix_normalized.as_ref())
+            index.exposes_keyword_absent_from(&elided, view_normalized.as_ref())
         })
 }
 
-/// `command` with each cmd.exe `%NAME%` and batch-parameter (`%1`, `%*`)
-/// expansion removed, or `None` when it has none.
+/// `command` with each cmd.exe `%NAME%`, delayed `!NAME!` and batch-parameter
+/// (`%1`, `%*`) expansion removed, or `None` when it has none.
 ///
-/// A name is what the evaluator's other cmd scanners accept: it starts with a
-/// letter, a digit or `_` and holds no whitespace, so `100%` and the `%` of
-/// `50% off` stay text. `%%` stays too: on a command line it is two literal
-/// percent signs.
+/// Any text up to the next `%` (or `!`) on the line is taken for a name:
+/// cmd.exe names may hold spaces and punctuation (`%a b%`, `%PATH:~0, 0%`),
+/// and the evaluator's own cmd scanner accepts the same. Reading too much as
+/// an expansion only asks for a replay, which then needs a keyword the POSIX
+/// view lacks, so `echo 50% off 20%` costs a keyword scan and nothing more.
+/// `%%` and `!!` stay: on a command line they are literal.
 fn elide_cmd_percent_expansions(command: &str) -> Option<String> {
     let bytes = command.as_bytes();
     let mut elided = String::with_capacity(command.len());
@@ -15208,23 +15282,29 @@ fn elide_cmd_percent_expansions(command: &str) -> Option<String> {
     let mut index = 0usize;
     let mut removed = false;
     while index < bytes.len() {
-        if bytes[index] != b'%' {
+        let sigil = bytes[index];
+        if !matches!(sigil, b'%' | b'!') {
             index += 1;
             continue;
         }
-        let end = match bytes.get(index + 1) {
-            Some(b'%') => {
-                index += 2;
-                continue;
-            }
-            Some(next) if next.is_ascii_digit() || *next == b'*' => Some(index + 2),
-            Some(next) if next.is_ascii_alphanumeric() || *next == b'_' => command[index + 1..]
-                .find(|ch: char| ch == '%' || ch.is_whitespace())
-                .map(|offset| index + 1 + offset)
-                .filter(|close| bytes[*close] == b'%')
-                .map(|close| close + 1),
-            _ => None,
-        };
+        if bytes.get(index + 1) == Some(&sigil) {
+            index += 2;
+            continue;
+        }
+        let closing = bytes[index + 1..]
+            .iter()
+            .position(|byte| *byte == sigil || *byte == b'\n')
+            .map(|offset| index + 1 + offset)
+            .filter(|close| bytes[*close] == sigil);
+        // `%1%` is the variable `1` on a command line, so a closing `%` takes
+        // precedence over the batch argument `%1`.
+        let end = closing.map(|close| close + 1).or_else(|| {
+            (sigil == b'%'
+                && bytes
+                    .get(index + 1)
+                    .is_some_and(|next| next.is_ascii_digit() || *next == b'*'))
+            .then_some(index + 2)
+        });
         let Some(end) = end else {
             index += 1;
             continue;
@@ -15258,7 +15338,11 @@ fn elide_cmd_percent_expansions(command: &str) -> Option<String> {
 /// The new segment must additionally start right after a `&` or `|` separator.
 /// cmd.exe also splits on `(`/`)` grouping, and a quoted `$(...)` or `(...)`
 /// that POSIX keeps inside one word would otherwise look like an exposed
-/// command when it is still argument text.
+/// command when it is still argument text. PowerShell also ends a statement
+/// at `;`, so there a `;` that POSIX reads inside quotes counts too:
+/// `Write-Output "a\" ; git push --force ; \"b"` runs the push only in
+/// PowerShell, which does not escape with a backslash. Not for a command with
+/// a heredoc: PowerShell has none, and would split the body at its `;`.
 fn view_exposes_extra_command_segments(command: &str, view: ShellDialect) -> bool {
     let segment_starts = |dialect| -> Vec<usize> {
         crate::packs::split_command_segments_in_dialect(command, dialect)
@@ -15266,9 +15350,14 @@ fn view_exposes_extra_command_segments(command: &str, view: ShellDialect) -> boo
             .map(|segment| (segment.as_ptr() as usize).saturating_sub(command.as_ptr() as usize))
             .collect()
     };
+    let separators: &[char] = if view == ShellDialect::PowerShell && !command.contains("<<") {
+        &['&', '|', ';']
+    } else {
+        &['&', '|']
+    };
     let posix_starts = segment_starts(ShellDialect::Posix);
     segment_starts(view).into_iter().any(|start| {
-        !posix_starts.contains(&start) && command[..start].trim_end().ends_with(['&', '|'])
+        !posix_starts.contains(&start) && command[..start].trim_end().ends_with(separators)
     })
 }
 
@@ -16348,7 +16437,20 @@ fn evaluate_command_in_single_dialect_view(
     let sanitized = if shell_dialect == ShellDialect::Cmd {
         Cow::Borrowed(command)
     } else {
-        precomputed_sanitized.unwrap_or_else(|| sanitize_for_pattern_matching(command))
+        let sanitized =
+            precomputed_sanitized.unwrap_or_else(|| sanitize_for_pattern_matching(command));
+        // PowerShell does not escape with a backslash, so the POSIX reading
+        // of `echo "x\"; git reset --hard; \"y"` is one argument, which it
+        // masks as echo data, while PowerShell runs `git reset --hard` as its
+        // own statement. Such a view is unusable; start from the command, as
+        // for Cmd, and leave the masking to the PowerShell overlays below.
+        if shell_dialect == ShellDialect::PowerShell
+            && posix_mask_blanks_a_powershell_separator(command, sanitized.as_ref())
+        {
+            Cow::Borrowed(command)
+        } else {
+            sanitized
+        }
     };
     let keep_custom_syntax = crate::packs::get_external_packs().is_some_and(|store| {
         ordered_packs
@@ -16425,6 +16527,9 @@ fn evaluate_command_in_single_dialect_view(
     } else {
         pack_aware_quick_reject_with_normalized(dialect_normalized.as_ref(), enabled_keywords)
     };
+    let quick_reject = quick_reject
+        && !(shell_dialect == ShellDialect::PowerShell
+            && powershell_statement_reaches_pack_keyword(normalized.as_ref(), enabled_keywords));
     // The same gating view as Step 4, over the normalized command. The
     // normalized text itself, not this view, is what the packs match.
     let quick_reject = quick_reject
@@ -32015,6 +32120,7 @@ fn command_pattern_match_is_inert_quoted_data(
     command: &str,
     span: MatchSpan,
     source_context: Option<(&str, usize)>,
+    shell_dialect: ShellDialect,
 ) -> bool {
     // Global-option support must not turn an agent name containing a dcg
     // command into an invocation. Apply the existing source-aware quote
@@ -32068,6 +32174,25 @@ fn command_pattern_match_is_inert_quoted_data(
     else {
         return false;
     };
+
+    // The quote reading below is POSIX. PowerShell does not escape with a
+    // backslash, so POSIX reads `echo "x\"; git reset --hard; \"y"` as one
+    // quoted argument while PowerShell runs `git reset --hard` as a statement
+    // of its own. A keyword that starts a PowerShell statement is that
+    // statement's command. The splitter does not know comments, so it reads
+    // the command with them blanked.
+    if shell_dialect == ShellDialect::PowerShell {
+        let uncommented = mask_powershell_comments(command);
+        if crate::packs::split_command_segments_in_dialect(&uncommented, ShellDialect::PowerShell)
+            .iter()
+            .any(|segment| {
+                (segment.as_ptr() as usize).saturating_sub(uncommented.as_ptr() as usize)
+                    == keyword_offset
+            })
+        {
+            return false;
+        }
+    }
 
     // A match inside a POSIX-shell inline payload (`bash -lc '…'`) keeps the
     // quote context the payload itself defines: the payload IS shell source,
@@ -32530,6 +32655,7 @@ fn find_actionable_command_pattern_span(
             command,
             span,
             source_context,
+            shell_dialect,
         ) && !command_match_is_literal_safe_inline_script(
             pack_id,
             pattern_name,
@@ -32572,6 +32698,7 @@ fn find_actionable_command_pattern_span(
             command,
             span,
             source_context,
+            shell_dialect,
         ) && !command_match_is_literal_safe_inline_script(
             pack_id,
             pattern_name,
@@ -59947,7 +60074,18 @@ mod tests {
     /// with its expansions removed.
     #[test]
     fn unknown_dialect_replays_a_cmd_expansion_inside_the_program_name() {
-        for command in ["gi%x%t reset --hard", "gi%PATH:~0,0%t reset --hard"] {
+        for command in [
+            "gi%x%t reset --hard",
+            "gi%PATH:~0,0%t reset --hard",
+            "gi%1%t reset --hard",
+            "gi%-x%t reset --hard",
+            "gi!PATH:~0,0!t reset --hard",
+            // cmd.exe expands inside double quotes too.
+            "gi\"%PATH:~0,0%\"t reset --hard",
+            // A benign occurrence of the keyword elsewhere is no cover.
+            "echo legit & gi%PATH:~0,0%t reset --hard",
+            "git status & gi%PATH:~0,0%t reset --hard",
+        ] {
             for (dialect, denied) in [
                 (ShellDialect::Posix, false),
                 (ShellDialect::Cmd, true),
@@ -59974,6 +60112,9 @@ mod tests {
             "echo %PATH%",
             "date +%Y-%m-%d",
             "echo 100%",
+            // A quoted `%` vouches only for what eliding expansions reveals,
+            // not for the quoted caret cmd.exe would also remove.
+            "printf '%s\\n' 'gi^t reset --hard'",
         ] {
             assert!(
                 !dialect_view_may_expose_hidden_execution(
@@ -59987,16 +60128,110 @@ mod tests {
         }
     }
 
+    /// PowerShell does not escape with a backslash: `"x\"` ends at its second
+    /// quote, so the git command below is a statement of its own. The POSIX
+    /// sanitizer read one double-quoted argument and masked it as `echo` data
+    /// (`echo` is PowerShell's alias for Write-Output), and the PowerShell
+    /// dialect allowed it. The unknown dialect did not replay PowerShell for a
+    /// statement only its `;` split exposes.
+    #[test]
+    fn powershell_statements_after_a_backslash_quote_are_evaluated() {
+        for (command, dialects) in [
+            (
+                r#"echo "x\"; git reset --hard; \"y""#,
+                &[ShellDialect::PowerShell][..],
+            ),
+            (
+                r#"echo "x\" | git reset --hard | \"y""#,
+                &[ShellDialect::PowerShell][..],
+            ),
+            (
+                r#"Write-Output "a\" ; git push --force ; \"b""#,
+                &[ShellDialect::PowerShell, ShellDialect::Unknown][..],
+            ),
+        ] {
+            for dialect in dialects {
+                let result = evaluate_with_pack_ids_in_dialect(command, &["core.git"], *dialect);
+                assert!(result.is_denied(), "{command:?} in {dialect:?}: {result:?}");
+            }
+        }
+
+        // One PowerShell string, a PowerShell comment, or a heredoc
+        // PowerShell would split: data.
+        for (command, dialect) in [
+            (r#"echo "x; git reset --hard; y""#, ShellDialect::PowerShell),
+            (r#"echo "x; git reset --hard; y""#, ShellDialect::Unknown),
+            ("echo hi # ; git reset --hard", ShellDialect::PowerShell),
+            ("echo hi # | git reset --hard", ShellDialect::PowerShell),
+            ("echo hi <# ; git reset --hard #>", ShellDialect::PowerShell),
+            ("echo hi <# ; git reset --hard #>", ShellDialect::Unknown),
+            (
+                "cat <<'EOF'\nnotes; git push --force\nEOF",
+                ShellDialect::Unknown,
+            ),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &["core.git"], dialect);
+            assert!(
+                result.is_allowed(),
+                "{command:?} in {dialect:?}: {result:?}"
+            );
+        }
+    }
+
+    /// `$name = '…'` assigns in PowerShell. The unknown dialect also takes
+    /// the POSIX reading, which runs `$name` with `=` as its first argument;
+    /// no Git invocation accepts that, so the assigned text is not Git argv.
+    #[test]
+    fn powershell_assignments_of_git_text_are_not_git_invocations() {
+        for command in [
+            "$warning = 'Do not use reset --hard here'",
+            "$title = \"docs: explain git reset --hard\"",
+            "$o = Select-String -Path .\\log.txt -Pattern 'reset --hard'",
+            "$s = \"checkout -- .\"",
+            "$msg = 'clean -fdx'",
+            "$pattern += 'push --force'",
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Unknown);
+            assert!(result.is_allowed(), "{command:?}: {result:?}");
+        }
+        for command in ["$d reset --hard", "$GIT push --force"] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &["core.git"], dialect);
+                assert!(result.is_denied(), "{command:?} in {dialect:?}: {result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn mask_powershell_comments_blanks_comments_only() {
+        for (command, masked) in [
+            ("echo hi # ; x\ny", format!("echo hi {}\ny", " ".repeat(5))),
+            ("echo <# ; #> y", format!("echo {} y", " ".repeat(7))),
+            ("echo a#b ; '#' \"#\"", "echo a#b ; '#' \"#\"".to_string()),
+            ("echo `# ; y", "echo `# ; y".to_string()),
+        ] {
+            assert_eq!(mask_powershell_comments(command), masked, "{command:?}");
+        }
+    }
+
     #[test]
     fn elide_cmd_percent_expansions_removes_only_expansions() {
         for (command, elided) in [
             ("gi%x%t reset --hard", Some("git reset --hard")),
             ("gi%PATH:~0,0%t", Some("git")),
-            ("echo %1 %* x", Some("echo   x")),
+            ("gi%1%t", Some("git")),
+            ("gi%1t", Some("git")),
+            ("gi%a b%t", Some("git")),
+            ("gi%-x%t", Some("git")),
+            ("gi!x!t", Some("git")),
+            ("echo %1 x", Some("echo  x")),
+            ("echo %* x", Some("echo  x")),
+            ("echo 50% off 20%", Some("echo 50")),
             ("echo 100%", None),
-            ("echo 50% off 20%", None),
-            ("echo %% literal", None),
+            ("echo %% literal !!", None),
             ("echo %~dp0", None),
+            ("echo 5%\ngi%t", None),
         ] {
             assert_eq!(
                 elide_cmd_percent_expansions(command).as_deref(),

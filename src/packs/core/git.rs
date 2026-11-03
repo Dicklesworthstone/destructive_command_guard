@@ -5027,10 +5027,16 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
         return Some("__dcg_non_git_command__".to_string());
     }
 
+    // A dynamic executable followed by `=` is no Git invocation; see
+    // `is_powershell_assignment_operator`.
     if let Some(semantic) = decode_git_semantic_words(command, dialect)
         && !semantic.over_limit
         && let Some(executable_index) = semantic_git_executable_index(&semantic.words, dialect)
         && semantic.words[executable_index].dynamic
+        && !semantic
+            .words
+            .get(executable_index + 1)
+            .is_some_and(|word| is_powershell_assignment_operator(&word.decoded))
     {
         let mut words: Vec<_> = semantic
             .words
@@ -5043,6 +5049,19 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
 
     let decoded = words.join(" ");
     Some(crate::normalize::normalize_command(&decoded).into_owned())
+}
+
+/// A PowerShell assignment operator: `=`, `+=`, `-=`, `*=`, `/=`, `%=`, `??=`.
+///
+/// `$warning = 'Do not use reset --hard here'` assigns a string in
+/// PowerShell. Read as POSIX it runs `$warning` with `=` as its first
+/// argument, and Git has no subcommand or option spelled like any of these:
+/// it stops there with an error. So a dynamic executable followed by one is
+/// not synthesized as `git`, which handed the assigned text to the Git rules
+/// and made the unknown dialect, which takes the POSIX reading, deny
+/// PowerShell assignments.
+fn is_powershell_assignment_operator(word: &str) -> bool {
+    matches!(word, "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "??=")
 }
 
 /// Build the decoded Git regex view without reintroducing inert argv data.
@@ -5098,6 +5117,14 @@ pub(crate) fn syntax_view_for_pattern_matching(
     let Some(executable_index) = semantic_git_executable_index(&decoded.words, dialect) else {
         return sanitized_view;
     };
+    // Not a Git invocation: see `is_powershell_assignment_operator`.
+    if decoded
+        .words
+        .get(executable_index + 1)
+        .is_some_and(|word| is_powershell_assignment_operator(&word.decoded))
+    {
+        return sanitized_view;
+    }
 
     // A dynamic argv word may become a destructive option at execution time.
     // Keep the established conservative sanitized view in that case. Only the
