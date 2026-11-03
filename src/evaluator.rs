@@ -10281,6 +10281,104 @@ fn ssh_pipeline_input_mode(args: &[String], depth: usize) -> PipelineShellInputM
     remote_shell_payload_input_mode(&args[index..].join(" "), depth)
 }
 
+/// Classify `at`/`batch` as a deferred POSIX shell (#627).
+///
+/// Both read a job from standard input and later run it with `/bin/sh`
+/// (POSIX `at`: "read commands from standard input"; `batch` is `at -q b`),
+/// so the bytes piped into them are shell source, exactly as for `| sh`. A
+/// job file (`-f FILE`) replaces stdin unless it may name stdin itself
+/// ([`at_job_file_may_be_stdin`]), and the list/remove/print modes
+/// (`-l`, `-r`, `-d`, `-c`) read no job at all. Any other option letter is
+/// not understood here, so the consumer is unverified rather than inert.
+///
+/// The whole argv is read before deciding. GNU getopt permutes, so an option
+/// after the time (`at now -f /dev/stdin`) still counts, and the LAST `-f`
+/// wins: `at -f job -f /dev/stdin now` reads the pipe.
+fn at_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
+    let mut lists_jobs = false;
+    let mut job_file: Option<&str> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if argument == "--" {
+            break;
+        }
+        let Some(cluster) = argument.strip_prefix('-') else {
+            // A word of the time specification.
+            index += 1;
+            continue;
+        };
+        if cluster.is_empty() {
+            return PipelineShellInputMode::Unverified;
+        }
+        let mut consumed_next = false;
+        for (offset, option) in cluster.char_indices() {
+            match option {
+                // Mail and verbosity flags, the batch alias, version.
+                'm' | 'M' | 'v' | 'b' | 'V' => {}
+                // Options that take a value; the value ends the cluster.
+                'q' | 't' | 'f' => {
+                    let attached = &cluster[offset + option.len_utf8()..];
+                    let value = if attached.is_empty() {
+                        consumed_next = true;
+                        match args.get(index + 1) {
+                            Some(value) => value.as_str(),
+                            None => return PipelineShellInputMode::Unverified,
+                        }
+                    } else {
+                        attached
+                    };
+                    if option == 'f' {
+                        job_file = Some(value);
+                    }
+                    break;
+                }
+                // List, remove, or print queued jobs: no job is read.
+                'l' | 'r' | 'd' | 'c' => lists_jobs = true,
+                _ => return PipelineShellInputMode::Unverified,
+            }
+        }
+        index += if consumed_next { 2 } else { 1 };
+    }
+    let job_file_is_not_stdin = job_file.is_some_and(|file| !at_job_file_may_be_stdin(file));
+    if lists_jobs || job_file_is_not_stdin {
+        PipelineShellInputMode::DoesNotReadStdin
+    } else {
+        PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell)
+    }
+}
+
+/// Whether an `at -f` job file may be the piped standard input (#627).
+///
+/// `-`, `/dev/stdin`, `/dev/fd/N` and `/proc/<pid>/fd/N` can all reach the
+/// pipe: a redirect such as `3<&0` puts it on any descriptor. Spellings like
+/// `/dev//stdin` and `/dev/./fd/0` name the same node, so the path is compared
+/// after lexical normalisation. An expansion, a process substitution such as
+/// `<(cat)` (which inherits the pipe), a glob or an escape may name any of
+/// these, so it counts as stdin too.
+fn at_job_file_may_be_stdin(file: &str) -> bool {
+    if file == "-"
+        || file.is_empty()
+        || file.contains(['$', '`', '<', '(', '*', '?', '[', '~', '\\'])
+    {
+        return true;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in file.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    matches!(
+        parts.as_slice(),
+        ["dev", "stdin"] | ["dev", "fd", _] | ["proc", _, "fd", _]
+    )
+}
+
 /// Classify whether a POSIX shell invocation consumes its standard input as
 /// shell source. A bare `sh`/`bash`/etc. does; `-c CODE` and a positional
 /// script path do not. `-s` explicitly restores stdin-source mode even when
@@ -10337,6 +10435,9 @@ fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineSh
             return PipelineShellInputMode::Unverified;
         }
         return parallel_pipeline_input_mode(&args);
+    }
+    if matches!(executable.as_str(), "at" | "batch") {
+        return at_pipeline_input_mode(&args);
     }
     if matches!(executable.as_str(), "powershell" | "pwsh") {
         return powershell_pipeline_input_mode(&args);
@@ -48916,6 +49017,122 @@ mod tests {
                 "stdin is data when source comes from an explicit argument: {command:?}: {:?}",
                 result.pattern_info
             );
+        }
+    }
+
+    #[test]
+    fn at_and_batch_run_piped_source_as_deferred_shell_issue_627() {
+        // `at`/`batch` read a job from stdin and run it later with /bin/sh,
+        // so the producer's bytes are shell source, as for `| sh`.
+        for command in [
+            "echo 'reboot' | at now",
+            "echo 'shutdown -h now' | batch",
+            "printf '%s\\n' 'systemctl poweroff' | at now + 1 minute",
+            "echo reboot | at -m now",
+            "echo reboot | at -q b -m now",
+            "echo reboot | at -qb now",
+            "echo reboot | at -t 202611030000",
+            "echo reboot | sudo at now",
+            "echo reboot | /usr/bin/at now",
+            "echo reboot | at -f /dev/stdin now",
+            "echo reboot | at -f - now",
+            "echo reboot | at -f job.sh -f /dev/stdin now",
+            "echo reboot | at -f job.sh now -f /dev/stdin",
+            "echo reboot | batch -v",
+            "echo 'date; reboot' | at now",
+        ] {
+            let result = evaluate_with_pack_ids(command, &["system.services"]);
+            assert!(
+                result.is_denied(),
+                "piped at/batch job must reach system.services: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "echo 'git reset --hard' | at now",
+            "echo 'git reset --hard' | batch",
+        ] {
+            let result = evaluate_with_pack_ids(command, &["core.git"]);
+            assert!(
+                result.is_denied(),
+                "piped at/batch job must reach core.git: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        // A harmless job, inert output, a job file, and the list/remove
+        // modes stay allowed.
+        for command in [
+            "echo 'date' | at now",
+            "echo 'date' | batch",
+            "echo 'reboot' | cat",
+            "echo 'reboot' | grep reboot",
+            "echo 'reboot' | at -f job.sh now",
+            "echo 'reboot' | at -fjob.sh now",
+            "echo 'reboot' | at -l",
+            "echo 'reboot' | at -r 12",
+            "echo 'reboot' | at -c 12",
+            "at -l",
+            "atq",
+        ] {
+            let result = evaluate_with_pack_ids(command, &["system.services"]);
+            assert!(
+                result.is_allowed(),
+                "inert at/batch use must stay allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn at_option_parser_classifies_stdin_use_issue_627() {
+        use std::mem::discriminant;
+        let mode = |command: &str| discriminant(&pipeline_shell_input_mode(command));
+        let reads = discriminant(&PipelineShellInputMode::ReadsStdin(
+            PipelineSourceKind::PosixShell,
+        ));
+        let inert = discriminant(&PipelineShellInputMode::DoesNotReadStdin);
+        let unverified = discriminant(&PipelineShellInputMode::Unverified);
+        for command in [
+            "at now",
+            "batch",
+            "at -mv now",
+            "at -q a now",
+            "at -- now",
+            // The last `-f` wins, and getopt also reads options after the
+            // time specification.
+            "at -f job -f /dev/stdin now",
+            "at -f job now -f /dev/stdin",
+            "at now -m",
+            // Other spellings of the pipe, and job files that may be it.
+            "at -f - now",
+            "at -f '/dev/stdin' now",
+            "at -f /dev//stdin now",
+            "at -f /dev/./fd/0 now",
+            "at -f /tmp/../dev/stdin now",
+            "at -f /proc/self/fd/0 now",
+            "at -f /proc/thread-self/fd/0 now",
+            "at -f /dev/fd/3 now 3<&0",
+            "at -f \"$job\" now",
+            "at -f <(cat) now",
+        ] {
+            assert_eq!(mode(command), reads, "{command}");
+        }
+        for command in [
+            "at -f job now",
+            "at -f ./jobs/nightly.sh now",
+            "at -f /var/spool/job now",
+            "at -l",
+            "at -d 3",
+            "at -mc 3",
+            "batch -f job",
+            "at now -f job",
+            "at now -l",
+        ] {
+            assert_eq!(mode(command), inert, "{command}");
+        }
+        // Unknown options and a missing option value are not trusted.
+        for command in ["at -Z now", "at -q", "at - now"] {
+            assert_eq!(mode(command), unverified, "{command}");
         }
     }
 
