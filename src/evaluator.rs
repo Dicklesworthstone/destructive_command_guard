@@ -15169,10 +15169,17 @@ fn view_decode_exposes_pack_keyword(
     let view_normalized = crate::normalize::normalize_command_in_dialect(command, view);
     let posix_normalized =
         crate::normalize::normalize_command_in_dialect(command, ShellDialect::Posix);
+    // cmd.exe expands `%NAME%` before it splits the line into words, and a
+    // value can be empty (`%PATH:~0,0%` always is), so `gi%x%t reset --hard`
+    // can run git while every other view reads one unknown program. The
+    // normalized view keeps the expansion, so ask the view without it too.
+    let elided = (view == ShellDialect::Cmd)
+        .then(|| elide_cmd_percent_expansions(view_normalized.as_ref()))
+        .flatten();
     // A decode that leaves the command where the POSIX view already had it
     // cannot have reconstructed an executable; that difference is the only
     // thing that could have.
-    if view_normalized == posix_normalized {
+    if view_normalized == posix_normalized && elided.is_none() {
         return false;
     }
     let Some(index) = keyword_index else {
@@ -15182,6 +15189,55 @@ fn view_decode_exposes_pack_keyword(
         return true;
     };
     index.exposes_keyword_absent_from(view_normalized.as_ref(), posix_normalized.as_ref())
+        || elided.is_some_and(|elided| {
+            index.exposes_keyword_absent_from(&elided, posix_normalized.as_ref())
+        })
+}
+
+/// `command` with each cmd.exe `%NAME%` and batch-parameter (`%1`, `%*`)
+/// expansion removed, or `None` when it has none.
+///
+/// A name is what the evaluator's other cmd scanners accept: it starts with a
+/// letter, a digit or `_` and holds no whitespace, so `100%` and the `%` of
+/// `50% off` stay text. `%%` stays too: on a command line it is two literal
+/// percent signs.
+fn elide_cmd_percent_expansions(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    let mut elided = String::with_capacity(command.len());
+    let mut copied_from = 0usize;
+    let mut index = 0usize;
+    let mut removed = false;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        let end = match bytes.get(index + 1) {
+            Some(b'%') => {
+                index += 2;
+                continue;
+            }
+            Some(next) if next.is_ascii_digit() || *next == b'*' => Some(index + 2),
+            Some(next) if next.is_ascii_alphanumeric() || *next == b'_' => command[index + 1..]
+                .find(|ch: char| ch == '%' || ch.is_whitespace())
+                .map(|offset| index + 1 + offset)
+                .filter(|close| bytes[*close] == b'%')
+                .map(|close| close + 1),
+            _ => None,
+        };
+        let Some(end) = end else {
+            index += 1;
+            continue;
+        };
+        elided.push_str(&command[copied_from..index]);
+        copied_from = end;
+        index = end;
+        removed = true;
+    }
+    removed.then(|| {
+        elided.push_str(&command[copied_from..]);
+        elided
+    })
 }
 
 /// Whether `view`'s parse of `command` exposes command segments the POSIX parse
@@ -16246,10 +16302,11 @@ fn evaluate_command_in_single_dialect_view(
             // and skipped every pack. PowerShell does not escape with a
             // backslash, so `Write-Output "a\" ; git push --force ; \"b"`
             // runs git there while POSIX reads one string. This branch runs
-            // whenever the keyword index is absent, which is every hook with
-            // an external pack loaded, and the unknown dialect's replays come
-            // through here too. Gate both without quote roles, as the keyword
-            // index does; Step 5 masks their data in their own syntax.
+            // whenever the keyword index is absent, as it is for the hook and
+            // `dcg test` with an external pack loaded, including the unknown
+            // dialect's PowerShell and cmd replays. Gate both without quote
+            // roles, as the keyword index does; Step 5 masks their data in
+            // their own syntax.
             if matches!(shell_dialect, ShellDialect::Cmd | ShellDialect::PowerShell) {
                 pack_aware_quick_reject_pre_normalized(gating.as_ref(), enabled_keywords)
             } else {
@@ -59881,6 +59938,72 @@ mod tests {
                 .and_then(|info| info.pattern_name.as_deref()),
             Some("system-prune")
         );
+    }
+
+    /// The unknown dialect's cmd replay missed a `%NAME%` inside the program
+    /// name. cmd.exe expands it before it reads words, and `%PATH:~0,0%` is
+    /// always empty, so these run git there; `--dialect cmd` denies them and
+    /// the unknown dialect allowed them. The replay now also asks the cmd view
+    /// with its expansions removed.
+    #[test]
+    fn unknown_dialect_replays_a_cmd_expansion_inside_the_program_name() {
+        for command in ["gi%x%t reset --hard", "gi%PATH:~0,0%t reset --hard"] {
+            for (dialect, denied) in [
+                (ShellDialect::Posix, false),
+                (ShellDialect::Cmd, true),
+                (ShellDialect::Unknown, true),
+            ] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &["core.git"], dialect);
+                assert_eq!(
+                    result.is_denied(),
+                    denied,
+                    "{command:?} in {dialect:?}: {result:?}"
+                );
+            }
+        }
+
+        // An expansion that hides no keyword the POSIX view lacks does not
+        // replay.
+        let ordered =
+            crate::packs::REGISTRY.expand_enabled_ordered(&["core.git".to_string()].into());
+        let index = crate::packs::REGISTRY
+            .build_enabled_keyword_index(&ordered)
+            .expect("keyword index should build");
+        for command in [
+            "git log --format=%H%n",
+            "echo %PATH%",
+            "date +%Y-%m-%d",
+            "echo 100%",
+        ] {
+            assert!(
+                !dialect_view_may_expose_hidden_execution(
+                    command,
+                    ShellDialect::Cmd,
+                    Some(&index),
+                    &ordered
+                ),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn elide_cmd_percent_expansions_removes_only_expansions() {
+        for (command, elided) in [
+            ("gi%x%t reset --hard", Some("git reset --hard")),
+            ("gi%PATH:~0,0%t", Some("git")),
+            ("echo %1 %* x", Some("echo   x")),
+            ("echo 100%", None),
+            ("echo 50% off 20%", None),
+            ("echo %% literal", None),
+            ("echo %~dp0", None),
+        ] {
+            assert_eq!(
+                elide_cmd_percent_expansions(command).as_deref(),
+                elided,
+                "{command:?}"
+            );
+        }
     }
 
     /// dcg#294: a proven dialect never fans out, so `--dialect posix` and every
