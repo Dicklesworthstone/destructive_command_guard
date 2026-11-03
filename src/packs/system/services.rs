@@ -31,42 +31,61 @@ macro_rules! services_safe_pattern {
 /// Negative-lookahead body: the `modprobe` arguments ask for a dry run
 /// (`-n`, `--dry-run`, `--show`), which only prints what would be removed.
 ///
-/// The walk steps over plain words and over an option whose value is the next
-/// word (`-C`, `-d`, `-S`, `-w` and their long forms), so `modprobe -C -n -r x`
-/// is not a dry run: there `-n` is the config file. It stops at `--`, which
-/// makes a later `-n` a module name, and at quotes, expansions, comments and
-/// redirections, whose words it cannot read. Stopping only loses the
-/// exemption, so the command stays denied (bd-w3l7).
+/// The walk steps only over words whose effect on the next word it knows: an
+/// option whose value is the next word (`-C`, `-d`, `-S`, `-w` and their long
+/// forms) together with that value, so `modprobe -C -n -r x` is not a dry
+/// run (there `-n` is the config file); a long option with its value attached
+/// (`--config=x`); a long option known to take none; a short-option cluster
+/// that takes none; and an operand. Any other long option stops it: kmod
+/// accepts an abbreviation (`--conf -n -r x` reads `-n` as the config file).
+/// So do `--`, which makes a later `-n` a module name, a glob, which can
+/// expand to an option, and quotes, expansions, comments and redirections,
+/// whose words it cannot read. Stopping only loses the exemption, so the
+/// command stays denied (bd-w3l7).
 macro_rules! modprobe_dry_run_ahead {
     () => {
         concat!(
             r"(?:[ \t]+(?:",
-            r"(?:-[a-zA-Z]*[CdSw]|--(?:config|dirname|set-version|wait))[ \t]+[^\s;&|'\x22`$()\\<>{}#]+",
-            r"|(?!--(?:[\s;&|]|$))(?!-[a-zA-Z]*[CdSw](?:[\s;&|]|$))",
-            r"(?!--(?:config|dirname|set-version|wait)(?:[\s;&|]|$))[^\s;&|'\x22`$()\\<>{}#]+",
+            r"(?:-[a-zA-Z]*[CdSw]|--(?:config|dirname|set-version|wait))[ \t]+[^\s;&|'\x22`$()\\<>{}#*?\[]+",
+            r"|--[a-z][a-z-]*=[^\s;&|'\x22`$()\\<>{}#*?\[]+",
+            r"|--(?:remove|remove-holders|verbose|quiet|all|first-time|force|ignore-install|ignore-remove|use-blacklist|syslog)(?=[\s;&|]|$)",
+            r"|(?!-[a-zA-Z]*[CdSw](?:[\s;&|]|$))",
+            r"(?:-[a-zA-Z]+|[^-\s;&|'\x22`$()\\<>{}#*?\[][^\s;&|'\x22`$()\\<>{}#*?\[]*)(?=[\s;&|]|$)",
             r"))*?[ \t]+(?:-[abcDfhiqrRsvV]*n[a-zA-Z]*|--dry-run|--show)(?:[\s;&|]|$)",
         )
     };
 }
 
-/// `modprobe` arguments that remove a module (`-r`, `--remove`, or a short-flag
-/// cluster holding `r` such as `-rf`), unless they ask for a dry run.
+/// `modprobe` arguments that remove a module (`-r`, `--remove` or an
+/// abbreviation of it, or a short-flag cluster holding `r` such as `-rf`),
+/// unless they ask for a dry run. `MODPROBE_OPTIONS` puts its options ahead
+/// of the command line (`MODPROBE_OPTIONS=-C modprobe -n -r x` reads `-n` as
+/// the config file) and `POSIXLY_CORRECT` makes a `-n` after the module name
+/// an operand, so either in the same segment withdraws the dry-run exemption.
+/// A removal flag in `MODPROBE_OPTIONS` itself removes the module the command
+/// line names (`MODPROBE_OPTIONS=-r modprobe nvidia`).
 macro_rules! modprobe_removal {
     () => {
         concat!(
-            r"modprobe\b(?!",
+            r"(?:MODPROBE_OPTIONS[^\n]*?[=\s'\x22]-(?:-rem[a-z-]*|[a-zA-Z]*r[a-zA-Z]*)\b[^\n]*?modprobe\b",
+            r"|(?:(?:MODPROBE_OPTIONS|POSIXLY_CORRECT)\b[^\n]*?modprobe\b|modprobe\b(?!",
             modprobe_dry_run_ahead!(),
-            r#")(?:[ \t]+[^;&|\n'"]*?)?[ \t]-(?:-remove\b|[a-zA-Z]*r[a-zA-Z]*\b)"#,
+            r#"))(?:[ \t]+[^;&|\n'"]*?)?[ \t]-(?:-rem[a-z-]*\b|[a-zA-Z]*r[a-zA-Z]*\b))"#,
         )
     };
 }
 
 /// `rmmod` with an operand, unless its only argument asks for help or the
-/// version (`rmmod --help`), which unloads nothing.
+/// version (`rmmod --help`), which unloads nothing. A quote after the flag
+/// counts only where it ends the segment, as the close of an ssh command's
+/// remote text (`ssh host 'rmmod -h'`): a separator after it may be inside
+/// the quote, and in `ssh host rmmod -h'; rmmod nvidia'` the remote shell
+/// runs both.
 macro_rules! rmmod_unload {
     () => {
         concat!(
-            r"rmmod\b(?![ \t]+(?:-h|--help|-V|--version)[ \t]*(?:$|[;&|\n'\x22]))",
+            r"rmmod\b(?![ \t]+(?:-h|--help|-V|--version)",
+            r"(?:[ \t]*(?:$|[;&|\n])|['\x22][ \t]*$))",
             r"[ \t]+[^\s;&|]",
         )
     };
@@ -352,8 +371,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 ssh_option!(),
                 r")*[ \t]+['\x22]?",
                 r"(?:(?:sudo|doas)(?:[ \t]+(?:-[a-zA-Z]*[CDgpRrTtUu][ \t]+[^\s;&|]+|-[^\s;&|]+))*[ \t]+",
-                r"|(?:env|nice|ionice|nohup|timeout|stdbuf|setsid|chrt|taskset|exec|time)",
-                r"(?:[ \t]+(?:-[^\s;&|]+|[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]*|[0-9][^\s;&|]*))*[ \t]+)*",
+                r"|(?:env|nice|ionice|nohup|timeout|stdbuf|setsid|chrt|taskset|exec|time|command",
+                r"|busybox|pkexec|run0|systemd-run|nsenter|unshare|strace|watch|flock|chroot)",
+                r"(?:[ \t]+(?:-[^\s;&|]+(?:[ \t]+[^\s;&|'\x22-][^\s;&|]*)?",
+                r"|[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]*|[0-9][^\s;&|]*|/[^\s;&|]*))*[ \t]+)*",
                 r"(?:[^\s;&|'\x22]*/)?(?:",
                 modprobe_removal!(),
                 r"|",
@@ -707,10 +728,52 @@ mod tests {
             "rmmod -v nvidia",
             "ssh gpu-host modprobe -n -r x; ssh gpu-host modprobe -r nvidia",
             "ssh gpu-host rmmod --help nvidia",
+            // kmod takes an abbreviated long option: `--conf` is `--config`,
+            // whose value is `-n`.
+            "modprobe --conf -n -r nvidia",
+            "modprobe --c -n -r nvidia",
+            "modprobe --dir -n -r nvidia",
+            "modprobe --set -n -r nvidia",
+            "modprobe --wai -n -r nvidia",
+            "ssh gpu-host modprobe --conf -n -r nvidia",
+            // The environment adds options or stops their permutation.
+            "MODPROBE_OPTIONS=-C modprobe -n -r nvidia",
+            "env MODPROBE_OPTIONS=-C modprobe -n -r nvidia",
+            "POSIXLY_CORRECT=1 modprobe -r nvidia -n",
+            "MODPROBE_OPTIONS=-r modprobe nvidia",
+            "MODPROBE_OPTIONS='-v -r' modprobe nvidia",
+            // A glob can expand to an option.
+            "modprobe -r nvidia * -n",
+            // An abbreviation of `--remove`.
+            "modprobe --rem nvidia",
+            // The quote after the help flag does not end the remote text.
+            "ssh gpu-host rmmod -h'; rmmod nvidia'",
+            "ssh gpu-host rmmod --help'&&'rmmod nvidia",
+            // Launchers at the remote program position.
+            "ssh gpu-host busybox rmmod nvidia",
+            "ssh gpu-host env -u FOO rmmod nvidia",
+            "ssh gpu-host timeout -s KILL 5 rmmod nvidia",
+            "ssh gpu-host flock /tmp/l rmmod nvidia",
+            "ssh gpu-host chroot / modprobe -r nvidia",
+            "ssh gpu-host nsenter -t 1 -m rmmod nvidia",
+            "ssh gpu-host strace -f rmmod nvidia",
         ] {
             assert!(
                 pack.check(command).is_some(),
                 "{command:?} must stay blocked"
+            );
+        }
+        // The walk still steps over what it understands.
+        for command in [
+            "modprobe --config=/etc/m.conf -n -r nvidia",
+            "modprobe --verbose -n -r nvidia",
+            "modprobe -r nvidia --dry-run",
+            "ssh gpu-host 'rmmod --help'",
+            "ssh gpu-host timeout 5 echo rmmod nvidia",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command:?} must not be blocked"
             );
         }
     }
