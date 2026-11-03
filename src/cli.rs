@@ -27588,9 +27588,11 @@ if ($errors.Count -ne 0) {
         std::os::unix::fs::symlink(&managed, &user_factory).unwrap();
         let alias = user_factory.join("settings.json");
         assert!(!alias.exists());
+        // Every symlink resolves, including macOS's `/var` -> `/private/var`
+        // above the temp dir, so the expected path is canonical too.
         assert_eq!(
             canonicalize_droid_destination(&alias).unwrap(),
-            managed.join("settings.json")
+            managed.canonicalize().unwrap().join("settings.json")
         );
         assert!(!alias.exists(), "resolution must remain read-only");
     }

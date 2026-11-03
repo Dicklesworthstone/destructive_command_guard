@@ -13926,7 +13926,12 @@ fn posix_executable_assignment_parts(segment: &str) -> Option<(&str, &str)> {
     {
         return None;
     }
-    let raw = token.text(segment)?;
+    posix_assignment_word_parts(token.text(segment)?)
+}
+
+/// The name and still-quoted value of one assignment word, or `None` when
+/// the word does not assign a valid shell name.
+fn posix_assignment_word_parts(raw: &str) -> Option<(&str, &str)> {
     let equals = raw.find('=')?;
     let name = raw.get(..equals)?;
     let raw_value = raw.get(equals + 1..)?;
@@ -13938,6 +13943,118 @@ fn posix_executable_assignment_parts(segment: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((name, raw_value))
+}
+
+/// The assignments of an assignment-only POSIX statement of two or more
+/// words, such as `UNREVIEWED=1 d=git`. With no command word, every one of
+/// them persists in the shell, in order.
+fn posix_multiple_assignment_parts(segment: &str) -> Option<Vec<(&str, &str)>> {
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    if tokens
+        .iter()
+        .any(|token| token.kind == NormalizeTokenKind::Separator)
+    {
+        return None;
+    }
+    let parts = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .map(|token| token.text(segment).and_then(posix_assignment_word_parts))
+        .collect::<Option<Vec<_>>>()?;
+    (parts.len() > 1).then_some(parts)
+}
+
+/// Command names the executable-assignment model does not step over even
+/// though they assign nothing. Reserved words open compound commands whose
+/// bodies may assign. The rest change the shell's options or its command
+/// lookup, or replace the shell. `cd` is stepped over: it changes no variable
+/// the model reads, and what follows it resolves deny-only, so losing its
+/// directory context can cost a denial the plain pass still has, never add an
+/// allow.
+const POSIX_BINDING_BOUNDARY_COMMANDS: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "do", "done", "case", "esac", "while", "until", "for",
+    "in", "select", "function", "coproc", "set", "shopt", "setopt", "unsetopt", "emulate", "exec",
+    "shift", "unalias", "hash", "enable", "disable",
+];
+
+/// Whether the executable-assignment model may step over `segment` with its
+/// bindings intact (bd-executable-assignment-scope): one simple command named
+/// by a plain literal word that cannot assign in this shell, such as `true`
+/// or `echo hi`. Anything else ends the model, as every intervening command
+/// used to.
+fn posix_segment_keeps_bindings(segment: &str) -> bool {
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    if tokens
+        .iter()
+        .any(|token| token.kind == NormalizeTokenKind::Separator)
+    {
+        return false;
+    }
+    let Some(name) = tokens
+        .iter()
+        .find(|token| token.kind == NormalizeTokenKind::Word)
+        .and_then(|token| token.text(segment))
+    else {
+        return false;
+    };
+    !name.starts_with('-')
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b'+')
+        })
+        && !POSIX_BINDING_BOUNDARY_COMMANDS.contains(&name)
+        && !modeled_posix_invocation_may_mutate_bindings(segment)
+}
+
+/// What recording one assignment word did to the model's bindings.
+enum PosixAssignmentOutcome {
+    Recorded,
+    Skipped,
+    /// The value is not a literal: the model stops here.
+    Stop,
+}
+
+fn record_posix_executable_assignment(
+    name: &str,
+    raw_value: &str,
+    bindings: &mut HashMap<String, ModeledPosixBinding>,
+    ifs: &mut ModeledPosixIfs,
+    binding_limit_exceeded: &mut bool,
+) -> PosixAssignmentOutcome {
+    let value = literal_posix_executable_value(raw_value);
+    if name == "IFS" {
+        *ifs = match value.as_deref() {
+            Some("") => ModeledPosixIfs::Empty,
+            Some(" \t\n") => ModeledPosixIfs::Default,
+            _ => ModeledPosixIfs::Unverified,
+        };
+    }
+    let Some(value) = value else {
+        if name == "IFS" {
+            // `${X:=git}` and arithmetic assignment can update an earlier
+            // binding while computing IFS. Quoting `$X` later suppresses
+            // splitting, not that parent mutation.
+            invalidate_modeled_posix_bindings(bindings, ifs);
+            return PosixAssignmentOutcome::Skipped;
+        }
+        return PosixAssignmentOutcome::Stop;
+    };
+    if !bindings.contains_key(name) && bindings.len() >= MAX_POSIX_EXECUTABLE_BINDINGS {
+        *binding_limit_exceeded = true;
+        return PosixAssignmentOutcome::Skipped;
+    }
+    let binding = if value.len() > MAX_POSIX_EXECUTABLE_VALUE_BYTES {
+        ModeledPosixBinding::Unverified(
+            "the executable variable exceeds the bounded literal-value limit",
+        )
+    } else if name != "IFS" && shell_maintained_posix_variable(name) {
+        ModeledPosixBinding::Unverified(
+            "the executable variable is maintained by the shell rather than a stable scalar",
+        )
+    } else {
+        ModeledPosixBinding::Literal(value)
+    };
+    bindings.insert(name.to_string(), binding);
+    PosixAssignmentOutcome::Recorded
 }
 
 /// Decode assignment-time quotes exactly once. In particular, those quotes
@@ -14155,16 +14272,31 @@ fn model_literal_posix_executable_assignments(
         return PosixExecutableAssignmentModel::default();
     }
     let ranges = top_level_segment_ranges(command);
-    if ranges.len() < 2
-        || ranges.windows(2).any(|pair| {
-            let separator = command.get(pair[0].1..pair[1].0).unwrap_or_default();
-            !separator
-                .chars()
-                .all(|ch| ch.is_ascii_whitespace() || ch == ';')
-        })
-    {
+    if ranges.len() < 2 {
         return PosixExecutableAssignmentModel::default();
     }
+    let separators: Vec<&str> = ranges
+        .windows(2)
+        .map(|pair| command.get(pair[0].1..pair[1].0).unwrap_or_default())
+        .collect();
+    let sequential = separators.iter().all(|separator| {
+        separator
+            .chars()
+            .all(|ch| ch.is_ascii_whitespace() || ch == ';')
+    });
+    // In a chain joined only by `&&`, each statement runs only after every
+    // earlier one succeeded, so each earlier assignment took effect. Mixed with
+    // `;` or `||` that no longer holds: `d=git && false && d=ls; $d …` runs Git.
+    let and_chain = !sequential && separators.iter().all(|separator| separator.trim() == "&&");
+    if !sequential && !and_chain {
+        return PosixExecutableAssignmentModel::default();
+    }
+    // Statements the model did not reach before bd-executable-assignment-scope
+    // (an `&&` chain, several assignments in one statement, a step past an
+    // unrelated command) resolve deny-only: a denial of the resolved command
+    // stands, but its source is not masked, so the ordinary pass still judges
+    // what is written and nothing can become allowed that was not before.
+    let mut deny_only = and_chain;
 
     // Tainted bindings remain known: forgetting one would let its later use
     // silently fall back to an unresolved executable after eval changed it.
@@ -14193,44 +14325,52 @@ fn model_literal_posix_executable_assignments(
             return model;
         }
         if let Some((name, raw_value)) = posix_executable_assignment_parts(segment) {
-            let value = literal_posix_executable_value(raw_value);
-            if name == "IFS" {
-                ifs = match value.as_deref() {
-                    Some("") => ModeledPosixIfs::Empty,
-                    Some(" \t\n") => ModeledPosixIfs::Default,
-                    _ => ModeledPosixIfs::Unverified,
-                };
+            match record_posix_executable_assignment(
+                name,
+                raw_value,
+                &mut bindings,
+                &mut ifs,
+                &mut binding_limit_exceeded,
+            ) {
+                PosixAssignmentOutcome::Recorded => assignment_ranges.push(start..end),
+                PosixAssignmentOutcome::Skipped => {}
+                PosixAssignmentOutcome::Stop => break,
             }
-            let Some(value) = value else {
-                if name == "IFS" {
-                    // `${X:=git}` and arithmetic assignment can update an
-                    // earlier binding while computing IFS. Quoting `$X`
-                    // later suppresses splitting, not that parent mutation.
-                    invalidate_modeled_posix_bindings(&mut bindings, &mut ifs);
-                    continue;
+            continue;
+        }
+        if let Some(assignments) = posix_multiple_assignment_parts(segment) {
+            deny_only = true;
+            let mut recorded = false;
+            let mut stop = false;
+            for (name, raw_value) in assignments {
+                match record_posix_executable_assignment(
+                    name,
+                    raw_value,
+                    &mut bindings,
+                    &mut ifs,
+                    &mut binding_limit_exceeded,
+                ) {
+                    PosixAssignmentOutcome::Recorded => recorded = true,
+                    PosixAssignmentOutcome::Skipped => {}
+                    PosixAssignmentOutcome::Stop => {
+                        stop = true;
+                        break;
+                    }
                 }
-                break;
-            };
-            if !bindings.contains_key(name) && bindings.len() >= MAX_POSIX_EXECUTABLE_BINDINGS {
-                binding_limit_exceeded = true;
-                continue;
             }
-            let binding = if value.len() > MAX_POSIX_EXECUTABLE_VALUE_BYTES {
-                ModeledPosixBinding::Unverified(
-                    "the executable variable exceeds the bounded literal-value limit",
-                )
-            } else if name != "IFS" && shell_maintained_posix_variable(name) {
-                ModeledPosixBinding::Unverified(
-                    "the executable variable is maintained by the shell rather than a stable scalar",
-                )
-            } else {
-                ModeledPosixBinding::Literal(value)
-            };
-            bindings.insert(name.to_string(), binding);
-            assignment_ranges.push(start..end);
+            if stop {
+                break;
+            }
+            if recorded {
+                assignment_ranges.push(start..end);
+            }
             continue;
         }
         let Some((name, argv0_range, quoted)) = posix_variable_argv0(segment) else {
+            if posix_segment_keeps_bindings(segment) {
+                deny_only = true;
+                continue;
+            }
             break;
         };
         if binding_limit_exceeded {
@@ -14291,8 +14431,10 @@ fn model_literal_posix_executable_assignments(
         resolved.push_str(&replacement);
         resolved.push_str(&segment[argv0_range.end..]);
         let may_mutate_bindings = modeled_posix_invocation_may_mutate_bindings(&resolved);
-        model.inert_ranges.append(&mut assignment_ranges);
-        model.inert_ranges.push(start..end);
+        if !deny_only {
+            model.inert_ranges.append(&mut assignment_ranges);
+            model.inert_ranges.push(start..end);
+        }
         model
             .invocations
             .push(ModeledPosixExecutableInvocation::Resolved(

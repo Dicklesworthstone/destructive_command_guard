@@ -1666,7 +1666,12 @@ mod allow_once_flow_tests {
                 .expect("native denial persisted its matching pending record");
             assert_eq!(pending.short_code, code);
             assert_eq!(pending.command_raw, command);
-            assert_eq!(std::path::Path::new(&pending.cwd), self.temp.path());
+            // dcg records the canonical cwd. macOS temp dirs sit under the
+            // `/var` -> `/private/var` symlink, so compare canonical forms.
+            assert_eq!(
+                std::path::Path::new(&pending.cwd),
+                self.temp.path().canonicalize().expect("canonical temp dir")
+            );
             assert_eq!(pending.source.as_deref() == Some("ConfigOverride"), force);
 
             let mut args = vec![
@@ -1706,7 +1711,10 @@ mod allow_once_flow_tests {
             assert_eq!(entry.command_raw, command);
             assert_eq!(entry.source_short_code, code);
             assert_eq!(entry.scope_kind, AllowOnceScopeKind::Cwd);
-            assert_eq!(std::path::Path::new(&entry.scope_path), self.temp.path());
+            assert_eq!(
+                std::path::Path::new(&entry.scope_path),
+                self.temp.path().canonicalize().expect("canonical temp dir")
+            );
             assert!(entry.single_use);
             assert!(entry.consumed_at.is_none());
             entry

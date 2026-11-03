@@ -5057,6 +5057,19 @@ pub(crate) fn syntax_view_for_pattern_matching(
 ) -> Option<String> {
     let sanitized_view = syntax_view_in_dialect(sanitized_command, dialect);
     if dialect == ShellDialect::Unknown {
+        // The unknown dialect stands for every shell, POSIX among them. When
+        // the POSIX reading proves an executable that can be Git and this
+        // view does not read as Git, the synthesized `git …` view is the one
+        // to match: without it `$d reset --hard`, denied under POSIX, was an
+        // unknown program here and allowed (bd-executable-assignment-scope).
+        // A view that already reads as Git keeps its existing role.
+        let reads_as_git =
+            |view: Option<&str>| view.is_some_and(|view| view == "git" || view.starts_with("git "));
+        let posix =
+            syntax_view_for_pattern_matching(command, sanitized_command, ShellDialect::Posix);
+        if reads_as_git(posix.as_deref()) && !reads_as_git(sanitized_view.as_deref()) {
+            return posix;
+        }
         return sanitized_view;
     }
 
