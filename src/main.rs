@@ -317,9 +317,12 @@ fn format_indeterminate_reason(
     if let Some(cpu) = detail.cpu {
         let _ = write!(context, ", process CPU {}ms", cpu.as_millis());
     }
-    // No clock ran out: an analysis step (a regex work limit, an unterminated
-    // heredoc a proof needs) gave up first, and a larger hook_timeout_ms would
-    // not have changed that (bd-indeterminate-reason-wording-jcpy).
+    // The hook deadline did not run out: an analysis step (a regex work
+    // limit, an unterminated heredoc a proof needs, a step's own clock) gave
+    // up first, so the deadline is not blamed (bd-indeterminate-reason-
+    // wording-jcpy). Some steps' clocks do grow with the remaining hook
+    // budget (dynamic-source analysis) or follow `[heredoc] timeout_ms`, so
+    // the message names no setting rather than one that may not help.
     if incomplete.is_some() {
         return format!(
             "DCG could not finish analyzing this command ({context}): an analysis step \
