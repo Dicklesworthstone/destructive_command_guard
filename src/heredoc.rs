@@ -25017,7 +25017,10 @@ mod issue_560_masking_tests {
             "\"$@\"",
             "$1 x",
         ] {
-            assert!(shell_script_runs_an_expansion_as_a_command(script), "{script}");
+            assert!(
+                shell_script_runs_an_expansion_as_a_command(script),
+                "{script}"
+            );
         }
         for script in [
             "echo $C",
@@ -25034,7 +25037,10 @@ mod issue_560_masking_tests {
             "$$ x",
             "$",
         ] {
-            assert!(!shell_script_runs_an_expansion_as_a_command(script), "{script}");
+            assert!(
+                !shell_script_runs_an_expansion_as_a_command(script),
+                "{script}"
+            );
         }
     }
 }

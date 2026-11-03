@@ -9213,8 +9213,8 @@ fn perl_ruby_option_word<'a>(
             (crate::heredoc::ScriptLanguage::Perl, b'l') => Letter::Octal { max: 4 },
             (
                 crate::heredoc::ScriptLanguage::Perl,
-                b'a' | b'c' | b'f' | b'g' | b'n' | b'p' | b's' | b'S' | b't' | b'T' | b'u'
-                | b'U' | b'w' | b'W' | b'X',
+                b'a' | b'c' | b'f' | b'g' | b'n' | b'p' | b's' | b'S' | b't' | b'T' | b'u' | b'U'
+                | b'w' | b'W' | b'X',
             ) => Letter::Flag,
             (crate::heredoc::ScriptLanguage::Perl, b'h' | b'v' | b'V') => Letter::Exits,
             (crate::heredoc::ScriptLanguage::Perl, b'C' | b'D' | b'F' | b'i' | b'x') => {
@@ -9228,8 +9228,7 @@ fn perl_ruby_option_word<'a>(
             (crate::heredoc::ScriptLanguage::Ruby, b'T') => Letter::Octal { max: 2 },
             (
                 crate::heredoc::ScriptLanguage::Ruby,
-                b'a' | b'c' | b'd' | b'l' | b'n' | b'p' | b's' | b'S' | b'U' | b'v' | b'w'
-                | b'y',
+                b'a' | b'c' | b'd' | b'l' | b'n' | b'p' | b's' | b'S' | b'U' | b'v' | b'w' | b'y',
             ) => Letter::Flag,
             (crate::heredoc::ScriptLanguage::Ruby, b'h') => Letter::Exits,
             (crate::heredoc::ScriptLanguage::Ruby, b'F' | b'i' | b'x') => Letter::RestOfWord,
@@ -9269,10 +9268,7 @@ fn perl_ruby_option_word<'a>(
                     && digits == 0
                     && rest.starts_with('x')
                 {
-                    at += 1 + rest[1..]
-                        .bytes()
-                        .take_while(u8::is_ascii_hexdigit)
-                        .count();
+                    at += 1 + rest[1..].bytes().take_while(u8::is_ascii_hexdigit).count();
                 } else {
                     at += digits;
                 }
@@ -9304,9 +9300,11 @@ fn perl_ruby_option_word<'a>(
                 if rest.starts_with(':') {
                     return Some((0, InterpreterOptionEffect::Nothing));
                 }
-                at += 1 + usize::from(rest.bytes().next().is_some_and(|byte| {
-                    (b'0'..=b'7').contains(&byte)
-                }));
+                at += 1 + usize::from(
+                    rest.bytes()
+                        .next()
+                        .is_some_and(|byte| (b'0'..=b'7').contains(&byte)),
+                );
             }
             Letter::OneCharacter => {
                 at += 1;
@@ -9341,7 +9339,9 @@ fn script_interpreter_option_word<'a>(
             let Some(long) = word.strip_prefix("--") else {
                 return perl_ruby_option_word(language, word, next);
             };
-            let (name, attached) = long.split_once('=').map_or((long, false), |(name, _)| (name, true));
+            let (name, attached) = long
+                .split_once('=')
+                .map_or((long, false), |(name, _)| (name, true));
             match name {
                 "version" | "help" | "copyright" => Some((0, Exits)),
                 "verbose" | "yydebug" | "jit" | "yjit" | "rjit" => Some((0, Nothing)),
@@ -9373,11 +9373,25 @@ fn script_interpreter_option_word<'a>(
                 "-e" | "--eval" | "-p" | "--print" | "-pe" => value(Program),
                 "-i" | "--interactive" => Some((0, ReadsStdin)),
                 "-v" | "--version" | "-h" | "--help" | "--v8-options" => Some((0, Exits)),
-                "-r" | "--require" | "--import" | "--loader" | "--experimental-loader" | "-C"
-                | "--conditions" | "--input-type" | "--env-file" | "--env-file-if-exists"
-                | "--title" | "--inspect-port" | "--debug-port" | "--openssl-config"
-                | "--icu-data-dir" | "--redirect-warnings" | "--disable-warning"
-                | "--unhandled-rejections" | "--dns-result-order" => value(|_| Nothing),
+                "-r"
+                | "--require"
+                | "--import"
+                | "--loader"
+                | "--experimental-loader"
+                | "-C"
+                | "--conditions"
+                | "--input-type"
+                | "--env-file"
+                | "--env-file-if-exists"
+                | "--title"
+                | "--inspect-port"
+                | "--debug-port"
+                | "--openssl-config"
+                | "--icu-data-dir"
+                | "--redirect-warnings"
+                | "--disable-warning"
+                | "--unhandled-rejections"
+                | "--dns-result-order" => value(|_| Nothing),
                 "-c"
                 | "--check"
                 | "--no-warnings"
