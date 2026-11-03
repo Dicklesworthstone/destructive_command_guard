@@ -77,11 +77,15 @@ fn run_hook(input: &str, home: &Path) -> (String, String, i32) {
 
 #[test]
 fn oversized_heredoc_run_as_code_is_not_allowed_blind() {
-    for (receiver, call) in [
-        ("python3 -", "exec(x)"),
-        ("node -", "eval(x);"),
-        ("ruby -", "eval x"),
-        ("bash", "echo done"),
+    const SIZE_LIMIT: &str = "exceeds limit";
+    for (receiver, call, verdict) in [
+        ("python3 -", "exec(x)", SIZE_LIMIT),
+        // Every window is evaluated as shell, and the one holding the call
+        // reads `eval(x);`, which the POSIX eval rule denies. A window's deny
+        // outranks the size-limit answer.
+        ("node -", "eval(x);", "heredoc.posix:eval-dynamic"),
+        ("ruby -", "eval x", SIZE_LIMIT),
+        ("bash", "echo done", SIZE_LIMIT),
     ] {
         let command = format!("{receiver} <<'EOF'\n{}EOF", body(call));
         let input = envelope(&command);
@@ -98,8 +102,8 @@ fn oversized_heredoc_run_as_code_is_not_allowed_blind() {
              not the silent allow\nstderr: {stderr}"
         );
         assert!(
-            stdout.contains("exceeds limit"),
-            "{receiver}: the verdict is the size-limit indeterminate: {stdout}"
+            stdout.contains(verdict),
+            "{receiver}: expected a verdict naming {verdict:?}: {stdout}"
         );
     }
 }
