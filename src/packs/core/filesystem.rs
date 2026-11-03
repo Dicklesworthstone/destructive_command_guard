@@ -5885,8 +5885,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                approval: `cp -a <source> <source>.bak && diff -r <source> <source>.bak` \
                (the recursive delete of a home or system source stays gated).\n\
              - Pure tmp-to-tmp moves: `mv /tmp/<a> /tmp/<b>` is allowed.\n\
-             - Moving a home root, a top-level home directory, or a dotfile tree is \
-               still gated: use `dcg allow-once` for those.",
+             - Moving a home root, a top-level home directory, or a dotfile tree \
+               anywhere but the Trash is still gated: use `dcg allow-once` for those. \
+               The Trash move above accepts any source below the home root, \
+               including `~/Documents` and `~/.ssh`, because it stays recoverable \
+               and deleting from the Trash is gated on its own. The home root \
+               itself (`mv ~ ~/.Trash/`) stays gated.",
             MV_SENSITIVE_SUGGESTIONS
         ),
         // Any shell-expanded mv path can resolve to `/`, `/etc`, or another

@@ -256,6 +256,44 @@ fn prose_scopes_the_trash_move_to_the_sources_it_admits() {
     }
 }
 
+/// GitHub #605 follow-up: the "still gated" bullet said a top-level home
+/// directory or dotfile tree could not be moved, but the Trash move accepts
+/// both (it stays recoverable, and deleting from the Trash is gated). The
+/// prose must name that exception, and the verdicts it describes must hold.
+#[test]
+fn prose_names_the_trash_exception_to_the_home_depth_rule() {
+    let registry = PackRegistry::new();
+    let pack = registry
+        .get("core.filesystem")
+        .expect("core.filesystem pack resolves");
+    let hit = pack
+        .check("mv ~/.ssh ~/ssh-old")
+        .expect("expected DENY for a dotfile tree rename");
+    assert_eq!(hit.name, Some("mv-sensitive-source-root-home"));
+    let prose = hit.explanation.expect("explanation");
+    assert!(
+        prose.contains("anywhere but the Trash is still gated"),
+        "the bullet must name the Trash exception: {prose}"
+    );
+    for command in [
+        "mv ~/Documents ~/.Trash/",
+        "mv ~/.ssh ~/.Trash/",
+        "mv ~/Library ~/.Trash/",
+        "mv ~/.gnupg ~/.local/share/Trash/",
+    ] {
+        assert_allowed(command);
+    }
+    for command in [
+        "mv ~ ~/.Trash/",
+        "mv ~/Documents ~/Documents-old",
+        "mv ~/.ssh ~/ssh-old",
+        "rm -rf ~/.Trash/.ssh",
+        "rm -rf ~/.local/share/Trash/files/Documents",
+    ] {
+        assert_denied(command);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GitHub #422: the same rename written with a relative source
 // ---------------------------------------------------------------------------
