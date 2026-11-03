@@ -191,22 +191,110 @@ enabled = [
 
 ## Installation
 
-### Quick Install (Recommended)
+### Quick Install (Verified Release)
+
+Install `minisign` through your trusted OS package manager first (for example,
+`apt install minisign` or `brew install minisign`). Then paste this function into
+**Bash**. It authenticates the release installer with the project's pinned
+Minisign key and checks its fixed SHA-256 identity before executing any downloaded
+code. The key is the trust root; establish it from a trusted copy of this
+documentation or an independent maintainer channel, not from the same download
+as the installer. A downloaded checksum alone does not authenticate a publisher.
+
+<!-- verified-release-install:begin -->
+```bash
+dcg_install() (
+  # Explicit failure guards also work when called inside `if dcg_install ...`.
+  set -eu
+  umask 077
+  if [ "$#" -gt 1 ]; then
+    printf '%s\n' 'Usage: dcg_install [--easy-mode|--system]' >&2
+    exit 1
+  fi
+  case "${1:-}" in
+    ''|--easy-mode|--system) ;;
+    *) printf '%s\n' 'Usage: dcg_install [--easy-mode|--system]' >&2; exit 1 ;;
+  esac
+
+  readonly dcg_tag='v0.16.0'
+  readonly dcg_sha256='072462974ad790008e8a3aadb1a9eecf2d9b6bd0ef7b469f69f0fb0fa3b51c7c'
+  readonly dcg_key='RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO'
+  dcg_minisign=$(type -P minisign) || {
+    printf '%s\n' 'Install minisign with your trusted OS package manager first.' >&2
+    exit 1
+  }
+  dcg_curl=$(type -P curl) || exit 1
+  dcg_bash=$(type -P bash) || exit 1
+  if dcg_hash=$(type -P sha256sum); then
+    dcg_hash_kind=sha256sum
+  elif dcg_hash=$(type -P shasum); then
+    dcg_hash_kind=shasum
+  else
+    printf '%s\n' 'A SHA-256 verifier (sha256sum or shasum) is required.' >&2
+    exit 1
+  fi
+
+  dcg_tmp=$(mktemp -d "${TMPDIR:-/tmp}/dcg-install.XXXXXXXXXX") || exit 1
+  printf 'Installer verification files: %s\n' "$dcg_tmp"
+  dcg_base="https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/$dcg_tag"
+  for dcg_asset in install.sh install.sh.minisig; do
+    "$dcg_curl" --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+      --max-time 120 --user-agent 'destructive_command_guard-installer' \
+      "$dcg_base/$dcg_asset" -o "$dcg_tmp/$dcg_asset" || exit 1
+  done
+  "$dcg_minisign" -Vm "$dcg_tmp/install.sh" \
+    -x "$dcg_tmp/install.sh.minisig" -P "$dcg_key" || exit 1
+  if [ "$dcg_hash_kind" = sha256sum ]; then
+    dcg_actual=$("$dcg_hash" "$dcg_tmp/install.sh") || exit 1
+  else
+    dcg_actual=$("$dcg_hash" -a 256 "$dcg_tmp/install.sh") || exit 1
+  fi
+  if [ "${dcg_actual%% *}" != "$dcg_sha256" ]; then
+    printf '%s\n' 'Installer does not match the pinned release; refusing execution.' >&2
+    exit 1
+  fi
+
+  case "${1:-}" in
+    --system)
+      # The first elevated command runs only after BOTH checks succeed.
+      sudo -- "$dcg_bash" "$dcg_tmp/install.sh" \
+        --version "$dcg_tag" --require-minisign --system ;;
+    --easy-mode)
+      "$dcg_bash" "$dcg_tmp/install.sh" \
+        --version "$dcg_tag" --require-minisign --easy-mode ;;
+    *) "$dcg_bash" "$dcg_tmp/install.sh" \
+        --version "$dcg_tag" --require-minisign ;;
+  esac
+)
+```
+<!-- verified-release-install:end -->
+
+Choose **one** installation mode after defining the function:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash
-
-# Easy mode: auto-update PATH
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
-
-# System-wide (requires sudo)
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | sudo bash -s -- --system
+dcg_install                 # Normal: install to ~/.local/bin
+dcg_install --easy-mode     # Also configure PATH automatically
+dcg_install --system        # Install to /usr/local/bin using sudo after verification
 ```
+
+For system-wide installation, install `minisign` on the system PATH so the
+elevated installer can also verify the binary archive. Missing tools, missing
+assets, invalid signatures, or a different installer digest stop installation;
+there is no unsigned or source-build fallback. The private download directory is
+retained for inspection. The tag and digest are a pair: upgrading this recipe
+requires independently verifying and pinning the new release's installer bytes.
+Do not replace the tag with `main` or `latest` or remove either verification.
+
+For native Windows, follow the [verified PowerShell workflow](docs/windows.md#verified-release-installation).
 
 ### From Source (Requires Rust Nightly)
 
+For development, build from a trusted, reviewed local checkout. This uses the
+checkout's pinned toolchain and lockfile; it is a separate source-trust decision,
+not a fallback when release authentication fails.
+
 ```bash
-cargo +nightly install --git https://github.com/Dicklesworthstone/destructive_command_guard
+cargo install --path . --locked
 ```
 
 ### Prebuilt Binaries

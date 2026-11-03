@@ -8,17 +8,110 @@ Windows-specific behavior, paths, default protection, and honest limitations.
 
 ## Install / update / uninstall
 
-Install with PowerShell:
+### Verified release installation
+
+Install `minisign` from a trusted OS package manager before using this recipe.
+Establish the public key below from a trusted copy of this documentation or an
+independent maintainer channel. Do not download a replacement key beside the
+installer and assume it is trusted.
+
+Paste this function into **native Windows PowerShell**. It downloads the
+`v0.16.0` installer and signature into a fresh directory readable only by your
+Windows account, verifies the pinned Minisign key and fixed installer SHA256,
+then invokes the authenticated local script. No downloaded script executes
+before both checks succeed. The binary archive must then pass its own Minisign
+and SHA256 checks too.
+
+<!-- verified-release-install-powershell:begin -->
+```powershell
+function Install-DcgRelease {
+    [CmdletBinding()]
+    param([ValidateSet('Normal', 'Easy')][string]$Mode = 'Easy')
+
+    $ErrorActionPreference = 'Stop'
+    $tag = 'v0.16.0'
+    $expectedHash = 'f662ac7d34d2b7545a0e3ad7d5c7baff561fb6ccf96e75ee31d7f8b37fce7696'
+    $key = 'RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO'
+    $verifier = (Get-Command minisign -CommandType Application -ErrorAction Stop).Source
+
+    # Restrict access before writing any downloaded bytes.
+    $parent = [Environment]::GetFolderPath('LocalApplicationData')
+    if (-not $parent) { throw 'A private local application-data directory is required.' }
+    $work = Join-Path $parent ('dcg-install-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $work -ErrorAction Stop
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetOwner($sid)
+    $acl.SetAccessRuleProtection($true, $false)
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+        $sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'
+    )
+    $acl.AddAccessRule($rule)
+    Set-Acl -LiteralPath $work -AclObject $acl -ErrorAction Stop
+    Write-Host "Installer verification files: $work"
+
+    # Windows PowerShell 5.1 may otherwise default to TLS 1.0/1.1.
+    [Net.ServicePointManager]::SecurityProtocol = `
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $base = "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/$tag"
+    $installer = Join-Path $work 'install.ps1'
+    $signature = Join-Path $work 'install.ps1.minisig'
+    foreach ($asset in @('install.ps1', 'install.ps1.minisig')) {
+        Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 `
+            -UserAgent 'destructive_command_guard-installer' `
+            -Uri "$base/$asset" -OutFile (Join-Path $work $asset) -ErrorAction Stop
+    }
+
+    # PowerShell 5.1 can wrap successful native stderr as NativeCommandError.
+    # Decide verification from the actual process exit code, including failure
+    # to start the verifier, rather than from stderr or a stale LASTEXITCODE.
+    $LASTEXITCODE = -1
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $verifier -Vm $installer -x $signature -P $key
+        $signatureExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = 'Stop'
+    }
+    if ($signatureExit -ne 0) { throw 'Installer signature verification failed.' }
+    $actualHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256 -ErrorAction Stop).Hash
+    if ($actualHash.ToLowerInvariant() -cne $expectedHash) {
+        throw 'Installer does not match the pinned release; refusing execution.'
+    }
+
+    # Allow this authenticated file under RemoteSigned without changing policy.
+    Unblock-File -LiteralPath $installer -ErrorAction Stop
+    $installArgs = @{ Version = $tag; RequireMinisign = $true; Verify = $true }
+    if ($Mode -eq 'Easy') { $installArgs.EasyMode = $true }
+    $LASTEXITCODE = 0
+    & $installer @installArgs
+    if ($LASTEXITCODE -ne 0) { throw "Installer failed with exit code $LASTEXITCODE." }
+}
+```
+<!-- verified-release-install-powershell:end -->
+
+Then choose one mode:
 
 ```powershell
-& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.ps1"))) -EasyMode -Verify
+Install-DcgRelease                 # Easy mode: configure hooks and add User PATH
+# Or: Install-DcgRelease -Mode Normal
 ```
+
+Missing verification tools or assets, invalid signatures, or a different
+installer digest stop installation. There is no unsigned installer or source
+fallback. Verification files remain in the private directory for inspection.
+The tag and digest are a fixed pair: upgrading this recipe requires independently
+verifying and pinning the new release's installer bytes. Do not substitute
+`main` or `latest`, edit only the version, or remove a verification check.
+
+The authenticated installer offers these options when invoked from a local file
+you have already verified:
 
 - `-EasyMode` adds the install directory (`%USERPROFILE%\.local\bin` by default)
   to your **User** `PATH` and makes `dcg` available in the current session.
 - `-Verify` runs a post-install self-test.
-- `-Version vX.Y.Z` pins a specific release; `-Dest <dir>` changes the install
-  location; `-ArtifactUrl <url|file://>` installs from a specific artifact.
+- `-Version vX.Y.Z` selects a release; keep it paired with the verified
+  installer release. `-Dest <dir>` changes the install location.
 - `-RequireMinisign` requires both the adjacent `.minisig` and the `minisign`
   verifier. `-MinisignSignatureUrl <url|file://>` overrides that sidecar source
   for mirrors and hermetic/offline installs.
@@ -26,14 +119,18 @@ Install with PowerShell:
 The installer auto-selects `dcg-x86_64-pc-windows-msvc.zip` or
 `dcg-aarch64-pc-windows-msvc.zip` from the host architecture, falling back to
 the x64 artifact under Windows-on-ARM emulation if an older release has no
-native ARM64 asset. It **verifies the SHA256 checksum** (required), verifies a
-present `.minisig` against the embedded release key (key ID
-`69B3955C8D2E62A8`) when `minisign` is on `PATH`, and independently verifies a
+native ARM64 asset. This recipe **requires both the SHA256 checksum and
+Minisign signature**, verified against the embedded release key (key ID
+`69B3955C8D2E62A8`). The installer independently verifies a
 **Sigstore/cosign** signature against the pinned local-release key or GitHub
-Actions OIDC identity when a patched `cosign` and trusted bundle are available.
+Actions OIDC identity when a patched `cosign` and trusted bundle are available;
+`v0.16.0` publishes Minisign signatures without Sigstore bundles.
 The retired minisign key `36B847D11BA5A0D0` is accepted only for v0.6.7. A
-present but invalid minisign signature is always fatal; by default a missing
-sidecar/tool warns and continues unless `-RequireMinisign` is supplied.
+missing verifier, unavailable signature, or invalid signature is fatal under
+the `-RequireMinisign` mode used above. Run the recipe as your normal user;
+it installs in your profile and does not request elevation.
+
+### Updating
 
 Update via the built-in updater (re-runs `install.ps1`):
 
@@ -50,14 +147,20 @@ to `%LOCALAPPDATA%\dcg\update.log` (or the platform cache directory selected by
 Windows when it differs). Use `dcg update --verify --no-configure` to update only
 the binary while preserving all existing agent-hook wiring.
 
-Uninstall:
+### Uninstalling
+
+Use `dcg uninstall` to remove hooks with the binary already installed (see
+`dcg uninstall --help` for agent selection). For full removal, review
+`uninstall.ps1` in a local checkout whose provenance you trust, then run it:
 
 ```powershell
-irm https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/uninstall.ps1 | iex
+& .\uninstall.ps1
 ```
 
 `uninstall.ps1` removes `dcg.exe`, the exact User `PATH` entry the installer
 added, dcg-owned Claude Code and Codex hooks, and dcg config/history directories.
+The `v0.16.0` release does not publish signed uninstaller assets. Do not execute
+an uninstaller downloaded from a mutable branch.
 
 ## File locations on Windows
 

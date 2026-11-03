@@ -21,19 +21,19 @@ A high-performance hook for AI coding agents that blocks destructive commands be
 Factory Droid's `Execute` tool is supported through `dcg install --droid`;
 see [coverage and Script-mode limitations](docs/agents.md#factory-droid).
 
-```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
-```
+[Install a verified release on Linux, macOS, or WSL](#quick-install-verified-release).
+The copyable recipe authenticates the pinned installer before running it and
+supports normal, easy-mode, and system-wide installation.
 
 <p><em>Works on Linux, macOS, and Windows via WSL. Auto-detects your platform, downloads the right binary, and configures supported agent hooks including Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, VS Code Copilot Chat (through VS Code's Claude-hook compatibility), Cursor IDE, Hermes Agent, Posit Assistant, Oh My Pi, and Grok (xAI) (via <code>dcg install --grok</code> for a native <code>~/.grok/hooks/dcg.json</code>, or via the Claude compatibility layer automatically picked up by Grok). For native Windows, use the PowerShell installer below.</em></p>
 
 <h4>Windows (native, PowerShell)</h4>
 
-```powershell
-& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.ps1"))) -EasyMode -Verify
-```
+[Install a verified release with PowerShell](docs/windows.md#verified-release-installation).
+This recipe checks the installer's pinned SHA256 and Minisign signature before
+execution, then requires Minisign verification of the native binary too.
 
-<p><em>Installs native <code>dcg.exe</code>, verifies the mandatory SHA256 checksum, verifies the release's long-lived minisign signature when <code>minisign</code> is available, and verifies Sigstore/cosign provenance when both <code>cosign</code> and a trusted bundle are available. It adds dcg to your User <code>PATH</code> (<code>-EasyMode</code>), runs a self-test (<code>-Verify</code>), and configures detected agent hooks for Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, Posit Assistant, and Oh My Pi. Copilot is configured at the user level under <code>%COPILOT_HOME%\hooks</code> (or <code>%USERPROFILE%\.copilot\hooks</code>) so every workspace is protected. On Windows the <code>windows.filesystem</code> and <code>windows.system</code> packs are on by default, so <code>del /s</code>, <code>rd /s</code>, <code>Remove-Item -Recurse</code> (with or without <code>-Force</code>), <code>format</code>, and <code>vssadmin delete shadows</code> are blocked out of the box. Pin a version with <code>-Version vX.Y.Z</code>; use <code>-RequireMinisign</code> to fail closed if the sidecar or verifier is unavailable.</em></p>
+<p><em>Installs native <code>dcg.exe</code>, adds dcg to your User <code>PATH</code> in easy mode, runs a self-test, and configures detected agent hooks for Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, Posit Assistant, and Oh My Pi. Copilot is configured at the user level under <code>%COPILOT_HOME%\hooks</code> (or <code>%USERPROFILE%\.copilot\hooks</code>) so every workspace is protected. On Windows the <code>windows.filesystem</code> and <code>windows.system</code> packs are on by default, so <code>del /s</code>, <code>rd /s</code>, <code>Remove-Item -Recurse</code> (with or without <code>-Force</code>), <code>format</code>, and <code>vssadmin delete shadows</code> are blocked out of the box.</em></p>
 </div>
 
 ---
@@ -1059,15 +1059,110 @@ same evaluator-side budget outside a live hook.
 
 ## Installation
 
-### Quick Install (Recommended)
+### Quick Install (Verified Release)
 
-The easiest way to install is using the install script, which downloads a prebuilt binary for your platform:
+Install `minisign` through your trusted OS package manager first (for example,
+`apt install minisign` or `brew install minisign`). Then paste this function into
+**Bash**. It authenticates the `v0.16.0` installer with the project's pinned
+Minisign key and checks its fixed SHA256 identity before executing any downloaded
+code. Establish the key from a trusted copy of this documentation or an
+independent maintainer channel, not from the same download as the installer.
+A downloaded checksum alone does not authenticate a publisher.
+
+<!-- verified-release-install:begin -->
+```bash
+dcg_install() (
+  # Explicit failure guards also work when called inside `if dcg_install ...`.
+  set -eu
+  umask 077
+  if [ "$#" -gt 1 ]; then
+    printf '%s\n' 'Usage: dcg_install [--easy-mode|--system]' >&2
+    exit 1
+  fi
+  case "${1:-}" in
+    ''|--easy-mode|--system) ;;
+    *) printf '%s\n' 'Usage: dcg_install [--easy-mode|--system]' >&2; exit 1 ;;
+  esac
+
+  readonly dcg_tag='v0.16.0'
+  readonly dcg_sha256='072462974ad790008e8a3aadb1a9eecf2d9b6bd0ef7b469f69f0fb0fa3b51c7c'
+  readonly dcg_key='RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO'
+  dcg_minisign=$(type -P minisign) || {
+    printf '%s\n' 'Install minisign with your trusted OS package manager first.' >&2
+    exit 1
+  }
+  dcg_curl=$(type -P curl) || exit 1
+  dcg_bash=$(type -P bash) || exit 1
+  if dcg_hash=$(type -P sha256sum); then
+    dcg_hash_kind=sha256sum
+  elif dcg_hash=$(type -P shasum); then
+    dcg_hash_kind=shasum
+  else
+    printf '%s\n' 'A SHA-256 verifier (sha256sum or shasum) is required.' >&2
+    exit 1
+  fi
+
+  dcg_tmp=$(mktemp -d "${TMPDIR:-/tmp}/dcg-install.XXXXXXXXXX") || exit 1
+  printf 'Installer verification files: %s\n' "$dcg_tmp"
+  dcg_base="https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/$dcg_tag"
+  for dcg_asset in install.sh install.sh.minisig; do
+    "$dcg_curl" --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+      --max-time 120 --user-agent 'destructive_command_guard-installer' \
+      "$dcg_base/$dcg_asset" -o "$dcg_tmp/$dcg_asset" || exit 1
+  done
+  "$dcg_minisign" -Vm "$dcg_tmp/install.sh" \
+    -x "$dcg_tmp/install.sh.minisig" -P "$dcg_key" || exit 1
+  if [ "$dcg_hash_kind" = sha256sum ]; then
+    dcg_actual=$("$dcg_hash" "$dcg_tmp/install.sh") || exit 1
+  else
+    dcg_actual=$("$dcg_hash" -a 256 "$dcg_tmp/install.sh") || exit 1
+  fi
+  if [ "${dcg_actual%% *}" != "$dcg_sha256" ]; then
+    printf '%s\n' 'Installer does not match the pinned release; refusing execution.' >&2
+    exit 1
+  fi
+
+  case "${1:-}" in
+    --system)
+      # The first elevated command runs only after BOTH checks succeed.
+      sudo -- "$dcg_bash" "$dcg_tmp/install.sh" \
+        --version "$dcg_tag" --require-minisign --system ;;
+    --easy-mode)
+      "$dcg_bash" "$dcg_tmp/install.sh" \
+        --version "$dcg_tag" --require-minisign --easy-mode ;;
+    *) "$dcg_bash" "$dcg_tmp/install.sh" \
+        --version "$dcg_tag" --require-minisign ;;
+  esac
+)
+```
+<!-- verified-release-install:end -->
+
+Choose **one** installation mode after defining the function:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
+dcg_install                 # Normal: install to ~/.local/bin
+dcg_install --easy-mode     # Also configure PATH automatically
+dcg_install --system        # Install to /usr/local/bin using sudo after verification
 ```
 
-Easy mode auto-detects your platform, downloads the right binary, verifies SHA256 checksums, configures all supported AI agent hooks and bridges (Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, Posit Assistant, Oh My Pi, OpenCode, Crush, Reasonix, Factory Droid, Aider), and updates your PATH. For Codex CLI 0.125.0+, the installer merges a `PreToolUse` Bash hook into `~/.codex/hooks.json`; invalid JSON or malformed existing Codex hook shapes are left unchanged and reported instead of being overwritten.
+The system-wide mode invokes `sudo` only after the installer's signature and
+pinned hash match. Install `minisign` on the system PATH too so the elevated
+installer can verify the binary archive. A missing verifier, unavailable asset,
+invalid signature, or different installer digest stops installation. This path
+has no unsigned or source-build fallback. The private download directory is
+retained for inspection.
+
+The tag and digest form a fixed pair. To update this recipe for another release,
+independently verify its installer signature and pin its exact SHA256; do not
+substitute `main` or `latest`, change only the tag, or remove either check.
+For native Windows, use the [verified PowerShell recipe](docs/windows.md#verified-release-installation).
+
+Easy mode auto-detects your platform, downloads the right binary, requires its
+Minisign signature and SHA256 checksum, configures supported AI agent hooks and
+bridges, and updates your PATH. For Codex CLI 0.125.0+, the installer merges a
+`PreToolUse` Bash hook into `~/.codex/hooks.json`; invalid JSON or malformed
+existing Codex hook shapes are left unchanged and reported instead of being
+overwritten.
 
 ### Homebrew
 
@@ -1092,73 +1187,29 @@ brew install dicklesworthstone/tap/dcg
 dcg install
 ```
 
-### Manual install (no `curl | bash`)
+### Manual archive verification
 
-Every release archive is signed, so you can verify it yourself and never run
-the installer script:
-
-```bash
-V=v0.15.0; T=aarch64-apple-darwin   # or x86_64-unknown-linux-musl, etc.
-curl -fLO "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/$V/dcg-$T.tar.xz"
-curl -fLO "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/$V/dcg-$T.tar.xz.minisig"
-minisign -Vm "dcg-$T.tar.xz" -P RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO
-tar -xJf "dcg-$T.tar.xz" && install -m 0755 dcg ~/.local/bin/dcg
-dcg install   # configure agent hooks
-```
-
-Each archive also has a `.sha256` and a `.sigstore.json` bundle. Verify the
-bundle with `cosign verify-blob --new-bundle-format --key <pub> --bundle
-dcg-$T.tar.xz.sigstore.json dcg-$T.tar.xz`, where `<pub>` is the key pinned
-as `COSIGN_RELEASE_PUBLIC_KEY` in `install.sh`.
-
-**Other options:**
-
-Interactive mode (prompts for each step; prompts read your terminal via
-`/dev/tty`, so they work even when the script is piped through `bash`. With no
-terminal at all — e.g. CI — the installer proceeds with safe defaults and
-prints each decision it makes):
-
-```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash
-```
-
-Install specific version:
-
-```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.7.6
-```
-
-Install to /usr/local/bin (system-wide, requires sudo):
-
-```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | sudo bash -s -- --system
-```
-
-Build from source instead of downloading binary:
-
-```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --from-source
-```
-
-Download/install only (skip agent hook configuration, the shell startup check and shell completions):
-
-```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --no-configure
-```
+The [verified release recipe](#quick-install-verified-release) installs the
+prebuilt archive for your platform after authenticating both the installer and
+archive. If you handle an archive manually, use the release's `.minisig` and
+the trusted public key documented under [Prebuilt Binaries](#prebuilt-binaries),
+as well as its SHA256 checksum. Stop on any missing asset or failed check before
+extracting, installing, or executing anything. A checksum downloaded beside the
+archive alone does not authenticate its publisher. Sigstore bundles are optional
+release assets; `v0.16.0` publishes Minisign signatures without Sigstore bundles.
 
 > **Note:** If you have [gum](https://github.com/charmbracelet/gum) installed, the installer will use it for fancy terminal formatting.
 
-The installer verifies each adjacent `.minisig` with the embedded release public
-key when `minisign` is available. A present but invalid signature is always fatal;
-`--require-minisign` also makes a missing sidecar or verifier fatal. The pinned key
-ID for current releases is `69B3955C8D2E62A8`; the retired
-`36B847D11BA5A0D0` key is accepted only when installing v0.6.7. Trusted Sigstore
-cosign bundles are checked independently against either the pinned local-release
-public key or the repository's GitHub Actions OIDC identity, and the SHA256
-checksum remains mandatory. Cosign versions affected by CVE-2026-22703 are not
-trusted. The installer falls back to building from source if no prebuilt is
-available and removes the legacy Python predecessor (`git_safety_guard.py`) if
-present.
+The recommended recipes always pass `--require-minisign` or `-RequireMinisign`
+to the authenticated installer, so the binary archive must also authenticate
+against the embedded release key. Current releases use key ID
+`69B3955C8D2E62A8`; the retired `36B847D11BA5A0D0` key remains scoped to
+`v0.6.7` in the underlying installer. Trusted Sigstore/cosign bundles, when
+published, are checked independently against the pinned local-release key or
+the historical GitHub Actions OIDC identity. SHA256 checks remain mandatory.
+The installer removes the legacy Python predecessor (`git_safety_guard.py`)
+if present. For binary-only updates, `dcg update --verify --no-configure`
+preserves existing hook wiring.
 
 <details>
 <summary>Agent-specific notes</summary>
@@ -1191,20 +1242,23 @@ present.
 The locked dependency graph requires Rust 1.95 or newer. Release builds use the
 repository's known-good `nightly-2026-08-25` pin; the included
 `rust-toolchain.toml` selects it automatically inside a checkout.
+Source development builds have a separate trust boundary: review the checkout
+and its provenance before running Cargo, which executes build scripts. They are
+not an automatic fallback when a release cannot be authenticated.
 
 ```bash
 # Install the release toolchain if you don't have it
 rustup toolchain install nightly-2026-08-25
 
-# Install the tagged source reproducibly
-cargo +nightly-2026-08-25 install --locked --git https://github.com/Dicklesworthstone/destructive_command_guard --tag v0.7.6 destructive_command_guard
+# From the local release checkout you have reviewed and trust:
+cargo +nightly-2026-08-25 install --locked --path .
 ```
 
 ### Manual build
 
+From that same reviewed checkout:
+
 ```bash
-git clone https://github.com/Dicklesworthstone/destructive_command_guard
-cd destructive_command_guard
 # rust-toolchain.toml automatically selects the pinned release nightly
 cargo build --release
 cp target/release/dcg ~/.local/bin/
@@ -1227,7 +1281,9 @@ dcg update --verify
 dcg update --verify --no-configure  # binary only; preserve existing hook wiring
 ```
 
-You can always re-run `install.sh` / `install.ps1` directly if preferred.
+You can also re-run the [verified release recipe](#quick-install-verified-release)
+or its [PowerShell equivalent](docs/windows.md#verified-release-installation).
+Authenticate the downloaded script each time before executing it.
 
 ### Local builds, pinning, and update refusal (#320)
 
@@ -1265,7 +1321,11 @@ Prebuilt binaries are available for:
 - Windows x64 (`x86_64-pc-windows-msvc`)
 - Windows ARM64 (`aarch64-pc-windows-msvc`)
 
-Download from [GitHub Releases](https://github.com/Dicklesworthstone/destructive_command_guard/releases) and verify the SHA256 checksum.
+Download from a specific [GitHub Release](https://github.com/Dicklesworthstone/destructive_command_guard/releases)
+and verify its Minisign signature against the trusted key below, plus its SHA256
+checksum, before extracting or executing it. Do not proceed when verification
+fails or the verifier/signature is unavailable. The recommended installation
+recipes enforce this refusal automatically.
 Starting with v0.7.5, each manually published artifact has an adjacent
 `.minisig`, verifiable with the DSR-managed public key (key ID
 `69B3955C8D2E62A8`). The installers do this automatically when `minisign` is
@@ -1289,16 +1349,22 @@ require the per-artifact SHA256 checksum.
 
 ## Uninstalling
 
-Remove dcg and all its hooks from AI agents:
+To remove hooks using your already installed binary, run `dcg uninstall` (see
+`dcg uninstall --help` for agent selection). For full removal, review
+`uninstall.sh` or `uninstall.ps1` in a local checkout whose provenance you trust,
+then run that local file. The `v0.16.0` release does not publish signed
+uninstaller assets; do not download an uninstaller from `main` and execute it.
+
+From your reviewed local checkout on Unix:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/uninstall.sh | bash
+bash ./uninstall.sh
 ```
 
 On Windows:
 
 ```powershell
-irm https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/uninstall.ps1 | iex
+& .\uninstall.ps1
 ```
 
 The Unix uninstaller:
@@ -2173,6 +2239,10 @@ CLI flags override config file values.
 
 ### CI Integration
 
+Provision `dcg` on the runner or in its image using the
+[verified release recipe](#quick-install-verified-release) before these jobs.
+The examples assume the authenticated binary is already on `PATH`.
+
 #### GitHub Actions
 
 ```yaml
@@ -2187,10 +2257,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install dcg
-        run: |
-          curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh" | bash
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+      - name: Check pre-provisioned dcg
+        run: dcg --version
 
       - name: Scan changed files
         run: |
@@ -2205,8 +2273,8 @@ jobs:
 scan:
   stage: test
   script:
-    - curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh" | bash
-    - ~/.local/bin/dcg scan --git-diff origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME..HEAD --fail-on error
+    - dcg --version
+    - dcg scan --git-diff origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME..HEAD --fail-on error
   rules:
     - if: $CI_MERGE_REQUEST_ID
 ```

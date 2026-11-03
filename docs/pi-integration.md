@@ -169,8 +169,8 @@ its shell tool differently, and set `DCG_BIN` if `dcg` is not on Pi's `PATH`
 
 ## Verifying it works
 
-1. Install dcg (`curl … | bash`) and confirm `dcg --version` works in the same
-   shell environment Pi runs in.
+1. Install dcg using the [verified release recipe](../README.md#quick-install-verified-release)
+   and confirm `dcg --version` works in the same shell environment Pi runs in.
 2. Drop `dcg-guard.ts` into one of the discovery paths above (or pass it
    explicitly: `pi -e ./dcg-guard.ts`).
 3. Ask Pi to run a known-destructive command, e.g. `git reset --hard HEAD~1`.

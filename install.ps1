@@ -1,7 +1,8 @@
 # dcg PowerShell installer
 #
-# Usage:
-#   irm https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.ps1 | iex
+# Authenticate this script before execution using the pinned release recipe:
+#   https://github.com/Dicklesworthstone/destructive_command_guard/blob/main/docs/windows.md#verified-release-installation
+# After verification, invoke the local file with -Version and -RequireMinisign.
 #
 # Options:
 #   -Version vX.Y.Z   Install specific version (default: latest)
@@ -2215,8 +2216,9 @@ if ($Help) {
 dcg PowerShell installer
 
 Usage:
-  irm https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.ps1 | iex
-  & ([scriptblock]::Create((irm "<install.ps1 URL>"))) -EasyMode -Verify
+  Authenticate this script before execution with the pinned release recipe:
+  https://github.com/Dicklesworthstone/destructive_command_guard/blob/main/docs/windows.md#verified-release-installation
+  Then invoke the verified local file with -Version and -RequireMinisign.
 
 Options:
   -Version vX.Y.Z   Install a specific version (default: latest GitHub release)

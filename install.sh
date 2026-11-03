@@ -2,11 +2,10 @@
 #
 # dcg installer
 #
-# One-liner install (with cache buster):
-#   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash
-#
-# Or without cache buster:
-#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh | bash
+# Authenticate a pinned release installer before running this script:
+#   https://github.com/Dicklesworthstone/destructive_command_guard#quick-install-verified-release
+# After verifying the signature and pinned digest, run the local file:
+#   bash ./install.sh --version v0.16.0 --require-minisign
 #
 # Options:
 #   --version vX.Y.Z   Install specific version (default: latest)
@@ -30,8 +29,9 @@
 # Keep this block POSIX sh: it runs before anything bash-specific is parsed.
 if [ -z "${BASH_VERSION:-}" ]; then
   printf '%s\n' \
-    "dcg installer: this script needs bash. Pipe it to bash instead, for example:" \
-    '  curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh" | bash' >&2
+    'dcg installer: this script needs bash. Authenticate the release installer first:' \
+    '  https://github.com/Dicklesworthstone/destructive_command_guard#quick-install-verified-release' \
+    'Then run the verified local file with bash ./install.sh --version v0.16.0 --require-minisign' >&2
   exit 1
 fi
 # bash run as `sh` starts in POSIX mode, which rejects the process

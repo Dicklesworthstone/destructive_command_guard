@@ -2,8 +2,9 @@
 #
 # dcg uninstaller
 #
-# One-liner uninstall:
-#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/uninstall.sh | bash
+# Run from a reviewed local checkout whose provenance you trust:
+#   bash ./uninstall.sh
+# Releases do not currently publish signed uninstaller assets.
 #
 # Options:
 #   --yes            Skip confirmation prompt
@@ -18,8 +19,8 @@
 # Keep this block POSIX sh: it runs before anything bash-specific is parsed.
 if [ -z "${BASH_VERSION:-}" ]; then
   printf '%s\n' \
-    "dcg uninstaller: this script needs bash. Pipe it to bash instead, for example:" \
-    '  curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/uninstall.sh" | bash' >&2
+    "dcg uninstaller: this script needs bash. From your reviewed local checkout, run:" \
+    '  bash ./uninstall.sh' >&2
   exit 1
 fi
 
@@ -1873,7 +1874,7 @@ main() {
             echo
             log "${YELLOW}Cannot read confirmation (no TTY available).${NC}"
             log "${YELLOW}Re-run with --yes to skip the prompt, e.g.:${NC}"
-            log "    curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/uninstall.sh | bash -s -- --yes"
+            log "    bash ./uninstall.sh --yes  # from your reviewed local checkout"
             return 1
         fi
         case "$response" in

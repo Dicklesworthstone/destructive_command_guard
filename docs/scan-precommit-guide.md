@@ -111,7 +111,9 @@ After the team is comfortable:
 
 ### Phase 3: Enforce in CI
 
-Once local pre-commit is stable, add CI enforcement:
+Once local pre-commit is stable, add CI enforcement. Provision `dcg` on the
+runner or in its image with the [verified release installation recipe](../README.md#quick-install-verified-release)
+before this job; the scan job does not download and execute an installer:
 
 ```yaml
 # .github/workflows/dcg-scan.yml
@@ -124,8 +126,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - run: |
-          curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh | bash
+      - run: dcg --version
       - run: dcg scan --git-diff origin/${{ github.base_ref }}...HEAD --fail-on error
 ```
 

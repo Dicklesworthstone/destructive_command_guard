@@ -1,7 +1,8 @@
 # dcg PowerShell uninstaller
 #
-# Usage:
-#   irm https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/uninstall.ps1 | iex
+# Run from a reviewed local checkout whose provenance you trust:
+#   & .\uninstall.ps1
+# Releases do not currently publish signed uninstaller assets.
 #
 # Options:
 #   -Dest DIR       Binary install directory (default: ~/.local/bin)
