@@ -832,6 +832,39 @@ assert_installed_version() {
   ok "Installed version verified: ${reported_version#v}"
 }
 
+# Put the binary at $DEST/dcg with a single rename(2).
+#
+# Running agents exec the hook on every shell tool call. `install -m` (GNU and
+# BSD alike) unlinks the target and then copies, so a hook starting during the
+# copy found no file or a partial one (bd-0zx5). The staged copy sits in $DEST,
+# so the final `mv -f` stays on one filesystem: a hook sees the old binary or
+# the new one, never neither. A staged binary that cannot report its version
+# is discarded and the installed one is left as it was.
+install_binary_atomically() {
+  local src="$1"
+  local staged
+
+  if ! staged=$(mktemp "$DEST/.dcg.XXXXXX"); then
+    err "Cannot create a temporary file in $DEST"
+    return 1
+  fi
+  if ! cp "$src" "$staged" || ! chmod 0755 "$staged"; then
+    rm -f "$staged"
+    err "Cannot stage the dcg binary in $DEST"
+    return 1
+  fi
+  if ! "$staged" --version >/dev/null 2>&1; then
+    rm -f "$staged"
+    err "The new dcg binary failed its --version check; $DEST/dcg was not replaced"
+    return 1
+  fi
+  if ! mv -f "$staged" "$DEST/dcg"; then
+    rm -f "$staged"
+    err "Cannot move the new dcg binary into place at $DEST/dcg"
+    return 1
+  fi
+}
+
 run_install_self_test() {
   local allow_output
   local dcg_path
@@ -1788,7 +1821,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   (cd "$TMP/src" && cargo build --release)
   BIN="$TMP/src/target/release/dcg"
   [ -x "$BIN" ] || { err "Build failed"; exit 1; }
-  install -m 0755 "$BIN" "$DEST/dcg"
+  install_binary_atomically "$BIN" || exit 1
   ok "Installed to $DEST/dcg (source build)"
   assert_installed_version "$VERSION" || exit 1
   maybe_add_path
@@ -1884,7 +1917,7 @@ BIN="$TMP/dcg.extracted"
 tar -xOf "$TMP/$TAR" dcg > "$BIN" || { err "Cannot stream dcg from release archive"; exit 1; }
 [ -s "$BIN" ] || { err "Release archive contained an empty dcg binary"; exit 1; }
 chmod 0755 "$BIN"
-install -m 0755 "$BIN" "$DEST/dcg"
+install_binary_atomically "$BIN" || exit 1
 ok "Installed to $DEST/dcg"
 assert_installed_version "$VERSION" || exit 1
 maybe_add_path

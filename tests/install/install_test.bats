@@ -977,6 +977,79 @@ MOCKEOF
 }
 
 # ============================================================================
+# Binary replacement (bd-0zx5)
+# ============================================================================
+
+# A mock dcg of about 4 MiB. The padding after `exit` is never read by sh, but
+# it makes the copy long enough that an unlink-then-copy leaves a window a
+# concurrent exec can land in.
+write_padded_mock_dcg() {
+    local path="$1" version="$2"
+    {
+        printf '#!/bin/sh\necho "dcg %s"\nexit 0\n' "$version"
+        head -c 4194304 /dev/zero | tr '\0' '#'
+        printf '\n'
+    } > "$path"
+    chmod 0755 "$path"
+}
+
+@test "install_binary_atomically: a dcg exec'd during replacement is never missing or partial" {
+    DEST="$TEST_TMPDIR/live-bin"
+    mkdir -p "$DEST"
+    write_padded_mock_dcg "$TEST_TMPDIR/dcg-a" 1.0.0
+    write_padded_mock_dcg "$TEST_TMPDIR/dcg-b" 2.0.0
+    cp "$TEST_TMPDIR/dcg-a" "$DEST/dcg"
+
+    local failures="$TEST_TMPDIR/exec-failures"
+    local stop="$TEST_TMPDIR/stop-reader"
+    : > "$failures"
+    # The hook's view: exec the installed path over and over while it is
+    # replaced. A missing file, a file without its mode yet, or an empty one
+    # all show up as a failed exec or a wrong version line.
+    (
+        while [ ! -e "$stop" ]; do
+            if ! out=$("$DEST/dcg" --version 2>&1); then
+                printf 'exec failed: %s\n' "$out" >> "$failures"
+            fi
+            case "$out" in
+                "dcg 1.0.0" | "dcg 2.0.0") ;;
+                *) printf 'unexpected output: %s\n' "$out" >> "$failures" ;;
+            esac
+        done
+    ) &
+    local reader=$!
+    local round
+    for round in $(seq 1 40); do
+        install_binary_atomically "$TEST_TMPDIR/dcg-b"
+        install_binary_atomically "$TEST_TMPDIR/dcg-a"
+    done
+    touch "$stop"
+    wait "$reader"
+
+    if [ -s "$failures" ]; then
+        sort "$failures" | uniq -c
+        false
+    fi
+    [ "$("$DEST/dcg" --version)" = "dcg 1.0.0" ]
+    [[ "$(ls -l "$DEST/dcg")" == -rwxr-xr-x* ]]
+    # No staged copy is left behind.
+    [ -z "$(find "$DEST" -name '.dcg.*')" ]
+}
+
+@test "install_binary_atomically: a new binary that cannot run leaves the installed one in place" {
+    DEST="$TEST_TMPDIR/live-bin"
+    mkdir -p "$DEST"
+    write_padded_mock_dcg "$DEST/dcg" 1.0.0
+    printf '#!/bin/sh\nexit 3\n' > "$TEST_TMPDIR/broken-dcg"
+
+    run install_binary_atomically "$TEST_TMPDIR/broken-dcg"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"was not replaced"* ]]
+    [ "$("$DEST/dcg" --version)" = "dcg 1.0.0" ]
+    [ -z "$(find "$DEST" -name '.dcg.*')" ]
+}
+
+# ============================================================================
 # Idempotency Tests
 # ============================================================================
 
