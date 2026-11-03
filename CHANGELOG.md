@@ -11,6 +11,17 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+**A dynamic command word or malformed shell before an interpreter heredoc no
+longer crashes the hook (#628).** In 0.16.0, `P=x; $P; python3 - <<'EOF'`,
+or a stray `)` or an unclosed `{` before a Python, Node or Ruby heredoc with
+a quoted delimiter, sent heredoc analysis into unbounded recursion. The hook
+overflowed its stack and exited without a verdict, and Claude Code ran the
+command. These commands now get a normal verdict: the reported
+`shutil.rmtree` is denied as `heredoc.python:shutil_rmtree`, and its
+harmless twin is allowed. Reported by Khang5687 (290d783a).
+
 ## [v0.16.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.16.0) -- 2026-11-01 [Release]
 
 This release closes commands that ran unguarded (writes hidden by `IFS`
