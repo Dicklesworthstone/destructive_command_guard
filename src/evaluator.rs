@@ -29283,6 +29283,9 @@ enum VariableResolution {
     /// operands such as `of=/dev/sda`. IFS cannot split a double-quoted use;
     /// every binding and mutation check still applies.
     ArgumentLiteral { wholly_double_quoted: bool },
+    /// `Literal` for an mv proof whose every use of the name is double-quoted:
+    /// a `for` candidate may then hold spaces (#625).
+    QuotedUseLiteral,
     /// Keep established literal candidates when propagation can only add a
     /// denial. A possibly stale candidate must never authorize an exemption.
     DenyOnlyLiteral,
@@ -29835,7 +29838,14 @@ fn resolve_variable_bindings(
                     && source
                         .get(..start)
                         .is_some_and(|prefix| prefix.trim_end().ends_with("&&"))
-                    && conditional_binding_dominates_redirect(source, end, segment_start)));
+                    && conditional_binding_dominates_redirect(source, end, segment_start))
+                || (posix_for_loop_binds(segment, name)
+                    && conditional_for_header_binds_first_body_command(
+                        source,
+                        start,
+                        end,
+                        segment_start,
+                    )));
         if binds_in_parent {
             let assignments = strip_assignment_declaration(segment);
             let binding = match assignment_only_segment_binding(assignments, name) {
@@ -29851,7 +29861,9 @@ fn resolve_variable_bindings(
                     return None;
                 }
                 values = Some(match mode {
-                    VariableResolution::Literal | VariableResolution::DenyOnlyLiteral => vec![
+                    VariableResolution::Literal
+                    | VariableResolution::QuotedUseLiteral
+                    | VariableResolution::DenyOnlyLiteral => vec![
                         literal_assignment_value(raw)
                             .or_else(|| mktemp_scratch_assignment_value(raw))?,
                     ],
@@ -29879,7 +29891,10 @@ fn resolve_variable_bindings(
                 if values.is_some() {
                     return None;
                 }
-                let (header_name, candidates) = parse_posix_for_loop_header(segment)?;
+                let (header_name, candidates) = parse_posix_for_loop_header_with(
+                    segment,
+                    matches!(mode, VariableResolution::QuotedUseLiteral),
+                )?;
                 if header_name != name {
                     return None;
                 }
@@ -30600,6 +30615,72 @@ fn segment_binding_reaches_parent_shell(source: &str, start: usize, end: usize) 
     true
 }
 
+/// Whether a `for` header that `segment_binding_reaches_parent_shell` refuses
+/// only for the `&&` or `||` in front of it still binds the loop name at the
+/// use: the use is the first command of that loop's own body (#625).
+///
+/// In `cd dir && for f in a b; do mv "$f" d/; done` the header runs only when
+/// `cd` succeeds, so after `done` the name may still hold its old value. Inside
+/// the body it cannot: each pass of the body starts right after the header
+/// assigns the next candidate, and the first command runs before anything else
+/// in the body. A use later in the body, or after `done`, keeps the refusal.
+fn conditional_for_header_binds_first_body_command(
+    source: &str,
+    start: usize,
+    end: usize,
+    use_start: usize,
+) -> bool {
+    let Some(before) = source.get(..start).map(str::trim_end) else {
+        return false;
+    };
+    if !before.ends_with("&&") && !before.ends_with("||") {
+        return false;
+    }
+    // The header ends at `;` or a newline, then the body opens with `do`. The
+    // use segment starts at that `do` or at the command right after it.
+    let Some(tail) = source.get(end..) else {
+        return false;
+    };
+    let Some(after_separator) = tail
+        .trim_start_matches([' ', '\t'])
+        .strip_prefix([';', '\n'])
+    else {
+        return false;
+    };
+    let body = after_separator.trim_start();
+    let Some(after_do) = body.strip_prefix("do") else {
+        return false;
+    };
+    if !after_do.starts_with([' ', '\t', '\n']) {
+        return false;
+    }
+    let Some(use_text) = source.get(use_start..).map(str::trim_start) else {
+        return false;
+    };
+    let use_text_start = source.len() - use_text.len();
+    let do_start = source.len() - body.len();
+    let first_command_start = source.len() - after_do.trim_start().len();
+    use_text_start == do_start || use_text_start == first_command_start
+}
+
+/// Whether any segment of the command could install a shell trap.
+///
+/// A loop-bound proof reads only the segments before the use. In
+/// `for f in a b; do mv "$f" d/; trap 'f=/etc' DEBUG; done` the trap is set
+/// after the first `mv`, but bash runs a DEBUG trap before every later simple
+/// command, so the second pass moves `/etc`. `eval`, `source`, `.`, and an
+/// expanded command word can set a trap too, so each of those refuses the
+/// proof wherever it sits.
+fn command_may_install_trap(source: &str, segment_ranges: &[(usize, usize)]) -> bool {
+    source
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| word == "trap")
+        || segment_ranges.iter().any(|&(start, end)| {
+            let first = hazard_first_word(source.get(start..end).map_or("", str::trim));
+            first.contains(['$', '`']) || matches!(first.as_ref(), "trap" | "eval" | "source" | ".")
+        })
+}
+
 /// Whether a segment's text could assign or mutate `NAME` in a form the
 /// binding scan does not model: plain `NAME=`, append `NAME+=`, or an array
 /// element `NAME[…]=` (bash makes `$NAME` alias element 0, so `f[0]=/etc`
@@ -30663,6 +30744,16 @@ fn posix_for_loop_binds(segment: &str, name: &str) -> bool {
 /// and double-quoted positions. Globs, expansions, `"$@"`, arithmetic `for
 /// ((…))`, and empty or oversized lists all refuse the parse.
 fn parse_posix_for_loop_header(segment: &str) -> Option<(String, Vec<String>)> {
+    parse_posix_for_loop_header_with(segment, false)
+}
+
+/// [`parse_posix_for_loop_header`], optionally also accepting candidates that
+/// hold spaces. Pass `quoted_use` only when every use of the name is
+/// double-quoted; see [`quoted_use_loop_candidate_value`].
+fn parse_posix_for_loop_header_with(
+    segment: &str,
+    quoted_use: bool,
+) -> Option<(String, Vec<String>)> {
     let segment = strip_command_prefix_reserved_words(segment);
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
     if tokens
@@ -30691,11 +30782,47 @@ fn parse_posix_for_loop_header(segment: &str) -> Option<(String, Vec<String>)> {
     let values = candidates
         .iter()
         .map(|raw| {
-            let value = literal_assignment_value(raw)?;
-            (!value.contains(|c: char| c.is_ascii_whitespace())).then_some(value)
+            literal_assignment_value(raw)
+                .filter(|value| !value.contains(|c: char| c.is_ascii_whitespace()))
+                .or_else(|| {
+                    quoted_use
+                        .then(|| quoted_use_loop_candidate_value(raw))
+                        .flatten()
+                })
         })
         .collect::<Option<Vec<String>>>()?;
     Some(((*name).to_string(), values))
+}
+
+/// A `for` candidate holding spaces, for a use where every reference to the
+/// name is double-quoted (#625).
+///
+/// `"a b.md"`, `'a b.md'` and `a\ b.md` are each one shell word with the value
+/// `a b.md`. Put back between the use's double quotes, a value with none of
+/// `"`, `$`, `` ` `` or `\` stays one word with that value, so the substituted
+/// segment reads the same as the unrolled `mv "a b.md" …` that dcg already
+/// judges. A newline or carriage return could change how the segment is split,
+/// so those still refuse. An unquoted use would field-split the value, which
+/// is why callers pass `quoted_use` only for all-quoted uses.
+fn quoted_use_loop_candidate_value(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let value = if raw.starts_with(['\'', '"']) {
+        literal_assignment_value(raw)?
+    } else {
+        // A bare word may escape a space; any other backslash refuses below.
+        let unescaped = raw.replace("\\ ", " ");
+        if unescaped.is_empty()
+            || !unescaped.bytes().all(|b| {
+                b == b' '
+                    || b.is_ascii_alphanumeric()
+                    || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'+' | b'@')
+            })
+        {
+            return None;
+        }
+        unescaped
+    };
+    (!value.contains(['"', '$', '`', '\\', '\n', '\r'])).then_some(value)
 }
 
 /// Synthetic stand-in for a path minted by `mktemp` in this same command.
@@ -31941,7 +32068,17 @@ fn statically_safe_loop_variable_mv(
     else {
         return false;
     };
-    let Some(values) = resolved_variable_values(source, segment_ranges, segment_start, &name)
+    if command_may_install_trap(source, segment_ranges) {
+        return false;
+    }
+    // Only an all-quoted use keeps a space-bearing candidate one word (#625).
+    let mode = if all_references_double_quoted {
+        VariableResolution::QuotedUseLiteral
+    } else {
+        VariableResolution::Literal
+    };
+    let Some(values) =
+        resolve_variable_bindings(source, segment_ranges, segment_start, &name, mode)
     else {
         return false;
     };
@@ -60317,7 +60454,8 @@ mod tests {
                 "for f in a b; do mv \"$f\" $DEST/; done",
                 &["mv-dynamic-path"],
             ),
-            // Whitespace-bearing candidates are not parse-neutral.
+            // Whitespace-bearing candidates are not parse-neutral at an
+            // unquoted use.
             ("for f in 'a b' c; do mv $f d/; done", &["mv-dynamic-path"]),
             // Nested rebinding behind the `do` prefix makes the live value
             // ambiguous.
@@ -60368,6 +60506,94 @@ mod tests {
                      (expected one of {expected_rules:?})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn literal_for_loop_after_and_or_and_spaced_words_issue_625() {
+        // `&&`/`||` before the header: the first body command runs only after
+        // the header assigned a candidate. Quoted or escaped words with
+        // spaces: one word each, and every use below is double-quoted.
+        for command in [
+            r#"cd /tmp/x && for f in a.md b.md; do mv "$f" archive/; done"#,
+            r#"mkdir -p archive && for f in a.md b.md; do mv "$f" archive/; done"#,
+            r#"test -d archive || for f in a.md b.md; do mv "$f" archive/; done"#,
+            r#"for f in "a b.md" "c d.md"; do mv "$f" archive/; done"#,
+            r#"for f in 'a b.md' 'c d.md'; do mv "$f" archive/; done"#,
+            r#"for f in a\ b.md c\ d.md; do mv "$f" archive/; done"#,
+            r#"cd /tmp/x && for f in "2026-08-01 notes.md" b.md; do mv "$f" "archive/$f"; done"#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "literal loop must fold: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn literal_for_loop_fold_keeps_unsafe_shapes_denied_issue_625() {
+        for command in [
+            // Protected candidates still deny after `&&`.
+            r#"cd /tmp/x && for f in ~/.ssh/id_ed25519 ~/.ssh/config; do mv "$f" /tmp/; done"#,
+            r#"cd /tmp/x && for f in /etc/hosts /etc/passwd; do mv "$f" /tmp/; done"#,
+            r#"cd /tmp/x && for f in "a b" /etc; do mv "$f" d/; done"#,
+            // After `done` the name may hold its value from before the loop:
+            // the header never ran when `cd` failed.
+            r#"cd /tmp/x && for f in a b; do :; done; mv "$f" d/"#,
+            // An unquoted use field-splits a spaced value.
+            r#"for f in "a b" c; do mv $f d/; done"#,
+            // Spaced candidates must not carry expansions or quotes.
+            r#"for f in "a b" "$HOME"; do mv "$f" d/; done"#,
+            r#"for f in 'a $(reboot)' b; do mv "$f" d/; done"#,
+            r#"for f in 'a "b' c; do mv "$f" d/; done"#,
+            r#"for f in a\ b /etc; do mv "$f" d/; done"#,
+            // A trap set later in the body runs before the next pass's mv.
+            r#"for f in a b; do mv "$f" d/; trap 'f=/etc' DEBUG; done"#,
+            r#"cd /tmp/x && for f in a b; do mv "$f" d/; eval "$setup"; done"#,
+            r#"for f in "a b" c; do mv "$f" d/; builtin trap 'f=/etc' DEBUG; done"#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "unsafe loop shape must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn spaced_loop_candidates_parse_only_for_quoted_uses_issue_625() {
+        assert_eq!(parse_posix_for_loop_header("for f in 'a b' c"), None);
+        assert_eq!(
+            parse_posix_for_loop_header_with("for f in 'a b' \"c d\" e", true),
+            Some((
+                "f".to_string(),
+                vec!["a b".to_string(), "c d".to_string(), "e".to_string()]
+            ))
+        );
+        assert_eq!(
+            quoted_use_loop_candidate_value(r"a\ b.md"),
+            Some("a b.md".to_string())
+        );
+        for raw in [
+            r"a\\ b",
+            r"a\tb",
+            "'a\nb'",
+            "'a\"b c'",
+            "'a `b` c'",
+            "~/a\\ b",
+        ] {
+            assert_eq!(quoted_use_loop_candidate_value(raw), None, "{raw:?}");
         }
     }
 
