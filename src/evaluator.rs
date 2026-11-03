@@ -7789,6 +7789,18 @@ fn posix_eval_single_substitution_body(arguments: &str) -> Option<&str> {
     unquoted.strip_prefix("$(")?.strip_suffix(')')
 }
 
+/// POSIX/zsh precommand modifiers that run the command word after them without
+/// changing which command runs: `builtin eval …`, `noglob trap …`,
+/// `nocorrect alias …`, and the zsh `-` modifier. A command can stack several
+/// (`builtin command eval …`). Reserved words and assignments are not here —
+/// each caller handles those separately — so this is only the "runs its
+/// operand unchanged" set the eval/trap/alias passes must skip past before the
+/// command word (bd-wrapped-eval-trap-alias-8r2l; see the normalize/git/heredoc
+/// wrapper lists this deliberately mirrors).
+fn is_posix_precommand_wrapper(word: &str) -> bool {
+    matches!(word, "command" | "builtin" | "noglob" | "nocorrect" | "-")
+}
+
 fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
     for segment in crate::packs::split_command_segments_in_dialect(command, ShellDialect::Posix) {
         if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
@@ -7824,8 +7836,11 @@ fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) 
                 index += 1;
                 continue;
             }
-            if matches!(decoded.as_ref(), "command" | "builtin") {
+            // Skip every stacked precommand wrapper, not just one:
+            // `builtin command eval '…'` still runs the eval.
+            if is_posix_precommand_wrapper(decoded.as_ref()) {
                 index += 1;
+                continue;
             }
             break;
         }
@@ -17889,7 +17904,7 @@ fn posix_alias_definition_bodies(command: &str) -> Vec<String> {
             continue;
         };
         let mut words = tokens.iter().skip_while(|token| {
-            matches!(token.as_str(), "builtin" | "command")
+            is_posix_precommand_wrapper(token.as_str())
                 || (token.contains('=') && !token.starts_with('-'))
         });
         if words.next().map(String::as_str) != Some("alias") {
@@ -18018,24 +18033,16 @@ fn posix_deferred_command_views(command: &str) -> Vec<String> {
             }
             // What may open a command before its program: a group or
             // subshell (`{ trap …; }`, `(trap …)`), a reserved word
-            // (`then trap …`), `builtin`/`command`, and a function
-            // definition's name (`f() { trap …; }`, `function f { … }`).
+            // (`then trap …`), a precommand wrapper (`noglob trap …`), and a
+            // function definition's name (`f() { trap …; }`, `function f { … }`).
             let bare = word.trim_start_matches(['(', '{']);
             if std::mem::take(&mut function_name)
                 || bare.is_empty()
                 || word.ends_with("()")
+                || is_posix_precommand_wrapper(bare)
                 || matches!(
                     bare,
-                    "!" | "if"
-                        | "then"
-                        | "else"
-                        | "elif"
-                        | "do"
-                        | "while"
-                        | "until"
-                        | "time"
-                        | "builtin"
-                        | "command"
+                    "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "time"
                 )
             {
                 index += 1;
@@ -39646,6 +39653,44 @@ mod tests {
         ] {
             let result = evaluate_with_pack_ids(command, &packs);
             assert!(result.is_allowed(), "{command} -> {result:?}");
+        }
+    }
+
+    /// eval/trap/alias run their operand through every stacked precommand
+    /// wrapper (`builtin command eval …`, `noglob trap …`, `nocorrect alias …`),
+    /// not just one `builtin`/`command` word. Each pass had its own narrow
+    /// wrapper list, so these were allowed (bd-wrapped-eval-trap-alias-8r2l).
+    #[test]
+    fn wrapped_eval_trap_alias_run_their_operand() {
+        let packs = ["core.filesystem", "core.git"];
+        for command in [
+            "builtin command eval 'rm -rf ~/x'",
+            "command builtin eval 'rm -rf ~/x'",
+            "noglob builtin eval 'rm -rf ~/x'",
+            "noglob eval \"git reset --hard\"",
+            "nocorrect eval \"rm -rf ~/x\"",
+            "noglob trap 'rm -rf ~/x' EXIT",
+            "nocorrect trap 'rm -rf ~/x' EXIT",
+            "noglob alias ls='rm -rf ~/x'",
+        ] {
+            assert!(
+                !evaluate_with_pack_ids(command, &packs).is_allowed(),
+                "{command} must not be allowed"
+            );
+        }
+        // Benign operands behind the same wrappers still pass, and `command`'s
+        // query forms (`-v`/`-V`) do not run their argument.
+        for command in [
+            "builtin command eval 'echo hello'",
+            "noglob eval 'echo done'",
+            "nocorrect alias ll='ls -la'",
+            "command -v eval",
+            "command -V eval",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &packs).is_allowed(),
+                "{command} must be allowed"
+            );
         }
     }
 
