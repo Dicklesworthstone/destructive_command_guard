@@ -16022,6 +16022,42 @@ fn evaluate_command_in_single_dialect_view(
             return denial;
         }
     }
+    // A checked producer's output can still be an option of its consumer:
+    // `git reset $(echo --hard)` executes a harmless echo, then a destructive
+    // reset. Judge proven argument values before the data sanitizer erases
+    // the producer spelling (bd-substitution-supplied-flags-1n9a).
+    if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        match posix_literal_argument_view(command, deadline) {
+            Ok(Some(expanded)) => {
+                let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+                    &expanded,
+                    enabled_keywords,
+                    ordered_packs,
+                    keyword_index,
+                    compiled_overrides,
+                    allowlists,
+                    heredoc_settings,
+                    None,
+                    project_path,
+                    deadline,
+                    ShellDialect::Posix,
+                    nested_command_depth + 1,
+                    inherited_automated_stdin,
+                );
+                if nested_result_decides(&result) {
+                    if let Some(info) = result.pattern_info.as_mut() {
+                        info.matched_span = None;
+                        info.matched_text_preview = None;
+                    }
+                    return result;
+                }
+                record_nested_allowlist_hit(&mut heredoc_allowlist_hit, &mut result);
+            }
+            Ok(None) => {}
+            Err(()) => return EvaluationResult::indeterminate_due_to_budget(),
+        }
+    }
+
     // `$IFS`/`${IFS}` word-splits to whitespace by default, so
     // `rm${IFS}-rf${IFS}~` runs `rm -rf ~` while presenting no whitespace the
     // tokenizer can split on. When IFS is not reassigned in the command, expand
@@ -17809,6 +17845,176 @@ fn posix_declaration_option(builtin: &str, option: &str) -> bool {
         _ => return false,
     };
     flags.chars().all(|flag| allowed.contains(flag))
+}
+
+/// Resolve a whole scalar argument or a literal command substitution to one atom.
+///
+/// Keep unknown values and multiword output on their existing paths. In
+/// particular, generated newlines and operators are argv data, never new shell
+/// source. A whole-word variable proof also avoids confusing an apostrophe in
+/// a double-quoted argument with the start of a single-quoted variable.
+fn proven_posix_argument_value(
+    raw: &str,
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    wholly_double_quoted: bool,
+) -> Option<String> {
+    let unquoted = raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(raw);
+    let value = if let Some((name, consumed)) = parse_leading_posix_variable(unquoted)
+        && consumed == unquoted.len()
+    {
+        let values = resolve_variable_bindings(
+            source,
+            segment_ranges,
+            segment_start,
+            name,
+            VariableResolution::ArgumentLiteral {
+                wholly_double_quoted,
+            },
+        )?;
+        let [value] = values.as_slice() else {
+            return None;
+        };
+        value.clone()
+    } else if raw.contains("$(") || raw.contains('`') {
+        let view = crate::packs::core::git::posix_argument_substitution_view(raw).ok()?;
+        if view.has_dynamic || view.command == raw {
+            return None;
+        }
+        for producer in view.literal_producers {
+            // Cut before the consuming command, then complete a possible
+            // trailing `&&` or pipe. Later definitions cannot change the
+            // producer that this expansion runs, and a cut inside `$(...)`
+            // would spuriously fail parsing.
+            let mut prefix = source.get(..segment_start)?.to_owned();
+            prefix.push_str(producer);
+            if std::env::var_os(format!("BASH_FUNC_{producer}%%")).is_some()
+                || crate::heredoc::shell_name_may_be_rebound(&prefix, producer)
+            {
+                return None;
+            }
+        }
+        let words = shell_words::split(&view.command).ok()?;
+        let [value] = words.as_slice() else {
+            return None;
+        };
+        value.clone()
+    } else {
+        return None;
+    };
+    literal_posix_argument_atom(&value).then_some(value)
+}
+
+fn literal_posix_argument_atom(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'.' | b'/' | b':' | b'+' | b',' | b'=' | b'@' | b'%' | b'-'
+                )
+        })
+}
+
+/// An additional, bounded view of proven POSIX argument values.
+///
+/// Only ordinary arguments in top-level simple commands participate. Executable
+/// words, assignments, redirections and nested source keep their own analyses.
+/// Quote each replacement so expansion output cannot become shell grammar.
+/// The caller only adopts findings; this view never grants permission.
+fn posix_literal_argument_view(
+    command: &str,
+    deadline: Option<&Deadline>,
+) -> Result<Option<String>, ()> {
+    const MAX_ARGUMENT_PROOFS: usize = 128;
+    if !command.contains(['$', '`']) {
+        return Ok(None);
+    }
+    if deadline_exceeded(deadline)
+        || command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
+        || crate::heredoc::longest_pipeline_stages(command)
+            > crate::heredoc::MAX_PARSED_PIPELINE_STAGES
+    {
+        return Err(());
+    }
+    let ast = crate::heredoc::try_parse_shell_ast(command).map_err(|_| ())?;
+    let root = ast.root();
+    if root.get_inner_node().has_error() {
+        return Ok(None);
+    }
+    let ranges = command_segment_ranges(command);
+    let mut replacements = Vec::new();
+    let mut attempts = 0usize;
+    let mut output_bytes = command.len();
+    for node in root.dfs() {
+        if deadline_exceeded(deadline) {
+            return Err(());
+        }
+        if node.kind().as_ref() != "command"
+            || !node.ancestors().all(|ancestor| {
+                matches!(
+                    ancestor.kind().as_ref(),
+                    "program" | "list" | "pipeline" | "redirected_statement"
+                )
+            })
+        {
+            continue;
+        }
+        // Only earlier shell state can affect this command's field splitting.
+        // A wholly double-quoted argument is not split, even with a custom IFS.
+        let ifs_may_be_set = segment_text_may_assign(&command[..node.range().start], "IFS");
+        for argument in node.field_children("argument") {
+            let range = argument.range();
+            let raw = &command[range.clone()];
+            if argument.kind().as_ref() == "raw_string" || !raw.contains(['$', '`']) {
+                continue;
+            }
+            if ifs_may_be_set && argument.kind().as_ref() != "string" {
+                continue;
+            }
+            attempts += 1;
+            if attempts > MAX_ARGUMENT_PROOFS
+                || raw.len() > crate::packs::core::git::MAX_STATIC_SUBSTITUTION_BYTES
+                || deadline_exceeded(deadline)
+            {
+                return Err(());
+            }
+            if !raw.contains("$(")
+                && !raw.contains('`')
+                && ranges.len() > MAX_POSIX_EXECUTABLE_SEGMENTS
+            {
+                return Err(());
+            }
+            let Some(value) = proven_posix_argument_value(
+                raw,
+                command,
+                &ranges,
+                node.range().start,
+                argument.kind().as_ref() == "string",
+            ) else {
+                continue;
+            };
+            let replacement = posix_single_quote_argument(&value);
+            output_bytes = output_bytes - range.len() + replacement.len();
+            if output_bytes > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
+                return Err(());
+            }
+            replacements.push((range, replacement));
+        }
+    }
+    if replacements.is_empty() {
+        return Ok(None);
+    }
+    replacements.sort_unstable_by_key(|(range, _)| range.start);
+    let mut expanded = command.to_string();
+    for (range, replacement) in replacements.into_iter().rev() {
+        expanded.replace_range(range, &replacement);
+    }
+    Ok(Some(expanded))
 }
 
 /// A view of `command` with every unquoted `$IFS`/`${IFS}` replaced by a
@@ -28107,6 +28313,10 @@ fn conditional_binding_dominates_redirect(source: &str, end: usize, use_start: u
 enum VariableResolution {
     /// Literal bindings shared by argv, rm, mv, and redirect proofs.
     Literal,
+    /// Equally strict bindings for an ordinary argument, including literal
+    /// operands such as `of=/dev/sda`. IFS cannot split a double-quoted use;
+    /// every binding and mutation check still applies.
+    ArgumentLiteral { wholly_double_quoted: bool },
     /// Keep established literal candidates when propagation can only add a
     /// denial. A possibly stale candidate must never authorize an exemption.
     DenyOnlyLiteral,
@@ -28679,6 +28889,12 @@ fn resolve_variable_bindings(
                         literal_assignment_value(raw)
                             .or_else(|| mktemp_scratch_assignment_value(raw))?,
                     ],
+                    VariableResolution::ArgumentLiteral { .. } => {
+                        vec![literal_assignment_value(raw).or_else(|| {
+                            let raw = raw.trim();
+                            literal_posix_argument_atom(raw).then(|| raw.to_owned())
+                        })?]
+                    }
                     VariableResolution::Redirect { remaining_depth } => redirect_assignment_values(
                         source,
                         segment_ranges,
@@ -28770,7 +28986,12 @@ fn resolve_variable_bindings(
         // substitution proof cannot reproduce (v0.9.1 review).
         if may_mutate_shell_variables
             || segment_text_may_assign(segment, name)
-            || segment_text_may_assign(segment, "IFS")
+            || (!matches!(
+                mode,
+                VariableResolution::ArgumentLiteral {
+                    wholly_double_quoted: true
+                }
+            ) && segment_text_may_assign(segment, "IFS"))
         {
             return None;
         }

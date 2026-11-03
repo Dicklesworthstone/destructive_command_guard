@@ -530,18 +530,19 @@ fn decode_branch_syntax(decoder: &mut ShellTokenDecoder, token: &str) -> Option<
         .map(std::borrow::Cow::into_owned)
 }
 
-const MAX_STATIC_SUBSTITUTION_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_STATIC_SUBSTITUTION_BYTES: usize = 16 * 1024;
 pub(crate) const POSIX_DYNAMIC_QUOTED: &str = "__DCG_POSIX_SUB_Q_7B8CFAE1__";
 pub(crate) const POSIX_DYNAMIC_UNQUOTED: &str = "__DCG_POSIX_SUB_U_7B8CFAE1__";
 
 /// Bounded matching-only view of POSIX command substitutions.
 ///
 /// The evaluator consumes this read-only view only while resolving an
-/// executable launcher command word; the original command remains
-/// authoritative for decisions, logging, allowlists, and source spans.
+/// executable or argument word; the original command remains authoritative
+/// for decisions, logging, allowlists, and source spans.
 pub(crate) struct PosixSubstitutionView {
     pub(crate) command: String,
     pub(crate) has_dynamic: bool,
+    pub(crate) literal_producers: Vec<&'static str>,
 }
 
 /// Resolve the deliberately small, non-executing subset of POSIX command
@@ -561,6 +562,20 @@ fn resolve_literal_printf_substitutions(command: &str) -> Result<Option<String>,
 }
 
 pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitutionView, ()> {
+    posix_substitution_view_inner(command, false)
+}
+
+/// Argument-only view that also recognizes literal dash-leading `echo`
+/// operands. Callers must prove that `literal_producers` have not been
+/// overridden in the shell before adopting the returned value.
+pub(crate) fn posix_argument_substitution_view(command: &str) -> Result<PosixSubstitutionView, ()> {
+    posix_substitution_view_inner(command, true)
+}
+
+fn posix_substitution_view_inner(
+    command: &str,
+    literal_echo_flags: bool,
+) -> Result<PosixSubstitutionView, ()> {
     if command.contains(POSIX_DYNAMIC_QUOTED) || command.contains(POSIX_DYNAMIC_UNQUOTED) {
         return Err(());
     }
@@ -571,6 +586,7 @@ pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitution
     let mut in_double = false;
     let mut changed = false;
     let mut has_dynamic = false;
+    let mut literal_producers = Vec::new();
 
     while index < bytes.len() {
         match bytes[index] {
@@ -593,9 +609,14 @@ pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitution
                 let close = find_posix_substitution_close(command, index + 2, b')')?;
                 match render_static_producer_body(
                     command.get(index + 2..close).ok_or(())?,
-                    in_double,
+                    literal_echo_flags,
                 ) {
-                    Ok(rendered) => output.push_str(&rendered),
+                    Ok((rendered, producer)) => {
+                        output.push_str(&rendered);
+                        if !literal_producers.contains(&producer) {
+                            literal_producers.push(producer);
+                        }
+                    }
                     Err(()) => {
                         output.push_str(if in_double {
                             POSIX_DYNAMIC_QUOTED
@@ -612,9 +633,14 @@ pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitution
                 let close = find_posix_substitution_close(command, index + 1, b'`')?;
                 match render_static_producer_body(
                     command.get(index + 1..close).ok_or(())?,
-                    in_double,
+                    literal_echo_flags,
                 ) {
-                    Ok(rendered) => output.push_str(&rendered),
+                    Ok((rendered, producer)) => {
+                        output.push_str(&rendered);
+                        if !literal_producers.contains(&producer) {
+                            literal_producers.push(producer);
+                        }
+                    }
                     Err(()) => {
                         output.push_str(if in_double {
                             POSIX_DYNAMIC_QUOTED
@@ -644,6 +670,7 @@ pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitution
     Ok(PosixSubstitutionView {
         command: if changed { output } else { command.to_string() },
         has_dynamic,
+        literal_producers,
     })
 }
 
@@ -688,7 +715,10 @@ fn find_posix_substitution_close(command: &str, start: usize, delimiter: u8) -> 
     Err(())
 }
 
-fn render_static_producer_body(body: &str, _in_double_quotes: bool) -> Result<String, ()> {
+fn render_static_producer_body(
+    body: &str,
+    literal_echo_flags: bool,
+) -> Result<(String, &'static str), ()> {
     if body.len() > MAX_STATIC_SUBSTITUTION_BYTES
         || body.bytes().any(|byte| {
             matches!(
@@ -722,12 +752,15 @@ fn render_static_producer_body(body: &str, _in_double_quotes: bool) -> Result<St
         return Err(());
     }
     let producer = words.remove(0);
-    let rendered = match producer.as_str() {
+    let (rendered, producer) = match producer.as_str() {
         "printf" => {
             if words.first().is_some_and(|word| word == "--") {
                 words.remove(0);
             }
-            crate::evaluator::render_literal_printf(&words).ok_or(())?
+            (
+                crate::evaluator::render_literal_printf(&words).ok_or(())?,
+                "printf",
+            )
         }
         // `echo` varies across shells once options or backslash escapes enter
         // the picture. Model only the portable literal subset. Command
@@ -735,10 +768,16 @@ fn render_static_producer_body(body: &str, _in_double_quotes: bool) -> Result<St
         // operands exactly reproduces the value that can become an executable
         // word without relying on implementation-specific echo behavior.
         "echo"
-            if words.first().is_none_or(|word| !word.starts_with('-'))
-                && words.iter().all(|word| !word.contains('\\')) =>
+            if words.first().is_none_or(|word| {
+                !word.starts_with('-')
+                    || (literal_echo_flags
+                        && !word.strip_prefix('-').is_some_and(|flags| {
+                            !flags.is_empty()
+                                && flags.bytes().all(|byte| matches!(byte, b'n' | b'e' | b'E'))
+                        }))
+            }) && words.iter().all(|word| !word.contains('\\')) =>
         {
-            words.join(" ")
+            (words.join(" "), "echo")
         }
         _ => return Err(()),
     };
@@ -760,7 +799,7 @@ fn render_static_producer_body(body: &str, _in_double_quotes: bool) -> Result<St
     // inside POSIX double quotes, so it can be inserted verbatim there. In an
     // unquoted word, literal whitespace intentionally reproduces field
     // splitting while the restricted alphabet prevents shell re-parsing.
-    Ok(rendered.to_string())
+    Ok((rendered.to_string(), producer))
 }
 
 #[derive(Clone)]
@@ -6163,10 +6202,13 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `--hard` may follow other arguments (`git reset HEAD~1 --hard`,
         // `git reset -q --hard`), and git accepts any unambiguous prefix of a
         // long option, down to `--h` here. Both were allowed while only
-        // `reset --hard` in first position denied.
+        // `reset --hard` in first position denied. A bare `--` terminates
+        // option parsing: a later `--hard` is a pathspec, including when a
+        // literal substitution supplied it. Keep the executable prefix
+        // permissive and stop only the option walk at that delimiter.
         destructive_pattern!(
             "reset-hard",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\b[^;&|\n<>()]*?\s--h(?:a(?:rd?)?)?\b",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\b(?:(?!\s--(?:\s|$))[^;&|\n<>()])*?\s--h(?:a(?:rd?)?)?\b",
             "git reset --hard destroys uncommitted changes. Use 'git stash' first.",
             Critical,
             "git reset --hard discards ALL uncommitted changes in your working directory \
@@ -6206,7 +6248,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "reset-merge",
             // Anywhere in the reset, and down to `--me` (`--m` is ambiguous
             // with `--mixed`), for the same reasons as `reset-hard`.
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\b[^;&|\n<>()]*?\s--me(?:r(?:ge?)?)?\b",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\b(?:(?!\s--(?:\s|$))[^;&|\n<>()])*?\s--me(?:r(?:ge?)?)?\b",
             "git reset --merge can lose uncommitted changes.",
             High,
             "git reset --merge resets the index and updates files in the working tree that \

@@ -15101,7 +15101,7 @@ fn command_may_run_heredoc_output<'a>(
 /// function or alias of that name, a `PATH` assignment, or an `eval`/`source`
 /// that could install one ([`find_visible_shell_name_override`]). A command
 /// the parser cannot read fails closed.
-fn shell_name_may_be_rebound(command: &str, name: &str) -> bool {
+pub(crate) fn shell_name_may_be_rebound(command: &str, name: &str) -> bool {
     let ast = parse_shell_ast(command);
     let mut overridden = false;
     let mut parse_error = false;
