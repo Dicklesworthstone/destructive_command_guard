@@ -430,6 +430,9 @@ pub struct LazyCompiledRegex {
     // Only rules needing a whole-command preview proof allocate this state.
     // Ordinary pack patterns retain their allocation-free constructors.
     exclusion: Option<Box<LinearFullMatchExclusion>>,
+    // A backtracking pattern can name a linear regex that matches wherever
+    // it does; input the superset misses never reaches the backtracking VM.
+    superset: Option<Box<LinearSuperset>>,
 }
 
 /// Derive only a mandatory literal at the absolute beginning of the input.
@@ -535,6 +538,27 @@ impl LinearFullMatchExclusion {
 }
 
 #[derive(Debug)]
+struct LinearSuperset {
+    pattern: &'static str,
+    compiled: OnceLock<Result<regex::Regex, regex::Error>>,
+}
+
+impl LinearSuperset {
+    /// Whether the candidate pattern can match anywhere in `haystack`. A
+    /// superset that does not compile proves nothing, so it answers yes.
+    fn may_match(&self, haystack: &str) -> bool {
+        let compiled = self.compiled.get_or_init(|| {
+            let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexCompile);
+            regex::Regex::new(self.pattern)
+        });
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexMatch);
+        compiled
+            .as_ref()
+            .map_or(true, |regex| regex.is_match(haystack))
+    }
+}
+
+#[derive(Debug)]
 enum PatternText {
     Static(&'static str),
     Owned(String),
@@ -561,6 +585,7 @@ impl LazyCompiledRegex {
             compiled: OnceLock::new(),
             anchored_prefix: None,
             exclusion: None,
+            superset: None,
         }
     }
 
@@ -578,6 +603,7 @@ impl LazyCompiledRegex {
             compiled: OnceLock::new(),
             anchored_prefix: None,
             exclusion: None,
+            superset: None,
         }
     }
 
@@ -619,6 +645,34 @@ impl LazyCompiledRegex {
             compiled: OnceLock::new(),
         }));
         self
+    }
+
+    /// Attach a linear superset to a backtracking pattern (bd-nxn1).
+    ///
+    /// `superset` is compiled by the linear engine and must match somewhere
+    /// in every input in which this pattern matches. The pattern itself with
+    /// its lookarounds and atomic groups removed and each back-reference
+    /// replaced by its group's pattern is one. Input the superset misses
+    /// cannot match, so the backtracking search, and the work limit that
+    /// leaves a long input unverified, never runs on it. A superset that
+    /// does not compile proves nothing, and the pattern runs as authored.
+    #[must_use]
+    pub(crate) fn requiring_linear_superset(mut self, superset: &'static str) -> Self {
+        self.superset = Some(Box::new(LinearSuperset {
+            pattern: superset,
+            compiled: OnceLock::new(),
+        }));
+        self
+    }
+
+    /// Whether the cheap proofs leave room for a match: the anchored prefix
+    /// and the linear superset, each where one was opted into.
+    fn may_match(&self, haystack: &str) -> bool {
+        self.prefix_may_match(haystack)
+            && self
+                .superset
+                .as_ref()
+                .is_none_or(|superset| superset.may_match(haystack))
     }
 
     /// The additional full-input exemption proof, if one was authored.
@@ -663,7 +717,7 @@ impl LazyCompiledRegex {
     /// Returns `false` on candidate regex execution or compile errors.
     #[must_use]
     pub fn is_match(&self, haystack: &str) -> bool {
-        self.prefix_may_match(haystack)
+        self.may_match(haystack)
             && self
                 .get_compiled()
                 .is_some_and(|compiled| compiled.is_match(haystack))
@@ -675,7 +729,7 @@ impl LazyCompiledRegex {
     /// Returns `None` if no match or on candidate execution/compile error.
     #[must_use]
     pub fn find(&self, haystack: &str) -> Option<(usize, usize)> {
-        if !self.prefix_may_match(haystack) {
+        if !self.may_match(haystack) {
             return None;
         }
         let span = self.get_compiled()?.find(haystack)?;
@@ -688,7 +742,7 @@ impl LazyCompiledRegex {
     /// Returns `None` if no match exists or on candidate execution/compile error.
     #[must_use]
     pub fn find_from(&self, haystack: &str, start: usize) -> Option<(usize, usize)> {
-        if !self.prefix_may_match(haystack) {
+        if !self.may_match(haystack) {
             return None;
         }
         let span = self.get_compiled()?.find_from(haystack, start)?;

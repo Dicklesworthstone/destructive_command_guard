@@ -6336,7 +6336,25 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - List them first: `Get-CimInstance Win32_ShadowCopy` or `vssadmin list shadows`."
         ),
     ]
+    .into_iter()
+    .map(|mut pattern| {
+        if pattern.name == Some("fork-bomb") {
+            pattern.regex = pattern
+                .regex
+                .requiring_linear_superset(FORK_BOMB_LINEAR_SUPERSET);
+        }
+        pattern
+    })
+    .collect()
 }
+
+/// The `fork-bomb` rule without its lookbehind, its atomic group and its
+/// back-references, each `\1` replaced by the name's character class. It
+/// matches wherever the rule does, and the linear engine runs it in one pass.
+/// The rule's own search is capped at 100,000 backtracking steps, and a long
+/// body of one repeated shape used to exhaust that and come back unverified
+/// (bd-nxn1). Text with no `name(){ x | y & }; z` shape now never reaches it.
+const FORK_BOMB_LINEAR_SUPERSET: &str = r"[A-Za-z0-9_:]+\s*\(\s*\)\s*\{\s*[A-Za-z0-9_:]+\s*\|\s*[A-Za-z0-9_:]+\s*&\s*;?\s*\}\s*;\s*[A-Za-z0-9_:]+";
 
 #[cfg(test)]
 mod tests {
@@ -6527,6 +6545,53 @@ mod tests {
             assert!(
                 !scope.has_failed(),
                 "the fork-bomb search must finish on a long program"
+            );
+        }
+    }
+
+    /// bd-nxn1: the linear superset matches wherever the `fork-bomb` rule
+    /// does, so text it misses can skip the backtracking search. Long bodies
+    /// of one shape used to run that search out of its work limit and come
+    /// back unverified.
+    #[test]
+    fn fork_bomb_search_runs_only_where_the_linear_superset_matches_bd_nxn1() {
+        let pack = create_pack();
+        let fork_bomb = pack
+            .destructive_patterns
+            .iter()
+            .find(|p| p.name == Some("fork-bomb"))
+            .expect("fork-bomb rule must exist");
+        let superset = regex::Regex::new(FORK_BOMB_LINEAR_SUPERSET).expect("superset compiles");
+
+        for bomb in [
+            ":(){ :|:& };:",
+            "bomb(){ bomb|bomb& };bomb",
+            ": () { : | : & ; } ; :",
+            "b(){ b|b&;};b",
+            ":( ){ :|:& };:",
+            "echo start; f(){ f|f& };f; echo end",
+        ] {
+            assert!(superset.is_match(bomb), "superset must match: {bomb}");
+            assert!(fork_bomb.regex.is_match(bomb), "rule must match: {bomb}");
+        }
+        // The superset ignores the back-references; the rule still decides.
+        for different_names in ["f(){ a|b& };f", "serve(){ python|tee & };logs"] {
+            assert!(superset.is_match(different_names), "{different_names}");
+            assert!(
+                !fork_bomb.regex.is_match(different_names),
+                "{different_names}"
+            );
+        }
+
+        let perl_body = format!("perl - <<'EOF'\n{}EOF", "\"nope\";\n".repeat(7_875));
+        let long_word = format!("f() {{ :; }}; echo {}", "A".repeat(60 * 1024));
+        for command in [perl_body, long_word] {
+            let scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
+            assert!(!fork_bomb.regex.is_match(&command));
+            assert!(
+                !scope.has_failed(),
+                "a {} byte body without the shape must not exhaust the search",
+                command.len()
             );
         }
     }

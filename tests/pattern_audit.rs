@@ -1244,8 +1244,9 @@ fn test_audit_backtracking_requirements() {
                 // (`modprobe -n -r`), `rmmod --help`/`--version`, and ssh
                 // text that only prints an unload. Each lookahead starts at
                 // the verb and reads that command's own words: none crosses
-                // `;`, `&` or `|`. The rules run only on the modprobe, rmmod
-                // and ssh keywords.
+                // `;`, `&` or `|`. Each rule is scoped to its executable
+                // (modprobe, rmmod, ssh), and the pack runs only on its own
+                // keywords, which include modprobe and rmmod.
                 "modprobe-remove",
                 "rmmod",
                 "ssh-remote-module-unload",
