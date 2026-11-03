@@ -132,14 +132,30 @@ it installs in your profile and does not request elevation.
 
 ### Updating
 
-Update via the built-in updater (re-runs `install.ps1`):
+**For installed `v0.16.0` and older clients, use the
+[verified release installation recipe](#verified-release-installation).** The
+published `v0.16.0` binary predates the updater authentication change below; the
+recipe independently authenticates its explicitly pinned installer before
+execution.
+
+In builds containing the issue #638 correction, update with `minisign` installed
+from a trusted package manager:
 
 ```powershell
 dcg update
 ```
 
+Before running an installer or staging a deferred worker, the corrected updater
+requires the release's installer, SHA256 sidecar, and Minisign signature. It
+checks the digest and verifies the signature with the embedded project key,
+then checks that the signed DSR trusted comment names exactly
+`destructive_command_guard`, the selected release tag, and that installer
+digest. Missing tools/assets, a wrong signature or release identity, and older
+signatures without the DSR identity all refuse the update. Binary installation
+then runs with `-RequireMinisign` as well as mandatory archive checksum checks.
+
 Windows cannot overwrite the `dcg.exe` process that is currently running.
-`dcg update` therefore verifies and stages the pinned installer, launches a
+After authentication, `dcg update` stages the pinned installer, launches a
 worker through Windows process management, and returns. The worker survives
 shell/process-job teardown, waits for the original dcg process to exit, and only
 then replaces the binary. Progress and any installer error are appended as UTF-8

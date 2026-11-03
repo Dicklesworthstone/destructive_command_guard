@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # e2e_fleet_install.sh — install dcg on every real platform from the PUBLIC
-# release URL using the same tag-pinned installer bytes as `dcg update`, then
+# release URL using the same authenticated installer assets as `dcg update`, then
 # prove the installed binary actually guards commands.
 #
 # WHY THIS EXISTS
@@ -37,12 +37,13 @@ HOSTS_OVERRIDE=""
 JSON_OUTPUT=false
 INCLUDE_WINDOWS=true
 LOCAL_ONLY=false
-REPO_RAW="https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard"
 REPO_RELEASE="https://github.com/Dicklesworthstone/destructive_command_guard/releases/download"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --version) VERSION="${2:-}"; shift 2 ;;
+    --version)
+      [[ $# -ge 2 ]] || { echo "error: --version requires a release tag" >&2; exit 2; }
+      VERSION="$2"; shift 2 ;;
     --hosts) HOSTS_OVERRIDE="${2:-}"; shift 2 ;;
     --json) JSON_OUTPUT=true; shift ;;
     --include-windows) INCLUDE_WINDOWS=true; shift ;;
@@ -59,6 +60,10 @@ if [[ -z "$VERSION" ]]; then
   [[ -z "$VERSION" ]] && { echo "error: --version required (could not query latest)" >&2; exit 2; }
 fi
 [[ "$VERSION" == v* ]] || VERSION="v$VERSION"
+if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+  echo "error: --version must name a v-prefixed semantic release tag" >&2
+  exit 2
+fi
 
 # Unix SSH hosts drawn from the DSR fleet (~/.config/dsr/hosts.yaml).
 UNIX_SSH_HOSTS=(trj ts1)
@@ -92,8 +97,10 @@ report() {
 # ---------------------------------------------------------------------------
 unix_probe() {
 cat <<'PROBE'
-set -u
-VERSION="$1"; REPO_RAW="$2"; REPO_RELEASE="$3"
+set -uo pipefail
+umask 077
+VERSION="$1"; REPO_RELEASE="$2"
+MINISIGN_PUBLIC_KEY='RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO'
 
 # Drop every ambient DCG_* for the WHOLE probe, before anything runs. The hook
 # calls below additionally use `env -i`, but the installer cannot: it needs the
@@ -117,19 +124,28 @@ cd "$WORK" || exit 2
 
 echo "RESULT:platform:$(uname -s)/$(uname -m)"
 
-# 1. Fetch the exact tag-pinned installer that `dcg update` executes.
-if ! curl -fsSL -o "$WORK/install.sh" "$REPO_RAW/$VERSION/install.sh"; then
+# 1. Fetch the exact release asset that the authenticated updater executes.
+if ! MINISIGN="$(type -P minisign)"; then
+  echo "RESULT:installer_signature_verified:FAIL:minisign is required on PATH"; exit 1
+fi
+if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+    --max-time 120 --user-agent 'destructive_command_guard-fleet-probe' \
+    -o "$WORK/install.sh" "$REPO_RELEASE/$VERSION/install.sh"; then
   echo "RESULT:fetch_installer:FAIL:curl failed"; exit 1
 fi
 echo "RESULT:fetch_installer:PASS"
 
 # 2. Verify the installer itself before executing it. Archive verification
 # cannot protect users from a modified installer that has already started.
-if ! curl -fsSL -o "$WORK/install.sh.sha256" \
+if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+    --max-time 120 --user-agent 'destructive_command_guard-fleet-probe' \
+    -o "$WORK/install.sh.sha256" \
     "$REPO_RELEASE/$VERSION/install.sh.sha256"; then
   echo "RESULT:installer_checksum_verified:FAIL:install.sh.sha256 unavailable"; exit 1
 fi
-INSTALLER_EXPECTED="$(awk 'NF { print $1; exit }' "$WORK/install.sh.sha256" | tr -d '\r')"
+if ! INSTALLER_EXPECTED="$(awk 'NF { print $1; exit }' "$WORK/install.sh.sha256" | tr -d '\r')"; then
+  echo "RESULT:installer_checksum_verified:FAIL:could not read install.sh.sha256"; exit 1
+fi
 if [ "${#INSTALLER_EXPECTED}" -ne 64 ]; then
   echo "RESULT:installer_checksum_verified:FAIL:malformed install.sh.sha256"; exit 1
 fi
@@ -137,9 +153,13 @@ case "$INSTALLER_EXPECTED" in
   *[!0-9a-fA-F]*) echo "RESULT:installer_checksum_verified:FAIL:non-hex install.sh.sha256"; exit 1 ;;
 esac
 if command -v sha256sum >/dev/null 2>&1; then
-  INSTALLER_ACTUAL="$(sha256sum "$WORK/install.sh" | awk '{print $1}')"
+  if ! INSTALLER_ACTUAL="$(sha256sum "$WORK/install.sh" | awk '{print $1}')"; then
+    echo "RESULT:installer_checksum_verified:FAIL:SHA256 verifier failed"; exit 1
+  fi
 elif command -v shasum >/dev/null 2>&1; then
-  INSTALLER_ACTUAL="$(shasum -a 256 "$WORK/install.sh" | awk '{print $1}')"
+  if ! INSTALLER_ACTUAL="$(shasum -a 256 "$WORK/install.sh" | awk '{print $1}')"; then
+    echo "RESULT:installer_checksum_verified:FAIL:SHA256 verifier failed"; exit 1
+  fi
 else
   echo "RESULT:installer_checksum_verified:FAIL:no SHA256 verifier"; exit 1
 fi
@@ -148,6 +168,34 @@ if [ "$(printf '%s' "$INSTALLER_ACTUAL" | tr 'A-F' 'a-f')" != \
   echo "RESULT:installer_checksum_verified:FAIL:install.sh digest mismatch"; exit 1
 fi
 echo "RESULT:installer_checksum_verified:PASS:$INSTALLER_ACTUAL"
+
+# A same-origin checksum is not publisher authentication. Require Minisign's
+# payload AND trusted-comment signature, then bind that authenticated comment
+# to the project, selected release, and actual installer digest. This rejects
+# both forged payload+checksum pairs and replay of another valid release.
+if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+    --max-time 120 --user-agent 'destructive_command_guard-fleet-probe' \
+    -o "$WORK/install.sh.minisig" "$REPO_RELEASE/$VERSION/install.sh.minisig"; then
+  echo "RESULT:installer_signature_verified:FAIL:install.sh.minisig unavailable"; exit 1
+fi
+if ! "$MINISIGN" -Vm "$WORK/install.sh" -x "$WORK/install.sh.minisig" \
+    -P "$MINISIGN_PUBLIC_KEY" >"$WORK/installer-signature.log" 2>&1; then
+  echo "RESULT:installer_signature_verified:FAIL:invalid installer signature"; exit 1
+fi
+if ! INSTALLER_COMMENT="$(sed -n '3p' "$WORK/install.sh.minisig" | tr -d '\r')" \
+    || ! INSTALLER_SIGNATURE_LINES="$(awk 'END { print NR }' "$WORK/install.sh.minisig")"; then
+  echo "RESULT:installer_signature_verified:FAIL:could not read authenticated release identity"; exit 1
+fi
+INSTALLER_IDENTITY="trusted comment: dsr-built destructive_command_guard $VERSION additional $(printf '%s' "$INSTALLER_ACTUAL" | tr 'A-F' 'a-f')"
+# DSR's strict release signer uses a new prefix with the same exact fields.
+# Accept these two known signed statements, never an arbitrary trusted comment.
+INSTALLER_STRICT_IDENTITY="trusted comment: dsr strict release destructive_command_guard $VERSION additional $(printf '%s' "$INSTALLER_ACTUAL" | tr 'A-F' 'a-f')"
+if [ "$INSTALLER_SIGNATURE_LINES" != 4 ] \
+    || { [ "$INSTALLER_COMMENT" != "$INSTALLER_IDENTITY" ] \
+         && [ "$INSTALLER_COMMENT" != "$INSTALLER_STRICT_IDENTITY" ]; }; then
+  echo "RESULT:installer_signature_verified:FAIL:signature does not authenticate the exact project, release, and digest"; exit 1
+fi
+echo "RESULT:installer_signature_verified:PASS:$VERSION"
 
 # 3. Install the pinned version with the release's long-lived signature as a
 #    hard requirement. This is a release gate, so a host without the verifier
@@ -442,7 +490,7 @@ PROBE
 }
 
 # The Windows probe. Fully quoted so bash performs NO substitution — the
-# caller prepends `$Version` / `$RepoRaw` assignments. Every step is wrapped so
+# caller prepends `$Version` / `$RepoRelease` assignments. Every step is wrapped so
 # a failure still emits a RESULT line instead of silently truncating output.
 windows_probe() {
 cat <<'PSEOF'
@@ -466,19 +514,40 @@ Get-ChildItem Env: | Where-Object { $_.Name -like 'DCG_*' } | ForEach-Object {
 # never touches a machine's agent configuration.
 $env:DCG_SELF_HEAL_HOOK = '0'
 $env:DCG_HISTORY_DISABLED = '1'
-$work = Join-Path $env:TEMP ("dcg-fleet-e2e-" + [System.Guid]::NewGuid().ToString('N').Substring(0,8))
-New-Item -ItemType Directory -Force -Path $work | Out-Null
+$work = Join-Path $env:TEMP ("dcg-fleet-e2e-" + [System.Guid]::NewGuid().ToString('N'))
+try {
+  New-Item -ItemType Directory -Path $work -ErrorAction Stop | Out-Null
+  $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+  $acl = New-Object Security.AccessControl.DirectorySecurity
+  $acl.SetOwner($sid)
+  $acl.SetAccessRuleProtection($true, $false)
+  $rule = New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+    $sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'
+  )
+  $acl.AddAccessRule($rule)
+  Set-Acl -LiteralPath $work -AclObject $acl -ErrorAction Stop
+  $minisign = (Get-Command minisign -CommandType Application -ErrorAction Stop).Source
+} catch {
+  Emit 'installer_signature_verified' 'FAIL' $_.Exception.Message
+  Emit 'probe_complete' 'PASS'
+  exit 0
+}
 $dest = Join-Path $work 'bin'
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 $homeSandbox = Join-Path $work 'home'
 New-Item -ItemType Directory -Force -Path $homeSandbox | Out-Null
 
-# Use the same tag-pinned installer bytes as `dcg update`, but retain the
-# documented scriptblock invocation after the bytes have been verified.
+# Authenticate the same release asset used by the updater before executing it.
+$minisignPublicKey = 'RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO'
 $installerPath = Join-Path $work 'install.ps1'
 $installerChecksumPath = Join-Path $work 'install.ps1.sha256'
+$installerSignaturePath = Join-Path $work 'install.ps1.minisig'
 try {
-  Invoke-WebRequest -UseBasicParsing -Uri "$RepoRaw/$Version/install.ps1" -OutFile $installerPath
+  [Net.ServicePointManager]::SecurityProtocol = `
+    [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 `
+    -UserAgent 'destructive_command_guard-fleet-probe' `
+    -Uri "$RepoRelease/$Version/install.ps1" -OutFile $installerPath -ErrorAction Stop
   Emit 'fetch_installer' 'PASS'
 } catch {
   Emit 'fetch_installer' 'FAIL' $_.Exception.Message
@@ -487,32 +556,65 @@ try {
 }
 
 try {
-  Invoke-WebRequest -UseBasicParsing -Uri "$RepoRelease/$Version/install.ps1.sha256" -OutFile $installerChecksumPath
-  $expectedInstallerSha = ((Get-Content -LiteralPath $installerChecksumPath -Raw).Trim() -split '\s+')[0]
+  Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 `
+    -UserAgent 'destructive_command_guard-fleet-probe' `
+    -Uri "$RepoRelease/$Version/install.ps1.sha256" -OutFile $installerChecksumPath -ErrorAction Stop
+  $expectedInstallerSha = ((Get-Content -LiteralPath $installerChecksumPath -Raw -ErrorAction Stop).Trim() -split '\s+')[0]
   if ($expectedInstallerSha -notmatch '^[0-9a-fA-F]{64}$') {
     throw 'install.ps1.sha256 is malformed'
   }
-  $actualInstallerSha = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+  $actualInstallerSha = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
   if ($actualInstallerSha -cne $expectedInstallerSha.ToLowerInvariant()) {
     throw 'install.ps1 digest mismatch'
   }
   Emit 'installer_checksum_verified' 'PASS' $actualInstallerSha
-  $installerSource = Get-Content -LiteralPath $installerPath -Raw
 } catch {
   Emit 'installer_checksum_verified' 'FAIL' $_.Exception.Message
   Emit 'probe_complete' 'PASS'
   exit 0
 }
 
+try {
+  Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 `
+    -UserAgent 'destructive_command_guard-fleet-probe' `
+    -Uri "$RepoRelease/$Version/install.ps1.minisig" -OutFile $installerSignaturePath -ErrorAction Stop
+  # Continue permits normal native stderr under PowerShell 5.1; the explicit
+  # process status remains authoritative, including a failure to launch.
+  $LASTEXITCODE = -1
+  & $minisign -Vm $installerPath -x $installerSignaturePath -P $minisignPublicKey `
+    *> (Join-Path $work 'installer-signature.log')
+  if ($LASTEXITCODE -ne 0) { throw 'invalid installer signature' }
+  $signatureLines = @(Get-Content -LiteralPath $installerSignaturePath -ErrorAction Stop)
+  $expectedIdentity = "trusted comment: dsr-built destructive_command_guard $Version additional $actualInstallerSha"
+  $strictIdentity = "trusted comment: dsr strict release destructive_command_guard $Version additional $actualInstallerSha"
+  if ($signatureLines.Count -ne 4 -or
+      ($signatureLines[2] -cne $expectedIdentity -and $signatureLines[2] -cne $strictIdentity)) {
+    throw 'signature does not authenticate the exact project, release, and digest'
+  }
+  Emit 'installer_signature_verified' 'PASS' $Version
+} catch {
+  Emit 'installer_signature_verified' 'FAIL' $_.Exception.Message
+  Emit 'probe_complete' 'PASS'
+  exit 0
+}
+
 $log = Join-Path $work 'install.log'
 try {
-  & ([scriptblock]::Create($installerSource)) -Version $Version -Dest $dest `
+  # Unblock only authenticated bytes for RemoteSigned compatibility. This
+  # leaves the host's execution policy unchanged.
+  Unblock-File -LiteralPath $installerPath -ErrorAction Stop
+  $ErrorActionPreference = 'Stop'
+  $LASTEXITCODE = 0
+  & $installerPath -Version $Version -Dest $dest `
       -RequireMinisign -Verify -NoConfigure *> $log
+  if ($LASTEXITCODE -ne 0) { throw "installer exited with code $LASTEXITCODE" }
   Emit 'install' 'PASS'
 } catch {
   $tail = ''
   if (Test-Path $log) { $tail = (Get-Content $log -Tail 3 -ErrorAction SilentlyContinue) -join ' ' }
   Emit 'install' 'FAIL' "$($_.Exception.Message) $tail"
+} finally {
+  $ErrorActionPreference = 'Continue'
 }
 
 $logText = ''
@@ -641,7 +743,8 @@ PSEOF
 # ---------------------------------------------------------------------------
 # Every probe must announce probe_complete. Without this, a probe that dies
 # halfway through (bad quoting, crashed shell) looks like a clean pass.
-EXPECTED_CASES=(fetch_installer installer_checksum_verified install checksum_verified minisign_verified binary_present
+EXPECTED_CASES=(fetch_installer installer_checksum_verified installer_signature_verified
+                install checksum_verified minisign_verified binary_present
                 version_match provenance_match effective_budget hook_deny hook_allow
                 no_indeterminate_verdicts latency_under_budget probe_complete)
 
@@ -690,7 +793,7 @@ $JSON_OUTPUT || echo
 
 # --- Local host (this machine) ---------------------------------------------
 $JSON_OUTPUT || echo "local ($(uname -s)/$(uname -m))"
-local_out="$(unix_probe | bash -s -- "$VERSION" "$REPO_RAW" "$REPO_RELEASE" 2>&1)"
+local_out="$(unix_probe | bash -s -- "$VERSION" "$REPO_RELEASE" 2>&1)"
 parse_results "local" "$local_out"
 
 # --- Remote Unix hosts ------------------------------------------------------
@@ -701,7 +804,7 @@ for host in "${UNIX_SSH_HOSTS[@]}"; do
     continue
   fi
   remote_out="$(unix_probe | ssh -o ConnectTimeout=10 -o BatchMode=yes "$host" \
-    "bash -s -- '$VERSION' '$REPO_RAW' '$REPO_RELEASE'" 2>&1)"
+    "bash -s -- '$VERSION' '$REPO_RELEASE'" 2>&1)"
   parse_results "$host" "$remote_out"
 done
 
@@ -712,8 +815,8 @@ if $INCLUDE_WINDOWS; then
     report skip "$WINDOWS_SSH_HOST" "reachability" "ssh unreachable"
   else
     # Inject parameters as PowerShell variables, then the fully-quoted probe.
-    win_out="$( { printf "\$Version = '%s'\n\$RepoRaw = '%s'\n\$RepoRelease = '%s'\n" \
-                    "$VERSION" "$REPO_RAW" "$REPO_RELEASE"
+    win_out="$( { printf "\$Version = '%s'\n\$RepoRelease = '%s'\n" \
+                    "$VERSION" "$REPO_RELEASE"
                   windows_probe; } \
       | ssh -o ConnectTimeout=10 -o BatchMode=yes "$WINDOWS_SSH_HOST" \
           "powershell -NoProfile -NonInteractive -Command -" 2>&1 )"

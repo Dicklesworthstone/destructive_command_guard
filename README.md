@@ -1266,7 +1266,16 @@ cp target/release/dcg ~/.local/bin/
 
 ## Updating
 
-Run the built-in updater to re-run the installer for your platform:
+**For installed `v0.16.0` and older clients, use the
+[verified release recipe](#quick-install-verified-release) or its
+[PowerShell equivalent](docs/windows.md#verified-release-installation).** The
+published `v0.16.0` binary predates the updater authentication changes described
+below; updating this documentation does not change its existing updater. The
+recipe installs its explicitly pinned release, so changing releases requires
+verifying and updating the recipe's tag/digest pair together.
+
+In builds containing the issue #638 correction, the built-in updater requires
+`minisign` installed through a trusted package manager:
 
 ```bash
 dcg update
@@ -1275,15 +1284,26 @@ dcg update
 Optional flags mirror the installer scripts (examples):
 
 ```bash
-dcg update --version v0.7.6
+dcg update --version v0.16.0
 dcg update --system
 dcg update --verify
 dcg update --verify --no-configure  # binary only; preserve existing hook wiring
 ```
 
-You can also re-run the [verified release recipe](#quick-install-verified-release)
-or its [PowerShell equivalent](docs/windows.md#verified-release-installation).
-Authenticate the downloaded script each time before executing it.
+The corrected updater resolves a release tag once and downloads that release's
+installer, SHA256 sidecar, and Minisign signature. Before any installer executes,
+it checks the digest, verifies the signature using the embedded project key,
+and requires the authenticated DSR trusted comment to name exactly
+`destructive_command_guard`, the selected release, and the computed installer
+digest. A valid signature from a different release or project is refused.
+
+Missing tools or verification assets, invalid signatures, and older signatures
+without that exact DSR release identity stop the update. There is no
+checksum-only compatibility fallback. Binary updates also require the archive's
+Minisign signature and retain the installer's checksum and other verification
+checks; they cannot fall back to an unsigned binary or source build. Explicit
+Unix `--from-source` updates still authenticate the installer but use the
+separate source-build trust path described above.
 
 ### Local builds, pinning, and update refusal (#320)
 

@@ -19771,7 +19771,17 @@ impl InstallerTempDir {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos();
             let path = base.join(format!("dcg-install-{process_id}-{nanos}-{attempt}"));
-            match std::fs::create_dir(&path) {
+            let directory = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            let directory = {
+                use std::os::unix::fs::DirBuilderExt;
+                // A permissive caller umask must not let another local user
+                // replace the installer between verification and execution.
+                let mut directory = directory;
+                directory.mode(0o700);
+                directory
+            };
+            match directory.create(&path) {
                 Ok(()) => return Ok(Self { path: Some(path) }),
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(err) => return Err(err.into()),
@@ -19816,7 +19826,18 @@ fn try_download_file(
         std::process::Command::new("curl")
     };
     let status = command
+        .arg("-q")
         .arg("-fsSL")
+        .arg("--proto")
+        .arg("=https")
+        .arg("--proto-redir")
+        .arg("=https")
+        .arg("--user-agent")
+        .arg(concat!(
+            "dcg/",
+            env!("CARGO_PKG_VERSION"),
+            " (+https://github.com/Dicklesworthstone/destructive_command_guard)"
+        ))
         .arg(url)
         .arg("-o")
         .arg(destination)
@@ -19840,7 +19861,7 @@ fn verify_installer_checksum(
     artifact_path: &std::path::Path,
     checksum_path: &std::path::Path,
     artifact_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error>> {
     use std::fmt::Write as _;
 
     use sha2::{Digest, Sha256};
@@ -19861,7 +19882,7 @@ fn verify_installer_checksum(
         let _ = write!(actual, "{byte:02x}");
     }
     if expected.eq_ignore_ascii_case(&actual) {
-        Ok(())
+        Ok(actual)
     } else {
         Err(format!("{artifact_name} sha256 verification failed").into())
     }
@@ -19870,78 +19891,157 @@ fn verify_installer_checksum(
 fn require_verified_installer(
     script_path: &std::path::Path,
     checksum_path: &std::path::Path,
+    signature_path: &std::path::Path,
     artifact_name: &str,
-    checksum_downloaded: bool,
+    normalized_tag: &str,
+    minisign: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !checksum_downloaded {
+    if !checksum_path.is_file() {
         return Err(format!(
             "{artifact_name}.sha256 is required; refusing to execute an unverified installer"
         )
         .into());
     }
+    if !signature_path.is_file() {
+        return Err(format!(
+            "{artifact_name}.minisig is required; refusing to execute an unauthenticated installer. \
+             Older releases without a current-key DSR installer signature are not supported by \
+             this update path; select a release with signed installer assets."
+        )
+        .into());
+    }
 
-    verify_installer_checksum(script_path, checksum_path, artifact_name)?;
-    eprintln!("dcg update: {artifact_name} sha256 verified.");
+    let digest = verify_installer_checksum(script_path, checksum_path, artifact_name)?;
+    // Embed the established repository trust root. Never accept a key fetched
+    // beside the installer, an environment override, or an unbounded legacy key.
+    let public_key = include_str!("../release/minisign.pub")
+        .lines()
+        .nth(1)
+        .ok_or("The embedded release Minisign public key is missing")?;
+    let verification = std::process::Command::new(minisign)
+        .arg("-Vm")
+        .arg(script_path)
+        .arg("-x")
+        .arg(signature_path)
+        .arg("-P")
+        .arg(public_key)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|err| {
+            format!(
+                "minisign is required to authenticate {artifact_name}: {err}. \
+                 Install minisign with your trusted package manager; refusing to execute the installer."
+            )
+        })?;
+    if !verification.status.success() {
+        return Err(format!(
+            "{artifact_name} Minisign verification failed under the pinned release key; \
+             refusing to execute the installer: {}. Older releases without a current-key \
+             DSR installer signature are not supported by this update path.",
+            String::from_utf8_lossy(&verification.stderr).trim()
+        )
+        .into());
+    }
+
+    // Minisign verifies the trusted comment's global signature as well as the
+    // payload signature. Bind that authenticated statement to this exact
+    // project, release and digest: a valid signature from another release is
+    // not authorization to execute it for the requested tag.
+    let signature = std::fs::read_to_string(signature_path)?;
+    verify_installer_release_identity(&signature, normalized_tag, &digest)?;
+    eprintln!("dcg update: {artifact_name} sha256 and Minisign release identity verified.");
+    Ok(())
+}
+
+fn verify_installer_release_identity(
+    signature: &str,
+    normalized_tag: &str,
+    digest: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Shipped v0.16.0 assets use `dsr-built`; the current DSR strict release
+    // signer uses `dsr strict release`. Both must bind every identity field.
+    let expected_historical = format!(
+        "trusted comment: dsr-built destructive_command_guard {normalized_tag} additional {digest}"
+    );
+    let expected_strict = format!(
+        "trusted comment: dsr strict release destructive_command_guard {normalized_tag} additional {digest}"
+    );
+    let mut lines = signature.lines();
+    let trusted_comment = lines.nth(2);
+    if (trusted_comment != Some(expected_historical.as_str())
+        && trusted_comment != Some(expected_strict.as_str()))
+        || lines.next().is_none()
+        || lines.next().is_some()
+    {
+        return Err(format!(
+            "Installer signature does not authenticate the exact destructive_command_guard \
+             {normalized_tag} release and SHA256 digest; refusing to execute the installer. \
+             Older signatures without that DSR release identity are not supported by this update path."
+        )
+        .into());
+    }
     Ok(())
 }
 
 fn download_verified_installer(
-    script_url: &str,
-    sha_url: &str,
+    normalized_tag: &str,
     artifact_name: &str,
 ) -> Result<(InstallerTempDir, std::path::PathBuf), Box<dyn std::error::Error>> {
+    let script_url = format!(
+        "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/{normalized_tag}/{artifact_name}"
+    );
     let temp_dir = InstallerTempDir::create()?;
     let script_path = temp_dir.path().join(artifact_name);
     let checksum_path = temp_dir.path().join(format!("{artifact_name}.sha256"));
+    let signature_path = temp_dir.path().join(format!("{artifact_name}.minisig"));
 
-    download_file(script_url, &script_path)?;
-    let checksum_downloaded = try_download_file(sha_url, &checksum_path)?;
+    download_file(&script_url, &script_path)?;
+    if !try_download_file(&format!("{script_url}.sha256"), &checksum_path)? {
+        return Err(format!(
+            "{artifact_name}.sha256 is required; refusing to execute an unverified installer"
+        )
+        .into());
+    }
+    if !try_download_file(&format!("{script_url}.minisig"), &signature_path)? {
+        return Err(format!(
+            "{artifact_name}.minisig is required; refusing to execute an unauthenticated installer. \
+             Older releases without current-key DSR signatures are not supported by this update path."
+        )
+        .into());
+    }
     require_verified_installer(
         &script_path,
         &checksum_path,
+        &signature_path,
         artifact_name,
-        checksum_downloaded,
+        normalized_tag,
+        std::path::Path::new("minisign"),
     )?;
 
     Ok((temp_dir, script_path))
 }
 
-fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
-    // Tag-pin the installer URL so the install.sh that runs is from the
-    // requested version, or from the latest release for the default update path
-    // (not whatever is on `main`).
-    //
-    // Download the tag-pinned installer to a temp file and require the matching
-    // release checksum before executing it. A missing checksum fails closed:
-    // the installer itself is executable code, so archive verification later
-    // in that script cannot repair an unverified handoff.
-    let requested_version = update.version.clone();
-    let normalized_tag = update_installer_tag(requested_version.as_deref())?;
-    let script_url = format!(
-        "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/{normalized_tag}/install.sh"
-    );
-    // Releases-download URL where the DSR release contract publishes
-    // install.sh.sha256.
-    let sha_url = format!(
-        "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/{normalized_tag}/install.sh.sha256"
-    );
-
-    eprintln!("dcg update: downloading and verifying install.sh from {normalized_tag}.");
-
+fn unix_update_installer_arguments(update: &UpdateCommand, normalized_tag: &str) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
     // Always pass the resolved tag. Otherwise the verified tag-pinned script
     // would perform a second "latest" lookup and could install a different
     // release than the one whose installer we verified.
     args.push("--version".to_string());
-    args.push(normalized_tag.clone());
+    args.push(normalized_tag.to_string());
+    // Source builds are an explicit operator choice and cannot satisfy the
+    // archive-signature contract. The installer script itself is authenticated
+    // in both modes; binary updates must never fall back to unsigned source.
+    if !update.from_source {
+        args.push("--require-minisign".to_string());
+    }
     if update.system {
         args.push("--system".to_string());
     }
     if update.easy_mode {
         args.push("--easy-mode".to_string());
     }
-    if let Some(dest) = update.dest {
+    if let Some(dest) = &update.dest {
         args.push("--dest".to_string());
         args.push(dest.to_string_lossy().into_owned());
     }
@@ -19963,9 +20063,18 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
     if update.no_configure {
         args.push("--no-configure".to_string());
     }
+    args
+}
 
-    let (_temp_dir, script_path) =
-        download_verified_installer(&script_url, &sha_url, "install.sh")?;
+fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
+    // Archive verification inside an installer cannot repair an unauthenticated
+    // handoff. Require both its SHA256 sidecar and a current-key DSR signature
+    // bound to the resolved release before invoking any downloaded script.
+    let normalized_tag = update_installer_tag(update.version.as_deref())?;
+    eprintln!("dcg update: downloading and authenticating install.sh from {normalized_tag}.");
+    let args = unix_update_installer_arguments(&update, &normalized_tag);
+
+    let (_temp_dir, script_path) = download_verified_installer(&normalized_tag, "install.sh")?;
 
     let status = std::process::Command::new("bash")
         .arg(&script_path)
@@ -20058,7 +20167,11 @@ fn windows_update_log_path() -> std::path::PathBuf {
 }
 
 fn windows_update_installer_arguments(update: &UpdateCommand, normalized_tag: &str) -> Vec<String> {
-    let mut args = vec!["-Version".to_string(), normalized_tag.to_string()];
+    let mut args = vec![
+        "-Version".to_string(),
+        normalized_tag.to_string(),
+        "-RequireMinisign".to_string(),
+    ];
     if let Some(dest) = &update.dest {
         args.push("-Dest".to_string());
         args.push(dest.to_string_lossy().into_owned());
@@ -20198,23 +20311,14 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
         );
     }
 
-    // Same tag-pinning + sha256 verification as `self_update_unix`. See
-    // that function's comment for the full rationale (`git_safety_guard-ythp`).
-    let requested_version = update.version.clone();
-    let normalized_tag = update_installer_tag(requested_version.as_deref())?;
-    let script_url = format!(
-        "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/{normalized_tag}/install.ps1"
-    );
-    let sha_url = format!(
-        "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/{normalized_tag}/install.ps1.sha256"
-    );
-
-    eprintln!("dcg update: downloading and verifying install.ps1 from {normalized_tag}.");
+    // Authenticate before even staging the deferred worker. It must never
+    // inherit an installer that only passed a same-origin checksum check.
+    let normalized_tag = update_installer_tag(update.version.as_deref())?;
+    eprintln!("dcg update: downloading and authenticating install.ps1 from {normalized_tag}.");
 
     let args = windows_update_installer_arguments(&update, &normalized_tag);
 
-    let (temp_dir, script_path) =
-        download_verified_installer(&script_url, &sha_url, "install.ps1")?;
+    let (temp_dir, script_path) = download_verified_installer(&normalized_tag, "install.ps1")?;
     let runner_path = temp_dir.path().join("run-update-after-exit.ps1");
     let configuration_path = temp_dir.path().join("runner-config.json");
     std::fs::write(&runner_path, WINDOWS_UPDATE_RUNNER)?;
@@ -27073,10 +27177,18 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         let temp_dir = InstallerTempDir::create().unwrap();
         let script_path = temp_dir.path().join("install.ps1");
         let checksum_path = temp_dir.path().join("install.ps1.sha256");
+        let signature_path = temp_dir.path().join("install.ps1.minisig");
         std::fs::write(&script_path, "Write-Host verified\n").unwrap();
 
-        let error = require_verified_installer(&script_path, &checksum_path, "install.ps1", false)
-            .expect_err("missing installer checksum must fail closed");
+        let error = require_verified_installer(
+            &script_path,
+            &checksum_path,
+            &signature_path,
+            "install.ps1",
+            "v0.16.0",
+            &temp_dir.path().join("missing-minisign"),
+        )
+        .expect_err("missing installer checksum must fail closed before launching the verifier");
 
         assert!(error.to_string().contains("install.ps1.sha256 is required"));
         assert!(
@@ -27099,7 +27211,404 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         )
         .unwrap();
 
-        require_verified_installer(&script_path, &checksum_path, "install.sh", true).unwrap();
+        assert_eq!(
+            verify_installer_checksum(&script_path, &checksum_path, "install.sh").unwrap(),
+            "9c76ec33e2b9013ce136f3bf6750ce60f6a40def87b4a724c89c7d55af27b4f7"
+        );
+
+        let error = require_verified_installer(
+            &script_path,
+            &checksum_path,
+            &temp_dir.path().join("install.sh.minisig"),
+            "install.sh",
+            "v0.16.0",
+            &temp_dir.path().join("missing-minisign"),
+        )
+        .expect_err("a matching checksum without a signature is not authentication");
+        assert!(error.to_string().contains("install.sh.minisig is required"));
+        assert!(error.to_string().contains("Older releases"));
+    }
+
+    #[test]
+    fn update_installer_checksum_rejects_malformed_and_modified_payloads() {
+        let temp_dir = InstallerTempDir::create().unwrap();
+        let script_path = temp_dir.path().join("install.sh");
+        let checksum_path = temp_dir.path().join("install.sh.sha256");
+        std::fs::write(&script_path, "#!/bin/sh\necho modified\n").unwrap();
+        for checksum in [
+            "",
+            "not-a-checksum  install.sh\n",
+            "9c76ec33e2b9013ce136f3bf6750ce60f6a40def87b4a724c89c7d55af27b4f7  install.sh\n",
+        ] {
+            std::fs::write(&checksum_path, checksum).unwrap();
+            assert!(verify_installer_checksum(&script_path, &checksum_path, "install.sh").is_err());
+        }
+    }
+
+    #[test]
+    fn update_installer_release_identity_is_exact() {
+        // This tests only the identity parser. Authentication is separately
+        // exercised with the real release signature in the opt-in test below.
+        let digest = "072462974ad790008e8a3aadb1a9eecf2d9b6bd0ef7b469f69f0fb0fa3b51c7c";
+        for prefix in ["dsr-built", "dsr strict release"] {
+            let signature = format!(
+                "untrusted comment: test\npayload signature\ntrusted comment: \
+                 {prefix} destructive_command_guard v0.16.0 additional {digest}\ncomment signature\n"
+            );
+            verify_installer_release_identity(&signature, "v0.16.0", digest).unwrap();
+            verify_installer_release_identity(&signature.replace('\n', "\r\n"), "v0.16.0", digest)
+                .unwrap();
+            for altered in [
+                signature.replace("v0.16.0", "v0.15.0"),
+                signature.replace("v0.16.0", "v0.16.0-rc.1"),
+                signature.replace("destructive_command_guard", "another_project"),
+                signature.replace("additional", "aggregate"),
+                signature.replace(digest, &"0".repeat(64)),
+                signature.replace(prefix, "dsr artifact"),
+                signature.replace(
+                    &format!("trusted comment: {prefix}"),
+                    &format!("trusted comment: timestamp:123 {prefix}"),
+                ),
+                signature.replace("\ncomment signature", " extra\ncomment signature"),
+                format!("{signature}trusted comment: duplicated\n"),
+                signature.lines().take(3).collect::<Vec<_>>().join("\n"),
+            ] {
+                assert!(
+                    verify_installer_release_identity(&altered, "v0.16.0", digest).is_err(),
+                    "accepted the wrong signed release identity: {altered}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_installer_temp_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = InstallerTempDir::create().unwrap();
+        let permissions = std::fs::metadata(temp_dir.path()).unwrap().permissions();
+        assert_eq!(permissions.mode() & 0o077, 0);
+    }
+
+    #[test]
+    fn unix_update_requires_signed_archives_and_preserves_modes() {
+        let cli = Cli::parse_from([
+            "dcg",
+            "update",
+            "--version",
+            "v0.16.0",
+            "--system",
+            "--easy-mode",
+            "--no-configure",
+        ]);
+        let Some(Command::Update(update)) = cli.command else {
+            unreachable!("Expected Update command");
+        };
+        assert_eq!(
+            unix_update_installer_arguments(&update, "v0.16.0"),
+            vec![
+                "--version",
+                "v0.16.0",
+                "--require-minisign",
+                "--system",
+                "--easy-mode",
+                "--no-configure",
+            ]
+        );
+    }
+
+    #[test]
+    fn unix_update_explicit_source_build_preserves_supported_arguments() {
+        let cli = Cli::parse_from(["dcg", "update", "--from-source"]);
+        let Some(Command::Update(update)) = cli.command else {
+            unreachable!("Expected Update command");
+        };
+        assert_eq!(
+            unix_update_installer_arguments(&update, "v0.16.0"),
+            vec!["--version", "v0.16.0", "--from-source"]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires DCG_TEST_SIGNED_INSTALLER_DIR (v0.16.0 scripts/signatures) and DCG_TEST_MINISIGN"]
+    fn update_installer_real_minisign_authenticates_both_platform_scripts() {
+        let fixtures = std::path::PathBuf::from(
+            std::env::var_os("DCG_TEST_SIGNED_INSTALLER_DIR")
+                .expect("stage genuine v0.16.0 installer assets before running this test"),
+        );
+        let minisign = std::path::PathBuf::from(
+            std::env::var_os("DCG_TEST_MINISIGN")
+                .expect("set DCG_TEST_MINISIGN to a real Minisign executable"),
+        );
+        let temp_dir = InstallerTempDir::create().unwrap();
+        for (name, digest) in [
+            (
+                "install.sh",
+                "072462974ad790008e8a3aadb1a9eecf2d9b6bd0ef7b469f69f0fb0fa3b51c7c",
+            ),
+            (
+                "install.ps1",
+                "f662ac7d34d2b7545a0e3ad7d5c7baff561fb6ccf96e75ee31d7f8b37fce7696",
+            ),
+        ] {
+            let script = fixtures.join(name);
+            let signature = fixtures.join(format!("{name}.minisig"));
+            let checksum = temp_dir.path().join(format!("{name}.sha256"));
+            std::fs::write(&checksum, format!("{digest}  {name}\n")).unwrap();
+            require_verified_installer(&script, &checksum, &signature, name, "v0.16.0", &minisign)
+                .unwrap();
+
+            let error = require_verified_installer(
+                &script, &checksum, &signature, name, "v0.16.1", &minisign,
+            )
+            .expect_err("a valid old release must not authenticate a newer requested tag");
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not authenticate the exact")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires DCG_TEST_SIGNED_INSTALLER_DIR (v0.16.0 scripts/sidecars) and DCG_TEST_MINISIGN"]
+    fn update_installer_real_minisign_handoff() {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        // Only a child process receives the isolated PATH and fixture server.
+        // The parent never mutates process-global environment, so this test can
+        // run alongside ordinary libtest threads as well as under nextest.
+        if let Ok(mode) = std::env::var("DCG_TEST_UPDATER_CHILD_MODE") {
+            let tag = std::env::var("DCG_TEST_UPDATER_TAG").unwrap();
+            let mut argv = vec!["dcg", "update", "--version", &tag];
+            match mode.as_str() {
+                "normal" => {}
+                "easy" => argv.push("--easy-mode"),
+                "system" => argv.push("--system"),
+                "source" => argv.push("--from-source"),
+                _ => panic!("unexpected child fixture mode: {mode}"),
+            }
+            let Some(Command::Update(update)) = Cli::parse_from(argv).command else {
+                unreachable!("Expected Update command");
+            };
+            self_update_unix(update).expect("updater refused the fixture release");
+            return;
+        }
+
+        let fixtures = std::path::PathBuf::from(
+            std::env::var_os("DCG_TEST_SIGNED_INSTALLER_DIR")
+                .expect("stage genuine v0.16.0 installer assets before running this test"),
+        );
+        let minisign = std::fs::canonicalize(
+            std::env::var_os("DCG_TEST_MINISIGN")
+                .expect("set DCG_TEST_MINISIGN to a real Minisign executable"),
+        )
+        .unwrap();
+        let script = std::fs::read(fixtures.join("install.sh")).unwrap();
+        let checksum = std::fs::read(fixtures.join("install.sh.sha256")).unwrap();
+        let signature = std::fs::read(fixtures.join("install.sh.minisig")).unwrap();
+        let other_signature = std::fs::read(fixtures.join("install.ps1.minisig")).unwrap();
+        let temp_dir = InstallerTempDir::create().unwrap();
+
+        for (scenario, mode, expected_error) in [
+            ("valid", "normal", None),
+            ("valid-easy", "easy", None),
+            ("valid-system", "system", None),
+            ("valid-source", "source", None),
+            ("modified", "normal", Some("sha256 verification failed")),
+            ("rehashed", "normal", Some("Minisign verification failed")),
+            (
+                "mismatched-signature",
+                "system",
+                Some("Minisign verification failed"),
+            ),
+            (
+                "wrong-release",
+                "normal",
+                Some("does not authenticate the exact"),
+            ),
+            (
+                "forged-release-comment",
+                "normal",
+                Some("Minisign verification failed"),
+            ),
+            ("missing-script", "normal", Some("Failed to download")),
+            (
+                "missing-checksum",
+                "system",
+                Some("install.sh.sha256 is required"),
+            ),
+            (
+                "missing-signature",
+                "system",
+                Some("install.sh.minisig is required"),
+            ),
+            (
+                "missing-signature-source",
+                "source",
+                Some("install.sh.minisig is required"),
+            ),
+            (
+                "empty-signature",
+                "normal",
+                Some("Minisign verification failed"),
+            ),
+            ("missing-verifier", "system", Some("minisign is required")),
+            (
+                "failed-download",
+                "system",
+                Some("install.sh.minisig is required"),
+            ),
+        ] {
+            let directory = temp_dir.path().join(scenario);
+            let server = directory.join("server");
+            let binaries = directory.join("bin");
+            std::fs::create_dir_all(&server).unwrap();
+            std::fs::create_dir(&binaries).unwrap();
+            let mut payload = script.clone();
+            if matches!(scenario, "modified" | "rehashed") {
+                payload.extend_from_slice(b"\n# Changed after release signing.\n");
+            }
+            if scenario != "missing-script" {
+                std::fs::write(server.join("install.sh"), &payload).unwrap();
+            }
+            if scenario == "rehashed" {
+                let mut digest = String::with_capacity(64);
+                for byte in Sha256::digest(&payload) {
+                    write!(digest, "{byte:02x}").unwrap();
+                }
+                std::fs::write(
+                    server.join("install.sh.sha256"),
+                    format!("{digest}  install.sh\n"),
+                )
+                .unwrap();
+            } else if scenario != "missing-checksum" {
+                std::fs::write(server.join("install.sh.sha256"), &checksum).unwrap();
+            }
+            match scenario {
+                "missing-signature" | "missing-signature-source" => {}
+                "mismatched-signature" => {
+                    std::fs::write(server.join("install.sh.minisig"), &other_signature).unwrap();
+                }
+                "empty-signature" => {
+                    std::fs::write(server.join("install.sh.minisig"), b"").unwrap();
+                }
+                "forged-release-comment" => {
+                    let forged = std::str::from_utf8(&signature)
+                        .unwrap()
+                        .replace("v0.16.0", "v0.16.1");
+                    std::fs::write(server.join("install.sh.minisig"), forged).unwrap();
+                }
+                _ => {
+                    std::fs::write(server.join("install.sh.minisig"), &signature).unwrap();
+                }
+            }
+
+            // Replace transport, never cryptographic verification. The local
+            // downloader refuses every URL outside this exact release's three
+            // assets. Even a valid old release served under a newer URL must
+            // fail the signed-comment check in the actual updater.
+            let downloader = binaries.join("curl");
+            std::fs::write(
+                &downloader,
+                r#"#!/bin/sh
+url= dest=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) dest=$2; shift 2 ;;
+    https://*) url=$1; shift ;;
+    *) shift ;;
+  esac
+done
+case "$url" in
+  "$DCG_TEST_UPDATER_BASE/install.sh"|"$DCG_TEST_UPDATER_BASE/install.sh.sha256"|"$DCG_TEST_UPDATER_BASE/install.sh.minisig") ;;
+  *) exit 98 ;;
+esac
+[ -n "$dest" ] || exit 98
+/bin/cp "$DCG_TEST_UPDATER_SERVER/${url##*/}" "$dest" || exit 22
+if [ "$DCG_TEST_UPDATER_FAILURE" = failed-download ] && [ "${url##*/}" = install.sh.minisig ]; then
+  exit 22
+fi
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&downloader, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if scenario != "missing-verifier" {
+                symlink(&minisign, binaries.join("minisign")).unwrap();
+            }
+            let executor = binaries.join("bash");
+            std::fs::write(
+                &executor,
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$DCG_TEST_UPDATER_MARKER\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&executor, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+            let marker = directory.join("installer-was-invoked");
+            let tag = if matches!(scenario, "wrong-release" | "forged-release-comment") {
+                "v0.16.1"
+            } else {
+                "v0.16.0"
+            };
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "cli::tests::update_installer_real_minisign_handoff",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("PATH", &binaries)
+                .env("TMPDIR", &directory)
+                .env("DCG_TEST_UPDATER_CHILD_MODE", mode)
+                .env("DCG_TEST_UPDATER_TAG", tag)
+                .env("DCG_TEST_UPDATER_SERVER", &server)
+                .env("DCG_TEST_UPDATER_MARKER", &marker)
+                .env("DCG_TEST_UPDATER_FAILURE", scenario)
+                .env(
+                    "DCG_TEST_UPDATER_BASE",
+                    format!(
+                        "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/{tag}"
+                    ),
+                )
+                .output()
+                .unwrap();
+            let diagnostics = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if let Some(expected) = expected_error {
+                assert!(
+                    !output.status.success(),
+                    "{scenario}: unexpectedly succeeded: {diagnostics}"
+                );
+                assert!(diagnostics.contains(expected), "{scenario}: {diagnostics}");
+                assert!(
+                    !marker.exists(),
+                    "{scenario}: unauthenticated installer reached Bash"
+                );
+            } else {
+                assert!(output.status.success(), "{scenario}: {diagnostics}");
+                let arguments = std::fs::read_to_string(&marker).unwrap();
+                let mut expected = vec!["--version", "v0.16.0"];
+                if mode != "source" {
+                    expected.push("--require-minisign");
+                }
+                match mode {
+                    "easy" => expected.push("--easy-mode"),
+                    "system" => expected.push("--system"),
+                    "source" => expected.push("--from-source"),
+                    _ => {}
+                }
+                assert_eq!(arguments.lines().skip(1).collect::<Vec<_>>(), expected);
+            }
+            eprintln!("{scenario}: authenticated handoff boundary passed");
+        }
     }
 
     #[test]
@@ -27202,6 +27711,7 @@ if ($errors.Count -ne 0) {
             vec![
                 "-Version",
                 "v0.7.3",
+                "-RequireMinisign",
                 "-Dest",
                 r"C:\Program Files\dcg",
                 "-Verify",

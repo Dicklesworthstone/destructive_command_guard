@@ -65,6 +65,15 @@ def verifier_path() -> str:
     return str(Path(binary).resolve())
 
 
+def fleet_probe_template(delimiter: str) -> str:
+    """Read a quoted probe template without running the fleet driver or SSH."""
+    script = (ROOT / "scripts/e2e_fleet_install.sh").read_text()
+    marker = f"cat <<'{delimiter}'\n"
+    if script.count(marker) != 1:
+        raise AssertionError(f"Expected exactly one {delimiter} fleet probe template")
+    return script.split(marker, 1)[1].split(f"\n{delimiter}\n", 1)[0]
+
+
 class DocumentationContractTests(unittest.TestCase):
     def test_recipe_parses_in_available_bash_installations(self):
         recipe = documented_shell(ROOT / "SKILL.md")
@@ -130,6 +139,40 @@ class DocumentationContractTests(unittest.TestCase):
         self.assertLess(hash_guard, recipe.index("throw ", hash_guard))
         self.assertLess(recipe.index("throw ", hash_guard), execute)
         self.assertIn("Version = $tag; RequireMinisign = $true", recipe[:execute])
+
+    def test_windows_fleet_probe_authenticates_before_execution_and_requires_a_receipt(self):
+        # Structural checks only: native PowerShell and Windows ACL execution
+        # still belong to the native release-host verification lane.
+        probe = fleet_probe_template("PSEOF")
+        self.assertEqual(probe.count(PUBLIC_KEY), 1)
+        self.assertNotIn("$RepoRaw", probe)
+        verify = probe.index("-Vm $installerPath -x $installerSignaturePath -P $minisignPublicKey")
+        signature_guard = probe.index("if ($LASTEXITCODE -ne 0) { throw 'invalid installer signature' }")
+        identity_guard = probe.index("$signatureLines.Count -ne 4 -or")
+        receipt = probe.index("Emit 'installer_signature_verified' 'PASS'")
+        unblock = probe.index("Unblock-File -LiteralPath $installerPath")
+        execute = probe.index("& $installerPath -Version $Version")
+        self.assertLess(verify, signature_guard)
+        self.assertLess(signature_guard, identity_guard)
+        self.assertLess(identity_guard, receipt)
+        self.assertLess(receipt, unblock)
+        self.assertLess(unblock, execute)
+        self.assertIn(
+            'trusted comment: dsr-built destructive_command_guard $Version additional $actualInstallerSha',
+            probe[:receipt],
+        )
+        self.assertIn(
+            'trusted comment: dsr strict release destructive_command_guard $Version additional $actualInstallerSha',
+            probe[:receipt],
+        )
+        self.assertIn(
+            '$signatureLines[2] -cne $expectedIdentity -and $signatureLines[2] -cne $strictIdentity',
+            probe[identity_guard:receipt],
+        )
+        driver = (ROOT / "scripts/e2e_fleet_install.sh").read_text()
+        cases = re.search(r"EXPECTED_CASES=\((.*?)\)", driver, re.DOTALL)
+        self.assertIsNotNone(cases)
+        self.assertIn("installer_signature_verified", cases.group(1).split())
 
 
 class VerifiedBootstrapTests(unittest.TestCase):
@@ -372,6 +415,125 @@ os.execvp(args[0], args)
             mode="--system", signature="untrusted-key", conditional=True,
             prelude="minisign() { return 0; }\nexport -f minisign",
         ))
+
+    def run_fleet_authentication(self, scenario: str, comment_prefix: str = "dsr-built"):
+        """Exercise only the real probe's authentication prefix, never install."""
+        type(self).sequence += 1
+        directory = self.work / f"{type(self).sequence:03d}-fleet-{scenario}"
+        directory.mkdir(mode=0o700)
+        server = directory / "release"
+        server.mkdir()
+        signed = directory / "signed-input.sh"
+        signed.write_bytes(MARKER_SCRIPT)
+        digest = self.fixture_digest
+        comment_tag = "v0.16.1" if scenario == "wrong-tag" else VERSION
+        comment_project = "another_project" if scenario == "wrong-project" else "destructive_command_guard"
+        comment_digest = "0" * 64 if scenario == "wrong-digest" else digest
+        comment_role = "aggregate" if scenario == "wrong-role" else "additional"
+        comment = f"{comment_prefix} {comment_project} {comment_tag} {comment_role} {comment_digest}"
+        if scenario == "generic-comment":
+            comment = f"{comment_prefix} timestamp:123"
+        if scenario == "mismatched-signature":
+            signed.write_bytes(MARKER_SCRIPT + b"# A different signed script.\n")
+        signer = "untrusted" if scenario == "untrusted-key" else "trusted"
+        signature = directory / "fixture.minisig"
+        subprocess.run(
+            [self.minisign, "-S", "-s", str(self.keys / f"{signer}.key"),
+             "-m", str(signed), "-x", str(signature), "-t", comment],
+            check=True, capture_output=True, timeout=15,
+        )
+        payload = MARKER_SCRIPT
+        if scenario == "rehashed":
+            payload += b"# Modified after signing; matching SHA256 sidecar supplied.\n"
+        if scenario != "missing-installer":
+            (server / "install.sh").write_bytes(payload)
+        if scenario != "missing-checksum":
+            (server / "install.sh.sha256").write_text(
+                hashlib.sha256(payload).hexdigest() + "  install.sh\n",
+            )
+        if scenario != "missing-signature":
+            (server / "install.sh.minisig").write_bytes(signature.read_bytes())
+
+        binaries = directory / "bin"
+        binaries.mkdir()
+        for name in ("env", "sed", "mktemp", "mkdir", "uname", "awk", "tr", "sha256sum"):
+            binary = shutil.which(name)
+            if not binary:
+                self.skipTest(f"{name} is required by the Unix fleet probe")
+            (binaries / name).symlink_to(binary)
+        if scenario != "missing-verifier":
+            (binaries / "minisign").symlink_to(self.minisign)
+        curl = binaries / "curl"
+        # Embed test fixture paths: the real probe deliberately removes every
+        # DCG_* environment variable before authenticating its download.
+        curl.write_text(
+            f"#!{sys.executable}\nimport pathlib, sys\n"
+            f"server = pathlib.Path({str(server)!r})\n"
+            f"base = {BASE_URL!r}\n"
+            "args = sys.argv[1:]\n"
+            "urls = [arg for arg in args if arg.startswith('https://')]\n"
+            "if len(urls) != 1:\n    sys.exit(98)\n"
+            "url = urls[0]\n"
+            "allowed = [base + '/' + name for name in "
+            "('install.sh', 'install.sh.sha256', 'install.sh.minisig')]\n"
+            "if url not in allowed:\n    sys.exit(98)\n"
+            "dest = None\n"
+            "for index, arg in enumerate(args):\n"
+            "    if arg in ('-o', '--output'):\n        dest = pathlib.Path(args[index + 1])\n"
+            "source = server / url.rsplit('/', 1)[1]\n"
+            "if dest is None or not source.is_file():\n    sys.exit(22)\n"
+            "dest.write_bytes(source.read_bytes())\n",
+        )
+        curl.chmod(0o700)
+        downloads = directory / "downloads"
+        downloads.mkdir(mode=0o700)
+        home = directory / "home"
+        home.mkdir(mode=0o700)
+        probe = fleet_probe_template("PROBE")
+        self.assertEqual(probe.count("# 3. Install"), 1, "Never execute a probe without its install boundary")
+        prefix = probe.split("# 3. Install", 1)[0]
+        self.assertIn("installer_signature_verified", prefix)
+        self.assertEqual(prefix.count(PUBLIC_KEY), 1)
+        prefix = prefix.replace(PUBLIC_KEY, self.fixture_key)
+        marker = directory / "authentication-passed"
+        sentinel = f"\nprintf '%s\\n' authenticated > {shlex.quote(str(marker))}\n"
+        result = subprocess.run(
+            [self.bash, "--noprofile", "--norc", "-c", prefix + sentinel, "fleet-auth-test",
+             VERSION, BASE_URL.rsplit("/", 1)[0]],
+            env={"PATH": str(binaries), "HOME": str(home), "TMPDIR": str(downloads), "LC_ALL": "C"},
+            cwd=directory, capture_output=True, text=True, check=False, timeout=20,
+        )
+        (directory / "stdout.log").write_text(result.stdout)
+        (directory / "stderr.log").write_text(result.stderr)
+        return result, marker
+
+    def test_fleet_probe_accepts_an_authenticated_release_before_its_install_boundary(self):
+        for prefix in ("dsr-built", "dsr strict release"):
+            with self.subTest(prefix=prefix):
+                result, marker = self.run_fleet_authentication("valid", prefix)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(marker.exists())
+                self.assertIn("RESULT:installer_checksum_verified:PASS", result.stdout)
+                self.assertIn("RESULT:installer_signature_verified:PASS", result.stdout)
+
+    def test_fleet_probe_refuses_unverified_or_wrong_release_before_install_boundary(self):
+        cases = [(scenario, "dsr-built") for scenario in (
+            "rehashed", "mismatched-signature", "untrusted-key", "missing-installer",
+            "missing-checksum", "missing-signature", "missing-verifier",
+        )]
+        cases += [(scenario, prefix) for prefix in ("dsr-built", "dsr strict release")
+                  for scenario in ("wrong-tag", "wrong-digest", "wrong-project", "wrong-role", "generic-comment")]
+        cases.append(("valid", "dsr-unknown-format"))
+        for scenario, prefix in cases:
+            with self.subTest(scenario=scenario, prefix=prefix):
+                result, marker = self.run_fleet_authentication(scenario, prefix)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(marker.exists(), f"{scenario}: authentication failure reached installation")
+                self.assertNotIn("RESULT:installer_signature_verified:PASS", result.stdout)
+                if scenario.startswith("wrong-") or scenario in ("generic-comment", "valid"):
+                    self.assertIn("does not authenticate the exact project, release, and digest", result.stdout)
+                elif scenario in ("rehashed", "mismatched-signature", "untrusted-key"):
+                    self.assertIn("invalid installer signature", result.stdout)
 
 
 @unittest.skipUnless(os.environ.get("DCG_TEST_RELEASE_ASSETS"), "Optional published release assets not supplied")
