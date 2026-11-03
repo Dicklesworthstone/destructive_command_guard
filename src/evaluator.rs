@@ -33009,6 +33009,12 @@ fn is_unmodeled_operand_launcher(argv0: &str) -> bool {
             | "unbuffer"
             | "chronic"
             | "caffeinate"
+            // macOS: `arch -arm64 cmd`, `xcrun cmd`, `taskpolicy -c utility
+            // cmd` and `sandbox-exec -n name cmd` run the command after them.
+            | "arch"
+            | "xcrun"
+            | "taskpolicy"
+            | "sandbox-exec"
             | "gtimeout"
             | "torsocks"
             | "proxychains"

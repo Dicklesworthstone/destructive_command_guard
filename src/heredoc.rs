@@ -9875,6 +9875,10 @@ fn runs_operand_program(name: &str) -> bool {
                 | "prlimit"
                 | "runuser"
                 | "pkexec"
+                | "arch"
+                | "xcrun"
+                | "taskpolicy"
+                | "sandbox-exec"
         )
 }
 

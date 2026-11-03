@@ -3266,8 +3266,9 @@ fn skip_wrapper(name: &str, args: &[&Word]) -> Option<usize> {
         "stdbuf" => (&['i', 'o', 'e'], &["input", "output", "error"]),
         "exec" => (&['a'], &[]),
         "caffeinate" => (&['t', 'w'], &[]),
-        "command" | "nohup" | "builtin" | "time" | "chronic" | "setsid" | "unbuffer" => (&[], &[]),
-        _ => return None,
+        "command" | "nohup" | "builtin" | "time" | "chronic" | "setsid" | "unbuffer" | "noglob"
+        | "nocorrect" | "-" => (&[], &[]),
+        _ => return launcher_writer_operand(name, args),
     };
     let mut index = 0usize;
     while let Some(word) = args.get(index) {
@@ -3320,6 +3321,26 @@ fn skip_wrapper(name: &str, args: &[&Word]) -> Option<usize> {
         break;
     }
     Some(index)
+}
+
+/// A launcher whose options [`skip_wrapper`] does not model still runs a
+/// program named among its operands: `strace -f tee ~/.ssh/authorized_keys`
+/// writes the key file. Returning `None` for it read the launcher as an
+/// unknown program, so these writes were allowed behind `strace`, `firejail`,
+/// `gosu`, `unshare`, `flock`, `chroot`, `watch` and every other launcher the
+/// Git pack already treats as running its operands. Its first writer operand
+/// is read as the wrapped program; an option value that happens to name a
+/// writer over-reads, which can only add a denial.
+fn launcher_writer_operand(name: &str, args: &[&Word]) -> Option<usize> {
+    let next = args.first().map(|word| word.as_string());
+    let runs_operand =
+        crate::packs::core::git::unmodeled_exec_wrapper(name, next.as_deref()) || name == "watch";
+    if !runs_operand {
+        return None;
+    }
+    args.iter().position(|word| {
+        executable_name(word).is_some_and(|executable| writer_kind(&executable).is_some())
+    })
 }
 
 const MAX_WRAPPER_DEPTH: usize = 16;
@@ -5756,6 +5777,36 @@ mod tests {
                     ));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn unmodeled_launchers_do_not_hide_credential_writers() {
+        for command in [
+            "echo k | strace -f tee ~/.ssh/authorized_keys",
+            "echo k | firejail tee ~/.ssh/authorized_keys",
+            "echo k | gosu me tee ~/.ssh/authorized_keys",
+            "echo k | unshare -r tee ~/.ssh/authorized_keys",
+            "echo k | flock /tmp/l tee ~/.ssh/authorized_keys",
+            "echo k | chroot / tee ~/.ssh/authorized_keys",
+            "watch -n1 tee ~/.ssh/authorized_keys",
+            "strace -f cp evil ~/.ssh/authorized_keys",
+            "echo k | arch -arch x86_64 tee ~/.ssh/authorized_keys",
+            "echo k | xcrun tee ~/.ssh/authorized_keys",
+            "echo k | noglob tee ~/.ssh/authorized_keys",
+            "echo k | nocorrect tee ~/.ssh/authorized_keys",
+            "echo k | builtin command tee ~/.ssh/authorized_keys",
+        ] {
+            denied(command);
+        }
+        for command in [
+            "strace -f tee ~/notes.txt",
+            "strace -e trace=open cat ~/.ssh/id_rsa",
+            "firejail ls ~/.ssh",
+            "watch -n1 ls ~/.ssh",
+            "unknown-tool tee ~/.ssh/authorized_keys",
+        ] {
+            allowed(command);
         }
     }
 

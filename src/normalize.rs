@@ -1544,6 +1544,10 @@ pub(crate) fn is_posix_execution_frontend_basename(basename: &str) -> bool {
     matches!(
         basename,
         "exec"
+            | "builtin"
+            | "noglob"
+            | "nocorrect"
+            | "-"
             | "nohup"
             | "time"
             | "nice"
@@ -1565,6 +1569,28 @@ pub(crate) fn strip_posix_execution_frontend(command: &str) -> Option<(&str, &'s
     let mut filesystem_context_changed = false;
     let command_index = match basename {
         "exec" => exec_wrapper_command_index(trimmed, &tokens, &mut filesystem_context_changed)?,
+        // `builtin NAME …` runs the shell builtin NAME, and when NAME is
+        // `command`, `exec` or `builtin` the words after it execute. Not
+        // stripping it left `builtin command git reset --hard` an unknown
+        // program, allowed in POSIX (bd-builtin-wrapper-bypass-pbxa). A NAME
+        // that is no builtin makes the shell fail without running anything,
+        // so reading it as the executable can only add denials.
+        "builtin" => {
+            let word = wrapper_word(trimmed, &tokens, 1)?;
+            if word == "--" {
+                2
+            } else if word.starts_with('-') {
+                return None;
+            } else {
+                1
+            }
+        }
+        // zsh's precommand modifiers take no options: `noglob git reset
+        // --hard`, `nocorrect …` and `- …` run the command after them.
+        "noglob" | "nocorrect" | "-" => {
+            wrapper_word(trimmed, &tokens, 1)?;
+            1
+        }
         "nohup" => {
             let word = wrapper_word(trimmed, &tokens, 1)?;
             if word == "--" {
@@ -1591,6 +1617,10 @@ pub(crate) fn strip_posix_execution_frontend(command: &str) -> Option<(&str, &'s
         remaining,
         match basename {
             "exec" => "exec",
+            "builtin" => "builtin",
+            "noglob" => "noglob",
+            "nocorrect" => "nocorrect",
+            "-" => "zsh-dash",
             "nohup" => "nohup",
             "time" => "time",
             "nice" => "nice",
@@ -6636,6 +6666,47 @@ mod tests {
             strip_posix_execution_frontend("mise exec --help -- foo"),
             None
         );
+    }
+
+    #[test]
+    fn strip_wrapper_prefixes_unwraps_builtin_and_zsh_precommand_chains() {
+        for (command, expected) in [
+            ("builtin command git reset --hard", "git reset --hard"),
+            ("builtin -- command git reset --hard", "git reset --hard"),
+            ("builtin command -p git reset --hard", "git reset --hard"),
+            (
+                "command builtin command git reset --hard",
+                "git reset --hard",
+            ),
+            (
+                "builtin builtin command git reset --hard",
+                "git reset --hard",
+            ),
+            ("builtin exec git reset --hard", "git reset --hard"),
+            ("builtin echo git reset --hard", "echo git reset --hard"),
+            ("noglob git reset --hard", "git reset --hard"),
+            ("nocorrect git reset --hard", "git reset --hard"),
+            ("- git reset --hard", "git reset --hard"),
+            (
+                "noglob builtin command git reset --hard",
+                "git reset --hard",
+            ),
+        ] {
+            let result = strip_wrapper_prefixes(command);
+            assert_eq!(result.normalized, expected, "{command:?}");
+        }
+        for command in [
+            "builtin",
+            "builtin -x command git",
+            "builtin >/tmp/out",
+            "noglob",
+            "-",
+        ] {
+            assert!(
+                !strip_wrapper_prefixes(command).was_normalized(),
+                "{command:?}"
+            );
+        }
     }
 
     #[test]
