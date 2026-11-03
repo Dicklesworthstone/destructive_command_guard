@@ -301,6 +301,49 @@ positives. As a result, an ACP client-terminal call does not yet receive exact
 Cmd/PowerShell-specific coverage; closing that residual requires OMP to expose
 the actual BashTool route before the `tool_call` handler runs.
 
+## Shell calls made from scripts ("code mode")
+
+Some harnesses let the model write a program, usually JavaScript run in a
+sandbox, that calls the harness's own tools, instead of issuing one tool call
+per turn. Whether dcg sees the shell commands such a program runs depends on
+the harness, not on dcg:
+
+- **dcg judges each shell tool call it is handed, as a finished command
+  string.** It never sees the program that built the string. A command
+  assembled in JavaScript reaches dcg exactly as the shell tool would receive
+  it, so the usual rules apply to it.
+- **Coverage therefore turns on one question per harness:** does a shell call
+  made from inside a script fire the same pre-tool hook as a top-level shell
+  call? If it does, the dcg hook you already installed covers it unchanged. If
+  it does not, dcg never sees those commands, and no dcg setting changes that.
+- **Hooking the outer script tool does not help.** Its input is the program,
+  and the commands that program will build do not exist yet when that hook
+  fires. The hook has to match the inner shell tool (`Bash`, `Execute`,
+  `shell`, …) and fire on each nested call.
+- **A denial is reported to the script as that call's failure.** The script
+  can catch it and carry on, and calls it made before the denial have already
+  run. dcg gates one call at a time; it cannot undo a script.
+- **Unattended scripts make the fail-closed settings matter more.** One script
+  can issue many calls with nobody watching, so consider
+  `general.fail_closed = true` (deny hook input that cannot be parsed) and
+  `general.unverified_decision = "deny"` (deny a command dcg could not finish
+  inspecting instead of asking a human who is not there).
+- **Capabilities that are not tool calls are invisible to every tool hook**,
+  such as a script runtime's built-in network or browser access.
+- **Writing a script file and then running it** is the same limitation as
+  anywhere else, and it is easier to hit when one program does both steps.
+
+To check a harness version you rely on, use a disposable project and a
+temporary hook that matches every tool and only records `tool_name` (and the
+command, for shell tools). Have the model run a script that calls the shell
+tool twice with harmless commands. Two shell-tool records mean nested calls
+are hooked; a single record for the script tool means they are not. To confirm
+enforcement as well as delivery, follow the canary procedure in
+[Loading regressions and Script-mode coverage](#loading-regressions-and-script-mode-coverage).
+For Factory Droid's Script tool specifically, nested coverage is currently
+unverified (same section). For Codex, `unified_exec` is a separate known gap,
+described in the [Codex integration notes](codex-integration.md#known-limitation-codex-unified_exec-path-windows-desktop--cli).
+
 ## Trust Levels
 
 Three trust levels label how much you trust a given agent:

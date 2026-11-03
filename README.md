@@ -1586,6 +1586,8 @@ had version-specific regressions, and **nested Execute calls inside Droid's
 Script tool are not verified as protected**. See [Factory Droid integration and
 verification](docs/agents.md#factory-droid) for configuration locations,
 diagnostics, and a safe procedure to establish live coverage on your version.
+The same question applies to any harness whose scripts call tools ("code
+mode"); see [shell calls made from scripts](docs/agents.md#shell-calls-made-from-scripts-code-mode).
 
 ## Reasonix Configuration
 
