@@ -516,6 +516,84 @@ fn issue_569_incomplete_window_analysis_on_an_oversized_payload_is_not_allowed()
     );
 }
 
+/// The window scan used to skip every window that named no enabled-pack
+/// keyword. The evaluator reaches commands no keyword spells through checks of
+/// its own (a variable or a glob in the program name, a cmd `%G%`, PowerShell
+/// `& $g`), so each of these was denied at normal size and allowed once padded
+/// past the input limit.
+#[test]
+fn oversized_windows_reach_commands_no_keyword_spells() {
+    let pad = "A".repeat(PADDING_BYTES);
+    let claude = |tool: &str, command: String| {
+        serde_json::json!({ "tool_name": tool, "tool_input": { "command": command } }).to_string()
+    };
+    let gemini = |command: String| {
+        serde_json::json!({
+            "session_id": "oversized",
+            "hook_event_name": "BeforeTool",
+            "tool_name": "run_shell_command",
+            "tool_input": { "command": command },
+        })
+        .to_string()
+    };
+    let deny: &[&str] = &["deny"];
+    let cases = [
+        (
+            "Bash $G",
+            claude("Bash", format!("$G reset --hard; echo {pad}")),
+            deny,
+        ),
+        (
+            "Bash glob",
+            claude("Bash", format!("g?t reset --hard; echo {pad}")),
+            deny,
+        ),
+        (
+            "Bash $@ inside rm",
+            claude("Bash", format!("r$@m -rf /; echo {pad}")),
+            deny,
+        ),
+        (
+            "cmd %G%",
+            claude("cmd", format!("%G% reset --hard & echo {pad}")),
+            deny,
+        ),
+        (
+            "Gemini $G",
+            gemini(format!("$G reset --hard ; echo {pad}")),
+            deny,
+        ),
+        // A PowerShell rule stops at its regex work limit on the 64 KiB
+        // window, which answers ask; either answer blocks.
+        (
+            "PowerShell & $g",
+            claude("PowerShell", format!("& $g reset --hard ; echo {pad}")),
+            &["deny", "ask"],
+        ),
+    ];
+    for (label, input, accepted) in cases {
+        assert!(input.len() > 256 * 1024, "{label}: must exceed the limit");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (stdout, stderr, exit_code) =
+            run_hook_raw_with_budget(&input, temp.path(), Some(SALVAGE_SCAN_BUDGET_MS));
+        assert_eq!(exit_code, 0, "{label}: hook mode exits 0\nstderr: {stderr}");
+        let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!(
+                "{label}: expected a blocking verdict ({e}); stdout: {stdout:?}\nstderr: {stderr}"
+            )
+        });
+        // Claude Code answers in `hookSpecificOutput`; Gemini CLI in `decision`.
+        let decision = json["hookSpecificOutput"]["permissionDecision"]
+            .as_str()
+            .or_else(|| json["decision"].as_str())
+            .unwrap_or_default();
+        assert!(
+            accepted.contains(&decision),
+            "{label}: expected one of {accepted:?}, got {stdout:?}"
+        );
+    }
+}
+
 /// #322 fresh-eyes follow-up (normal size): a `Bash`-labeled PowerShell
 /// alias invocation (`rm -Recurse -Force`) is widened and denied by the
 /// windows pack. Proves the alias-widening signal end-to-end, not just at

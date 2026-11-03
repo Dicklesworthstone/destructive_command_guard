@@ -314,11 +314,9 @@ fn oversized_split_payloads_are_denied() {
         ),
         (gemini(&format!("{split} ; echo {pad}")), true),
         (gemini(&format!("echo {pad} ; {split}")), true),
+        (gemini(&format!("{quoted} ; echo {pad}")), false),
         // POSIX keeps reading single quotes as quoting.
         (claude("Bash", &format!("{split} ; echo {pad}")), false),
-        // No unknown-dialect quoted control: a 64 KiB window of it stops at a
-        // regex work limit (bd-nxn1) and answers incomplete, as the unpadded
-        // command does once it is that long. That is not this gate's verdict.
     ];
     for (payload, want_deny) in &cases {
         assert!(payload.len() > 256 * 1024, "payload must exceed the limit");

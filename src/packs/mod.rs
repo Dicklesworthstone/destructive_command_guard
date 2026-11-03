@@ -4895,58 +4895,6 @@ pub(crate) fn pack_aware_quick_reject_pre_normalized(
         && !span_matches_any_keyword(normalized, enabled_keywords)
 }
 
-/// [`pack_aware_quick_reject`] for a raw command, read the way `dialect` reads
-/// it.
-///
-/// The span gate in [`pack_aware_quick_reject`] reads POSIX quoting. cmd.exe
-/// passes single quotes through as argv bytes, so `echo 'x & git reset --hard'`
-/// runs `git` there while the POSIX gate sees one quoted argument, and
-/// PowerShell ends `"a\"` at its second quote. Cmd and PowerShell are gated
-/// like the evaluator gates them, with no quote roles. The unknown dialect is
-/// the union of POSIX, PowerShell and cmd, so it is skipped only when every
-/// reading is free of keywords. Use this when a skipped command is never
-/// evaluated at all, as the oversized-payload window scan does.
-#[must_use]
-pub fn pack_aware_quick_reject_in_dialect(
-    cmd: &str,
-    dialect: crate::normalize::ShellDialect,
-    enabled_keywords: &[&str],
-) -> bool {
-    use crate::normalize::{ShellDialect, normalize_command_in_dialect};
-    if enabled_keywords.is_empty() || external_pack_forces_full_evaluation() {
-        return false;
-    }
-    // Pure padding: no keyword, and no byte any of these shells removes from
-    // a word (quotes, escapes, cmd's caret and `%` expansion, PowerShell's
-    // backtick). Nothing can be decoded into a keyword, so skip normalizing.
-    if !cmd
-        .bytes()
-        .any(|byte| matches!(byte, b'\\' | b'\'' | b'"' | b'^' | b'%' | b'`'))
-        && !enabled_keywords
-            .iter()
-            .any(|keyword| keyword_matches_substring(cmd, keyword))
-    {
-        return true;
-    }
-    match dialect {
-        ShellDialect::Cmd | ShellDialect::PowerShell => pack_aware_quick_reject_pre_normalized(
-            normalize_command_in_dialect(cmd, dialect).as_ref(),
-            enabled_keywords,
-        ),
-        ShellDialect::Posix => pack_aware_quick_reject(
-            normalize_command_in_dialect(cmd, ShellDialect::Posix).as_ref(),
-            enabled_keywords,
-        ),
-        ShellDialect::Unknown => [
-            ShellDialect::Posix,
-            ShellDialect::PowerShell,
-            ShellDialect::Cmd,
-        ]
-        .into_iter()
-        .all(|reading| pack_aware_quick_reject_in_dialect(cmd, reading, enabled_keywords)),
-    }
-}
-
 /// [`pack_aware_quick_reject`] for a view that is already normalized, such as
 /// the evaluator's normalized command after [`blank_inert_redirections`].
 #[inline]
@@ -5632,42 +5580,6 @@ destructive_patterns:
             assert!(
                 pack_aware_quick_reject(command, &keywords),
                 "inert quoted text must retain the quick-reject path: {command:?}"
-            );
-        }
-    }
-
-    /// bd-external-pack-cmd-quick-reject-z0cq: cmd.exe does not quote with
-    /// apostrophes and PowerShell does not escape with a backslash, so a
-    /// keyword that POSIX reads as quoted data runs in both. Only POSIX may
-    /// use the quote-aware span gate.
-    #[test]
-    fn pack_aware_quick_reject_in_dialect_gates_cmd_and_powershell_without_quote_roles() {
-        use crate::normalize::ShellDialect::{Cmd, Posix, PowerShell, Unknown};
-        let keywords: Vec<&str> = vec!["git"];
-        let split = "echo 'x & git reset --hard & y'";
-        let backslash_quote = r#"Write-Output "a\" ; git push --force ; \"b""#;
-        let padding = "A".repeat(4096);
-
-        for (command, dialect, rejected) in [
-            (split, Posix, true),
-            (split, Cmd, false),
-            (split, PowerShell, false),
-            (split, Unknown, false),
-            (backslash_quote, Posix, true),
-            (backslash_quote, PowerShell, false),
-            (backslash_quote, Unknown, false),
-            ("dir 'x & git reset --hard'", Cmd, false),
-            ("echo hello & dir", Cmd, true),
-            ("echo hello & dir", PowerShell, true),
-            ("echo hello & dir", Unknown, true),
-            ("git status", Posix, false),
-            (padding.as_str(), Unknown, true),
-            (padding.as_str(), Cmd, true),
-        ] {
-            assert_eq!(
-                pack_aware_quick_reject_in_dialect(command, dialect, &keywords),
-                rejected,
-                "{command:?} in {dialect:?}"
             );
         }
     }

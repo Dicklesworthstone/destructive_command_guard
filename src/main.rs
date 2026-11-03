@@ -859,19 +859,13 @@ fn try_deny_unparseable_payload(
         // routed it here with an unrefined Posix dialect, where a cmdlet is an
         // inert unknown binary — reopening the #322 hole on the oversized path.
         let refined_dialect = hook::refine_shell_dialect(command, shell_dialect);
-        // Windows made of pure padding carry no enabled keyword; skipping
-        // them keeps the multi-window scan a substring search per megabyte
-        // rather than a full evaluation per window. The gate reads the window
-        // in the dialect it is evaluated in: the POSIX gate took a cmd or
-        // unknown-dialect `echo 'x & git reset --hard & y'` for quoted data,
-        // so padding it past the size limit allowed it.
-        if destructive_command_guard::packs::pack_aware_quick_reject_in_dialect(
-            command,
-            refined_dialect,
-            &enabled_keywords,
-        ) {
-            continue;
-        }
+        // Every window goes to the evaluator, with no keyword gate in front.
+        // The evaluator's own quick reject knows which commands no keyword
+        // spells: a variable or glob in the program name (`$G reset --hard`,
+        // `g?t reset --hard`), a cmd `%G%`, PowerShell `& $g`, sed and tar
+        // helpers. A keyword gate here skipped those windows, so padding them
+        // past the size limit allowed what the same command denied at normal
+        // size. A window of padding costs the evaluator one keyword scan.
         let outcome = resolve_hook_command(&eval_context, command, refined_dialect, None);
         match outcome {
             ResolvedCommandOutcome::DenyFamily(resolved)
