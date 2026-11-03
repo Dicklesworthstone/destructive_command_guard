@@ -16237,14 +16237,21 @@ fn evaluate_command_in_single_dialect_view(
         && !force_scp_semantics
         && {
             let _phase = phase(ProfilePhase::Normalization);
-            pack_aware_quick_reject(
-                inert_redirection_gating_view(
-                    crate::normalize::normalize_command_in_dialect(command, shell_dialect).as_ref(),
-                    shell_dialect,
-                )
-                .as_ref(),
-                enabled_keywords,
-            )
+            let dialect_normalized =
+                crate::normalize::normalize_command_in_dialect(command, shell_dialect);
+            let gating = inert_redirection_gating_view(dialect_normalized.as_ref(), shell_dialect);
+            // The span gate in `pack_aware_quick_reject` reads POSIX quoting.
+            // cmd.exe passes single quotes through as argv bytes, so that gate
+            // took `echo 'x & git reset --hard & y'` for one quoted argument
+            // and skipped every pack. This branch runs whenever the keyword
+            // index is absent, which is every hook with an external pack loaded,
+            // and the unknown dialect's cmd replay comes through here too. Gate
+            // Cmd the way Step 5 does.
+            if shell_dialect == ShellDialect::Cmd {
+                pack_aware_quick_reject_pre_normalized(gating.as_ref(), enabled_keywords)
+            } else {
+                pack_aware_quick_reject(gating.as_ref(), enabled_keywords)
+            }
         }
         // The keyword gate reads text. An external pack whose program the
         // text does not spell (a variable, a substitution, a glob, quotes

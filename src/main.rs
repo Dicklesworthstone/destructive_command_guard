@@ -853,18 +853,25 @@ fn try_deny_unparseable_payload(
             drop_history_writer(history_writer);
             return Some(exit_code);
         }
-        // Windows made of pure padding carry no enabled keyword; skipping
-        // them keeps the multi-window scan a substring search per megabyte
-        // rather than a full evaluation per window.
-        if destructive_command_guard::packs::pack_aware_quick_reject(command, &enabled_keywords) {
-            continue;
-        }
         // Down-trust a `Bash`-labeled dialect when this window is unmistakably
         // PowerShell/cmd, exactly as the normal parsed path does (#322). Without
         // this, padding a mislabeled PowerShell payload past `max_command_bytes`
         // routed it here with an unrefined Posix dialect, where a cmdlet is an
         // inert unknown binary — reopening the #322 hole on the oversized path.
         let refined_dialect = hook::refine_shell_dialect(command, shell_dialect);
+        // Windows made of pure padding carry no enabled keyword; skipping
+        // them keeps the multi-window scan a substring search per megabyte
+        // rather than a full evaluation per window. The gate reads the window
+        // in the dialect it is evaluated in: the POSIX gate took a cmd or
+        // unknown-dialect `echo 'x & git reset --hard & y'` for quoted data,
+        // so padding it past the size limit allowed it.
+        if destructive_command_guard::packs::pack_aware_quick_reject_in_dialect(
+            command,
+            refined_dialect,
+            &enabled_keywords,
+        ) {
+            continue;
+        }
         let outcome = resolve_hook_command(&eval_context, command, refined_dialect, None);
         match outcome {
             ResolvedCommandOutcome::DenyFamily(resolved)
