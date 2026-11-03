@@ -43,10 +43,27 @@ macro_rules! dd_literal_word {
     };
 }
 
+// The input operand alone may also name its file through a plain parameter
+// expansion inside double quotes (`if="$f"`, `if="${dir}/$name.img"`, #633).
+// Inside double quotes an expansion is never field-split or globbed, so the
+// whole word stays ONE argv operand that starts with `if=`: it selects what dd
+// reads and cannot smuggle in an `of=`. Only `$name`, `${name}` and `$N` are
+// accepted. `"$@"` expands to one word per positional parameter even inside
+// quotes (`"$*"` is refused with it), and `$(…)`, backticks, `${x:-…}` forms
+// and backslashes are left to the evaluator. An unquoted
+// `if=$f` stays denied because field splitting can produce a second operand.
+macro_rules! dd_dynamic_input_operand {
+    () => {
+        r#"if="(?:[^"\\$`\r\n]|\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\}|[0-9]))*""#
+    };
+}
+
 macro_rules! dd_non_output_operand {
     () => {
         concat!(
-            r"(?:(?:if|ibs|obs|bs|cbs|skip|iseek|seek|oseek|count|conv|iflag|oflag|status)=",
+            r"(?:",
+            dd_dynamic_input_operand!(),
+            r"|(?:if|ibs|obs|bs|cbs|skip|iseek|seek|oseek|count|conv|iflag|oflag|status)=",
             dd_literal_word!(),
             r"|[0-9]*[<>]&(?:[0-9]+|-)|[0-9]*<[ \t]*",
             dd_literal_word!(),
@@ -1729,6 +1746,57 @@ mod tests {
         ] {
             assert_safe_pattern_matches(&pack, command);
             assert_allows(&pack, command);
+        }
+    }
+
+    #[test]
+    fn dd_discard_accepts_a_quoted_parameter_input_issue_633() {
+        let pack = create_pack();
+        // A double-quoted parameter expansion is one argv word that starts
+        // with `if=`: it chooses what dd reads, never where it writes.
+        for command in [
+            r#"dd if="$f" of=/dev/null bs=4M"#,
+            r#"dd if="$f" of=/dev/null bs=4M count=100"#,
+            r#"dd if="${f}" of=/dev/null"#,
+            r#"dd if="$dir/${name}.img" of=/dev/null status=progress"#,
+            r#"dd if="$1" of=/dev/null"#,
+            r#"dd of=/dev/null if="$f""#,
+            r#"sudo dd if="$DEV" of=/dev/null bs=1M count=10"#,
+        ] {
+            assert_safe_pattern_matches(&pack, command);
+            assert_allows(&pack, command);
+        }
+        // Everything that could add an operand, run code, or move the
+        // dynamic word to the output side keeps the deny.
+        for command in [
+            // Unquoted: field splitting can yield a second `of=`.
+            "dd if=$f of=/dev/null",
+            "dd if=${f} of=/dev/null",
+            // `"$@"` expands to one word per parameter even inside quotes;
+            // `"$*"` is refused with it.
+            r#"dd if="$@" of=/dev/null"#,
+            r#"dd if="$*" of=/dev/null"#,
+            // Command substitution and backticks run code.
+            r#"dd if="$(pick)" of=/dev/null"#,
+            r#"dd if="`pick`" of=/dev/null"#,
+            // Operator expansions are left to the evaluator.
+            r#"dd if="${f:-/dev/sda}" of=/dev/null"#,
+            // A dynamic word anywhere but `if=` is not accepted.
+            r#"dd if=/dev/zero of="$f""#,
+            r#"dd if="$f" of="$g""#,
+            r#"dd bs="$bs" if=x of=/dev/null"#,
+            // A real device output after the discard target still denies.
+            r#"dd if="$f" of=/dev/null of=/dev/sda"#,
+            r#"dd if="$f" of=/dev/sda"#,
+        ] {
+            assert!(!pack.matches_safe(command), "exempted: {command}");
+        }
+        for command in [
+            r#"dd if="$f" of=/dev/sda"#,
+            r#"dd if="$f" of=/dev/null of=/dev/sda"#,
+            r#"dd if="$f" of="/dev/disk2""#,
+        ] {
+            assert_blocks_with_pattern(&pack, command, "dd-device");
         }
     }
 
