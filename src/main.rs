@@ -317,6 +317,16 @@ fn format_indeterminate_reason(
     if let Some(cpu) = detail.cpu {
         let _ = write!(context, ", process CPU {}ms", cpu.as_millis());
     }
+    // No clock ran out: an analysis step (a regex work limit, an unterminated
+    // heredoc a proof needs) gave up first, and a larger hook_timeout_ms would
+    // not have changed that (bd-indeterminate-reason-wording-jcpy).
+    if incomplete.is_some() {
+        return format!(
+            "DCG could not finish analyzing this command ({context}): an analysis step \
+             stopped before reaching a verdict, so the command was not verified. \
+             Review manually."
+        );
+    }
     format!(
         "DCG could not complete safety evaluation within {}ms ({context}); \
          command was not verified. Review manually or increase hook_timeout_ms.",
@@ -3115,6 +3125,35 @@ mod tests {
             ),
             "reason: {reason}"
         );
+        // No deadline ran out, so the reason must not blame one or suggest a
+        // larger hook budget (bd-indeterminate-reason-wording-jcpy).
+        assert!(
+            reason.starts_with("DCG could not finish analyzing this command"),
+            "reason: {reason}"
+        );
+        assert!(
+            reason.contains("the command was not verified"),
+            "reason: {reason}"
+        );
+        assert!(!reason.contains("within 1000ms"), "reason: {reason}");
+        assert!(!reason.contains("hook_timeout_ms"), "reason: {reason}");
+
+        // An incomplete step with no deadline recorded at all is worded the same.
+        let no_deadline = IndeterminateDetail {
+            exhaustion: perf::BudgetExhaustion {
+                deadline: None,
+                incomplete: Some(("unterminated_interpreter_stdin", None)),
+            },
+            elapsed: Duration::from_millis(69),
+            cpu: Some(Duration::from_millis(75)),
+        };
+        let reason =
+            format_indeterminate_reason("evaluation", Duration::from_secs(1), &no_deadline);
+        assert!(
+            reason.contains("incomplete: unterminated_interpreter_stdin; elapsed 69ms"),
+            "reason: {reason}"
+        );
+        assert!(!reason.contains("hook_timeout_ms"), "reason: {reason}");
 
         // Past the deadline, the deadline is the cause even if an optional
         // step also stopped short earlier.
@@ -3130,6 +3169,10 @@ mod tests {
         assert!(
             reason.contains("(stage: evaluation, phase: pattern_rules; elapsed 1003ms)"),
             "reason: {reason}"
+        );
+        assert!(
+            reason.contains("within 1000ms") && reason.contains("increase hook_timeout_ms"),
+            "a real deadline keeps the deadline wording: {reason}"
         );
     }
 
