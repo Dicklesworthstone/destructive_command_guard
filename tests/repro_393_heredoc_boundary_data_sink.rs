@@ -30,11 +30,16 @@ fn evaluate(command: &str, dialect: ShellDialect) -> destructive_command_guard::
         .expect("keyword index should build for enabled pack set");
     let compiled_overrides = config.overrides.compile();
     let allowlists = LayeredAllowlist::default();
-    let heredoc_settings = config.heredoc_settings();
+    let mut heredoc_settings = config.heredoc_settings();
     assert!(
         heredoc_settings.enabled,
         "heredoc scanning must be on for these repros"
     );
+    // These assert verdicts, not scheduling. Heredoc extraction has its own
+    // 50 ms wall clock, and a loaded host ran past it and answered
+    // `heredoc.shell:incomplete-analysis` (bd-e1xl). The shipped budget is
+    // measured by the performance harness.
+    heredoc_settings.limits.timeout_ms = 5000;
     evaluate_command_with_pack_order_at_path_in_dialect(
         command,
         &enabled_keywords,

@@ -49,6 +49,8 @@ fn assert_verdict(case: &Case, command: &str, hook: bool) {
         // Production deadlines and the performance gates are unchanged.
         .env("DCG_HOOK_TIMEOUT_MS", "5000")
         .env("DCG_AST_TIMEOUT_MS", "5000")
+        // Heredoc extraction has its own 50 ms clock (bd-e1xl).
+        .env("DCG_HEREDOC_TIMEOUT_MS", "5000")
         .current_dir(scratch.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

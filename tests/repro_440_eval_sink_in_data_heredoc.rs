@@ -71,6 +71,9 @@ fn decision(command: &str) -> String {
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
         .env("DCG_SELF_HEAL_HOOK", "0")
         .env("DCG_HOOK_TIMEOUT_MS", "5000")
+        // Verdicts, not scheduling: heredoc extraction's own 50 ms clock
+        // answered incomplete-analysis on a loaded host (bd-e1xl).
+        .env("DCG_HEREDOC_TIMEOUT_MS", "5000")
         .current_dir(temp.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

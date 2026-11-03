@@ -143,6 +143,10 @@ EOF";
             // These assert semantics and rule ownership. The process-per-hook
             // performance harness exercises the shipped budgets separately.
             .env("DCG_AST_TIMEOUT_MS", "5000")
+            // Heredoc extraction has its own 50 ms wall clock, and the AST
+            // budget does not cover it; under load it answered
+            // `heredoc.shell:incomplete-analysis` (bd-e1xl).
+            .env("DCG_HEREDOC_TIMEOUT_MS", "5000")
             .current_dir(temporary.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
