@@ -3328,9 +3328,16 @@ fn skip_wrapper(name: &str, args: &[&Word]) -> Option<usize> {
 /// writes the key file. Returning `None` for it read the launcher as an
 /// unknown program, so these writes were allowed behind `strace`, `firejail`,
 /// `gosu`, `unshare`, `flock`, `chroot`, `watch` and every other launcher the
-/// Git pack already treats as running its operands. Its first writer operand
-/// is read as the wrapped program; an option value that happens to name a
-/// writer over-reads, which can only add a denial.
+/// Git pack already treats as running its operands.
+///
+/// The launcher's options are not modeled, so the program is not known to be
+/// its first writer-named operand: an option value or a lock file can name a
+/// writer too (`strace -o sed tee ~/.ssh/authorized_keys`,
+/// `flock /tmp/dd tee …`), and reading that one as the program judged
+/// `sed tee …`, which writes nothing, and allowed the write. So the writer
+/// returned is the first whose own argv writes a credential file, and the
+/// first writer-named operand only when none does. A writer word is never a
+/// launcher, so judging its argv here does not come back to this function.
 fn launcher_writer_operand(name: &str, args: &[&Word]) -> Option<usize> {
     let next = args.first().map(|word| word.as_string());
     let runs_operand =
@@ -3338,9 +3345,16 @@ fn launcher_writer_operand(name: &str, args: &[&Word]) -> Option<usize> {
     if !runs_operand {
         return None;
     }
-    args.iter().position(|word| {
-        executable_name(word).is_some_and(|executable| writer_kind(&executable).is_some())
-    })
+    let mut writers = args.iter().enumerate().filter_map(|(index, word)| {
+        executable_name(word)
+            .is_some_and(|executable| writer_kind(&executable).is_some())
+            .then_some(index)
+    });
+    let first = writers.next()?;
+    std::iter::once(first)
+        .chain(writers)
+        .find(|&index| classify_writer_argv(&args[index..]).is_some())
+        .or(Some(first))
 }
 
 const MAX_WRAPPER_DEPTH: usize = 16;
@@ -3411,6 +3425,11 @@ fn classify_command_in_view(tokens: &[Token], source_syntax: bool) -> Option<Cre
     } else {
         strip_prefixes_in_view(&words, false)
     }?;
+    classify_writer_argv(argv)
+}
+
+/// The credential write an argv whose program is a writer performs.
+fn classify_writer_argv(argv: &[&Word]) -> Option<CredentialFileWrite> {
     let (argv0, args) = argv.split_first()?;
     let kind = writer_kind(&executable_name(argv0)?)?;
     match kind {
@@ -5796,6 +5815,14 @@ mod tests {
             "echo k | noglob tee ~/.ssh/authorized_keys",
             "echo k | nocorrect tee ~/.ssh/authorized_keys",
             "echo k | builtin command tee ~/.ssh/authorized_keys",
+            // A writer name earlier among the launcher's operands, as an
+            // option value or a lock file, is not the program.
+            "echo k | strace -o sed tee ~/.ssh/authorized_keys",
+            "echo k | strace -o dd tee ~/.ssh/authorized_keys",
+            "echo k | flock /tmp/dd tee ~/.ssh/authorized_keys",
+            "echo k | chroot /tmp/sed tee ~/.ssh/authorized_keys",
+            "echo k | gosu dd tee ~/.ssh/authorized_keys",
+            "strace -o dd cp /tmp/k ~/.ssh/authorized_keys",
         ] {
             denied(command);
         }
