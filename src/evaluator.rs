@@ -15222,11 +15222,12 @@ fn view_decode_exposes_pack_keyword(
     });
     // A cmd `%NAME%` or `!NAME!` is expanded inside double quotes as well, and
     // cmd.exe has no single quotes, so `gi"%PATH:~0,0%"t` runs git wherever
-    // the POSIX quotes sit. A quoted one is evidence only for what removing
-    // the expansion itself reveals, not for the rest of cmd's decode: a quoted
-    // caret in `printf '%s\n' 'doc^ker system prune -af'` stays a string.
+    // the POSIX quotes sit. Only an expansion in the executable word counts:
+    // one in argument data (a printf format `'%-50s -> %s\n'`) reconstructs no
+    // command, and fanning out on it lets cmd.exe's quote handling read an
+    // inert `->` as a redirect.
     let cmd_expansion_present =
-        view == ShellDialect::Cmd && command.bytes().any(|byte| matches!(byte, b'%' | b'!'));
+        view == ShellDialect::Cmd && cmd_expansion_in_executable_word(command);
     if !view_escape_present && !cmd_expansion_present {
         return false;
     }
@@ -15266,8 +15267,8 @@ fn view_decode_exposes_pack_keyword(
         })
 }
 
-/// `command` with each cmd.exe `%NAME%`, delayed `!NAME!` and batch-parameter
-/// (`%1`, `%*`) expansion removed, or `None` when it has none.
+/// The byte ranges of cmd.exe `%NAME%`, delayed `!NAME!` and batch-parameter
+/// (`%1`, `%*`) expansions in `command`.
 ///
 /// Any text up to the next `%` (or `!`) on the line is taken for a name:
 /// cmd.exe names may hold spaces and punctuation (`%a b%`, `%PATH:~0, 0%`),
@@ -15275,12 +15276,10 @@ fn view_decode_exposes_pack_keyword(
 /// an expansion only asks for a replay, which then needs a keyword the POSIX
 /// view lacks, so `echo 50% off 20%` costs a keyword scan and nothing more.
 /// `%%` and `!!` stay: on a command line they are literal.
-fn elide_cmd_percent_expansions(command: &str) -> Option<String> {
+fn cmd_expansion_spans(command: &str) -> Vec<std::ops::Range<usize>> {
     let bytes = command.as_bytes();
-    let mut elided = String::with_capacity(command.len());
-    let mut copied_from = 0usize;
+    let mut spans = Vec::new();
     let mut index = 0usize;
-    let mut removed = false;
     while index < bytes.len() {
         let sigil = bytes[index];
         if !matches!(sigil, b'%' | b'!') {
@@ -15309,12 +15308,61 @@ fn elide_cmd_percent_expansions(command: &str) -> Option<String> {
             index += 1;
             continue;
         };
-        elided.push_str(&command[copied_from..index]);
-        copied_from = end;
+        spans.push(index..end);
         index = end;
-        removed = true;
     }
-    removed.then(|| {
+    spans
+}
+
+/// Whether a cmd expansion sits in a command-position word of `command`.
+///
+/// A quoted expansion is evidence only when removing it can reconstruct the
+/// program that runs (`gi"%PATH:~0,0%"t` → `git`), i.e. when it lies in the
+/// first word of a command. One in argument data — a printf format
+/// `'%-50s -> %s\n'` — cannot run anything; counting it would fan the command
+/// out to cmd.exe, whose quote handling then reads an inert `->` as a
+/// redirect. A command-position word is the first POSIX word, or the first
+/// after a separator; the word range covers its quoted segments, so a `%…%`
+/// inside the quotes of the program word (which POSIX reads as data) counts.
+fn cmd_expansion_in_executable_word(command: &str) -> bool {
+    let spans = cmd_expansion_spans(command);
+    if spans.is_empty() {
+        return false;
+    }
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Posix);
+    let mut at_command = true;
+    for token in &tokens {
+        match token.kind {
+            NormalizeTokenKind::Separator => at_command = true,
+            NormalizeTokenKind::Word => {
+                let range = token.byte_range.clone();
+                if at_command
+                    && spans
+                        .iter()
+                        .any(|span| span.start < range.end && range.start < span.end)
+                {
+                    return true;
+                }
+                at_command = false;
+            }
+        }
+    }
+    false
+}
+
+/// `command` with each cmd expansion removed, or `None` when it has none.
+fn elide_cmd_percent_expansions(command: &str) -> Option<String> {
+    let spans = cmd_expansion_spans(command);
+    if spans.is_empty() {
+        return None;
+    }
+    let mut elided = String::with_capacity(command.len());
+    let mut copied_from = 0usize;
+    for span in spans {
+        elided.push_str(&command[copied_from..span.start]);
+        copied_from = span.end;
+    }
+    Some({
         elided.push_str(&command[copied_from..]);
         elided
     })
@@ -60097,6 +60145,29 @@ mod tests {
                     denied,
                     "{command:?} in {dialect:?}: {result:?}"
                 );
+            }
+        }
+
+        // A `%` in argument data, not the executable word, is no expansion
+        // evidence: a printf format must not fan out to cmd.exe, whose quote
+        // handling would read the inert `->` as a redirect (regression).
+        for command in [
+            r"printf '%-50s -> %s\n' a b",
+            r"if true; then printf '%-50s -> %s\n' a b; fi; mv x y",
+            "echo 50% done 20%",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Cmd] {
+                let result = evaluate_with_pack_ids_in_dialect(
+                    command,
+                    &["core.filesystem", "windows.filesystem", "windows.disk"],
+                    dialect,
+                );
+                if dialect == ShellDialect::Unknown {
+                    assert!(
+                        result.is_allowed(),
+                        "{command:?} in {dialect:?}: {result:?}"
+                    );
+                }
             }
         }
 
