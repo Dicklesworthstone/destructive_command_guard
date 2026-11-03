@@ -9147,6 +9147,464 @@ fn python_pipeline_input_mode(
     PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Interpreter(language))
 }
 
+/// What an option of a Perl, Ruby, Node or PHP interpreter supplies, as read
+/// by [`script_interpreter_option_word`] (#611, #612).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterpreterOptionEffect<'a> {
+    /// Nothing that decides where the program comes from (`-w`, `-I lib`,
+    /// ruby's `-E UTF-8`, perl's `-p`).
+    Nothing,
+    /// The program text itself (`-e CODE`, `-pe CODE`, php's `-r CODE`).
+    Program(&'a str),
+    /// A file holding the program (php's `-f FILE`).
+    ProgramFile(&'a str),
+    /// Source is read from standard input whatever else the command line
+    /// holds (`node -i`, `php -a`).
+    ReadsStdin,
+    /// The interpreter prints something and exits before reading a program
+    /// (`-v`, `-h`, `--version`).
+    Exits,
+}
+
+/// One option word of a Perl or Ruby interpreter, with the short-option
+/// bundling both accept (`-lne`, `-anF:`, `-rjson`, `-0777`).
+///
+/// Each letter is read the way `perl`'s and `ruby`'s own switch parsers read
+/// it: a flag lets the next letter of the word be another option, `-e` takes
+/// the rest of the word or else the next word as the program, a value option
+/// such as `-I` or ruby's `-E` takes the rest of the word or else the next
+/// word, and options such as `-i[ext]` or `-F[pattern]` take the rest of the
+/// word. Returns the number of following words the option consumed, and what
+/// it supplies; `None` for a letter this reader does not model, or a value
+/// that is missing.
+fn perl_ruby_option_word<'a>(
+    language: crate::heredoc::ScriptLanguage,
+    word: &'a str,
+    next: Option<&'a String>,
+) -> Option<(usize, InterpreterOptionEffect<'a>)> {
+    #[derive(Clone, Copy)]
+    enum Letter {
+        /// No value; the next letter is another option.
+        Flag,
+        /// Prints and exits before reading a program.
+        Exits,
+        /// Takes the rest of the word, which may be empty.
+        RestOfWord,
+        /// Takes the rest of the word, which must not be empty (perl `-M`).
+        AttachedValue,
+        /// Takes octal digits from the word (at most `max`), then the next
+        /// letter is another option (`-0777`, `-l`, ruby's `-T1`).
+        Octal { max: usize },
+        /// Takes the rest of the word or, when that is empty, the next word.
+        Value,
+        /// The program: the rest of the word or, when that is empty, the next
+        /// word.
+        Program,
+        /// perl's `-d[t][:module]`.
+        PerlDebugger,
+        /// ruby's `-W[level]` and `-W:category`.
+        RubyWarning,
+        /// ruby's `-K[kcode]`: one more character, then more options.
+        OneCharacter,
+    }
+    let letter_kind = |letter: u8| -> Option<Letter> {
+        Some(match (language, letter) {
+            (crate::heredoc::ScriptLanguage::Perl, b'0') => Letter::Octal { max: 4 },
+            (crate::heredoc::ScriptLanguage::Perl, b'l') => Letter::Octal { max: 4 },
+            (
+                crate::heredoc::ScriptLanguage::Perl,
+                b'a' | b'c' | b'f' | b'g' | b'n' | b'p' | b's' | b'S' | b't' | b'T' | b'u'
+                | b'U' | b'w' | b'W' | b'X',
+            ) => Letter::Flag,
+            (crate::heredoc::ScriptLanguage::Perl, b'h' | b'v' | b'V') => Letter::Exits,
+            (crate::heredoc::ScriptLanguage::Perl, b'C' | b'D' | b'F' | b'i' | b'x') => {
+                Letter::RestOfWord
+            }
+            (crate::heredoc::ScriptLanguage::Perl, b'm' | b'M') => Letter::AttachedValue,
+            (crate::heredoc::ScriptLanguage::Perl, b'I') => Letter::Value,
+            (crate::heredoc::ScriptLanguage::Perl, b'e' | b'E') => Letter::Program,
+            (crate::heredoc::ScriptLanguage::Perl, b'd') => Letter::PerlDebugger,
+            (crate::heredoc::ScriptLanguage::Ruby, b'0') => Letter::Octal { max: 4 },
+            (crate::heredoc::ScriptLanguage::Ruby, b'T') => Letter::Octal { max: 2 },
+            (
+                crate::heredoc::ScriptLanguage::Ruby,
+                b'a' | b'c' | b'd' | b'l' | b'n' | b'p' | b's' | b'S' | b'U' | b'v' | b'w'
+                | b'y',
+            ) => Letter::Flag,
+            (crate::heredoc::ScriptLanguage::Ruby, b'h') => Letter::Exits,
+            (crate::heredoc::ScriptLanguage::Ruby, b'F' | b'i' | b'x') => Letter::RestOfWord,
+            (crate::heredoc::ScriptLanguage::Ruby, b'C' | b'E' | b'I' | b'r' | b'X') => {
+                Letter::Value
+            }
+            (crate::heredoc::ScriptLanguage::Ruby, b'e') => Letter::Program,
+            (crate::heredoc::ScriptLanguage::Ruby, b'W') => Letter::RubyWarning,
+            (crate::heredoc::ScriptLanguage::Ruby, b'K') => Letter::OneCharacter,
+            _ => return None,
+        })
+    };
+    let letters = word.as_bytes();
+    let mut at = 1usize;
+    while let Some(&letter) = letters.get(at) {
+        // Every modeled letter is ASCII, so the byte after it starts a char.
+        let rest = word.get(at + 1..)?;
+        match letter_kind(letter)? {
+            Letter::Flag => at += 1,
+            Letter::Exits => return Some((0, InterpreterOptionEffect::Exits)),
+            Letter::RestOfWord => return Some((0, InterpreterOptionEffect::Nothing)),
+            Letter::AttachedValue => {
+                return (!rest.is_empty()).then_some((0, InterpreterOptionEffect::Nothing));
+            }
+            Letter::Octal { max } => {
+                // perl's -0 counts its own `0` among the digits it reads.
+                let own = usize::from(letter == b'0');
+                at += 1;
+                let digits = rest
+                    .bytes()
+                    .take(max - own)
+                    .take_while(|byte| (b'0'..=b'7').contains(byte))
+                    .count();
+                // perl's -0xHH reads hexadecimal digits instead.
+                if letter == b'0'
+                    && language == crate::heredoc::ScriptLanguage::Perl
+                    && digits == 0
+                    && rest.starts_with('x')
+                {
+                    at += 1 + rest[1..]
+                        .bytes()
+                        .take_while(u8::is_ascii_hexdigit)
+                        .count();
+                } else {
+                    at += digits;
+                }
+            }
+            Letter::Value => {
+                return if rest.is_empty() {
+                    next.map(|_| (1, InterpreterOptionEffect::Nothing))
+                } else {
+                    Some((0, InterpreterOptionEffect::Nothing))
+                };
+            }
+            Letter::Program => {
+                return if rest.is_empty() {
+                    next.map(|code| (1, InterpreterOptionEffect::Program(code.as_str())))
+                } else {
+                    Some((0, InterpreterOptionEffect::Program(rest)))
+                };
+            }
+            Letter::PerlDebugger => {
+                at += 1;
+                if letters.get(at) == Some(&b't') {
+                    at += 1;
+                }
+                if matches!(letters.get(at), Some(b':' | b'=')) {
+                    return Some((0, InterpreterOptionEffect::Nothing));
+                }
+            }
+            Letter::RubyWarning => {
+                if rest.starts_with(':') {
+                    return Some((0, InterpreterOptionEffect::Nothing));
+                }
+                at += 1 + usize::from(rest.bytes().next().is_some_and(|byte| {
+                    (b'0'..=b'7').contains(&byte)
+                }));
+            }
+            Letter::OneCharacter => {
+                at += 1;
+                if let Some(kcode) = rest.chars().next() {
+                    at += kcode.len_utf8();
+                }
+            }
+        }
+    }
+    Some((0, InterpreterOptionEffect::Nothing))
+}
+
+/// One option word of a Perl, Ruby, Node or PHP interpreter. See
+/// [`perl_ruby_option_word`] for the return value.
+///
+/// Node and PHP do not bundle short options; every word is one option, read
+/// with its value from the rest of the word (`--eval=CODE`, php's `-dX=1`) or
+/// the next word. A long option this reader does not model is unknown, so a
+/// value it may take is never mistaken for the program or a script.
+fn script_interpreter_option_word<'a>(
+    language: crate::heredoc::ScriptLanguage,
+    word: &'a str,
+    next: Option<&'a String>,
+) -> Option<(usize, InterpreterOptionEffect<'a>)> {
+    use InterpreterOptionEffect::{Exits, Nothing, Program, ProgramFile, ReadsStdin};
+    let value = |effect: fn(&'a str) -> InterpreterOptionEffect<'a>| {
+        next.map(|value| (1, effect(value.as_str())))
+    };
+    match language {
+        crate::heredoc::ScriptLanguage::Perl => perl_ruby_option_word(language, word, next),
+        crate::heredoc::ScriptLanguage::Ruby => {
+            let Some(long) = word.strip_prefix("--") else {
+                return perl_ruby_option_word(language, word, next);
+            };
+            let (name, attached) = long.split_once('=').map_or((long, false), |(name, _)| (name, true));
+            match name {
+                "version" | "help" | "copyright" => Some((0, Exits)),
+                "verbose" | "yydebug" | "jit" | "yjit" | "rjit" => Some((0, Nothing)),
+                "enable" | "disable" | "encoding" | "external-encoding" | "internal-encoding"
+                | "dump" | "backtrace-limit" | "crash-report" | "parser" => {
+                    if attached {
+                        Some((0, Nothing))
+                    } else {
+                        value(|_| Nothing)
+                    }
+                }
+                _ if name.starts_with("enable-")
+                    || name.starts_with("disable-")
+                    || (attached && (name.starts_with("yjit-") || name.starts_with("jit-"))) =>
+                {
+                    Some((0, Nothing))
+                }
+                _ => None,
+            }
+        }
+        crate::heredoc::ScriptLanguage::JavaScript => {
+            if let Some(code) = word
+                .strip_prefix("--eval=")
+                .or_else(|| word.strip_prefix("--print="))
+            {
+                return Some((0, Program(code)));
+            }
+            match word {
+                "-e" | "--eval" | "-p" | "--print" | "-pe" => value(Program),
+                "-i" | "--interactive" => Some((0, ReadsStdin)),
+                "-v" | "--version" | "-h" | "--help" | "--v8-options" => Some((0, Exits)),
+                "-r" | "--require" | "--import" | "--loader" | "--experimental-loader" | "-C"
+                | "--conditions" | "--input-type" | "--env-file" | "--env-file-if-exists"
+                | "--title" | "--inspect-port" | "--debug-port" | "--openssl-config"
+                | "--icu-data-dir" | "--redirect-warnings" | "--disable-warning"
+                | "--unhandled-rejections" | "--dns-result-order" => value(|_| Nothing),
+                "-c"
+                | "--check"
+                | "--no-warnings"
+                | "--no-deprecation"
+                | "--trace-warnings"
+                | "--trace-deprecation"
+                | "--throw-deprecation"
+                | "--pending-deprecation"
+                | "--enable-source-maps"
+                | "--preserve-symlinks"
+                | "--preserve-symlinks-main"
+                | "--abort-on-uncaught-exception"
+                | "--use-strict"
+                | "--expose-gc"
+                | "--jitless"
+                | "--frozen-intrinsics"
+                | "--no-addons"
+                | "--trace-uncaught"
+                | "--trace-exit"
+                | "--zero-fill-buffers"
+                | "--inspect"
+                | "--inspect-brk"
+                | "--inspect-wait"
+                | "--experimental-vm-modules"
+                | "--experimental-strip-types"
+                | "--no-experimental-strip-types"
+                | "--experimental-transform-types"
+                | "--experimental-detect-module"
+                | "--experimental-require-module"
+                | "--experimental-json-modules"
+                | "--experimental-wasm-modules" => Some((0, Nothing)),
+                // A self-contained `--name=value` cannot take the next word.
+                _ if word.starts_with("--") && word.contains('=') => Some((0, Nothing)),
+                _ => None,
+            }
+        }
+        crate::heredoc::ScriptLanguage::Php => {
+            let bytes = word.as_bytes();
+            if word.starts_with("--") {
+                return match word {
+                    "--ini" => Some((0, Exits)),
+                    "--rf" | "--rc" | "--re" | "--rz" | "--ri" => value(|_| Exits),
+                    _ => None,
+                };
+            }
+            let (Some(&letter), Some(rest)) = (bytes.get(1), word.get(2..)) else {
+                return None;
+            };
+            let attached_or_next = |effect: fn(&'a str) -> InterpreterOptionEffect<'a>| {
+                if rest.is_empty() {
+                    value(effect)
+                } else {
+                    Some((0, effect(rest)))
+                }
+            };
+            match letter {
+                b'r' | b'R' => attached_or_next(Program),
+                b'f' | b'F' => attached_or_next(ProgramFile),
+                b'c' | b'd' | b'z' | b'B' | b'E' | b'S' | b't' => attached_or_next(|_| Nothing),
+                _ if !rest.is_empty() => None,
+                b'a' => Some((0, ReadsStdin)),
+                b'h' | b'i' | b'm' | b'v' => Some((0, Exits)),
+                b'e' | b'H' | b'l' | b'n' | b'q' | b's' | b'w' => Some((0, Nothing)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether a Perl or Ruby inline program at the end of a pipe is shown not to
+/// run the text it reads (#611, #624).
+///
+/// The piped text is that program's data, but a `-pe`/`-ne` filter that hands
+/// its input to a command runner or an evaluator runs it anyway. The program
+/// is cleared only when it names none of them and, for Perl, has no
+/// substitution flag `e`. Words are matched anywhere in the text, strings and
+/// comments included, so a miss costs a denial, never an allow. Node and PHP
+/// inline programs keep the reading they had before options were parsed.
+fn piped_inline_program_is_inert(language: crate::heredoc::ScriptLanguage, code: &str) -> bool {
+    static PERL_RUNNER: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\b(?:system|exec|eval|qx|readpipe|open|sysopen|pipe|syscall|fork)\b")
+            .expect("perl runner regex compiles")
+    });
+    static RUBY_RUNNER: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"\b(?:system|exec|spawn|fork|syscall|open|popen\w*|capture\w*|pipeline\w*",
+            r"|eval|instance_eval|class_eval|module_eval|instance_exec|class_exec",
+            r"|module_exec|send|public_send|__send__)\b|%x",
+        ))
+        .expect("ruby runner regex compiles")
+    });
+    let runner = match language {
+        crate::heredoc::ScriptLanguage::Perl => &*PERL_RUNNER,
+        crate::heredoc::ScriptLanguage::Ruby => &*RUBY_RUNNER,
+        _ => return true,
+    };
+    !code.contains('`')
+        && !runner.is_match(code)
+        && !(language == crate::heredoc::ScriptLanguage::Perl && perl_may_have_eval_flag(code))
+}
+
+/// Whether Perl text may hold a substitution with an `e` flag, which runs its
+/// replacement as code (`s/x/y/e`, `s{x}{y}ee`). Read as: a punctuation mark,
+/// then a run of substitution flag letters that includes `e` and is not
+/// followed by that same mark, which would make the run the pattern of a
+/// match such as `/needle/` rather than flags.
+fn perl_may_have_eval_flag(code: &str) -> bool {
+    const FLAGS: &[u8] = b"msixnpodualgcer";
+    let bytes = code.as_bytes();
+    bytes.iter().enumerate().any(|(at, &mark)| {
+        if !mark.is_ascii_punctuation() || mark == b'_' {
+            return false;
+        }
+        let run = bytes[at + 1..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_lowercase())
+            .count();
+        let letters = &bytes[at + 1..at + 1 + run];
+        let after = bytes.get(at + 1 + run).copied();
+        letters.contains(&b'e')
+            && letters.iter().all(|letter| FLAGS.contains(letter))
+            && after != Some(mark)
+            && !after.is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    })
+}
+
+/// Whether a Perl, Ruby, Node or PHP pipeline stage reads its program from
+/// the pipe (#611, #612).
+///
+/// The program comes from an inline-code option (`-e CODE`, the bundled
+/// `-pe CODE` and `-lne CODE`, php's `-r CODE`), from a script operand, or,
+/// with neither, from standard input. A flag's mere presence proves nothing:
+/// ruby's `-E UTF-8` names an encoding and perl's `-p` only wraps a loop
+/// around a program, so `… | ruby -E UTF-8` and `… | perl -p` run the piped
+/// text, `BEGIN` blocks first. Each option is read with the grammar its
+/// interpreter uses, and an option this reader does not model leaves the
+/// stage unverified rather than guessing whether it takes a value. An inline
+/// program clears the stage only when [`piped_inline_program_is_inert`] says
+/// it does not run what it reads. A script operand, whose program nothing
+/// here reads, stays unverified; a stdin device or `-` reads the pipe.
+fn script_interpreter_pipeline_input_mode(
+    executable: &str,
+    args: &[String],
+    language: crate::heredoc::ScriptLanguage,
+) -> PipelineShellInputMode {
+    let reads_stdin = PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Interpreter(language));
+    // irb reads its input as Ruby statements and has no inline-code option.
+    if language == crate::heredoc::ScriptLanguage::Ruby && executable.starts_with("irb") {
+        return reads_stdin;
+    }
+    let names_stdin =
+        |word: &str| word == "-" || classify_shell_positional(word) == ShellPositional::StdinDevice;
+    // A script file is a program nothing here has read, so it stays
+    // unverified, as it was before the options were parsed.
+    let operand_mode = |word: &str| {
+        if names_stdin(word) {
+            reads_stdin.clone()
+        } else {
+            PipelineShellInputMode::Unverified
+        }
+    };
+    let mut program = false;
+    let mut program_file = None;
+    let mut forced_stdin = false;
+    let mut operand = None;
+    let mut options_ended = false;
+    let mut index = 0usize;
+    while let Some(word) = args.get(index) {
+        // `shell_words` keeps redirections as words; the interpreter never
+        // sees them.
+        let class = classify_shell_positional(word);
+        if matches!(class, ShellPositional::StdinReassignRedirect { .. }) {
+            return PipelineShellInputMode::Unverified;
+        }
+        if let Some(next) = skip_redirect_token(class, index, args.len()) {
+            index = next;
+            continue;
+        }
+        if options_ended || word == "-" || !word.starts_with('-') {
+            operand = Some(word.as_str());
+            break;
+        }
+        if word == "--" {
+            // php reads `--` as the start of the script's own arguments, its
+            // program still coming from stdin; the others take a script next.
+            if language == crate::heredoc::ScriptLanguage::Php {
+                break;
+            }
+            options_ended = true;
+            index += 1;
+            continue;
+        }
+        let Some((consumed, effect)) =
+            script_interpreter_option_word(language, word, args.get(index + 1))
+        else {
+            return PipelineShellInputMode::Unverified;
+        };
+        match effect {
+            InterpreterOptionEffect::Nothing => {}
+            InterpreterOptionEffect::Program(code) => {
+                // A program spelled `-` or a stdin device is no program text a
+                // reader can vouch for.
+                if names_stdin(code) || !piped_inline_program_is_inert(language, code) {
+                    return PipelineShellInputMode::Unverified;
+                }
+                program = true;
+            }
+            InterpreterOptionEffect::ProgramFile(file) => program_file = Some(file),
+            InterpreterOptionEffect::ReadsStdin => forced_stdin = true,
+            InterpreterOptionEffect::Exits => return PipelineShellInputMode::DoesNotReadStdin,
+        }
+        index += 1 + consumed;
+    }
+    if forced_stdin {
+        return reads_stdin;
+    }
+    if program {
+        return PipelineShellInputMode::DoesNotReadStdin;
+    }
+    if let Some(file) = program_file {
+        return operand_mode(file);
+    }
+    // php's first operand is its script, like the other interpreters'.
+    operand.map_or(reads_stdin.clone(), operand_mode)
+}
+
 fn powershell_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
     let mut index = 0usize;
     while let Some(argument) = args.get(index) {
@@ -9752,19 +10210,10 @@ fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineSh
         if language == crate::heredoc::ScriptLanguage::Python {
             return python_pipeline_input_mode(&args, language);
         }
-        if args.is_empty() || args.first().is_some_and(|argument| argument == "-") {
-            return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Interpreter(language));
-        }
-        return if args.iter().any(|argument| {
-            matches!(
-                argument.as_str(),
-                "-c" | "-e" | "-E" | "-m" | "-r" | "-p" | "--eval" | "--print" | "--require"
-            )
-        }) {
-            PipelineShellInputMode::DoesNotReadStdin
-        } else {
-            PipelineShellInputMode::Unverified
-        };
+        // Each interpreter's own option grammar decides whether an option
+        // supplies the program: `-pe CODE` does, `-E UTF-8` and `-p` do not
+        // (#611, #612).
+        return script_interpreter_pipeline_input_mode(&executable, &args, language);
     }
 
     let mut force_stdin = false;
@@ -39670,6 +40119,176 @@ mod tests {
             discriminant(&pipeline_shell_input_mode("bash script.sh")),
             discriminant(&PipelineShellInputMode::DoesNotReadStdin)
         );
+    }
+
+    /// A Perl, Ruby, Node or PHP stage reads its program from the pipe unless
+    /// an option supplies one, read with each interpreter's own option
+    /// grammar: a bundled `-pe CODE` supplies it (#611), while `-p` and
+    /// ruby's `-E UTF-8` do not (#612). An inline Perl or Ruby program that
+    /// may run what it reads, and a script file nothing here reads, stay
+    /// unverified (#624).
+    #[test]
+    fn script_interpreter_stage_reads_the_program_its_options_name_611_612() {
+        use std::mem::discriminant;
+        let mode = |cmd: &str| discriminant(&pipeline_shell_input_mode(cmd));
+        let data = discriminant(&PipelineShellInputMode::DoesNotReadStdin);
+        let unverified = discriminant(&PipelineShellInputMode::Unverified);
+        let program = discriminant(&PipelineShellInputMode::ReadsStdin(
+            PipelineSourceKind::Interpreter(crate::heredoc::ScriptLanguage::Perl),
+        ));
+        for cmd in [
+            "perl -pe 's/x//'",
+            "perl -ne 'print'",
+            "perl -lne 'print'",
+            "perl -anE 'say $F[0]'",
+            "perl -le 'print 1'",
+            "perl -i -pe 's/x//'",
+            "perl -pi -e 's/x//' f",
+            "perl -0777 -pe 's/a/b/'",
+            "perl -00 -ne 'print'",
+            "perl -F: -lane 'print $F[0]'",
+            "perl -CS -pe 's/a/b/'",
+            "perl -Mutf8 -CSD -ne 'print'",
+            "perl -MList::Util=sum -lane 'print sum @F'",
+            "perl -ne 'print if /needle/'",
+            r"perl -pe 's/\e\[[0-9;]*m//g'",
+            "perl -e 'print 1' -e 'print 2'",
+            "perl -v",
+            "ruby -ne 'puts $_'",
+            "ruby -pe '$_.upcase!'",
+            "ruby -rjson -ne 'puts 1'",
+            "ruby -r json -ne 'puts 1'",
+            "ruby -E UTF-8 -ne 'puts $_'",
+            "ruby -Eutf-8 -ne 'puts $_'",
+            "ruby -an -F, -e 'puts $F[0]'",
+            "ruby --version",
+            "node -pe '1+1'",
+            "node --input-type=module -e 'console.log(1)'",
+            "php -r 'echo 1;'",
+        ] {
+            assert_eq!(mode(cmd), data, "{cmd}: the program is the inline code");
+        }
+        for cmd in [
+            "perl",
+            "perl -",
+            "perl -p",
+            "perl -n",
+            "perl -c",
+            "perl -w",
+            "perl -Mstrict",
+            "perl -I lib",
+            "perl /dev/stdin",
+            "ruby",
+            "ruby -w",
+            "ruby -p",
+            "ruby -E UTF-8",
+            "ruby --encoding UTF-8",
+            "ruby -r json",
+            "ruby -I lib",
+            "ruby -Ku",
+            "node",
+            "node -",
+            "node -r ./x.js",
+            "node --require ./x.js",
+            "php",
+            "php -c /etc/php.ini",
+            "php -e",
+        ] {
+            assert_eq!(mode(cmd), program, "{cmd}: the program is the piped text");
+        }
+        for cmd in [
+            // A script file nothing here reads.
+            "perl script.pl",
+            "perl -p script.pl",
+            "perl -w script.pl",
+            "ruby script.rb",
+            "node script.js",
+            "php script.php",
+            // `-pie` is `-p -i` with backup suffix `e`: `s/x//` is a file.
+            "perl -pie 's/x//'",
+            // Inline programs that may run the text they read.
+            "perl -ne 'system $_'",
+            "perl -n -e 'system $_'",
+            "perl -ne 'print `$_`'",
+            "perl -ne 'eval $_'",
+            "perl -pe 's/(.*)/$1/ee'",
+            "perl -pe 's/x/y/e'",
+            "perl -pe 's{x}{y}e'",
+            "perl -ne 'open(F, $_)'",
+            "perl -e 'print 1' -e 'system <STDIN>'",
+            "ruby -ne 'system $_'",
+            "ruby -n -e 'system $_'",
+            "ruby -e 'eval STDIN.read'",
+            "ruby -ne 'puts %x(#{$_})'",
+            "ruby -ne 'send(:system, $_)'",
+            // An option no reader models.
+            "perl --unknown",
+            "node --unmodeled-option x",
+        ] {
+            assert_eq!(mode(cmd), unverified, "{cmd}: must stay unverified");
+        }
+    }
+
+    /// The verdicts behind #611, #612 and #624 under the default packs: a
+    /// filter whose program is inline code is judged by that code, and a
+    /// program that comes from the pipe or may run what it reads is denied.
+    #[test]
+    fn piped_perl_ruby_filters_are_judged_by_their_program_611_612_624() {
+        let config = default_config();
+        let pack_ids: Vec<String> = config.enabled_pack_ids().into_iter().collect();
+        let pack_ids: Vec<&str> = pack_ids.iter().map(String::as_str).collect();
+        let evaluate =
+            |cmd: &str| evaluate_with_pack_ids_in_dialect(cmd, &pack_ids, ShellDialect::Posix);
+        for cmd in [
+            "cat /tmp/t.txt | perl -pe 's/x//'",
+            "cat /tmp/t.txt | perl -ne 'print'",
+            "cat /tmp/t.txt | perl -lne 'print'",
+            "cat /tmp/t.txt | perl -anE 'say $F[0]'",
+            "cat /tmp/t.txt | perl -i -pe 's/x//'",
+            "cat /tmp/t.txt | perl -pe 's/x//' | sort",
+            "cat /tmp/t.txt | ruby -ne 'puts $_'",
+            "cat /tmp/t.txt | ruby -pe '$_.upcase!'",
+            "cat x | perl -ne 'print if /error/'",
+            "cat x | ruby -pe 'gsub(/foo/, \"bar\")'",
+            r"tail -n 3 some.log | perl -pe 's/\e\[[0-9;]*m//g' | cut -c1-130",
+            "cat <<'EOF' | perl -pe 's/x//'\nsome data\nEOF",
+        ] {
+            let result = evaluate(cmd);
+            assert!(result.is_allowed(), "{cmd:?} must be allowed: {result:?}");
+        }
+        for cmd in [
+            // #612: the program is the piped text.
+            "echo 'system(\"git reset --hard\")' | ruby -E UTF-8",
+            "echo 'system(\"git reset --hard\")' | ruby -r json",
+            "echo 'BEGIN { system(\"git reset --hard\") }' | perl -p",
+            "echo 'END { system(\"git reset --hard\") }' | perl -p",
+            "echo 'BEGIN { system(\"git reset --hard\") }' | ruby -p",
+            "echo 'BEGIN { system(\"git reset --hard\") }' | perl -c",
+            "cat <<'EOF' | ruby -E UTF-8\nsystem(\"git reset --hard\")\nEOF",
+            "cat <<'EOF' | perl -p\nBEGIN { system(\"git reset --hard\") }\nEOF",
+            "echo 'require(\"child_process\").execSync(\"git reset --hard\")' | node -r ./x.js",
+            "echo '<?php system(\"git reset --hard\");' | php -c /etc/php.ini",
+            // #611: the inline program is still judged.
+            "cat /tmp/t.txt | perl -pe 'system(\"git reset --hard\")'",
+            "cat /tmp/t.txt | ruby -ne 'system(\"git reset --hard\")'",
+            // #624: a program that may run what it reads.
+            "cat x | perl -pe 's/x/system(\"git reset --hard\")/e'",
+            "cat x | perl -ne 'system $_'",
+            "cat x | perl -n -e 'system $_'",
+            "cat x | perl -pe 's/(.*)/$1/ee'",
+            "cat x | ruby -ne 'system $_'",
+            "cat x | ruby -n -e 'system $_'",
+            "cat x | ruby -e 'eval STDIN.read'",
+            "cat <<'EOF' | perl -ne 'system $_'\ngit reset --hard\nEOF",
+            // No program, or one nothing here reads.
+            "cat /tmp/t.txt | perl",
+            "cat /tmp/t.txt | perl -",
+            "cat /tmp/t.txt | perl -p script.pl",
+            "cat /tmp/t.txt | perl -pie 's/x//'",
+        ] {
+            let result = evaluate(cmd);
+            assert!(result.is_denied(), "{cmd:?} must be denied: {result:?}");
+        }
     }
 
     fn default_config() -> Config {
