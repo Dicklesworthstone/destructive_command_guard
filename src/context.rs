@@ -1145,6 +1145,19 @@ pub static SAFE_STRING_REGISTRY: SafeStringRegistry = SafeStringRegistry {
         SafeFlagEntry::long_multi("br", "--body"),
         SafeFlagEntry::long_multi("br", "--notes"),
         SafeFlagEntry::long_multi("br", "--reason"),
+        // The rest of `br update`/`br create`/`br close`'s free-text fields
+        // (#618). br stores each value; it never runs one. `--description-file`
+        // names a path and stays unmasked. A value holding `$(…)` or backticks
+        // is never masked: those run in the caller's shell before br starts.
+        SafeFlagEntry::long_multi("br", "--append-notes"),
+        SafeFlagEntry::long_multi("br", "--design"),
+        SafeFlagEntry::long_multi("br", "--acceptance-criteria"),
+        SafeFlagEntry::long_multi("br", "--acceptance"),
+        SafeFlagEntry::long_multi("br", "--add-acceptance"),
+        SafeFlagEntry::long_multi("br", "--prerequisites"),
+        SafeFlagEntry::long_multi("br", "--transition-comment"),
+        SafeFlagEntry::long_multi("br", "--agent-context"),
+        SafeFlagEntry::long_multi("br", "--bypass-reason"),
         // Search tools - patterns are data, not executed (only pattern-supplying flags)
         SafeFlagEntry::both("grep", "-e", "--regexp"),
         SafeFlagEntry::both("rg", "-e", "--regexp"),
