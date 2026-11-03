@@ -58,19 +58,18 @@ macro_rules! modprobe_dry_run_ahead {
 
 /// `modprobe` arguments that remove a module (`-r`, `--remove` or an
 /// abbreviation of it, or a short-flag cluster holding `r` such as `-rf`),
-/// unless they ask for a dry run. `MODPROBE_OPTIONS` puts its options ahead
-/// of the command line (`MODPROBE_OPTIONS=-C modprobe -n -r x` reads `-n` as
-/// the config file) and `POSIXLY_CORRECT` makes a `-n` after the module name
-/// an operand, so either in the same segment withdraws the dry-run exemption.
-/// A removal flag in `MODPROBE_OPTIONS` itself removes the module the command
-/// line names (`MODPROBE_OPTIONS=-r modprobe nvidia`).
+/// unless they ask for a dry run.
+///
+/// `MODPROBE_OPTIONS=-r`/`POSIXLY_CORRECT` prefixes cannot be matched here:
+/// the evaluator strips a leading environment assignment as a wrapper before
+/// any pack sees the command, so the variable is gone by match time. That
+/// env-layer bypass is bd-modprobe-env-option-bypass-fhep.
 macro_rules! modprobe_removal {
     () => {
         concat!(
-            r"(?:MODPROBE_OPTIONS[^\n]*?[=\s'\x22]-(?:-rem[a-z-]*|[a-zA-Z]*r[a-zA-Z]*)\b[^\n]*?modprobe\b",
-            r"|(?:(?:MODPROBE_OPTIONS|POSIXLY_CORRECT)\b[^\n]*?modprobe\b|modprobe\b(?!",
+            r"modprobe\b(?!",
             modprobe_dry_run_ahead!(),
-            r#"))(?:[ \t]+[^;&|\n'"]*?)?[ \t]-(?:-rem[a-z-]*\b|[a-zA-Z]*r[a-zA-Z]*\b))"#,
+            r#")(?:[ \t]+[^;&|\n'"]*?)?[ \t]-(?:-rem[a-z-]*\b|[a-zA-Z]*r[a-zA-Z]*\b)"#,
         )
     };
 }
@@ -736,12 +735,6 @@ mod tests {
             "modprobe --set -n -r nvidia",
             "modprobe --wai -n -r nvidia",
             "ssh gpu-host modprobe --conf -n -r nvidia",
-            // The environment adds options or stops their permutation.
-            "MODPROBE_OPTIONS=-C modprobe -n -r nvidia",
-            "env MODPROBE_OPTIONS=-C modprobe -n -r nvidia",
-            "POSIXLY_CORRECT=1 modprobe -r nvidia -n",
-            "MODPROBE_OPTIONS=-r modprobe nvidia",
-            "MODPROBE_OPTIONS='-v -r' modprobe nvidia",
             // A glob can expand to an option.
             "modprobe -r nvidia * -n",
             // An abbreviation of `--remove`.
