@@ -774,6 +774,32 @@ EOF";
         }
     }
 
+    /// A quoted `<<` earlier in the command swallowed the real operator into
+    /// the extractor's delimiter, so the program the heredoc runs was never
+    /// read: allowed by 0.16.0, denied by 0.15.3.
+    #[test]
+    fn quoted_operator_text_before_an_interpreter_heredoc_stays_denied() {
+        for (program, body) in [
+            (
+                "python3",
+                "import subprocess\nsubprocess.run('git reset --hard', shell=True)",
+            ),
+            (
+                "node",
+                "require('child_process').execSync('git reset --hard');",
+            ),
+        ] {
+            for prefix in ["echo '<<'; ", "grep -c '<<' notes.txt; ", "x='<<'; "] {
+                let command = format!("{prefix}{program} - <<'EOF'\n{body}\nEOF");
+                let (decision, rule) = hook_decision(&command);
+                assert_eq!(decision, "deny", "{command:?}: {rule}");
+            }
+        }
+        let command = "echo '<<'; python3 - <<'EOF'\nprint('hello')\nEOF";
+        let (decision, rule) = hook_decision(command);
+        assert_eq!(decision, "allow", "{command:?}: {rule}");
+    }
+
     #[test]
     fn issue_544_child_process_options_keep_executable_source_visible() {
         for (program, body) in [

@@ -1672,6 +1672,24 @@ static HEREDOC_EXTRACTOR: LazyLock<Regex> = LazyLock::new(|| {
         .expect("heredoc regex compiles")
 });
 
+/// [`HEREDOC_EXTRACTOR`] at every `<<`, overlapping matches included.
+///
+/// `captures_iter` resumes after each match, and a quoted fragment of the
+/// delimiter runs to the next `'`. So a `<<` inside quotes took the real
+/// operator into its delimiter: `echo '<<'; python3 - <<'EOF'` matched once,
+/// as `<<'; python3 - <<'EOF…`, and the Python heredoc was never extracted.
+/// Each search here resumes two bytes into the previous match, so every
+/// operator is a candidate of its own; the callers' checks reject false ones.
+fn heredoc_operator_captures(command: &str) -> impl Iterator<Item = regex::Captures<'_>> {
+    let mut next = 0usize;
+    std::iter::from_fn(move || {
+        let capture = HEREDOC_EXTRACTOR.captures_at(command, next)?;
+        // A match starts with the ASCII `<<`, so two bytes on is a boundary.
+        next = capture.get(0)?.start() + 2;
+        Some(capture)
+    })
+}
+
 /// Regex for here-string extraction with single quotes (<<<).
 static HERESTRING_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // Matches: <<< 'content' - content can contain double quotes
@@ -7957,7 +7975,7 @@ fn extract_heredocs(
         .or_else(|| {
             written_heredoc_interpreter_with_argv(command, true).map(|source| (source, true))
         });
-    for cap in HEREDOC_EXTRACTOR.captures_iter(command) {
+    for cap in heredoc_operator_captures(command) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
@@ -8309,10 +8327,14 @@ pub(crate) fn first_heredoc_target_command(command: &str) -> Option<String> {
     extract_heredoc_target_command(command, operator)
 }
 
-/// Whether a shell or interpreter runs the first heredoc in `command` as code.
+/// Whether a shell or interpreter receives the first heredoc in `command`.
 ///
-/// That is a shell, or an interpreter reading its program from standard input
-/// (`python3 - <<'EOF'`, `node -`, `ruby -`); here-strings count too.
+/// Any receiver [`ScriptLanguage::from_command`] knows counts, whether it
+/// reads its program from standard input (`python3 - <<'EOF'`) or runs a
+/// script that reads the body as input (`python3 load.py <<'EOF'`), which may
+/// run it too; here-strings count as well. Only the first operator and a
+/// directly resolved receiver are considered
+/// (bd-oversized-code-heredoc-receivers-azu4).
 ///
 /// The oversized hook-input path (bd-ym0p) asks this of a command too large
 /// to evaluate. Its scan windows cut such a body away from the program that
@@ -9480,7 +9502,7 @@ fn quoted_stdin_has_dynamic_source(
     unread: impl Fn(Option<&SkipReason>) -> bool,
 ) -> bool {
     let timeout = Duration::from_millis(limits.timeout_ms);
-    HEREDOC_EXTRACTOR.captures_iter(command).any(|cap| {
+    heredoc_operator_captures(command).any(|cap| {
         let (Some(operator), Some(word)) = (cap.get(0), cap.get(2)) else {
             return false;
         };
@@ -20455,6 +20477,32 @@ mod tests {
                 assert!(
                     range_is_quoted_interpreter_source(&command, range, ScriptLanguage::Python),
                     "extraction and source identity must agree: {command:?}"
+                );
+            }
+        }
+
+        /// A `<<` inside quotes earlier on the line is a candidate that the
+        /// checks reject, not one that swallows the real operator: its quoted
+        /// delimiter fragment used to run on to the `'` of `<<'EOF'`.
+        #[test]
+        fn quoted_operator_text_does_not_hide_the_real_heredoc() {
+            let body = "print('x')";
+            for prefix in [
+                "echo '<<'; ",
+                "grep -c '<<' f.txt; ",
+                "x='<<'; ",
+                "echo \"<<\"; ",
+            ] {
+                let command = format!("{prefix}python3 - <<'EOF'\n{body}\nEOF");
+                let ExtractionResult::Extracted(contents) =
+                    extract_content(&command, &ExtractionLimits::structural_scan())
+                else {
+                    panic!("expected the heredoc body: {command:?}");
+                };
+                assert!(
+                    contents.iter().any(|content| content.content == body
+                        && content.delimiter.as_deref() == Some("EOF")),
+                    "{command:?}: {contents:?}"
                 );
             }
         }
