@@ -1240,6 +1240,15 @@ fn test_audit_backtracking_requirements() {
                 "systemctl-reload",
                 "systemctl-show",
                 "systemctl-status",
+                // bd-w3l7: negative lookaheads exempt a dry run
+                // (`modprobe -n -r`), `rmmod --help`/`--version`, and ssh
+                // text that only prints an unload. Each lookahead starts at
+                // the verb and reads that command's own words: none crosses
+                // `;`, `&` or `|`. The rules run only on the modprobe, rmmod
+                // and ssh keywords.
+                "modprobe-remove",
+                "rmmod",
+                "ssh-remote-module-unload",
             ]),
         ),
         (
