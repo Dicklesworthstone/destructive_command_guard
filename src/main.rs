@@ -731,6 +731,16 @@ fn try_deny_unparseable_payload(
     // receiver (`cat > file <<'EOF'`) and padding outside any heredoc keep
     // the documented fail-open default.
     let mut oversized_code_command: Option<usize> = None;
+    // A PowerShell/cmd payload needs the `windows.*` packs, which are off by
+    // default on a non-Windows host and only enabled for a Windows payload.
+    // The normal parsed path computes this (see the `windows_payload` block in
+    // `run_hook`); omitting it here let an oversized `format C: /q` or
+    // `Remove-Item -Recurse -Force C:\` through, since padding past the input
+    // limit routes the command here instead (bd-oversized-windows-packs-t2jo).
+    // Judged over each whole extracted command — not the overlapping scan
+    // windows, which can split a command word — and refined exactly as the
+    // scan loop below refines each window.
+    let mut windows_payload = false;
     for command in hook::extract_commands_from_truncated_json(prefix) {
         if command.len() > max_command_bytes && oversized_code_command.is_none() {
             let mut head = max_command_bytes.min(command.len());
@@ -740,6 +750,13 @@ fn try_deny_unparseable_payload(
             if destructive_command_guard::heredoc::first_heredoc_runs_as_code(&command[..head]) {
                 oversized_code_command = Some(command.len());
             }
+        }
+        if !windows_payload {
+            windows_payload = match hook::refine_shell_dialect(&command, shell_dialect) {
+                ShellDialect::PowerShell | ShellDialect::Cmd => true,
+                ShellDialect::Unknown => hook::command_is_windows_shell_payload(&command),
+                ShellDialect::Posix => false,
+            };
         }
         push_oversized_scan_windows(&mut commands, &command, max_command_bytes);
     }
@@ -755,21 +772,6 @@ fn try_deny_unparseable_payload(
     let history_agent_type = history_agent_type_for_protocol(hook_protocol, detected_agent);
 
     let allowlists = load_effective_allowlists_for_agent(config, &effective_agent);
-    // A PowerShell/cmd payload needs the `windows.*` packs, which are off by
-    // default on a non-Windows host and only enabled for a Windows payload.
-    // The normal parsed path computes this (see the `windows_payload` block in
-    // `run_hook`); omitting it here let an oversized `format C: /q` or
-    // `Remove-Item -Recurse -Force C:\` through, since padding past the input
-    // limit routes the command here instead (bd-oversized-windows-packs-t2jo).
-    // Each window is refined exactly as the scan loop below refines it.
-    let windows_payload =
-        commands.iter().any(
-            |window| match hook::refine_shell_dialect(window, shell_dialect) {
-                ShellDialect::PowerShell | ShellDialect::Cmd => true,
-                ShellDialect::Unknown => hook::command_is_windows_shell_payload(window),
-                ShellDialect::Posix => false,
-            },
-        );
     let mut enabled_packs: HashSet<String> =
         config.enabled_pack_ids_for_agent_and_payload(&effective_agent, windows_payload);
     enabled_packs.extend(config.enabled_external_pack_ids(external_store, Some(&effective_agent)));
