@@ -709,7 +709,25 @@ fn try_deny_unparseable_payload(
     // destructive-then-padding.
     let max_command_bytes = config.general.max_command_bytes();
     let mut commands: Vec<String> = Vec::new();
+    // An over-length command whose heredoc a shell or interpreter runs as
+    // code (bd-ym0p). The windows below cut its body away from that program,
+    // so a scan that finds nothing has not judged the code. The normal path
+    // answers any command over `max_command_bytes` with the size-limit
+    // indeterminate; without this, the same `python3 - <<'EOF'` body allowed
+    // once the whole input also passed `max_hook_input_bytes`. A data
+    // receiver (`cat > file <<'EOF'`) and padding outside any heredoc keep
+    // the documented fail-open default.
+    let mut oversized_code_command: Option<usize> = None;
     for command in hook::extract_commands_from_truncated_json(prefix) {
+        if command.len() > max_command_bytes && oversized_code_command.is_none() {
+            let mut head = max_command_bytes.min(command.len());
+            while !command.is_char_boundary(head) {
+                head -= 1;
+            }
+            if destructive_command_guard::heredoc::first_heredoc_runs_as_code(&command[..head]) {
+                oversized_code_command = Some(command.len());
+            }
+        }
         push_oversized_scan_windows(&mut commands, &command, max_command_bytes);
     }
     if commands.is_empty() {
@@ -866,7 +884,10 @@ fn try_deny_unparseable_payload(
             ResolvedCommandOutcome::DenyFamily(_) | ResolvedCommandOutcome::Allow(_) => {}
         }
     }
-    let indeterminate = pending_indeterminate?;
+    let indeterminate = pending_indeterminate.or_else(|| {
+        oversized_code_command
+            .map(|command_len| ResolvedCommandOutcome::OversizedCommand { command_len })
+    })?;
     let mut history_writer = if config.history.enabled {
         let mut writer = create_history_writer(&config.history);
         writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());

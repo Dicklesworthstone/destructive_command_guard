@@ -8309,6 +8309,23 @@ pub(crate) fn first_heredoc_target_command(command: &str) -> Option<String> {
     extract_heredoc_target_command(command, operator)
 }
 
+/// Whether a shell or interpreter runs the first heredoc in `command` as code.
+///
+/// That is a shell, or an interpreter reading its program from standard input
+/// (`python3 - <<'EOF'`, `node -`, `ruby -`); here-strings count too.
+///
+/// The oversized hook-input path (bd-ym0p) asks this of a command too large
+/// to evaluate. Its scan windows cut such a body away from the program that
+/// runs it, so finding nothing in them is not an answer about the code, and
+/// the command gets the same indeterminate a merely over-length command gets.
+/// Data receivers (`cat > file <<'EOF'`) and unrecognized programs answer
+/// `false` and keep the documented fail-open default.
+#[must_use]
+pub fn first_heredoc_runs_as_code(command: &str) -> bool {
+    first_heredoc_target_command(command)
+        .is_some_and(|target| ScriptLanguage::from_command(&target) != ScriptLanguage::Unknown)
+}
+
 /// Extract the lexical command token that owns a heredoc, preserving an
 /// explicit path. Most callers need only the basename, but shell-name override
 /// analysis must distinguish a bare `cat` (subject to function/alias lookup)
