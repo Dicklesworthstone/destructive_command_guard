@@ -28,6 +28,63 @@ macro_rules! services_safe_pattern {
     };
 }
 
+/// Negative-lookahead body: the `modprobe` arguments ask for a dry run
+/// (`-n`, `--dry-run`, `--show`), which only prints what would be removed.
+///
+/// The walk steps over plain words and over an option whose value is the next
+/// word (`-C`, `-d`, `-S`, `-w` and their long forms), so `modprobe -C -n -r x`
+/// is not a dry run: there `-n` is the config file. It stops at `--`, which
+/// makes a later `-n` a module name, and at quotes, expansions, comments and
+/// redirections, whose words it cannot read. Stopping only loses the
+/// exemption, so the command stays denied (bd-w3l7).
+macro_rules! modprobe_dry_run_ahead {
+    () => {
+        concat!(
+            r"(?:[ \t]+(?:",
+            r"(?:-[a-zA-Z]*[CdSw]|--(?:config|dirname|set-version|wait))[ \t]+[^\s;&|'\x22`$()\\<>{}#]+",
+            r"|(?!--(?:[\s;&|]|$))(?!-[a-zA-Z]*[CdSw](?:[\s;&|]|$))",
+            r"(?!--(?:config|dirname|set-version|wait)(?:[\s;&|]|$))[^\s;&|'\x22`$()\\<>{}#]+",
+            r"))*?[ \t]+(?:-[abcDfhiqrRsvV]*n[a-zA-Z]*|--dry-run|--show)(?:[\s;&|]|$)",
+        )
+    };
+}
+
+/// `modprobe` arguments that remove a module (`-r`, `--remove`, or a short-flag
+/// cluster holding `r` such as `-rf`), unless they ask for a dry run.
+macro_rules! modprobe_removal {
+    () => {
+        concat!(
+            r"modprobe\b(?!",
+            modprobe_dry_run_ahead!(),
+            r#")(?:[ \t]+[^;&|\n'"]*?)?[ \t]-(?:-remove\b|[a-zA-Z]*r[a-zA-Z]*\b)"#,
+        )
+    };
+}
+
+/// `rmmod` with an operand, unless its only argument asks for help or the
+/// version (`rmmod --help`), which unloads nothing.
+macro_rules! rmmod_unload {
+    () => {
+        concat!(
+            r"rmmod\b(?![ \t]+(?:-h|--help|-V|--version)[ \t]*(?:$|[;&|\n'\x22]))",
+            r"[ \t]+[^\s;&|]",
+        )
+    };
+}
+
+/// One OpenSSH option word: `--`, a cluster of no-value flags, or a cluster
+/// ending in a value-taking letter with its value attached or in the next word.
+/// The letters are `heredoc::SSH_VALUE_OPTIONS` and `SSH_FLAG_OPTIONS`.
+macro_rules! ssh_option {
+    () => {
+        concat!(
+            r"(?:--|-[1246AaCfGgKkMNnqsTtVvXxYy]*[BbcDEeFIiJLlmOoPpQRSWw][ \t]*",
+            r"(?:'[^'\n]*'|\x22[^\x22\n]*\x22|[^\s;&|'\x22])+",
+            r"|-[1246AaCfGgKkMNnqsTtVvXxYy]+)",
+        )
+    };
+}
+
 /// Create the Services pack.
 #[must_use]
 pub fn create_pack() -> Pack {
@@ -240,52 +297,80 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Check current runlevel:\n  \
              runlevel"
         ),
-        // modprobe -r / --remove (also clustered short flags such as -rf)
-        destructive_pattern!(
-            "modprobe-remove",
-            r#"modprobe\b(?:[ \t]+[^;&|\n'"]*?)?[ \t]-(?:-remove\b|[a-zA-Z]*r[a-zA-Z]*\b)"#,
-            "Unloading a kernel module on a running host can crash or wedge the kernel.",
-            High,
-            "Removing a driver from a live kernel is not a safe reset. Unloading a GPU/DRM \
-             driver (nvidia, amdgpu, i915, ...) tears down the framebuffer console; on some \
-             kernels that teardown Oopses while holding the console lock, after which every \
-             new terminal, every tty close and `ps aux` hang in uninterruptible sleep until \
-             the machine is rebooted. Storage and network drivers can take their devices \
-             down with them.\n\n\
-             An nvidia-smi \"driver/library version mismatch\" means userspace was upgraded \
-             under a loaded module: schedule a reboot instead.\n\n\
-             Inspect without changing anything:\n  \
-             lsmod\n  \
-             modinfo <module>\n  \
-             modprobe -n -v -r <module>   (dry run)",
-            executables = ["modprobe"]
-        ),
-        // rmmod
-        destructive_pattern!(
-            "rmmod",
-            r"rmmod\b[ \t]+[^\s;&|]",
-            "Unloading a kernel module on a running host can crash or wedge the kernel.",
-            High,
-            "rmmod removes a driver from the running kernel. Unloading GPU/DRM, storage or \
-             network drivers can Oops the kernel or leave the console and tty layer wedged \
-             until reboot.\n\n\
-             Inspect without changing anything:\n  \
-             lsmod\n  \
-             modinfo <module>",
-            executables = ["rmmod"]
-        ),
-        // `ssh host sudo modprobe -r x`: an unquoted remote command is part of the ssh
-        // segment, so the two executable-scoped rules above never see it.
-        destructive_pattern!(
-            "ssh-remote-module-unload",
-            r#"ssh\b[^;&|\n]*?[ \t](?:sudo[ \t]+(?:-[a-zA-Z]+[ \t]+)*)?(?:modprobe\b[^;&|\n'"]*?[ \t]-(?:-remove\b|[a-zA-Z]*r[a-zA-Z]*\b)|rmmod[ \t]+[^\s;&|])"#,
-            "Unloading a kernel module on a remote host can crash or wedge its kernel.",
-            High,
-            "The remote command unloads a kernel module (modprobe -r / rmmod). Unloading \
-             GPU/DRM, storage or network drivers on a running host can Oops the kernel or \
-             leave the console and tty layer wedged until reboot.",
-            executables = ["ssh"]
-        ),
+        // modprobe -r / --remove (also clustered short flags such as -rf); a dry
+        // run (`-n`), which this rule's own advice recommends, removes nothing.
+        DestructivePattern {
+            regex: LazyCompiledRegex::new(modprobe_removal!()),
+            reason: "Unloading a kernel module on a running host can crash or wedge the kernel.",
+            name: Some("modprobe-remove"),
+            severity: crate::packs::Severity::High,
+            explanation: Some(
+                "Removing a driver from a live kernel is not a safe reset. Unloading a GPU/DRM \
+                 driver (nvidia, amdgpu, i915, ...) tears down the framebuffer console; on some \
+                 kernels that teardown Oopses while holding the console lock, after which every \
+                 new terminal, every tty close and `ps aux` hang in uninterruptible sleep until \
+                 the machine is rebooted. Storage and network drivers can take their devices \
+                 down with them.\n\n\
+                 An nvidia-smi \"driver/library version mismatch\" means userspace was upgraded \
+                 under a loaded module: schedule a reboot instead.\n\n\
+                 Inspect without changing anything:\n  \
+                 lsmod\n  \
+                 modinfo <module>\n  \
+                 modprobe -n -v -r <module>   (dry run)",
+            ),
+            suggestions: &[],
+            executables: Some(&["modprobe"]),
+        },
+        // rmmod with an operand; `rmmod --help` and `rmmod --version` unload nothing.
+        DestructivePattern {
+            regex: LazyCompiledRegex::new(rmmod_unload!()),
+            reason: "Unloading a kernel module on a running host can crash or wedge the kernel.",
+            name: Some("rmmod"),
+            severity: crate::packs::Severity::High,
+            explanation: Some(
+                "rmmod removes a driver from the running kernel. Unloading GPU/DRM, storage or \
+                 network drivers can Oops the kernel or leave the console and tty layer wedged \
+                 until reboot.\n\n\
+                 Inspect without changing anything:\n  \
+                 lsmod\n  \
+                 modinfo <module>",
+            ),
+            suggestions: &[],
+            executables: Some(&["rmmod"]),
+        },
+        // `ssh host sudo modprobe -r x`: the remote command is part of the ssh
+        // segment, so the two executable-scoped rules above never see it. The
+        // heredoc extractor normally lifts it out and those rules answer; this is
+        // the backstop for when it does not. It reads ssh's options and destination
+        // and wants the unloader at the remote program position, behind at most
+        // sudo/doas or a launcher: `ssh host echo rmmod x` only prints (bd-w3l7).
+        DestructivePattern {
+            regex: LazyCompiledRegex::new(concat!(
+                r"ssh\b(?:[ \t]+",
+                ssh_option!(),
+                r")*[ \t]+[^\s;&|<>()#-][^\s;&|<>()]*(?:[ \t]+",
+                ssh_option!(),
+                r")*[ \t]+['\x22]?",
+                r"(?:(?:sudo|doas)(?:[ \t]+(?:-[a-zA-Z]*[CDgpRrTtUu][ \t]+[^\s;&|]+|-[^\s;&|]+))*[ \t]+",
+                r"|(?:env|nice|ionice|nohup|timeout|stdbuf|setsid|chrt|taskset|exec|time)",
+                r"(?:[ \t]+(?:-[^\s;&|]+|[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]*|[0-9][^\s;&|]*))*[ \t]+)*",
+                r"(?:[^\s;&|'\x22]*/)?(?:",
+                modprobe_removal!(),
+                r"|",
+                rmmod_unload!(),
+                r")",
+            )),
+            reason: "Unloading a kernel module on a remote host can crash or wedge its kernel.",
+            name: Some("ssh-remote-module-unload"),
+            severity: crate::packs::Severity::High,
+            explanation: Some(
+                "The remote command unloads a kernel module (modprobe -r / rmmod). Unloading \
+                 GPU/DRM, storage or network drivers on a running host can Oops the kernel or \
+                 leave the console and tty layer wedged until reboot.",
+            ),
+            suggestions: &[],
+            executables: Some(&["ssh"]),
+        },
     ]
 }
 
@@ -500,6 +585,41 @@ mod tests {
                 "ssh -i key gpu-host sudo -n rmmod nvidia",
                 "ssh-remote-module-unload",
             ),
+            (
+                "ssh -p 22 gpu-host rmmod nvidia",
+                "ssh-remote-module-unload",
+            ),
+            (
+                "ssh -p22 -tt gpu-host rmmod nvidia",
+                "ssh-remote-module-unload",
+            ),
+            (
+                "ssh -o 'ProxyJump bastion' gpu-host modprobe -r nvidia",
+                "ssh-remote-module-unload",
+            ),
+            (
+                "ssh gpu-host -t -- sudo modprobe -rf nvidia",
+                "ssh-remote-module-unload",
+            ),
+            (
+                "ssh gpu-host 'sudo modprobe -r nvidia'",
+                "ssh-remote-module-unload",
+            ),
+            ("ssh gpu-host \"rmmod nvidia\"", "ssh-remote-module-unload"),
+            (
+                "ssh gpu-host sudo -u root /sbin/rmmod nvidia",
+                "ssh-remote-module-unload",
+            ),
+            (
+                "ssh gpu-host nice -n 5 env LC_ALL=C rmmod nvidia",
+                "ssh-remote-module-unload",
+            ),
+            // `-l` takes the next word as the login, so `rmmod` there is the
+            // user name and the remote program is the one after the host.
+            (
+                "ssh -l rmmod gpu-host modprobe -r nvidia",
+                "ssh-remote-module-unload",
+            ),
         ] {
             assert!(
                 pack.might_match(command),
@@ -526,10 +646,71 @@ mod tests {
             "pgrep -f \"modprobe -r nvidia\"",
             "echo use rmmod carefully",
             "ssh gpu-host lsmod",
+            // A dry run prints what would be removed; the rule's own advice
+            // recommends `modprobe -n -v -r <module>` (bd-w3l7).
+            "modprobe -n -v -r nvidia",
+            "sudo modprobe -nvr nvidia",
+            "modprobe -rn nvidia",
+            "modprobe -r -n nvidia",
+            "modprobe --dry-run -r nvidia",
+            "modprobe --remove --show nvidia",
+            "modprobe -C /etc/modprobe.conf -n -r nvidia",
+            "modprobe -n -r nvidia nvidia_drm",
+            // Help and version print and exit.
+            "rmmod --help",
+            "rmmod -h",
+            "rmmod --version",
+            "sudo rmmod -V",
+            // The remote program is the word after the destination; unload
+            // syntax later in its arguments is text.
+            "ssh gpu-host echo modprobe -r nvidia",
+            "ssh gpu-host echo rmmod nvidia",
+            "ssh gpu-host 'echo rmmod nvidia'",
+            "ssh gpu-host grep -rn \"modprobe -r\" /etc",
+            "ssh gpu-host journalctl -k --grep rmmod",
+            "ssh -l rmmod gpu-host lsmod",
+            "ssh gpu-host modprobe -n -r nvidia",
+            "ssh gpu-host sudo rmmod --help",
         ] {
             assert!(
                 pack.check(command).is_none(),
                 "{command:?} must not be blocked"
+            );
+        }
+    }
+
+    /// The dry-run exemption only applies where `-n` really is modprobe's
+    /// dry-run option. Everywhere it is not, or cannot be read, the removal
+    /// stays blocked.
+    #[test]
+    fn kernel_module_dry_run_exemption_does_not_reach_real_removals() {
+        let pack = create_pack();
+        for command in [
+            // `-n` is the value of an option that takes the next word.
+            "modprobe -C -n -r nvidia",
+            "modprobe -d -n -r nvidia",
+            "modprobe --config -n -r nvidia",
+            "modprobe -rS -n nvidia",
+            // `--` ends the options: `-n` is a module name.
+            "modprobe -r nvidia -- -n",
+            // Text the walk cannot read as modprobe's own words.
+            "modprobe -r nvidia # -n",
+            "modprobe -r nvidia 'opt -n x'",
+            "modprobe -r nvidia $( echo -n )",
+            "modprobe -r nvidia > -n",
+            // `n` as the attached value of `-C`.
+            "modprobe -Cn -r nvidia",
+            // Each segment is judged on its own.
+            "modprobe -n -r nvidia; modprobe -r nvidia",
+            // rmmod with more than a lone help/version word.
+            "rmmod --help nvidia",
+            "rmmod -v nvidia",
+            "ssh gpu-host modprobe -n -r x; ssh gpu-host modprobe -r nvidia",
+            "ssh gpu-host rmmod --help nvidia",
+        ] {
+            assert!(
+                pack.check(command).is_some(),
+                "{command:?} must stay blocked"
             );
         }
     }
