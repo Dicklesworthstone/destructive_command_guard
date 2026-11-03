@@ -43,6 +43,7 @@ delete process.env.DCG_BRIDGE_CRASH_DECISION;
 
 const DESTRUCTIVE = "rm -rf /";
 const SAFE = "git status";
+const WARNING = "git stash drop stash@{0}";
 let failures = 0;
 let checks = 0;
 const check = (name, ok, detail = "") => {
@@ -181,14 +182,14 @@ for (const [adapter, invoke] of adapters) {
     const originalError = console.error;
     console.error = (...parts) => warnings.push(parts.join(" "));
     try {
-      for (const command of [DESTRUCTIVE, "git reset --hard", SAFE]) {
+      for (const command of [DESTRUCTIVE, "git reset --hard", WARNING, SAFE]) {
         let executed = false;
         const args = { command };
         const error = await threw(async () => {
           await invoke(tool, args);
           executed = true;
         });
-        const allowed = command === SAFE;
+        const allowed = command === SAFE || command === WARNING;
         check(`${adapter}/${tool}: ${command}`, (error === null) === allowed, String(error?.message));
         check(`${adapter}/${tool}: interception precedes execution`, executed === allowed);
         check(`${adapter}/${tool}: command is not rewritten`, args.command === command);
@@ -291,17 +292,76 @@ fn javascript_runtimes() -> Vec<&'static str> {
         .collect()
 }
 
-/// Install the plugin the way the CLI does, into a HOME that is not the
-/// operator's: this test must never write to a real OpenCode config.
-fn install_plugin(home: &Path) -> PathBuf {
-    let output = Command::new(env!("CARGO_BIN_EXE_dcg"))
-        .args(["install", "--opencode"])
+/// Keep the installed plugin and its dcg subprocesses on the shipped policy,
+/// isolated from the operator's bypasses, profiles, config, and state.
+fn isolate_dcg_command(command: &mut Command, home: &Path) {
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("DCG_"))
+        {
+            command.env_remove(key);
+        }
+    }
+    // Earlier markers in agent::detect_from_environment would otherwise win
+    // over the OPENCODE=1 supplied by the real plugin and the direct probe.
+    for marker in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE",
+        "CLAUDE_SESSION_ID",
+        "AUGMENT_AGENT",
+        "AUGMENT_CONVERSATION_ID",
+        "AIDER_SESSION",
+        "CONTINUE_SESSION_ID",
+        "CODEX_CLI",
+        "GEMINI_CLI",
+        "COPILOT_CLI",
+        "COPILOT_AGENT_START_TIME_SEC",
+        "CURSOR_IDE",
+        "HERMES_AGENT",
+        "HERMES_SESSION_ID",
+        "GROK_SESSION_ID",
+        "GROK_HOOK_EVENT",
+        "GROK_WORKSPACE_ROOT",
+        "ANTIGRAVITY_CONVERSATION_ID",
+        "OPENCODE",
+        "CRUSH",
+        "PI_CODING_AGENT",
+        "PA_PROJECT_DIR",
+        "FACTORY_PROJECT_DIR",
+    ] {
+        command.env_remove(marker);
+    }
+    command
+        .current_dir(home)
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("DCG_NO_SELF_HEAL", "1")
-        .env("NO_COLOR", "1")
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("APPDATA", home.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", home.join("AppData/Local"))
+        .env("ProgramData", home)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env(
+            "DCG_CONFIG",
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/fixtures/configs/minimal.toml"),
+        )
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_HISTORY_DISABLED", "1")
+        .env("DCG_SELF_HEAL_HOOK", "0")
+        .env("NO_COLOR", "1");
+}
+
+/// Install the plugin the way the CLI does, into a HOME that is not the
+/// operator's: this test must never write to a real OpenCode config.
+fn install_plugin(home: &Path) -> PathBuf {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dcg"));
+    isolate_dcg_command(&mut command, home);
+    let output = command
+        .args(["install", "--opencode"])
         .output()
         .expect("run dcg install --opencode");
     assert!(
@@ -367,7 +427,7 @@ fn write_no_verdict_fakes(_root: &Path) -> Option<PathBuf> {
 }
 
 /// The dcg side of the plugin contract: asked for an explicit verdict, an
-/// allowed command (or a tool dcg does not judge) answers
+/// allowed or warning command (or a tool dcg does not judge) answers
 /// `{"dcg_verdict":"allow"}`, a denied one answers with the deny document
 /// alone, and a request without the field keeps the Claude-compatible silent
 /// allow. Needs no JavaScript runtime.
@@ -375,14 +435,10 @@ fn write_no_verdict_fakes(_root: &Path) -> Option<PathBuf> {
 fn explicit_verdict_request_gets_exactly_one_answer() {
     let temp = tempfile::tempdir().expect("create a temporary HOME");
     let run_payload = |payload: serde_json::Value| {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_dcg"))
-            .env("HOME", temp.path())
-            .env("USERPROFILE", temp.path())
-            .env("XDG_CONFIG_HOME", temp.path().join(".config"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dcg"));
+        isolate_dcg_command(&mut command, temp.path());
+        let mut child = command
             .env("OPENCODE", "1")
-            .env("DCG_NO_SELF_HEAL", "1")
-            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
-            .env_remove("DCG_BYPASS")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -402,7 +458,10 @@ fn explicit_verdict_request_gets_exactly_one_answer() {
             output.status,
             String::from_utf8_lossy(&output.stderr)
         );
-        String::from_utf8(output.stdout).expect("UTF-8 stdout")
+        (
+            String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+            String::from_utf8(output.stderr).expect("UTF-8 stderr"),
+        )
     };
     let bash = |command: &str, explicit: serde_json::Value| {
         run_payload(serde_json::json!({
@@ -413,37 +472,65 @@ fn explicit_verdict_request_gets_exactly_one_answer() {
     };
     const ALLOW_LINE: &str = "{\"dcg_verdict\":\"allow\"}\n";
 
-    assert_eq!(bash("git status", true.into()), ALLOW_LINE);
+    assert_eq!(bash("git status", true.into()).0, ALLOW_LINE);
     // A tool dcg does not judge is allowed, so it is answered too.
     assert_eq!(
         run_payload(serde_json::json!({
             "tool_name": "Read",
             "tool_input": { "file_path": "/etc/hosts" },
             "dcg_explicit_verdict": true,
-        })),
+        }))
+        .0,
         ALLOW_LINE
     );
 
-    let denied = bash("git reset --hard", true.into());
-    assert_eq!(denied.lines().count(), 1, "one document: {denied}");
-    let document: serde_json::Value = serde_json::from_str(&denied).expect("a JSON deny");
-    assert_eq!(
-        document["hookSpecificOutput"]["permissionDecision"], "deny",
-        "{document}"
+    // #639/#640: warnings write only to stderr under this exact OpenCode
+    // envelope. That must leave the stdout slot available for the requested
+    // allow acknowledgement, while keeping the warning visible.
+    let (warned, warning) = bash("git stash drop stash@{0}", true.into());
+    assert_eq!(warned, ALLOW_LINE, "warning stderr: {warning}");
+    let document: serde_json::Value =
+        serde_json::from_str(&warned).expect("exactly one parseable warning acknowledgement");
+    assert_eq!(document, serde_json::json!({"dcg_verdict": "allow"}));
+    assert!(
+        warning.contains("WARNING")
+            && warning.contains("core.git:stash-drop")
+            && warning.contains("git stash drop stash@{0}"),
+        "warning must remain on stderr: {warning}"
     );
-    assert!(!denied.contains("dcg_verdict"), "{denied}");
+
+    for command in [
+        "git reset --hard",
+        "git stash drop stash@{0}; git reset --hard",
+        "git reset --hard; git stash drop stash@{0}",
+    ] {
+        let (denied, stderr) = bash(command, true.into());
+        assert_eq!(denied.lines().count(), 1, "one document: {denied}");
+        let document: serde_json::Value =
+            serde_json::from_str(&denied).expect("a single JSON deny, with no trailing allow");
+        assert_eq!(
+            document["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{command}: {document}"
+        );
+        assert!(!denied.contains("dcg_verdict"), "{denied}");
+        assert!(stderr.contains("BLOCKED"), "{command}: {stderr}");
+    }
 
     // Hosts never send the field and keep the silent allow; only a JSON
     // `true` asks for the line.
-    assert_eq!(
-        run_payload(serde_json::json!({
+    for command in ["git status", "git stash drop stash@{0}"] {
+        let (stdout, stderr) = run_payload(serde_json::json!({
             "tool_name": "Bash",
-            "tool_input": { "command": "git status" },
-        })),
-        ""
-    );
-    assert_eq!(bash("git status", "true".into()), "");
-    assert_eq!(bash("git status", false.into()), "");
+            "tool_input": { "command": command },
+        }));
+        assert!(stdout.is_empty(), "{command}: {stdout}");
+        assert_eq!(stderr.contains("WARNING"), command.contains("stash drop"));
+        for explicit in [serde_json::json!("true"), serde_json::json!(false)] {
+            let (stdout, stderr) = bash(command, explicit);
+            assert!(stdout.is_empty(), "{command}: {stdout}");
+            assert_eq!(stderr.contains("WARNING"), command.contains("stash drop"));
+        }
+    }
 }
 
 #[test]
@@ -464,18 +551,13 @@ fn generated_opencode_plugin_loads_and_denies_under_both_contracts() {
     let fakes = write_no_verdict_fakes(temp.path());
 
     for runtime in &runtimes {
-        let output = Command::new(runtime)
+        let mut command = Command::new(runtime);
+        isolate_dcg_command(&mut command, temp.path());
+        let output = command
             .arg(&driver)
             .arg(&plugin)
             .arg(env!("CARGO_BIN_EXE_dcg"))
             .args(&fakes)
-            // The plugin shells out to dcg, which must not read operator config.
-            .env("HOME", temp.path())
-            .env("USERPROFILE", temp.path())
-            .env("XDG_CONFIG_HOME", temp.path().join(".config"))
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("DCG_NO_SELF_HEAL", "1")
-            .env("NO_COLOR", "1")
             .output()
             .unwrap_or_else(|error| panic!("run the driver under {runtime}: {error}"));
 

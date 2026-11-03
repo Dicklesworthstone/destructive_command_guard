@@ -631,6 +631,123 @@ fn run_hook_mode_raw_with_options(
     (stdout, stderr, exit_code)
 }
 
+#[test]
+fn test_stderr_only_warnings_preserve_exit_and_stdout_contracts() {
+    let command = "git stash drop stash@{0}";
+    let cases = [
+        (
+            "claude-code",
+            serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}}),
+            0,
+        ),
+        (
+            "cursor",
+            serde_json::json!({"tool_name": "shell", "tool_input": {"command": command}}),
+            0,
+        ),
+        (
+            "codex",
+            serde_json::json!({"turn_id": "warn-640", "tool_name": "Bash", "tool_input": {"command": command}}),
+            0,
+        ),
+        (
+            "copilot",
+            serde_json::json!({"event": "pre-tool-use", "toolName": "bash", "toolArgs": {"command": command}}),
+            0,
+        ),
+        (
+            "agy",
+            serde_json::json!({"toolCall": {"name": "run_command", "args": {"CommandLine": command}}}),
+            0,
+        ),
+        (
+            "reasonix",
+            serde_json::json!({"event": "PreToolUse", "toolName": "bash", "toolArgs": {"command": command}}),
+            1,
+        ),
+    ];
+
+    for (agent, payload, expected_exit) in cases {
+        for explicit in [false, true] {
+            let mut input = payload.clone();
+            if explicit {
+                input["dcg_explicit_verdict"] = true.into();
+            }
+            let (stdout, stderr, exit_code) =
+                run_hook_mode_raw_with_options(&input.to_string(), &["--agent", agent], &[]);
+            assert_eq!(exit_code, expected_exit, "{agent}: {stderr}");
+            assert!(
+                stderr.contains("WARNING") && stderr.contains("core.git:stash-drop"),
+                "{agent} warning must remain visible: {stderr}"
+            );
+            if explicit && expected_exit == 0 {
+                let document: serde_json::Value = serde_json::from_str(&stdout)
+                    .unwrap_or_else(|error| panic!("{agent}: {error}; {stdout:?}; {stderr}"));
+                assert_eq!(document, serde_json::json!({"dcg_verdict": "allow"}));
+            } else {
+                // Native hosts did not request an acknowledgement. Reasonix
+                // communicates a non-blocking warning through exit 1 alone.
+                assert!(stdout.is_empty(), "{agent}: {stdout:?}; {stderr}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_structured_warnings_own_exactly_one_explicit_response() {
+    let command = "git stash drop stash@{0}";
+    let cases = [
+        (
+            "gemini",
+            serde_json::json!({"hook_event_name": "BeforeTool", "tool_name": "run_shell_command", "tool_input": {"command": command}}),
+            "systemMessage",
+            Some("allow"),
+        ),
+        (
+            "hermes",
+            serde_json::json!({"hook_event_name": "pre_tool_call", "tool_name": "terminal", "tool_input": {"command": command}}),
+            "context",
+            None,
+        ),
+        (
+            "grok",
+            serde_json::json!({"hookEventName": "pre_tool_use", "toolName": "run_terminal_cmd", "toolInput": {"command": command}}),
+            "reason",
+            Some("allow"),
+        ),
+        (
+            "crush",
+            serde_json::json!({"event": "PreToolUse", "tool_name": "bash", "tool_input": {"command": command}}),
+            "context",
+            None,
+        ),
+    ];
+
+    for (agent, mut input, warning_field, decision) in cases {
+        input["dcg_explicit_verdict"] = true.into();
+        let (stdout, stderr, exit_code) =
+            run_hook_mode_raw_with_options(&input.to_string(), &["--agent", agent], &[]);
+        assert_eq!(exit_code, 0, "{agent}: {stderr}");
+        // Parsing the entire byte stream rejects a second document appended
+        // by the explicit-allow fallback after a real warning response.
+        let document: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|error| panic!("{agent}: {error}; {stdout:?}; {stderr}"));
+        assert!(document.get("dcg_verdict").is_none(), "{agent}: {document}");
+        assert_eq!(
+            document["decision"].as_str(),
+            decision,
+            "{agent}: {document}"
+        );
+        assert!(
+            document[warning_field]
+                .as_str()
+                .is_some_and(|warning| warning.contains("git stash drop")),
+            "{agent} must preserve its structured warning: {document}"
+        );
+        assert!(stderr.contains("WARNING"), "{agent}: {stderr}");
+    }
+}
+
 /// Independent consumer schema: extra output fields must fail deserialization,
 /// rather than being ignored by `serde_json::Value`.
 #[derive(Debug, serde::Deserialize)]

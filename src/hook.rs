@@ -824,9 +824,14 @@ impl HookProtocol {
 /// [`HookProtocol::undeliverable_block_exit_code`] for blocking verdicts and
 /// ignores it for warnings, whose command was going to proceed anyway.
 fn deliver_verdict(payload: &[u8]) -> io::Result<()> {
+    // A stderr-only warning has no stdout document to publish. Leave the
+    // slot available for an explicit verdict requested by the caller.
+    if payload.is_empty() {
+        return Ok(());
+    }
     if !claim_verdict_output() {
-        // The panic backstop already owns stdout and is about to exit with
-        // its own fail-closed verdict; a second document would corrupt it.
+        // A prior verdict or the panic backstop already owns stdout; a
+        // second document would corrupt the response.
         return Ok(());
     }
     let stdout = io::stdout();
@@ -843,8 +848,9 @@ fn deliver_verdict(payload: &[u8]) -> io::Result<()> {
 /// this line uses a dcg-only key that no host acts on.
 pub const EXPLICIT_ALLOW_VERDICT: &[u8] = b"{\"dcg_verdict\":\"allow\"}\n";
 
-/// Write [`EXPLICIT_ALLOW_VERDICT`] unless a verdict document has already
-/// claimed stdout (a deny, ask, or warning was written for this request).
+/// Write [`EXPLICIT_ALLOW_VERDICT`] unless a verdict document has claimed stdout.
+///
+/// A warning written only to stderr leaves stdout available.
 ///
 /// # Errors
 ///
