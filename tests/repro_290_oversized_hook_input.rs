@@ -594,6 +594,39 @@ fn oversized_windows_reach_commands_no_keyword_spells() {
     }
 }
 
+/// An oversized Windows-shell payload must get the `windows.*` packs, which
+/// are off by default on a non-Windows host. The oversized path computed its
+/// enabled packs without the payload signal, so a padded `format C: /q` or
+/// `Remove-Item -Recurse -Force C:\` was allowed while the same command under
+/// the limit denied (bd-oversized-windows-packs-t2jo).
+#[test]
+fn oversized_windows_payloads_enable_the_windows_packs() {
+    let pad = "A".repeat(PADDING_BYTES);
+    let envelope = |tool: &str, command: String| {
+        serde_json::json!({ "tool_name": tool, "tool_input": { "command": command } }).to_string()
+    };
+    for (tool, command) in [
+        ("cmd", format!("format C: /q /y & echo {pad}")),
+        ("cmd", format!("echo {pad} & rd /s /q C:\\")),
+        (
+            "PowerShell",
+            format!("Write-Output '{pad}' ; Remove-Item -Recurse -Force C:\\"),
+        ),
+    ] {
+        assert_denied(tool, &envelope(tool, command));
+    }
+    // A benign oversized Windows payload still fails open.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let benign = envelope("cmd", format!("echo {pad}"));
+    let (stdout, stderr, exit_code) =
+        run_hook_raw_with_budget(&benign, temp.path(), Some(SALVAGE_SCAN_BUDGET_MS));
+    assert_eq!(exit_code, 0, "benign: exits 0\nstderr: {stderr}");
+    assert!(
+        stdout.trim().is_empty(),
+        "a benign oversized Windows payload keeps failing open, got: {stdout:?}"
+    );
+}
+
 /// #322 fresh-eyes follow-up (normal size): a `Bash`-labeled PowerShell
 /// alias invocation (`rm -Recurse -Force`) is widened and denied by the
 /// windows pack. Proves the alias-widening signal end-to-end, not just at

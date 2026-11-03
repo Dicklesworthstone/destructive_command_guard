@@ -755,7 +755,23 @@ fn try_deny_unparseable_payload(
     let history_agent_type = history_agent_type_for_protocol(hook_protocol, detected_agent);
 
     let allowlists = load_effective_allowlists_for_agent(config, &effective_agent);
-    let mut enabled_packs: HashSet<String> = config.enabled_pack_ids_for_agent(&effective_agent);
+    // A PowerShell/cmd payload needs the `windows.*` packs, which are off by
+    // default on a non-Windows host and only enabled for a Windows payload.
+    // The normal parsed path computes this (see the `windows_payload` block in
+    // `run_hook`); omitting it here let an oversized `format C: /q` or
+    // `Remove-Item -Recurse -Force C:\` through, since padding past the input
+    // limit routes the command here instead (bd-oversized-windows-packs-t2jo).
+    // Each window is refined exactly as the scan loop below refines it.
+    let windows_payload =
+        commands.iter().any(
+            |window| match hook::refine_shell_dialect(window, shell_dialect) {
+                ShellDialect::PowerShell | ShellDialect::Cmd => true,
+                ShellDialect::Unknown => hook::command_is_windows_shell_payload(window),
+                ShellDialect::Posix => false,
+            },
+        );
+    let mut enabled_packs: HashSet<String> =
+        config.enabled_pack_ids_for_agent_and_payload(&effective_agent, windows_payload);
     enabled_packs.extend(config.enabled_external_pack_ids(external_store, Some(&effective_agent)));
 
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
