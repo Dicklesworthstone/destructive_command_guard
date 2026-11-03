@@ -4900,11 +4900,12 @@ pub(crate) fn pack_aware_quick_reject_pre_normalized(
 ///
 /// The span gate in [`pack_aware_quick_reject`] reads POSIX quoting. cmd.exe
 /// passes single quotes through as argv bytes, so `echo 'x & git reset --hard'`
-/// runs `git` there while the POSIX gate sees one quoted argument. Cmd is gated
-/// like the evaluator gates it, with no quote roles. The unknown dialect is the
-/// union of POSIX, PowerShell and cmd, so it is skipped only when every reading
-/// is free of keywords. Use this when a skipped command is never evaluated at
-/// all, as the oversized-payload window scan does.
+/// runs `git` there while the POSIX gate sees one quoted argument, and
+/// PowerShell ends `"a\"` at its second quote. Cmd and PowerShell are gated
+/// like the evaluator gates them, with no quote roles. The unknown dialect is
+/// the union of POSIX, PowerShell and cmd, so it is skipped only when every
+/// reading is free of keywords. Use this when a skipped command is never
+/// evaluated at all, as the oversized-payload window scan does.
 #[must_use]
 pub fn pack_aware_quick_reject_in_dialect(
     cmd: &str,
@@ -4928,12 +4929,12 @@ pub fn pack_aware_quick_reject_in_dialect(
         return true;
     }
     match dialect {
-        ShellDialect::Cmd => pack_aware_quick_reject_pre_normalized(
-            normalize_command_in_dialect(cmd, ShellDialect::Cmd).as_ref(),
+        ShellDialect::Cmd | ShellDialect::PowerShell => pack_aware_quick_reject_pre_normalized(
+            normalize_command_in_dialect(cmd, dialect).as_ref(),
             enabled_keywords,
         ),
-        ShellDialect::Posix | ShellDialect::PowerShell => pack_aware_quick_reject(
-            normalize_command_in_dialect(cmd, dialect).as_ref(),
+        ShellDialect::Posix => pack_aware_quick_reject(
+            normalize_command_in_dialect(cmd, ShellDialect::Posix).as_ref(),
             enabled_keywords,
         ),
         ShellDialect::Unknown => [
@@ -5636,21 +5637,28 @@ destructive_patterns:
     }
 
     /// bd-external-pack-cmd-quick-reject-z0cq: cmd.exe does not quote with
-    /// apostrophes, so a keyword inside them is not data there.
+    /// apostrophes and PowerShell does not escape with a backslash, so a
+    /// keyword that POSIX reads as quoted data runs in both. Only POSIX may
+    /// use the quote-aware span gate.
     #[test]
-    fn pack_aware_quick_reject_in_dialect_reads_cmd_apostrophes_as_bytes() {
+    fn pack_aware_quick_reject_in_dialect_gates_cmd_and_powershell_without_quote_roles() {
         use crate::normalize::ShellDialect::{Cmd, Posix, PowerShell, Unknown};
         let keywords: Vec<&str> = vec!["git"];
         let split = "echo 'x & git reset --hard & y'";
+        let backslash_quote = r#"Write-Output "a\" ; git push --force ; \"b""#;
         let padding = "A".repeat(4096);
 
         for (command, dialect, rejected) in [
             (split, Posix, true),
-            (split, PowerShell, true),
             (split, Cmd, false),
+            (split, PowerShell, false),
             (split, Unknown, false),
+            (backslash_quote, Posix, true),
+            (backslash_quote, PowerShell, false),
+            (backslash_quote, Unknown, false),
             ("dir 'x & git reset --hard'", Cmd, false),
             ("echo hello & dir", Cmd, true),
+            ("echo hello & dir", PowerShell, true),
             ("echo hello & dir", Unknown, true),
             ("git status", Posix, false),
             (padding.as_str(), Unknown, true),

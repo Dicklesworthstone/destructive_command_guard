@@ -4,10 +4,12 @@
 //! An external pack in `packs.custom_paths` turns off the keyword index, and the
 //! evaluator then gates on keywords with `pack_aware_quick_reject`, which reads
 //! POSIX quoting. cmd.exe passes single quotes through as argv bytes, so
-//! `echo 'x & git reset --hard & y'` runs `git reset --hard` there. The POSIX
-//! gate saw one quoted argument and skipped every pack, in the cmd dialect and
-//! in the unknown dialect's cmd replay. The hook drops the index whenever a
-//! custom pack is configured, so a single `/etc/dcg` pack was enough.
+//! `echo 'x & git reset --hard & y'` runs `git reset --hard` there, and
+//! PowerShell, which does not escape with a backslash, runs the `git push` in
+//! `Write-Output "a\" ; git push --force ; \"b"`. The POSIX gate saw one quoted
+//! argument and skipped every pack, in both dialects and in the unknown
+//! dialect's cmd replay. The hook drops the index whenever a custom pack is
+//! configured, so a single `/etc/dcg` pack was enough.
 //!
 //! The external pack below declares a keyword that no command here contains.
 //! Every verdict must match the verdict with no external pack. The commands
@@ -34,9 +36,16 @@ destructive_patterns:
     description: Placeholder rule.
 ";
 
-/// Commands that cmd.exe splits at `&`, `&&` or `|` inside single quotes.
+/// Commands that cmd.exe or PowerShell splits where POSIX reads one quoted word:
+/// cmd at `&`, `&&` or `|` inside single quotes, PowerShell at `;` after a
+/// backslash it does not treat as an escape.
 /// `(command, dialects that must deny, expected rule suffix)`.
-const CMD_SPLIT_DENIALS: &[(&str, &[&str], &str)] = &[
+const SPLIT_DENIALS: &[(&str, &[&str], &str)] = &[
+    (
+        r#"Write-Output "a\" ; git push --force ; \"b""#,
+        &["powershell"],
+        "push-force-long",
+    ),
     (
         "echo 'x & git reset --hard & y'",
         &["cmd", "unknown"],
@@ -206,10 +215,10 @@ fn padding() -> String {
 }
 
 #[test]
-fn cmd_split_commands_stay_denied_with_an_external_pack_loaded() {
+fn split_commands_stay_denied_with_an_external_pack_loaded() {
     let pack_dir = tempfile::tempdir().expect("pack dir");
     let pack = write_pack(pack_dir.path());
-    for (command, dialects, rule) in CMD_SPLIT_DENIALS {
+    for (command, dialects, rule) in SPLIT_DENIALS {
         for dialect in *dialects {
             for custom_paths in ["", pack.as_str()] {
                 let (decision, rule_id) = cli_verdict(command, dialect, custom_paths);
@@ -265,13 +274,15 @@ fn cmd_hook_denies_split_commands_with_an_external_pack_loaded() {
 }
 
 /// The oversized-payload window scan skipped windows with the same POSIX gate,
-/// so padding a cmd or unknown-dialect split command past the input limit
-/// allowed it, with or without an external pack. Unpadded, both are denied.
+/// so padding a cmd, PowerShell or unknown-dialect split command past the
+/// input limit allowed it, with or without an external pack. Unpadded, each is
+/// denied.
 #[test]
-fn oversized_cmd_and_unknown_payloads_deny_split_commands() {
+fn oversized_split_payloads_are_denied() {
     let pad = padding();
     let split = "echo 'x & git reset --hard & y'";
     let quoted = "echo \"x & git reset --hard & y\"";
+    let backslash_quote = r#"Write-Output "a\" ; git push --force ; \"b""#;
     let claude = |tool: &str, command: &str| {
         serde_json::json!({
             "hook_event_name": "PreToolUse",
@@ -293,13 +304,21 @@ fn oversized_cmd_and_unknown_payloads_deny_split_commands() {
         (claude("cmd", &format!("{split} & echo {pad}")), true),
         (claude("cmd", &format!("echo {pad} & {split}")), true),
         (claude("cmd", &format!("{quoted} & echo {pad}")), false),
+        (
+            claude("PowerShell", &format!("{backslash_quote} ; echo {pad}")),
+            true,
+        ),
+        (
+            claude("PowerShell", &format!("echo {pad} ; {backslash_quote}")),
+            true,
+        ),
         (gemini(&format!("{split} ; echo {pad}")), true),
         (gemini(&format!("echo {pad} ; {split}")), true),
-        // No unknown-dialect quoted control: a 64 KiB window of it stops at a
-        // regex work limit and answers incomplete, as the unpadded command
-        // does once it is that long. That is not this gate's verdict.
         // POSIX keeps reading single quotes as quoting.
         (claude("Bash", &format!("{split} ; echo {pad}")), false),
+        // No unknown-dialect quoted control: a 64 KiB window of it stops at a
+        // regex work limit (bd-nxn1) and answers incomplete, as the unpadded
+        // command does once it is that long. That is not this gate's verdict.
     ];
     for (payload, want_deny) in &cases {
         assert!(payload.len() > 256 * 1024, "payload must exceed the limit");

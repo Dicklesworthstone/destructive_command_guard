@@ -16243,11 +16243,14 @@ fn evaluate_command_in_single_dialect_view(
             // The span gate in `pack_aware_quick_reject` reads POSIX quoting.
             // cmd.exe passes single quotes through as argv bytes, so that gate
             // took `echo 'x & git reset --hard & y'` for one quoted argument
-            // and skipped every pack. This branch runs whenever the keyword
-            // index is absent, which is every hook with an external pack loaded,
-            // and the unknown dialect's cmd replay comes through here too. Gate
-            // Cmd the way Step 5 does.
-            if shell_dialect == ShellDialect::Cmd {
+            // and skipped every pack. PowerShell does not escape with a
+            // backslash, so `Write-Output "a\" ; git push --force ; \"b"`
+            // runs git there while POSIX reads one string. This branch runs
+            // whenever the keyword index is absent, which is every hook with
+            // an external pack loaded, and the unknown dialect's replays come
+            // through here too. Gate both without quote roles, as the keyword
+            // index does; Step 5 masks their data in their own syntax.
+            if matches!(shell_dialect, ShellDialect::Cmd | ShellDialect::PowerShell) {
                 pack_aware_quick_reject_pre_normalized(gating.as_ref(), enabled_keywords)
             } else {
                 pack_aware_quick_reject(gating.as_ref(), enabled_keywords)
