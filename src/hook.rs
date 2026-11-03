@@ -1807,6 +1807,24 @@ fn extract_string_values_for_key(prefix: &str, key: &str) -> Vec<String> {
 /// the decoded prefix. Returns `None` on structure that cannot be a JSON
 /// string (malformed escape, raw control character) — see
 /// [`extract_commands_from_truncated_json`] for why distrust must fail open.
+/// The outcome of reading a JSON `\uXXXX` escape's four hex digits.
+enum JsonHex4 {
+    Value(u32),
+    /// Fewer than four digits remained: the input was truncated mid-escape.
+    Truncated,
+    /// A non-hex digit appeared: the string is malformed.
+    Malformed,
+}
+
+/// Consume the four hex digits of a `\uXXXX` escape (the `\u` is already past).
+fn read_json_hex4(chars: &mut std::str::Chars<'_>) -> JsonHex4 {
+    let hex: String = chars.by_ref().take(4).collect();
+    if hex.len() < 4 {
+        return JsonHex4::Truncated;
+    }
+    u32::from_str_radix(&hex, 16).map_or(JsonHex4::Malformed, JsonHex4::Value)
+}
+
 fn decode_json_string_prefix(body: &str) -> Option<String> {
     let mut out = String::new();
     let mut chars = body.chars();
@@ -1828,21 +1846,44 @@ fn decode_json_string_prefix(body: &str) -> Option<String> {
                     'r' => out.push('\r'),
                     't' => out.push('\t'),
                     'u' => {
-                        let hex: String = chars.by_ref().take(4).collect();
-                        if hex.len() < 4 {
+                        let code_point = match read_json_hex4(&mut chars) {
                             // Truncated mid-escape: keep what decoded cleanly.
-                            return Some(out);
-                        }
-                        let Ok(code_point) = u32::from_str_radix(&hex, 16) else {
-                            return None;
+                            JsonHex4::Truncated => return Some(out),
+                            JsonHex4::Malformed => return None,
+                            JsonHex4::Value(value) => value,
                         };
-                        match char::from_u32(code_point) {
-                            Some(ch) => out.push(ch),
-                            // Surrogate half (e.g. emoji pair): stop here and
-                            // keep the cleanly decoded prefix rather than
-                            // implementing pair reassembly for a best-effort
-                            // scan.
-                            None => return Some(out),
+                        if (0xD800..=0xDBFF).contains(&code_point) {
+                            // High surrogate: a `\uXXXX` low surrogate right
+                            // after it completes an astral character (an emoji
+                            // pair). `JSON.stringify` emits exactly this for a
+                            // non-BMP char, and stopping at it dropped the rest
+                            // of an oversized command — so `… ; rm -rf / ; …`
+                            // after an emoji was never scanned. Decode the pair
+                            // and keep going; a half with no mate becomes
+                            // U+FFFD rather than ending the recovery.
+                            let mut lookahead = chars.clone();
+                            let low = (lookahead.next() == Some('\\')
+                                && lookahead.next() == Some('u'))
+                            .then(|| read_json_hex4(&mut lookahead))
+                            .and_then(|hex| match hex {
+                                JsonHex4::Value(low) if (0xDC00..=0xDFFF).contains(&low) => {
+                                    Some(low)
+                                }
+                                _ => None,
+                            });
+                            if let Some(low) = low {
+                                let combined =
+                                    0x10000 + ((code_point - 0xD800) << 10) + (low - 0xDC00);
+                                out.push(char::from_u32(combined).unwrap_or('\u{FFFD}'));
+                                chars = lookahead;
+                            } else {
+                                out.push('\u{FFFD}');
+                            }
+                        } else {
+                            // A lone low surrogate, or any other code point.
+                            // `char::from_u32` rejects a low surrogate, which
+                            // becomes U+FFFD so recovery continues.
+                            out.push(char::from_u32(code_point).unwrap_or('\u{FFFD}'));
                         }
                     }
                     _ => return None,
@@ -9734,6 +9775,27 @@ mod tests {
         assert_eq!(
             extract_commands_from_truncated_json(unfinished),
             vec!["echo 🧪\ngit reset --hard"]
+        );
+        // The `command` key's own decoder (`decode_json_string_prefix`) used to
+        // stop at a valid surrogate pair, dropping the destructive tail of an
+        // oversized payload after an emoji — `JSON.stringify`/`json.dumps`
+        // escape a non-BMP char that way. It now decodes the pair and keeps
+        // going; an unpaired half becomes U+FFFD, not a full stop.
+        let command_pair = concat!(
+            r#"{"tool_name":"Bash","tool_input":{"command":"echo "#,
+            r#"😀 ; git reset --hard"}}"#
+        );
+        assert_eq!(
+            extract_commands_from_truncated_json(command_pair),
+            vec!["echo 😀 ; git reset --hard"]
+        );
+        let command_lone = concat!(
+            r#"{"tool_name":"Bash","tool_input":{"command":"echo "#,
+            r#"\ud800 ; git reset --hard"}}"#
+        );
+        assert_eq!(
+            extract_commands_from_truncated_json(command_lone),
+            vec!["echo \u{FFFD} ; git reset --hard"]
         );
     }
 
