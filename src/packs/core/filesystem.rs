@@ -6050,6 +6050,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //      keeps `/dev/tty0`..`/dev/ttyN` (consoles / other terminals)
         //      blocked as before.
         //
+        //      `/dev/kmsg`, the kernel log, joins on the same ground (#603):
+        //      it is always the (1,11) character device, each write() appends
+        //      one record to the printk ring buffer, and O_TRUNC is ignored
+        //      on a character device, so no file or disk is truncated. `>>`
+        //      into it was already allowed. Its name, and any closing quote,
+        //      must end the word, so `/dev/kmsg.bak`, `/dev/kmsgx` and
+        //      `"/dev/kmsg"x` stay blocked.
+        //
         //      `/dev/tcp/<host>/<port>` and `/dev/udp/<host>/<port>` join the
         //      carve-out for a different reason (#404): they are not files at
         //      all. Bash intercepts those two prefixes in its *own* redirect
@@ -6076,7 +6084,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //      bypass with `> $'/etc/passwd'` or `> $"/etc/passwd"`.
         destructive_pattern!(
             "redirect-truncate-root-home",
-            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:(?:null|zero|full|tty)\b|(?:tcp|udp)/(?!\.\.?(?:/|$))[^/\s]+/[A-Za-z0-9_-]+(?=[\s;|&)'"]|$)))(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:(?:null|zero|full|tty)\b|kmsg(?=['"]?(?:[\s;|&)<>]|$))|(?:tcp|udp)/(?!\.\.?(?:/|$))[^/\s]+/[A-Za-z0-9_-]+(?=[\s;|&)'"]|$)))(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to an existing sensitive system or home path destroys the previous file contents. A currently absent literal target under the home directory with an existing parent is allowed (creation, not truncation — the same thing `>>` would do); existing files, dynamic paths, symlinks, missing parents, system paths, and .git internals stay blocked.",
             Critical,
             "`> /etc/passwd` (or `: > /etc/passwd`, `echo > /etc/passwd`, etc.) opens \
@@ -8437,6 +8445,40 @@ mod tests {
             "echo x > /dev/full",
         ] {
             assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_to_kernel_log_is_allowed_issue_603() {
+        // `/dev/kmsg` is always the kernel-log character device: a write
+        // appends one printk record and O_TRUNC is ignored, so `>` into it
+        // truncates nothing (`>>` was already allowed).
+        let pack = create_pack();
+        for cmd in [
+            "printf x > /dev/kmsg",
+            "printf '<4>netconsole check\\n' > /dev/kmsg",
+            "echo mark >/dev/kmsg",
+            "echo mark > '/dev/kmsg'",
+            "echo mark > \"/dev/kmsg\"",
+            "echo mark > /dev/kmsg 2>&1",
+            "echo mark > /dev/kmsg; echo done",
+            "(echo mark > /dev/kmsg)",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+        // Only the exact node name is carved out.
+        for cmd in [
+            "echo x > /dev/kmsg.bak",
+            "echo x > /dev/kmsgx",
+            "echo x > /dev/kmsg/../sda",
+            "echo x > /dev/kmsg-old",
+            "echo x > /dev/sda",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+        // A word that goes on past the closing quote names another path.
+        for cmd in ["echo x > \"/dev/kmsg\"x", "echo x > '/dev/kmsg'.bak"] {
+            assert_blocks(&pack, cmd, "");
         }
     }
 

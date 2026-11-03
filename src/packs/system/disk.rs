@@ -244,9 +244,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // regular file or /dev/null, but do not mistake an input redirect for
         // an output. Quote capture keeps "/dev/null extra" from being exempted.
         // Pseudo-device names are exact; /dev/shm paths cannot escape via `..`.
+        // `/dev/kmsg` is the kernel log: each write() appends one record to
+        // the printk ring buffer and O_TRUNC does nothing to a character
+        // device, so tee into it changes no file or disk (#603). It is NOT
+        // in copy-to-device's list below: mv and install replace the
+        // destination node instead of writing through it.
         destructive_pattern!(
             "tee-device",
-            r#"\b(?:tee|sponge)\b(?:\s+(?:[^\s"'\\;&|<>]|\\[^\r\n]|'[^']*'|"[^"]*")+)*\s+(['"]?)/dev/(?!(?:(?:null|zero|full|random|urandom|std(?:in|out|err)|tty|console|ptmx)|(?:fd|pts)/\d+)\1(?:\s|$|[|<>])|shm/(?!(?:[^\s'"]*/)?\.\.(?:/|\1(?:\s|$)))[^\s'"]*\1(?:\s|$|[|<>]))"#,
+            r#"\b(?:tee|sponge)\b(?:\s+(?:[^\s"'\\;&|<>]|\\[^\r\n]|'[^']*'|"[^"]*")+)*\s+(['"]?)/dev/(?!(?:(?:null|zero|full|random|urandom|std(?:in|out|err)|tty|console|ptmx|kmsg)|(?:fd|pts)/\d+)\1(?:\s|$|[|<>])|shm/(?!(?:[^\s'"]*/)?\.\.(?:/|\1(?:\s|$)))[^\s'"]*\1(?:\s|$|[|<>]))"#,
             "tee/sponge into a device will OVERWRITE that device, exactly as dd would. Extremely dangerous!"
         ),
         // cp/mv/install write their LAST argument, so the device has to be in
@@ -1833,6 +1838,42 @@ mod tests {
             "cp file /dev/shm/buffer",
         ] {
             assert_allows(&pack, command);
+        }
+    }
+
+    #[test]
+    fn tee_into_kernel_log_is_allowed_issue_603() {
+        let pack = create_pack();
+        // A tee into the kernel log appends a printk record; it overwrites
+        // no device the way dd would.
+        for command in [
+            "printf x | sudo tee /dev/kmsg",
+            "printf '<4>x\\n' | sudo tee /dev/kmsg >/dev/null",
+            "printf x | tee -a /dev/kmsg",
+            "printf x | tee '/dev/kmsg'",
+            "printf x | tee out.log /dev/kmsg",
+        ] {
+            assert_allows(&pack, command);
+        }
+        // The carve-out is the exact name only, and does not shield another
+        // device operand on the same tee.
+        for command in [
+            "printf x | tee /dev/kmsg /dev/sda",
+            "printf x | tee /dev/kmsg.bak",
+            "printf x | tee /dev/kmsgx",
+            "printf x | tee '/dev/kmsg extra'",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "tee-device");
+        }
+        // mv/install replace the node rather than write through it, so the
+        // copy rule keeps kmsg out of its pseudo-device list, and dd stays
+        // gated as before.
+        for (command, rule) in [
+            ("mv file /dev/kmsg", "copy-to-device"),
+            ("install file /dev/kmsg", "copy-to-device"),
+            ("printf x | sudo dd of=/dev/kmsg", "dd-device"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
         }
     }
 
