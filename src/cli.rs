@@ -1802,12 +1802,12 @@ pub struct UpdateCommand {
     #[arg(long, conflicts_with_all = ["check", "version", "system", "easy_mode", "from_source", "rollback"])]
     pub list_versions: bool,
 
-    /// Only update the binary; skip hook configuration and shell RC modifications.
+    /// Only update the binary; skip hook configuration, shell RC modifications and completions.
     ///
     /// Equivalent to passing `--no-configure` to the installer. Useful when the
     /// hook is managed at the project level (`.claude/settings.json`) and you
-    /// don't want `dcg update` to re-add the hook to user-level settings or
-    /// re-inject the shell startup check.
+    /// don't want `dcg update` to re-add the hook to user-level settings,
+    /// re-inject the shell startup check, or rewrite shell completion files.
     #[arg(long, visible_alias = "binary-only", conflicts_with_all = ["check", "rollback", "list_versions"])]
     pub no_configure: bool,
 

@@ -1140,7 +1140,7 @@ Build from source instead of downloading binary:
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --from-source
 ```
 
-Download/install only (skip agent hook configuration):
+Download/install only (skip agent hook configuration, the shell startup check and shell completions):
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --no-configure
