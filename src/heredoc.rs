@@ -8327,25 +8327,54 @@ pub(crate) fn first_heredoc_target_command(command: &str) -> Option<String> {
     extract_heredoc_target_command(command, operator)
 }
 
-/// Whether a shell or interpreter receives the first heredoc in `command`.
+/// Whether a shell or interpreter directly receives *any* heredoc in `command`.
 ///
-/// Any receiver [`ScriptLanguage::from_command`] knows counts, whether it
-/// reads its program from standard input (`python3 - <<'EOF'`) or runs a
-/// script that reads the body as input (`python3 load.py <<'EOF'`), which may
-/// run it too; here-strings count as well. Only the first operator and a
-/// directly resolved receiver are considered
-/// (bd-oversized-code-heredoc-receivers-azu4).
+/// A receiver [`ScriptLanguage::from_command`] knows counts, whether it reads
+/// its program from standard input (`python3 - <<'EOF'`) or runs a script that
+/// reads the body as input (`python3 load.py <<'EOF'`), which may run it too;
+/// here-strings do not (`<<<` is skipped).
+///
+/// Every `<<` operator is examined, not just the first, and the caller passes
+/// the whole command rather than one scan window: an earlier data heredoc
+/// (`cat <<'A'\n…\nA\npython3 - <<'EOF'\n…`) or padding before the interpreter
+/// heredoc otherwise left it undetected and the oversized payload failed open
+/// (bd-oversized-code-heredoc-receivers-azu4). A receiver reached only through
+/// a pipe (`cat <<'EOF' | python3 -`), a wrapper, or a file-descriptor heredoc
+/// is still not detected here — those keep the documented fail-open until the
+/// receiver analysis is generalized.
 ///
 /// The oversized hook-input path (bd-ym0p) asks this of a command too large
 /// to evaluate. Its scan windows cut such a body away from the program that
 /// runs it, so finding nothing in them is not an answer about the code, and
 /// the command gets the same indeterminate a merely over-length command gets.
 /// Data receivers (`cat > file <<'EOF'`) and unrecognized programs answer
-/// `false` and keep the documented fail-open default.
+/// `false` and keep the documented fail-open default. The operator count is
+/// bounded; past the bound the answer is the conservative `true`.
 #[must_use]
-pub fn first_heredoc_runs_as_code(command: &str) -> bool {
-    first_heredoc_target_command(command)
-        .is_some_and(|target| ScriptLanguage::from_command(&target) != ScriptLanguage::Unknown)
+pub fn any_heredoc_runs_as_code(command: &str) -> bool {
+    const MAX_HEREDOC_OPERATORS: usize = 256;
+    let bytes = command.as_bytes();
+    let mut search = 0usize;
+    let mut examined = 0usize;
+    while let Some(relative) = memchr::memmem::find(&bytes[search..], b"<<") {
+        let operator = search + relative;
+        search = operator + 2;
+        // `<<<` is a here-string, not a heredoc; skip the operator whether this
+        // `<<` is its first two `<` or (via the overlapping scan) its last two.
+        if bytes.get(operator + 2) == Some(&b'<') || (operator > 0 && bytes[operator - 1] == b'<') {
+            continue;
+        }
+        examined += 1;
+        if examined > MAX_HEREDOC_OPERATORS {
+            return true;
+        }
+        if extract_heredoc_target_command(command, operator)
+            .is_some_and(|target| ScriptLanguage::from_command(&target) != ScriptLanguage::Unknown)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Extract the lexical command token that owns a heredoc, preserving an

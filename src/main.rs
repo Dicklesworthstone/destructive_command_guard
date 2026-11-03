@@ -742,14 +742,14 @@ fn try_deny_unparseable_payload(
     // scan loop below refines each window.
     let mut windows_payload = false;
     for command in hook::extract_commands_from_truncated_json(prefix) {
-        if command.len() > max_command_bytes && oversized_code_command.is_none() {
-            let mut head = max_command_bytes.min(command.len());
-            while !command.is_char_boundary(head) {
-                head -= 1;
-            }
-            if destructive_command_guard::heredoc::first_heredoc_runs_as_code(&command[..head]) {
-                oversized_code_command = Some(command.len());
-            }
+        if command.len() > max_command_bytes
+            && oversized_code_command.is_none()
+            && destructive_command_guard::heredoc::any_heredoc_runs_as_code(&command)
+        {
+            // The whole command is scanned, not just its first window: padding
+            // or an earlier data heredoc before the interpreter heredoc must
+            // not hide it (bd-oversized-code-heredoc-receivers-azu4).
+            oversized_code_command = Some(command.len());
         }
         if !windows_payload {
             windows_payload = match hook::refine_shell_dialect(&command, shell_dialect) {

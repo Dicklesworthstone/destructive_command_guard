@@ -108,6 +108,32 @@ fn oversized_heredoc_run_as_code_is_not_allowed_blind() {
     }
 }
 
+/// The interpreter heredoc is not the first on the line, or padding precedes
+/// it: the backstop checked only the first `<<` and only the first window, so
+/// these failed open. Every `<<` across the whole command is now examined
+/// (bd-oversized-code-heredoc-receivers-azu4).
+#[test]
+fn oversized_code_heredoc_behind_an_earlier_heredoc_or_padding_is_not_allowed_blind() {
+    let interpreter = format!("python3 - <<'EOF'\n{}EOF", body("exec(x)"));
+    for prefix in [
+        // An earlier *data* heredoc whose own `<<` resolves first.
+        "cat <<'A'\nnotes\nA\n".to_string(),
+        // Padding past one scan window (64 KiB) before the heredoc.
+        format!("# {}\n", "p".repeat(70 * 1024)),
+    ] {
+        let command = format!("{prefix}{interpreter}");
+        let input = envelope(&command);
+        assert!(input.len() > 256 * 1024, "input must be oversized");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (stdout, stderr, exit_code) = run_hook(&input, temp.path());
+        assert_eq!(exit_code, 0, "hook exits 0\nstderr: {stderr}");
+        assert!(
+            stdout.contains("exceeds limit"),
+            "an interpreter heredoc behind {prefix:.20?} must not fail open: {stdout}"
+        );
+    }
+}
+
 #[test]
 fn oversized_data_heredoc_keeps_the_fail_open_default() {
     let command = format!("cat > notes.txt <<'EOF'\n{}EOF", body("done = 1"));
