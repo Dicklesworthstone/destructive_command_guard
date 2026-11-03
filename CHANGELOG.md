@@ -22,6 +22,26 @@ command. These commands now get a normal verdict: the reported
 `shutil.rmtree` is denied as `heredoc.python:shutil_rmtree`, and its
 harmless twin is allowed. Reported by Khang5687 (290d783a).
 
+**Commands run through `builtin`, zsh's `noglob`/`nocorrect`, or macOS's
+`arch`/`xcrun` are now judged as the command they run.** In 0.16.0,
+`builtin command git reset --hard` was allowed in Claude Code's Bash tool,
+and `builtin command mkfs.ext4 /dev/sda1` was allowed everywhere, though
+0.15.3 denied it. `noglob git reset --hard`, `arch -arm64 git reset --hard`,
+`xcrun git reset --hard`, `taskpolicy … git …` and `sandbox-exec … git …`
+were allowed too. Writes to credential files behind a launcher were allowed
+in 0.15.3 and 0.16.0 alike: `strace -f tee ~/.ssh/authorized_keys`, and the
+same behind `firejail`, `gosu`, `unshare`, `flock`, `chroot`, `watch` and
+similar. These now deny under the rule the plain command gets (2975ad77).
+
+**A command run through a shell variable is denied even when other commands
+come between.** `true; m=mkfs.ext4; $m /dev/sda1`, and the same shape for
+`dd` and `wipefs`, were allowed in every shell: a command before the
+assignment hid it. Gemini CLI, Cursor, Copilot and OpenCode also got an
+allow for `$d reset --hard` and `true; d=git; $d reset --hard`, which Claude
+Code's Bash tool denied. These now deny as `system.disk:*` or
+`core.git:reset-hard`. Harmless uses such as `d=git; true; $d status` are
+still allowed (0e32c953).
+
 ## [v0.16.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.16.0) -- 2026-11-01 [Release]
 
 This release closes commands that ran unguarded (writes hidden by `IFS`
