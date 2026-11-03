@@ -1373,15 +1373,24 @@ mod tests {
             windows_probe.contains("-RequireMinisign -Verify -NoConfigure"),
             "Windows fleet installs must require a valid minisign signature"
         );
+        // #638: the installer is the selected release's own asset, checked
+        // against that release's checksum and Minisign signature before it runs.
         assert!(
-            unix_probe.contains("$REPO_RAW/$VERSION/install.sh")
-                && unix_probe.contains("$REPO_RELEASE/$VERSION/install.sh.sha256")
-                && windows_probe.contains("$RepoRaw/$Version/install.ps1")
-                && windows_probe.contains("$RepoRelease/$Version/install.ps1.sha256"),
+            unix_probe.contains("\"$REPO_RELEASE/$VERSION/install.sh\"")
+                && unix_probe.contains("\"$REPO_RELEASE/$VERSION/install.sh.sha256\"")
+                && unix_probe.contains("\"$REPO_RELEASE/$VERSION/install.sh.minisig\"")
+                && windows_probe.contains("\"$RepoRelease/$Version/install.ps1\"")
+                && windows_probe.contains("\"$RepoRelease/$Version/install.ps1.sha256\"")
+                && windows_probe.contains("\"$RepoRelease/$Version/install.ps1.minisig\""),
             "fleet installs must verify the exact tag-pinned installer before execution"
         );
         assert!(
-            expected_cases.contains("installer_checksum_verified"),
+            !unix_probe.contains("REPO_RAW") && !windows_probe.contains("RepoRaw"),
+            "fleet installs must not fetch the installer outside the signed release assets"
+        );
+        assert!(
+            expected_cases.contains("installer_checksum_verified")
+                && expected_cases.contains("installer_signature_verified"),
             "a truncated probe must not pass without reporting installer verification"
         );
         assert!(
