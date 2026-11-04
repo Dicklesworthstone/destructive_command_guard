@@ -10649,12 +10649,13 @@ fn at_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
 /// pipe: a redirect such as `3<&0` puts it on any descriptor. Spellings like
 /// `/dev//stdin` and `/dev/./fd/0` name the same node, so the path is compared
 /// after lexical normalisation. An expansion, a process substitution such as
-/// `<(cat)` (which inherits the pipe), a glob or an escape may name any of
-/// these, so it counts as stdin too.
+/// `<(cat)` (which inherits the pipe), a glob, a brace list (`{x,/dev/stdin}`
+/// is two `-f` values, and the last wins) or an escape may name any of these,
+/// so it counts as stdin too.
 fn at_job_file_may_be_stdin(file: &str) -> bool {
     if file == "-"
         || file.is_empty()
-        || file.contains(['$', '`', '<', '(', '*', '?', '[', '~', '\\'])
+        || file.contains(['$', '`', '<', '(', '*', '?', '[', '{', '~', '\\'])
     {
         return true;
     }
@@ -50491,6 +50492,8 @@ mod tests {
             "at -f /dev/fd/3 now 3<&0",
             "at -f \"$job\" now",
             "at -f <(cat) now",
+            // Brace expansion can make the job file any word.
+            "at -f{x,/dev/stdin} now",
         ] {
             assert_eq!(mode(command), reads, "{command}");
         }
