@@ -28969,8 +28969,9 @@ fn filesystem_pre_rm_pattern_excluding_dynamic(name: Option<&str>) -> bool {
 /// literal for-loop variable and an immediately derived loop-local path.
 /// These additional forms must resolve under a tmp-family root, including a
 /// verified local startup `TMPDIR` (#590). Rebinding,
-/// unknown values, unsupported control flow, traversal, protected files, and
-/// additional non-fd redirects all retain the dynamic-path denial.
+/// unknown values, unsupported control flow, traversal, and protected files
+/// retain the dynamic-path denial. Every dynamic truncating target in a
+/// segment needs its own proof; literal targets still face the other rules.
 fn statically_safe_variable_redirect(
     source: &str,
     segment_ranges: &[(usize, usize)],
@@ -28979,23 +28980,79 @@ fn statically_safe_variable_redirect(
     dialect: ShellDialect,
     require_proven_scope: bool,
 ) -> bool {
+    proven_variable_redirect_offsets(
+        source,
+        segment_ranges,
+        segment_start,
+        dialect_segment,
+        dialect,
+        require_proven_scope,
+    )
+    .is_some()
+}
+
+/// Keep the proof and its exact operator offsets together. Embedded scripts
+/// use these offsets to recover their complete source, so proving just the
+/// first target must never authorize another redirect in the same statement.
+fn proven_variable_redirect_offsets(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    segment: &str,
+    dialect: ShellDialect,
+    require_proven_scope: bool,
+) -> Option<Vec<usize>> {
     if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
-        return false;
+        return None;
     }
-    let Some(redirect) = first_unquoted_output_redirect(dialect_segment, ShellDialect::Posix)
-    else {
-        return false;
-    };
-    let Some(mut target) = dialect_segment.get(redirect + 1..).map(str::trim_start) else {
-        return false;
-    };
-    for prefix in ['>', '|'] {
-        if let Some(rest) = target.strip_prefix(prefix) {
-            target = rest.trim_start();
+    if !segment.contains('>')
+        || segment.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
+        || segment_ranges.len() > MAX_REDIRECT_PROOF_SEGMENTS
+    {
+        return None;
+    }
+    let redirects = posix_output_redirects_for_proof(segment, false)?;
+    let mut proved_dynamic_target = false;
+    for redirect in &redirects {
+        if redirect.append || redirect.fd_duplication {
+            continue;
         }
+        // Only plain literal words can stand aside here. In particular,
+        // escaped paths, named-user tildes and glob syntax still belong to
+        // the dynamic rule even when they contain no variable reference.
+        if literal_redirect_word(redirect.target) {
+            continue;
+        }
+        if !statically_safe_redirect_target(
+            source,
+            segment_ranges,
+            segment_start,
+            redirect.operator,
+            redirect.target,
+            require_proven_scope,
+        ) {
+            return None;
+        }
+        proved_dynamic_target = true;
     }
+    proved_dynamic_target.then(|| redirects.iter().map(|redirect| redirect.operator).collect())
+}
+
+fn literal_redirect_word(word: &str) -> bool {
+    !word.contains(['$', '`', '\\', '*', '?', '[', '{', '~', '%', '!', '^'])
+        && literal_assignment_value(word).is_some()
+}
+
+fn statically_safe_redirect_target(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    redirect: usize,
+    target: &str,
+    require_proven_scope: bool,
+) -> bool {
     let target_was_quoted = target.starts_with('"');
-    let (token, outer_suffix, trailing) = if let Some(rest) = target.strip_prefix('"') {
+    let (token, outer_suffix) = if let Some(rest) = target.strip_prefix('"') {
         let Some(end) = rest.find('"') else {
             return false;
         };
@@ -29005,28 +29062,16 @@ fn statically_safe_variable_redirect(
         // no quoting, expansion, or glob syntax — as an additional suffix;
         // the benign-path check below still rejects `..` traversal, so
         // `> "$log"/../../etc/passwd` keeps its fail-closed denial.
-        let chunk_len = after_quote
+        if !after_quote
             .bytes()
-            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
-            .count();
-        let trailing = &after_quote[chunk_len..];
-        if !trailing.is_empty()
-            && !trailing.as_bytes().first().is_some_and(|byte| {
-                byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&' | b'<' | b'>')
-            })
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
         {
             return false;
         }
-        (&rest[..end], &after_quote[..chunk_len], trailing)
+        (&rest[..end], after_quote)
     } else {
-        let end = target
-            .find(|c: char| c.is_ascii_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>'))
-            .unwrap_or(target.len());
-        (&target[..end], "", &target[end..])
+        (target, "")
     };
-    if !trailing_redirects_are_fd_duplications(trailing) {
-        return false;
-    }
     if token.len().saturating_add(outer_suffix.len()) > MAX_REDIRECT_VALUE_BYTES {
         return false;
     }
@@ -29057,7 +29102,15 @@ fn statically_safe_variable_redirect(
     // New prefix-bearing forms also need a proof of execution order. A
     // literal assignment inside a skipped branch is not a binding at the use.
     let literal_values = ((!require_proven_scope && prefix.is_empty()) || simple_scope())
-        .then(|| resolved_variable_values(source, segment_ranges, segment_start, name))
+        .then(|| {
+            resolve_variable_bindings(
+                source,
+                segment_ranges,
+                segment_start,
+                name,
+                VariableResolution::RedirectLiteral,
+            )
+        })
         .flatten();
     let (values, requires_tmp_root) = if let Some(values) = literal_values {
         (values, require_proven_scope || !prefix.is_empty())
@@ -29087,12 +29140,13 @@ fn statically_safe_variable_redirect(
         return false;
     }
     // An unquoted target lets a glob-bearing value expand further at run
-    // time (shell-dependent), which the literal benign-path check cannot
-    // cover; double-quoted targets never glob.
+    // time (shell-dependent), and whitespace can split it into multiple
+    // fields. Neither is a single established path; quoted targets do not
+    // undergo either expansion.
     if !target_was_quoted
-        && values
-            .iter()
-            .any(|value| value_expands_when_unquoted(value))
+        && values.iter().any(|value| {
+            value_expands_when_unquoted(value) || value.bytes().any(|b| b.is_ascii_whitespace())
+        })
     {
         return false;
     }
@@ -29115,6 +29169,215 @@ fn statically_safe_variable_redirect(
 const MAX_REDIRECT_BINDING_DEPTH: usize = 8;
 const MAX_REDIRECT_VALUE_BYTES: usize = 4096;
 const MAX_REDIRECT_PROOF_SEGMENTS: usize = 256;
+const MAX_REDIRECT_PROOF_TARGETS: usize = 32;
+
+struct PosixOutputRedirect<'a> {
+    /// The `>` byte, including for `&>` and descriptor-prefixed operators.
+    operator: usize,
+    target: &'a str,
+    append: bool,
+    fd_duplication: bool,
+}
+
+/// Read complete redirect words without losing their source offsets. This is
+/// deliberately a proof parser, not a permissive shell parser: unsupported
+/// syntax leaves the existing dynamic rule active. All words are inspected,
+/// including argv, input and append targets, because their expansions happen
+/// in the same shell and can invalidate a later redirect's binding (#634).
+fn posix_output_redirects_for_proof(
+    segment: &str,
+    allow_child_substitutions: bool,
+) -> Option<Vec<PosixOutputRedirect<'_>>> {
+    let bytes = segment.as_bytes();
+    let mut redirects = Vec::new();
+    let mut index = 0;
+    let mut command_seen = false;
+    let mut prefix_assignment = false;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        // This cursor is at a word boundary, including immediately after a
+        // grouping operator. Quote/backslash bytes inside a comment are data.
+        if bytes[index] == b'#' {
+            index = segment[index..]
+                .find('\n')
+                .map_or(bytes.len(), |end| index + end + 1);
+            continue;
+        }
+        if bytes[index] == b'&' && bytes.get(index + 1) == Some(&b'>') {
+            index += 1;
+        }
+        if matches!(bytes[index], b'<' | b'>') {
+            let operator = index;
+            let output = bytes[index] == b'>';
+            index += 1;
+            // Here-documents, here-strings and process substitutions need
+            // their own ownership analysis. They cannot lend this proof.
+            if !output && bytes.get(index) == Some(&b'<') {
+                return None;
+            }
+            let append = output && bytes.get(index) == Some(&b'>');
+            let read_write = !output && bytes.get(index) == Some(&b'>');
+            if append || read_write || (output && bytes.get(index) == Some(&b'|')) {
+                index += 1;
+            }
+            let fd_duplication = bytes.get(index) == Some(&b'&');
+            if fd_duplication {
+                index += 1;
+            }
+            while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+                index += 1;
+            }
+            if bytes.get(index) == Some(&b'#') {
+                return None;
+            }
+            let end =
+                posix_word_end_without_side_effects(segment, index, allow_child_substitutions)?;
+            let target = segment.get(index..end)?;
+            if fd_duplication && target != "-" && !target.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                // Consume the WHOLE descriptor word. `>&1$OTHER` is not
+                // the static duplication `>&1`; neither are dynamic FDs
+                // or the shell-dependent `>&file` form modeled here.
+                return None;
+            }
+            if output {
+                if redirects.len() == MAX_REDIRECT_PROOF_TARGETS {
+                    return None;
+                }
+                redirects.push(PosixOutputRedirect {
+                    operator,
+                    target,
+                    append,
+                    fd_duplication,
+                });
+            }
+            index = end;
+            continue;
+        }
+        match bytes[index] {
+            b'(' if bytes.get(index + 1) == Some(&b'(') => return None,
+            b'(' | b')' => index += 1,
+            b';' | b'|' | b'&' => return None,
+            _ => {
+                let end =
+                    posix_word_end_without_side_effects(segment, index, allow_child_substitutions)?;
+                let word = &segment[index..end];
+                if word.starts_with('{')
+                    && word.ends_with('}')
+                    && matches!(bytes.get(end), Some(b'<' | b'>'))
+                {
+                    // `{S}>file` (also input/read-write forms) assigns an
+                    // FD to S while redirects are processed left to right.
+                    // Earlier segment bindings no longer prove later uses.
+                    return None;
+                }
+                if !command_seen {
+                    let identifier_len = word
+                        .bytes()
+                        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                        .count();
+                    if identifier_len > 0 && word.as_bytes().get(identifier_len) == Some(&b'[') {
+                        // The first `=` can be INSIDE an arithmetic subscript
+                        // (`X[S=0]=value`), so is_env_assignment cannot alone
+                        // identify this mutation-capable prefix.
+                        return None;
+                    }
+                    if word.bytes().all(|byte| byte.is_ascii_digit())
+                        && matches!(bytes.get(end), Some(b'<' | b'>'))
+                    {
+                        // A numeric IO prefix is part of the redirect, not
+                        // the command word. Later assignments remain prefixes.
+                    } else if crate::normalize::is_env_assignment(word) {
+                        // Array subscripts can evaluate arithmetic and
+                        // assign another variable without any `$` byte.
+                        // Appends/array writes are outside scalar proofs.
+                        posix_scalar_assignment(word)?;
+                        prefix_assignment = true;
+                    } else if word != "!" && !is_command_prefix_reserved_word(word) {
+                        if prefix_assignment {
+                            // Shells may perform assignments before redirects
+                            // for special builtins. Do not borrow an older
+                            // binding through an assignment-prefixed command.
+                            return None;
+                        }
+                        command_seen = true;
+                    }
+                }
+                index = end;
+            }
+        }
+    }
+    // Assignment-only statements are useful preceding bindings, but combining
+    // an assignment and redirect has the same ordering ambiguity as above.
+    (!prefix_assignment || redirects.is_empty()).then_some(redirects)
+}
+
+/// End of one raw shell word whose expansions cannot assign a variable or
+/// execute code. Preserve quotes and concatenation for the target proof to
+/// judge; allow only ordinary scalar/positional reads and `$$`. For an earlier
+/// statement, child-shell substitutions cannot assign a parent-shell binding;
+/// its receiving command still faces the existing argv/mutator checks. The
+/// redirecting statement itself rejects child execution as unmodeled work.
+/// Arithmetic, parameter operators and indirect/array reads always refuse.
+fn posix_word_end_without_side_effects(
+    text: &str,
+    start: usize,
+    allow_child_substitutions: bool,
+) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = start;
+    let mut in_double = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                if matches!(bytes.get(index + 1)?, b'\n' | b'\r') {
+                    return None;
+                }
+                index += 2;
+            }
+            b'\'' if !in_double => {
+                index += 1 + text.get(index + 1..)?.find('\'')? + 1;
+            }
+            b'"' => {
+                in_double = !in_double;
+                index += 1;
+            }
+            b'`' if allow_child_substitutions => {
+                index = skip_backquoted_word_part(text, index)?;
+            }
+            b'`' => return None,
+            b'$' if allow_child_substitutions
+                && bytes.get(index + 1) == Some(&b'(')
+                && bytes.get(index + 2) != Some(&b'(') =>
+            {
+                index = skip_dollar_group_word_part(text, index)?;
+            }
+            b'$' => {
+                if let Some((_, consumed)) = parse_leading_posix_variable(&text[index..]) {
+                    index += consumed;
+                } else if bytes.get(index + 1).is_some_and(|byte| {
+                    byte.is_ascii_digit()
+                        || matches!(byte, b'@' | b'*' | b'#' | b'?' | b'-' | b'$' | b'!')
+                }) {
+                    index += 2;
+                } else {
+                    return None;
+                }
+            }
+            byte if !in_double
+                && (byte.is_ascii_whitespace()
+                    || matches!(byte, b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b')')) =>
+            {
+                break;
+            }
+            _ => index += 1,
+        }
+    }
+    (index > start && !in_double).then_some(index)
+}
 
 fn redirect_path_has_tmp_root(path: &str) -> bool {
     ["/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/"]
@@ -29219,9 +29482,9 @@ fn literal_pid_redirect_value(token: &str) -> Option<String> {
         .then_some(value)
 }
 
-/// The additional redirect proof models simple lists, not branches, functions,
-/// loops, or execution-scope changes. The existing literal/loop proof is tried
-/// first, so this restriction does not change its accepted forms.
+/// The scalar redirect proof models simple lists, not branches, functions,
+/// loops, or execution-scope changes. Check both the binding site and any
+/// additional derived use; literal loop scope has its own bounded AST proof.
 fn redirect_proof_has_simple_scope(source: &str) -> bool {
     tokenize_for_shell_dialect(source, ShellDialect::Posix)
         .iter()
@@ -29279,6 +29542,9 @@ fn conditional_binding_dominates_redirect(source: &str, end: usize, use_start: u
 enum VariableResolution {
     /// Literal bindings shared by argv, rm, mv, and redirect proofs.
     Literal,
+    /// Literal redirect bindings from original source, with scope and
+    /// expansion-effect checks before lifting the dynamic-path denial.
+    RedirectLiteral,
     /// Equally strict bindings for an ordinary argument, including literal
     /// operands such as `of=/dev/sda`. IFS cannot split a double-quoted use;
     /// every binding and mutation check still applies.
@@ -29318,6 +29584,22 @@ fn redirect_assignment_values(
         return Some(vec![value]);
     }
     let (prefix, name, suffix) = parse_posix_variable_with_literal_affixes(token)?;
+    // Assignment words in one statement are evaluated in order. Resolving a
+    // dependency at statement entry is valid only when no sibling also assigns
+    // it: `S=/tmp; S=/etc T="$S"` must not copy the old /tmp candidate into T.
+    // Leave intra-statement copies unproven instead of guessing their order.
+    let assignment_end = segment_ranges
+        .iter()
+        .filter(|&&(start, end)| start <= assignment_start && assignment_start < end)
+        .min_by_key(|&&(start, end)| end - start)?
+        .1;
+    let statement = strip_assignment_declaration(source.get(assignment_start..assignment_end)?);
+    if split_assignment_words(statement)?
+        .iter()
+        .any(|word| posix_scalar_assignment(word).is_none_or(|(assigned, _)| assigned == name))
+    {
+        return None;
+    }
     // Resolve at the assignment, not at the eventual redirect: assignments
     // copy strings, and a later mutation of the source cannot change the copy.
     let mut values = resolve_variable_bindings(
@@ -29378,11 +29660,32 @@ fn literal_loop_redirect_values(
         .children()
         .filter(ast_grep_core::Node::is_named)
         .collect();
-    let redirect = statements.last()?;
-    let redirect_start = redirect.range().start;
-    let use_starts_at_redirect = redirect_start == segment_start
+    let outer_redirect = statements.last()?;
+    let mut redirect = outer_redirect.clone();
+    let mut use_starts_at_redirect = redirect.range().start == segment_start
         || (body.range().start == segment_start
-            && source.get(segment_start..redirect_start)?.trim() == "do");
+            && source.get(segment_start..redirect.range().start)?.trim() == "do");
+    // A subshell inherits the iteration value. Only peel a bounded chain of
+    // single-statement subshells, retaining the original body for the shared
+    // mutation checks. An assignment inside one must never prove an outer
+    // value, and additional commands/branches need their own flow analysis.
+    let mut depth = 0;
+    while redirect.kind().as_ref() == "subshell" {
+        if depth == MAX_REDIRECT_BINDING_DEPTH {
+            return None;
+        }
+        let child = {
+            let mut children = redirect.children().filter(ast_grep_core::Node::is_named);
+            let child = children.next()?;
+            if children.next().is_some() {
+                return None;
+            }
+            child
+        };
+        use_starts_at_redirect |= child.range().start == segment_start;
+        redirect = child;
+        depth += 1;
+    }
     if !use_starts_at_redirect
         || !matches!(redirect.kind().as_ref(), "command" | "redirected_statement")
     {
@@ -29390,8 +29693,13 @@ fn literal_loop_redirect_values(
     }
     // Include the whole body in the shared mutation checks: a trap or alias
     // installed after a redirect can change the next iteration's expansion.
-    let loop_values =
-        resolved_variable_values(source, segment_ranges, loop_node.range().end, &loop_name)?;
+    let loop_values = resolve_variable_bindings(
+        source,
+        segment_ranges,
+        loop_node.range().end,
+        &loop_name,
+        VariableResolution::RedirectLiteral,
+    )?;
     match statements.as_slice() {
         [_] if name == loop_name => Some(loop_values),
         [assignment, _] if assignment.kind().as_ref() == "variable_assignment" => {
@@ -29463,18 +29771,21 @@ fn proven_bash_redirect_offsets(source: &str) -> Vec<usize> {
     }
     ranges
         .iter()
-        .filter_map(|&(start, end)| {
-            let segment = source.get(start..end)?;
-            let operator = first_unquoted_output_redirect(segment, ShellDialect::Posix)?;
-            statically_safe_variable_redirect(
-                source,
-                &ranges,
-                start,
-                segment,
-                ShellDialect::Posix,
-                true,
-            )
-            .then_some(start + operator)
+        .flat_map(|&(start, end)| {
+            let offsets = source.get(start..end).and_then(|segment| {
+                proven_variable_redirect_offsets(
+                    source,
+                    &ranges,
+                    start,
+                    segment,
+                    ShellDialect::Posix,
+                    true,
+                )
+            });
+            offsets
+                .into_iter()
+                .flatten()
+                .map(move |operator| start + operator)
         })
         .collect()
 }
@@ -29760,22 +30071,8 @@ const MAX_LOOP_CANDIDATES: usize = 16;
 /// `for NAME in …` loop header (issue #242). Refuses when a second binding
 /// exists, when a `for` header binding `NAME` is not statically enumerable,
 /// or when any other preceding segment could mutate `NAME` in the parent
-/// shell.
-fn resolved_variable_values(
-    source: &str,
-    segment_ranges: &[(usize, usize)],
-    segment_start: usize,
-    name: &str,
-) -> Option<Vec<String>> {
-    resolve_variable_bindings(
-        source,
-        segment_ranges,
-        segment_start,
-        name,
-        VariableResolution::Literal,
-    )
-}
-
+/// shell. Redirect modes additionally validate binding scope and permit
+/// bounded assignment-time copies or modeled `mktemp` values.
 fn resolve_variable_bindings(
     source: &str,
     segment_ranges: &[(usize, usize)],
@@ -29857,11 +30154,26 @@ fn resolve_variable_bindings(
                 AssignmentOnlyBinding::Ambiguous => return None,
             };
             if let Some(raw) = binding {
+                if matches!(
+                    mode,
+                    VariableResolution::RedirectLiteral | VariableResolution::Redirect { .. }
+                ) && (!source
+                    .get(..start)
+                    .is_some_and(redirect_proof_has_simple_scope)
+                    || !redirect_binding_statement_preserves_siblings(segment, name))
+                {
+                    // A newline inside a skipped branch is not an
+                    // unconditional assignment. Check scope at the binding,
+                    // not at a later grouped/looped use. Scoped loop-local
+                    // derivations go through the AST proof instead.
+                    return None;
+                }
                 if values.is_some() {
                     return None;
                 }
                 values = Some(match mode {
                     VariableResolution::Literal
+                    | VariableResolution::RedirectLiteral
                     | VariableResolution::QuotedUseLiteral
                     | VariableResolution::DenyOnlyLiteral => vec![
                         literal_assignment_value(raw)
@@ -29884,6 +30196,15 @@ fn resolve_variable_bindings(
                 continue;
             }
             if posix_for_loop_binds(segment, name) {
+                if matches!(
+                    mode,
+                    VariableResolution::RedirectLiteral | VariableResolution::Redirect { .. }
+                ) && !source
+                    .get(..start)
+                    .is_some_and(redirect_proof_has_simple_scope)
+                {
+                    return None;
+                }
                 // A second binding (assignment or another loop) makes the
                 // live value ambiguous; a header that is not statically
                 // enumerable (globs, substitutions, `"$@"`) makes it
@@ -29953,6 +30274,25 @@ fn resolve_variable_bindings(
     values
 }
 
+/// Accepting one binding must account for the other assignment words in its
+/// statement. A sibling's arithmetic/parameter expansion or array subscript
+/// can overwrite the candidate before the statement finishes. Child-shell
+/// producers are isolated; the requested binding still has to pass its own
+/// literal/copy/mktemp value proof.
+fn redirect_binding_statement_preserves_siblings(segment: &str, name: &str) -> bool {
+    let assignments = strip_assignment_declaration(segment);
+    let Some(words) = split_assignment_words(assignments) else {
+        return false;
+    };
+    !words.is_empty()
+        && words.iter().all(|word| {
+            posix_scalar_assignment(word).is_some_and(|(assigned, _)| {
+                assigned == name || !shell_configuration_variable(assigned)
+            })
+        })
+        && posix_output_redirects_for_proof(assignments, true).is_some()
+}
+
 /// Whether a use of a variable may run more than once in this command: it
 /// holds a loop (every POSIX loop ends with `done`; zsh's short and brace
 /// forms still start with a loop keyword, and `repeat`/`foreach` are zsh's
@@ -30017,6 +30357,24 @@ fn segment_may_rebind_variable(
     // the segment inert. Fail closed instead, matching what that function
     // already does for any argument list it cannot read statically.
     let command_word_was_quoted = matches!(first, Cow::Owned(_));
+    let original_redirect_source = matches!(
+        mode,
+        VariableResolution::RedirectLiteral | VariableResolution::Redirect { .. }
+    );
+    if original_redirect_source
+        && !command_word_was_quoted
+        && literal_declaration_preserves_variable(segment, name)
+    {
+        // Every operand has been read literally, so assignment-looking bytes
+        // inside a quoted value are data rather than a hidden write to NAME.
+        return false;
+    }
+    if original_redirect_source && posix_output_redirects_for_proof(segment, true).is_none() {
+        // A previous statement can assign during expansion or allocate a
+        // named descriptor too. Checking just the redirecting command would
+        // retain a stale binding across either effect.
+        return true;
+    }
     let may_mutate_shell_variables = match first.as_ref() {
         // Only `printf -v NAME` binds; a plain printf writes to stdout
         // and cannot change what a later `$NAME` expands to (#422).
@@ -30032,11 +30390,11 @@ fn segment_may_rebind_variable(
         "trap" | "alias" => !matches!(mode, VariableResolution::DenyOnlyLiteral),
         other => matches!(
             other,
-            "readonly"
+            "export"
+                | "readonly"
                 | "declare"
                 | "typeset"
                 | "local"
-                | "export"
                 | "let"
                 | "eval"
                 | "source"
@@ -30058,6 +30416,57 @@ fn segment_may_rebind_variable(
                 wholly_double_quoted: true
             }
         ) && segment_text_may_assign(segment, "IFS"))
+}
+
+/// A bare declaration with wholly literal scalar assignments has a known
+/// binding effect. Never infer this from stripped argv: the caller supplies
+/// the complete original statement. Options, dynamic names/values, array or
+/// append assignments, and shell configuration changes remain hazards.
+fn literal_declaration_preserves_variable(segment: &str, name: &str) -> bool {
+    let Some(words) = split_assignment_words(segment) else {
+        return false;
+    };
+    let [
+        "export" | "readonly" | "declare" | "typeset",
+        assignments @ ..,
+    ] = words.as_slice()
+    else {
+        return false;
+    };
+    !assignments.is_empty()
+        && assignments.iter().all(|word| {
+            let Some((assigned, raw)) = posix_scalar_assignment(word) else {
+                return false;
+            };
+            assigned != name
+                && !shell_configuration_variable(assigned)
+                && literal_assignment_value(raw).is_some()
+        })
+}
+
+fn shell_configuration_variable(name: &str) -> bool {
+    shell_maintained_posix_variable(name)
+        || name.starts_with("LC_")
+        || name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+        || matches!(
+            name,
+            "PATH"
+                | "CDPATH"
+                | "FPATH"
+                | "path"
+                | "cdpath"
+                | "fpath"
+                | "HOME"
+                | "ENV"
+                | "ZDOTDIR"
+                | "TMPDIR"
+                | "TMP"
+                | "TEMP"
+                | "GLOBIGNORE"
+                | "FIGNORE"
+                | "LANG"
+        )
 }
 
 fn shell_maintained_posix_variable(name: &str) -> bool {
@@ -32943,6 +33352,25 @@ fn evaluate_core_filesystem_pack(
     };
     let dialect_source = dialect_source.as_ref();
     let rm_stdin_context = crate::packs::core::filesystem::RmStdinContext::new(command_for_packs);
+    // A permission-lifting proof must see original argv, including operands
+    // masked as data by the matching view. Recompute original ranges too:
+    // trimming a masked segment can otherwise drop a trailing export operand
+    // or an expansion that changes a later redirect (#634).
+    let redirect_proof_ranges =
+        if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+            && original_command.len() <= crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
+            && original_command.contains('>')
+            && original_command.contains('$')
+        {
+            let ranges = command_segment_ranges(original_command);
+            if ranges.len() <= MAX_REDIRECT_PROOF_SEGMENTS {
+                ranges
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
 
     for &(segment_start, segment_end) in segment_ranges {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
@@ -33153,20 +33581,31 @@ fn evaluate_core_filesystem_pack(
             }
         }
 
-        // A `$VAR` redirect target proven to resolve to a benign literal path
-        // (single prior literal assignment in this same command) is exempt
-        // from the dynamic-path rule only; every other redirect rule still
-        // runs.
+        // Every dynamic truncating target must resolve independently. Recover
+        // the smallest complete original segment owning this matching span;
+        // offsets that cannot be mapped retain the dynamic-path denial. Only
+        // that rule stands down, so literal paths and command rules still run.
         let redirect_source = dialect_source;
         let proven_variable_redirect =
-            statically_safe_variable_redirect(
-                redirect_source,
-                segment_ranges,
-                segment_start,
-                dialect_segment,
-                shell_dialect,
-                false,
-            ) || powershell_null_device_redirects_only(dialect_segment, shell_dialect);
+            normalized_offset.is_some_and(|base| {
+                redirect_proof_ranges
+                    .iter()
+                    .filter(|&&(start, end)| {
+                        start <= base.saturating_add(segment_start)
+                            && base.saturating_add(segment_end) <= end
+                    })
+                    .min_by_key(|&&(start, end)| end - start)
+                    .is_some_and(|&(start, end)| {
+                        statically_safe_variable_redirect(
+                            original_command,
+                            &redirect_proof_ranges,
+                            start,
+                            &original_command[start..end],
+                            shell_dialect,
+                            false,
+                        )
+                    })
+            }) || powershell_null_device_redirects_only(dialect_segment, shell_dialect);
         let redirect_filter: fn(Option<&str>) -> bool = if proven_variable_redirect {
             filesystem_redirect_pattern_excluding_dynamic
         } else {
@@ -50315,6 +50754,101 @@ mod tests {
                 "true; ".repeat(MAX_REDIRECT_PROOF_SEGMENTS - 3 + extra)
             );
             assert_eq!(proves(&command), extra == 0, "segment work bound");
+        }
+    }
+
+    #[test]
+    fn redirect_target_proofs_and_embedded_offsets_are_bounded_issue_634() {
+        use std::fmt::Write as _;
+
+        for count in [MAX_REDIRECT_PROOF_TARGETS, MAX_REDIRECT_PROOF_TARGETS + 1] {
+            let mut source = "S=/tmp/x; foo".to_string();
+            let mut expected = Vec::new();
+            for index in 0..count {
+                write!(source, " {index}> ").expect("redirect operator");
+                expected.push(source.len() - 2);
+                write!(source, "\"$S/file-{index}\"").expect("redirect target");
+            }
+            let proven = proven_bash_redirect_offsets(&source);
+            if count == MAX_REDIRECT_PROOF_TARGETS {
+                assert_eq!(proven, expected, "each target retains its own operator");
+            } else {
+                assert!(
+                    proven.is_empty(),
+                    "a partial proof cannot exempt a statement"
+                );
+            }
+        }
+
+        let source = r#"S=/tmp/x; foo 'inert > $UNKNOWN' >> "$LOG" 3>&2 > "$S/o" 2> "$S/e""#;
+        let proven = proven_bash_redirect_offsets(source);
+        assert_eq!(proven.len(), 4);
+        assert!(
+            proven
+                .iter()
+                .all(|&offset| source.as_bytes()[offset] == b'>')
+        );
+        assert!(!proven.contains(&source.find("> $UNKNOWN").expect("inert operator")));
+        for source in [
+            r#"S=/tmp/x; foo > "$S/o" 2> "$UNKNOWN""#,
+            r#"S=/tmp/x; foo > "$S/o" 2> "$S/e"${UNKNOWN}"#,
+            r#"S=/tmp/x; foo > "$S/o" 2> "$S/e""unclosed"#,
+            r#"S=/tmp/x; foo > "$S/o" 3>&1$UNKNOWN"#,
+        ] {
+            assert!(
+                proven_bash_redirect_offsets(source).is_empty(),
+                "incomplete targets cannot contribute embedded exemptions: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_proofs_read_original_arguments_in_both_posix_views_issue_634() {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for command in [
+                "export FOO=1; S=/tmp/x; foo > $S/o 2> $S/e",
+                "S=/tmp/x; export FOO='two words'; echo hi > $S/a",
+                "S=/tmp/x; foo 'inert > $UNKNOWN' > $S/o 2> $S/e",
+            ] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_allowed(),
+                    "{dialect:?}: {command:?}: {:?}",
+                    result.pattern_info
+                );
+            }
+            for command in [
+                r#"S=/tmp/x; export FOO=1 "$binding"; echo hi > "$S/a""#,
+                r#"S=/tmp/x; foo > "$S/a" "$((S=0))""#,
+                r#"S=/tmp/x; foo "$((S=0))" > "$S/a""#,
+                r#"S='/tmp/a b'; foo > "$S/a" 2> $S/b"#,
+                "export FOO=1; cd /tmp && S=/tmp/x; echo hi > $S/a",
+            ] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_denied(),
+                    "{dialect:?}: {command:?}: {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn loop_redirect_subshell_proof_has_a_depth_bound_issue_634() {
+        for depth in [MAX_REDIRECT_BINDING_DEPTH, MAX_REDIRECT_BINDING_DEPTH + 1] {
+            let source = format!(
+                "for w in a b; do {}echo hi > /tmp/s-$w{}; done",
+                "( ".repeat(depth),
+                " )".repeat(depth),
+            );
+            assert_eq!(
+                !proven_bash_redirect_offsets(&source).is_empty(),
+                depth == MAX_REDIRECT_BINDING_DEPTH,
+                "nested subshell work must stay bounded: {source:?}"
+            );
         }
     }
 

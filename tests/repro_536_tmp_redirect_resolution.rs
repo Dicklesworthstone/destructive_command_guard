@@ -1,4 +1,4 @@
-//! #536: bounded POSIX redirect resolution admits proven temporary paths.
+//! #536 / #634: bounded POSIX redirect resolution admits proven temporary paths.
 //!
 //! All command strings are sent as JSON data to the real Claude Code hook;
 //! they are never executed by a shell. Positive cases cover each reported
@@ -463,5 +463,326 @@ fn shared_mutation_guards_preserve_literal_and_mktemp_proofs() {
             decision, "allow",
             "sound proof must survive {command:?}: {rule}"
         );
+    }
+}
+
+#[test]
+fn every_dynamic_redirect_is_proven_independently_issue_634() {
+    for command in [
+        "S=/tmp/x; foo > $S/o 2> $S/e",
+        "S=/tmp/x; foo 2>$S/e >$S/o",
+        r#"S=/tmp/x; foo > "$S"/o 2> "${S}/e""#,
+        "S=/tmp/x; T=/var/tmp/y; foo > $S/o 2> $T/e",
+        r#"S=/tmp/x; T="$S/sub"; foo > "$S/o" 2> "$T/e""#,
+        "S=/tmp/x; foo > /tmp/literal 2> $S/e",
+        "S=/tmp/x; foo > $S/o 2> /tmp/literal",
+        "S=/tmp/x; foo > $S/o 2> $S/e 3>&1",
+        "S=/tmp/x; foo 3>&2 > $S/o 2> $S/e",
+        "S=/tmp/x; foo >| $S/o 2>| $S/e",
+        "S=/tmp/x; foo &>$S/o 3>$S/e",
+        r#"S=/tmp/x; foo &> "$S/o" 3> "${S}/e""#,
+        "foo > /tmp/stdout-$$ 2> /tmp/stderr-$$",
+        r#"for w in a b; do foo > "/tmp/s-$w" 2> "/tmp/e-$w"; done"#,
+        r#"bash -c 'S=/tmp/x; foo > "$S/o" 2> "$S/e"'"#,
+    ] {
+        let (decision, rule) = hook(command);
+        assert_eq!(
+            decision, "allow",
+            "every truncating target has its own temporary-path proof: {command:?}: {rule}"
+        );
+    }
+}
+
+#[test]
+fn every_dynamic_redirect_must_pass_the_proof_issue_634() {
+    for command in [
+        "S=/tmp/x; foo > $S/o 2> $UNKNOWN",
+        "S=/tmp/x; foo > $UNKNOWN 2> $S/e",
+        "S=/tmp/x; T=/etc; foo > $S/o 2> $T/passwd",
+        "S=/tmp/x; T=/etc; foo > $T/passwd 2> $S/e",
+        "S=/tmp/x; foo > $S/o 2> $S/../../etc/passwd",
+        "S=/tmp/x; foo > $S/../../etc/passwd 2> $S/e",
+        "S=/tmp/x; foo > $S/o 2> $S/.git/config",
+        "S=/tmp/x; foo > $S/o 2> $S/.ssh/id_rsa",
+        "S=/tmp/x; foo > $S/o 2> $S/$UNKNOWN",
+        "S=/tmp/x; foo > $S/o 2> $(cat destination)",
+        r#"S=/tmp/x; foo > "$S/o" 2> "$S"/"$UNKNOWN""#,
+        r#"S='/tmp/*'; foo > "$S/o" 2> $S/e"#,
+        "S=/tmp/x; foo > $S/o >&$UNKNOWN",
+        "S=/tmp/x; foo > $S/o >&1$UNKNOWN",
+        // A later numeric descriptor must not make a prior target irrelevant.
+        "S=/tmp/x; foo > $UNKNOWN > $S/o 2>&1",
+    ] {
+        assert_denied(command);
+    }
+}
+
+#[test]
+fn independently_proven_redirects_preserve_literal_and_command_denials_issue_634() {
+    for command in [
+        "S=/tmp/x; foo > $S/o 2> /etc/passwd",
+        "S=/tmp/x; foo > /etc/passwd 2> $S/e",
+        "S=/tmp/x; foo > $S/o 2> .git/config",
+        "S=/tmp/x; foo > .git/config 2> $S/e",
+        "S=/tmp/x; foo > $S/o 2> $S/e 3> /etc/passwd",
+        "S=/tmp/x; foo > $S/o 2> $S/e 3>> .git/config",
+        "export FOO=1 > /etc/passwd; S=/tmp/x; foo > $S/o 2> $S/e",
+    ] {
+        assert_denied(command);
+    }
+    for command in [
+        "S=/tmp/x; git reset --hard > $S/o 2> $S/e",
+        "S=/tmp/x; foo > $S/o 2> $S/e; git reset --hard",
+        "export FOO=1; S=/tmp/x; git reset --hard > $S/o 2> $S/e",
+    ] {
+        assert_eq!(
+            hook(command),
+            ("deny".to_string(), "core.git:reset-hard".to_string()),
+            "redirect proofs must not exempt the command: {command:?}"
+        );
+    }
+}
+
+#[test]
+fn appends_do_not_need_truncation_proofs_issue_634() {
+    for command in [
+        "S=/tmp/x; foo > $S/o 2>> $LOG",
+        "S=/tmp/x; foo >> $LOG 2> $S/e",
+        "S=/tmp/x; foo >$S/o 2>>$LOG",
+        "S=/tmp/x; foo >>$LOG 2>$S/e",
+        r#"S=/tmp/x; foo >>"$LOG" 2>"$S/e""#,
+        "S=/tmp/x; foo &>>$LOG 3>$S/e",
+    ] {
+        let (decision, rule) = hook(command);
+        assert_eq!(
+            decision, "allow",
+            "an append is not a second truncating redirect: {command:?}: {rule}"
+        );
+    }
+    for command in [
+        "S=/tmp/x; foo >> $S/o 2> $UNKNOWN",
+        "S=/tmp/x; foo > $UNKNOWN 2>> $S/e",
+        "S=/tmp/x; foo >> .git/config 2> $S/e",
+        "S=/tmp/x; foo > $S/o 2>> .git/config",
+    ] {
+        assert_denied(command);
+    }
+}
+
+#[test]
+fn original_redirect_words_preserve_quoted_data_and_escaped_separators_issue_634() {
+    for command in [
+        r"S=/tmp/x; echo 'literal > $UNKNOWN ; export S=/etc' > $S/o 2> $S/e",
+        r#"S=/tmp/x; printf '%s' 'literal > $UNKNOWN' 2> "$S/e" > "$S/o""#,
+        r"S=/tmp/x; echo semi\;colon > $S/o 2> $S/e",
+        r#"S=/tmp/x; echo quote\"test > $S/o 2> $S/e"#,
+        r"S=/tmp/x; foo \>literal > $S/o 2> $S/e",
+        "export FOO='x; y'; S=/tmp/x; foo > $S/o 2> $S/e",
+    ] {
+        let (decision, rule) = hook(command);
+        assert_eq!(
+            decision, "allow",
+            "only actual redirect words need path proofs: {command:?}: {rule}"
+        );
+    }
+    for command in [
+        r"S=/tmp/x; echo 'literal > $S/o'; foo > $UNKNOWN 2> $S/e",
+        r#"S=/tmp/x; echo 'export FOO=1'; export "$binding"; echo hi > $S/a"#,
+        "S=/tmp/x; export FOO=1 \\\n\"$binding\"; echo hi > $S/a",
+    ] {
+        assert_denied(command);
+    }
+}
+
+#[test]
+fn unrelated_literal_exports_preserve_redirect_bindings_issue_634() {
+    for command in [
+        "export FOO=1; S=/tmp/x; echo hi > $S/a",
+        "S=/tmp/x; export FOO=1; echo hi > $S/a",
+        "export FOO=1 BAR=two; S=/tmp/x; foo > $S/o 2> $S/e",
+        "export FOO=1\nS=/tmp/x\necho hi > $S/a",
+        "export FOO=1; S=/tmp/x; export BAR=two; foo > $S/o 2> $S/e",
+        "export FOO=1 && S=/tmp/x && echo hi > $S/a",
+        "export FOO='two words'; S=/tmp/x; echo hi > $S/a",
+        r#"S=/tmp/x; export FOO="two words"; echo hi > "$S/a""#,
+        "export FOO='S=/etc'; S=/tmp/x; echo hi > $S/a",
+        "readonly FOO=1; S=/tmp/x; echo hi > $S/a",
+        "S=/tmp/x; declare FOO=1; echo hi > $S/a",
+        "S=/tmp/x; typeset FOO=1; echo hi > $S/a",
+    ] {
+        let (decision, rule) = hook(command);
+        assert_eq!(
+            decision, "allow",
+            "literal declarations of unrelated scalars preserve the proof: {command:?}: {rule}"
+        );
+    }
+}
+
+#[test]
+fn declaration_proofs_require_literal_unrelated_operands_issue_634() {
+    for command in [
+        // Read the original arguments, including ones masked as command data.
+        "S=/tmp/x; export $binding; echo hi > $S/a",
+        r#"S=/tmp/x; export "$binding"; echo hi > $S/a"#,
+        r#"S=/tmp/x; export FOO=1 "$binding"; echo hi > $S/a"#,
+        r#"binding='S=/etc'; S=/tmp/x; export "$binding"; echo hi > $S/passwd"#,
+        r#"S=/tmp/x; command export "$binding"; echo hi > $S/a"#,
+        r#"S=/tmp/x; ex'port' "$binding"; echo hi > $S/a"#,
+        r#"S=/tmp/x; "export" $binding; echo hi > $S/a"#,
+        r"S=/tmp/x; \export $binding; echo hi > $S/a",
+        "S=/tmp/x; export FOO=$(cat declarations); echo hi > $S/a",
+        "S=/tmp/x; export S=/etc; echo hi > $S/passwd",
+        "S=/tmp/x; S=/etc export FOO=1; echo hi > $S/passwd",
+        "S=/tmp/x; S=/etc export FOO=1 > $S/passwd 2> $S/e",
+        "S=/tmp/x; export IFS=/; echo hi > $S/a",
+        "export IFS=/; S=/tmp/x; echo hi > $S/a",
+        // Environment configuration is not an unrelated ordinary scalar.
+        "export TMPDIR=/etc; D=$(mktemp -d); echo hi > $D/a",
+        "export PATH=/usr/bin:$PATH; S=/tmp/x; echo hi > $S/a",
+        // Declaration flags can introduce references, arrays or transforms.
+        "declare -n T=S; S=/tmp/x; T=/etc; echo hi > $S/passwd",
+        "S=/tmp/x; typeset -n T=S; T=/etc; echo hi > $S/passwd",
+        "S=/tmp/x; declare -a S; S[0]=/etc; echo hi > $S/passwd",
+        r#"S=/tmp/x; readonly "$binding"; echo hi > $S/a"#,
+        r#"S=/tmp/x; declare "$binding"; echo hi > $S/a"#,
+        r#"S=/tmp/x; typeset "$binding"; echo hi > $S/a"#,
+        // A special variable is not an ordinary stable scalar.
+        "export FOO=1; PWD=/tmp/x; cd /etc; echo hi > $PWD/passwd",
+    ] {
+        assert_denied(command);
+    }
+}
+
+#[test]
+fn named_descriptors_cannot_rebind_a_proven_path_during_redirection_issue_634() {
+    for command in [
+        "S=/tmp/x; foo {S}>/tmp/fd > $S/a",
+        "S=/tmp/x; foo > $S/o {S}>/tmp/fd 2> $S/e",
+        "S=/tmp/x; foo {S}</tmp/input > $S/o 2> $S/e",
+        r#"S=/tmp/x; T="$S/sub"; foo {T}>/tmp/fd > "$T/a""#,
+    ] {
+        assert_denied(command);
+    }
+}
+
+#[test]
+fn redirect_proofs_do_not_ignore_expansion_side_effects_issue_634() {
+    for command in [
+        // Expanding an append/input target or argv can change shell state or
+        // the filesystem before a later, apparently temporary redirect opens.
+        r#"S=/tmp/x; foo >>"$((S=0))" > "$S/a""#,
+        r#"S=/tmp/x; foo <"$((S=0))" > "$S/a""#,
+        r#"S=/tmp/x; foo "$((S=0))" > "$S/o" 2> "$S/e""#,
+        r#"S=/tmp/x; foo >>"$(ln -s /etc /tmp/x; echo /tmp/log)" > "$S/passwd""#,
+        r#"S=/tmp/x; foo "$(ln -s /etc /tmp/x)" > "$S/o" 2> "$S/e""#,
+        // Unsupported parameter operators must not become an implicit proof
+        // just because a different redirect in the command is provable.
+        r#"S=/tmp/x; foo > "$S/o" 2> "${UNKNOWN:=/etc/passwd}""#,
+        r#"S=/tmp/x; foo > "$S/o" 2> "${S%/*}/../../etc/passwd""#,
+    ] {
+        assert_denied(command);
+    }
+}
+
+#[test]
+fn literal_loop_bindings_reach_simple_subshell_redirects_issue_634() {
+    for command in [
+        "for w in a b; do (echo hi > /tmp/s-$w); done",
+        "for w in a b; do (foo > /tmp/s-$w 2> /tmp/e-$w); done",
+        r#"for w in a b; do ( (foo > "/tmp/$w/o" 2> "/tmp/$w/e") ); done"#,
+        r#"bash -c 'for w in a b; do (echo hi > "/tmp/s-$w"); done'"#,
+    ] {
+        let (decision, rule) = hook(command);
+        assert_eq!(
+            decision, "allow",
+            "the simple subshell inherits the literal iteration value: {command:?}: {rule}"
+        );
+    }
+}
+
+#[test]
+fn loop_subshell_proofs_preserve_scope_and_path_boundaries_issue_634() {
+    for command in [
+        "for w in ../../etc/passwd; do (echo hi > /tmp/$w); done",
+        "for w in a b; do (w=../../etc/passwd; echo hi > /tmp/$w); done",
+        "for w in a b; do (read w; echo hi > /tmp/$w); done",
+        "for w in a b; do (echo ready; echo hi > /tmp/s-$w); done",
+        "for w in a b; do (false && D=/tmp/$w; echo hi > $D/a); done",
+        "for w in a b; do (echo hi > /tmp/s-$w); trap 'w=../../etc/passwd' DEBUG; done",
+        r#"for w in a b; do (foo > "$UNKNOWN" 2> "/tmp/s-$w"); done"#,
+        r#"for w in a b; do (foo > "/tmp/s-$w" 2> /etc/passwd); done"#,
+        r#"for w in a b; do (foo > "/tmp/s-$w" 2> "/tmp/$w/.git/config"); done"#,
+        // Runtime glob candidates and parameter operators need separate proofs.
+        r#"for w in *.doc; do (echo hi > "/tmp/slips/${w%.*}.txt"); done"#,
+        r#"for w in a.doc b.doc; do (echo hi > "/tmp/slips/${w%.*}.txt"); done"#,
+        // Assigning inside a subshell cannot establish a later outer value.
+        "for w in a b; do (D=/tmp/$w); echo hi > $D/a; done",
+    ] {
+        assert_denied(command);
+    }
+}
+
+#[test]
+fn conditional_assignments_must_dominate_every_redirect_issue_634() {
+    for command in [
+        "cd /tmp && S=/tmp/x; echo hi > $S/a",
+        "cd /tmp && S=/tmp/x; foo > $S/o 2> $S/e",
+        "export FOO=1; cd /tmp && S=/tmp/x; echo hi > $S/a",
+        "S=/tmp/x; false && T=/tmp/y; foo > $S/o 2> $T/e",
+        "false && S=/tmp/x || foo > $S/o 2> $S/e",
+        "true || S=/tmp/x; foo > $S/o 2> $S/e",
+        "(S=/tmp/x); foo > $S/o 2> $S/e",
+    ] {
+        assert_denied(command);
+    }
+    for command in [
+        "cd /tmp && S=/tmp/x && echo hi > $S/a",
+        "cd /tmp && S=/tmp/x && foo > $S/o 2> $S/e",
+        "export FOO=1; cd /tmp && S=/tmp/x && foo > $S/o 2> $S/e",
+    ] {
+        let (decision, rule) = hook(command);
+        assert_eq!(
+            decision, "allow",
+            "the unbroken success path establishes the binding: {command:?}: {rule}"
+        );
+    }
+}
+
+#[test]
+fn baseline_scope_and_effect_holes_stay_denied_issue_634() {
+    // The single-target baseline accepted several stale-binding forms here.
+    // Extending the proof must reject stale evidence in both target counts.
+    for prefix in [
+        // A newline does not turn a skipped branch into an unconditional bind.
+        "if false; then\nS=/tmp/x\nfi\n",
+        // A subshell assignment never establishes the later parent value.
+        "(\nS=/tmp/x\n)\n",
+        // An earlier redirect can allocate a descriptor into the path variable.
+        "S=/tmp/x; : {S}>/tmp/fd; ",
+        // zsh's ::= parameter operator assigns even when S was already set.
+        r#"S=/tmp/x; : "${S::=/etc}"; "#,
+        // Inspect sibling assignment values before accepting the literal S.
+        "S=/tmp/x T=$((S=0)); ",
+        "S=/tmp/x T=${S::=/etc}; ",
+        // An indexed-array subscript can evaluate arithmetic without `$((`.
+        "S=/tmp/x; X[S=0]=value; ",
+    ] {
+        for redirect in ["foo > $S/o", "foo > $S/o 2> $S/e"] {
+            assert_denied(&format!("{prefix}{redirect}"));
+        }
+    }
+
+    for redirect in [r#"foo > "$T/o""#, r#"foo > "$T/o" 2> "$T/e""#] {
+        // Assignment words run left to right: T copies the sibling /etc value,
+        // not the older S value visible at the beginning of this statement.
+        assert_denied(&format!(r#"S=/tmp/x; S=/etc T="$S"; {redirect}"#));
+    }
+
+    for suffix in ["", r#" 2> "$S/e""#] {
+        // A comment can start immediately after `(`. Its quotes and trailing
+        // backslash are inert; they cannot hide the live UNKNOWN redirect on
+        // the following line or let it borrow the outer temporary-path proof.
+        let command = format!("S=/tmp/x;\n(#\"\n : >\"$UNKNOWN\"\n #\"\\\n ) >\"$S/o\"{suffix}");
+        assert_denied(&command);
     }
 }
