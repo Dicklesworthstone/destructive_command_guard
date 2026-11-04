@@ -543,6 +543,13 @@ fn git_admin_queries_and_bound_values_reach_native_writer_rules() {
         "cp source \"$(git -C /r rev-parse --git-common-dir)/hooks/pre-commit\"",
         "cp source \"$(git -C /r rev-parse --git-dir)/config\"",
         "cp source $(git -C sub rev-parse --git-common-dir)/config",
+        // The same for --git-path: `.git/hooks/pre-commit` from the caller's
+        // directory is still an administered path.
+        "cp source \"$(git -C /r rev-parse --git-path hooks/pre-commit)\"",
+        "cp source \"$(git -C /r rev-parse --git-path hooks)/pre-commit\"",
+        "cp source \"$(git -C /r rev-parse --git-path config)\"",
+        "cp source \"$(git -C sub rev-parse --git-path index)\"",
+        "d=$(git -C /r rev-parse --git-path hooks); cp source \"$d/pre-commit\"",
         "cp source \"$(git rev-parse --git-path hooks)/pre-commit\"",
         "cp source \"$(git rev-parse --git-path hooks/pre-commit)\"",
         "cp source \"$(git rev-parse --git-path config)\"",
@@ -592,6 +599,8 @@ fn git_redirects_keep_separate_append_and_truncate_identities() {
         for target in [
             "\"$(git rev-parse --git-dir)/config\"",
             "\"$(git rev-parse --git-path hooks)/pre-commit\"",
+            "\"$(git -C /r rev-parse --git-dir)/config\"",
+            "\"$(git -C /r rev-parse --git-path hooks)/pre-commit\"",
         ] {
             fixture.deny(&format!("printf x {operator} {target}"), rule);
         }
@@ -619,6 +628,11 @@ fn ordinary_queries_traversal_and_literal_query_text_are_not_git_destinations() 
         "cp source \"$(git -C src --git-dir=/outside/admin rev-parse --git-path index)\"",
         "cp source \"$(git -C src --git-dir=/outside/admin rev-parse --git-common-dir)/config\"",
         "cp source \"$(git -C src --git-dir=/outside/admin rev-parse --git-path hooks/pre-commit)\"",
+        "cp source \"$(git -C /r rev-parse --show-toplevel)/notes.txt\"",
+        "cp source \"$(git -C /r rev-parse --git-dir)/../notes.txt\"",
+        "cp source \"$(git -C /r rev-parse --git-path ../notes.txt)\"",
+        "cp source \"$(git -C /r rev-parse --git-path hooks)/../notes.txt\"",
+        "d=$(git -C /r rev-parse --git-path hooks); cat \"$d/pre-commit\"",
         "cp source '$(git rev-parse --git-dir)/config'",
         "cp source '`git rev-parse --git-dir`/config'",
         "d='$(git rev-parse --git-dir)'; cp source \"$d/config\"",
