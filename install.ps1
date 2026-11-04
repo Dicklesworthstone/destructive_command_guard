@@ -8,7 +8,7 @@
 #   -Version vX.Y.Z   Install specific version (default: latest)
 #   -Dest DIR         Install to DIR (default: ~/.local/bin)
 #   -EasyMode         Auto-add to PATH
-#   -Verify           Run self-test after install
+#   -Verify           Self-test the candidate before installing
 #   -RequireMinisign  Require a valid release .minisig and the minisign tool
 #   -MinisignSignatureUrl <url|file://> Override the adjacent .minisig source
 #   -Force            Configure agent hooks even if the agent CLI isn't detected
@@ -2036,7 +2036,7 @@ function Assert-DcgInstalledVersion {
       throw "Installed dcg version mismatch: expected $expected, got $reported"
     }
   }
-  Write-Ok "Installed version verified: $($reported.Substring(1))"
+  Write-Ok "Binary version verified: $($reported.Substring(1))"
 }
 
 function Invoke-DcgInstallSelfTest {
@@ -2103,6 +2103,112 @@ function Invoke-DcgInstallSelfTest {
   }
 
   Write-Ok "Self-test complete"
+}
+
+# Call only after the archive verification and layout checks. Qualify
+# exactly the staged bytes before making them live: a failed --version/-Verify
+# must never replace a working guard. The sibling stage keeps promotion on the
+# destination volume, and File.Replace preserves existing Windows access rules.
+function Install-DcgBinary {
+  param(
+    [string]$SourcePath,
+    [string]$DestinationPath,
+    [string]$ExpectedVersion,
+    [string]$ProbeRoot,
+    [switch]$Verify
+  )
+
+  $SourcePath = (Get-Item -LiteralPath $SourcePath -Force -ErrorAction Stop).FullName
+  $directory = Split-Path -Parent $DestinationPath
+  if ([string]::IsNullOrEmpty($directory)) { $directory = '.' }
+  if (-not (Test-Path -LiteralPath $directory)) {
+    New-Item -ItemType Directory -Path $directory -Force -ErrorAction Stop | Out-Null
+  }
+  $directory = (Get-Item -LiteralPath $directory -Force -ErrorAction Stop).FullName
+  $DestinationPath = Join-Path $directory (Split-Path -Leaf $DestinationPath)
+  $existing = Get-Item -LiteralPath $DestinationPath -Force -ErrorAction SilentlyContinue
+  if ($null -ne $existing) {
+    if ($existing.PSIsContainer -or
+        ($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+      throw "Cannot safely replace a directory or linked dcg executable; leaving unchanged: $DestinationPath"
+    }
+    if ($ExecutionContext.SessionState.LanguageMode -eq 'ConstrainedLanguage') {
+      # Move-Item -Force can delete the old executable before its replacement
+      # succeeds. This policy cannot call the atomic ACL-preserving API, so
+      # refuse an update without changing the incumbent. Fresh installs below
+      # still use a no-overwrite rename and remain supported under this policy.
+      throw "Cannot atomically replace an existing dcg executable in ConstrainedLanguage; leaving unchanged: $DestinationPath"
+    }
+  }
+
+  $stage = Join-Path $directory ('.dcg-install-' + [Guid]::NewGuid().ToString('N') + '.exe')
+  $backup = $DestinationPath + '.bak.' + [Guid]::NewGuid().ToString('N')
+  $promoted = $false
+  try {
+    if ($null -ne $existing) {
+      # Keep the incumbent's restrictive Unix mode on the stage. Copy-Item of
+      # the candidate over it can replace that mode; streaming its bytes does
+      # not. Windows ACLs are retained by the final File.Replace operation.
+      Copy-Item -LiteralPath $DestinationPath -Destination $stage -ErrorAction Stop
+      $inputStream = [System.IO.File]::OpenRead($SourcePath)
+      try {
+        $outputStream = [System.IO.File]::Open($stage, [System.IO.FileMode]::Open,
+          [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        try {
+          $outputStream.SetLength(0)
+          $inputStream.CopyTo($outputStream)
+          $outputStream.Flush($true)
+        } finally {
+          $outputStream.Dispose()
+        }
+      } finally {
+        $inputStream.Dispose()
+      }
+    } else {
+      Copy-Item -LiteralPath $SourcePath -Destination $stage -ErrorAction Stop
+    }
+
+    # The stage has passed archive verification. Remove Mark-of-the-Web before
+    # its qualification probes; never unblock unchecked downloaded bytes.
+    if (Get-Command Unblock-File -ErrorAction SilentlyContinue) {
+      try { Unblock-File -LiteralPath $stage -ErrorAction SilentlyContinue } catch { }
+    }
+    Assert-DcgInstalledVersion -Path $stage -ExpectedVersion $ExpectedVersion
+    if ($Verify) {
+      Write-Info "Running self-test..."
+      Invoke-DcgInstallSelfTest -Path $stage -ProbeRoot $ProbeRoot
+    }
+
+    if ($null -ne $existing) {
+      [System.IO.File]::Replace($stage, $DestinationPath, $backup)
+    } else {
+      # No Force: a raced file or directory must not be silently overwritten.
+      Rename-Item -LiteralPath $stage -NewName (Split-Path -Leaf $DestinationPath) -ErrorAction Stop
+    }
+    $promoted = $true
+  } catch {
+    # ReplaceFile can move the old executable to its backup before failing.
+    # Recover only an absent destination; never overwrite a concurrent writer.
+    if (-not (Test-Path -LiteralPath $DestinationPath) -and
+        (Test-Path -LiteralPath $backup -PathType Leaf)) {
+      try {
+        Rename-Item -LiteralPath $backup -NewName (Split-Path -Leaf $DestinationPath) -ErrorAction Stop
+      } catch {
+        throw "dcg replacement failed; previous executable is preserved at: $backup. $_"
+      }
+    }
+    if (Test-Path -LiteralPath $backup -PathType Leaf) {
+      throw "dcg replacement failed; previous executable is preserved at: $backup. $_"
+    }
+    throw
+  } finally {
+    if (Test-Path -LiteralPath $stage -PathType Leaf) {
+      Remove-Item -LiteralPath $stage -Force -ErrorAction SilentlyContinue
+    }
+    if ($promoted -and (Test-Path -LiteralPath $backup -PathType Leaf)) {
+      Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    }
+  }
 }
 
 function Resolve-ChecksumToken {
@@ -2256,7 +2362,7 @@ Options:
   -Version vX.Y.Z   Install a specific version (default: latest GitHub release)
   -Dest DIR         Install to DIR (default: ~/.local/bin)
   -EasyMode         Add the install dir to PATH and force agent configuration
-  -Verify           Run a self-test after install
+  -Verify           Self-test the candidate before installing
   -RequireMinisign  Require a valid .minisig and the minisign verifier
   -MinisignSignatureUrl <url|file://>  Override the adjacent .minisig source
   -Force            Configure agent hooks even if the agent CLI isn't detected
@@ -2461,21 +2567,24 @@ if (-not (Test-Path -LiteralPath $binPath -PathType Leaf)) {
   exit 1
 }
 
-# Install
-if (-not (Test-Path $Dest)) {
-  New-Item -ItemType Directory -Force -Path $Dest | Out-Null
-}
+# Stage, qualify, then atomically install. No PATH or hook changes precede
+# successful qualification and promotion of the verified candidate.
 $installedExe = Join-Path $Dest "dcg.exe"
-Copy-Item $binPath $installedExe -Force
-# Strip Mark-of-the-Web (Zone.Identifier) so the freshly-installed binary does not
-# trip SmartScreen / "publisher could not be verified". Done only AFTER the
-# required checksum and, when a bundle and compatible cosign are available,
-# signature verification above, so unchecked bytes are never unblocked.
+try {
+  Install-DcgBinary -SourcePath $binPath -DestinationPath $installedExe `
+    -ExpectedVersion $Version -ProbeRoot $tmp -Verify:$Verify
+} catch {
+  Write-Err $_.Exception.Message
+  exit 1
+}
+# File.Replace can preserve the old file's alternate streams. Clear any inherited
+# Mark-of-the-Web (Zone.Identifier) after the verified stage is promoted, so the
+# new binary does not inherit a SmartScreen warning from the previous file.
 # Wrapped in try/catch because Unblock-File is present-but-unsupported on non-Windows
 # PowerShell (it throws "does not support Linux", which -ErrorAction can't suppress);
 # on Windows it works normally. Keeps the installer body hermetically testable.
 if (Get-Command Unblock-File -ErrorAction SilentlyContinue) {
-  try { Unblock-File -Path $installedExe -ErrorAction SilentlyContinue } catch { }
+  try { Unblock-File -LiteralPath $installedExe -ErrorAction SilentlyContinue } catch { }
 }
 Write-Ok "Installed to $Dest\dcg.exe"
 
@@ -2498,17 +2607,6 @@ if (-not (Test-UserPathContains -PathValue $path -PathToFind $Dest)) {
   } else {
     Write-Warn "Add $Dest to PATH to use dcg"
   }
-}
-
-try {
-  Assert-DcgInstalledVersion -Path $installedExe -ExpectedVersion $Version
-  if ($Verify) {
-    Write-Info "Running self-test..."
-    Invoke-DcgInstallSelfTest -Path $installedExe -ProbeRoot $tmp
-  }
-} catch {
-  Write-Err $_.Exception.Message
-  exit 1
 }
 
 }

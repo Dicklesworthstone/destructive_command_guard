@@ -12,7 +12,7 @@
 #   --dest DIR         Install to DIR (default: ~/.local/bin)
 #   --system           Install to /usr/local/bin (requires sudo)
 #   --easy-mode        Auto-update PATH in shell rc files
-#   --verify           Run self-test after install
+#   --verify           Self-test the candidate before installing
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
@@ -765,19 +765,20 @@ normalize_version_tag() {
   printf 'v%s\n' "$without_v"
 }
 
-get_installed_version() {
+get_binary_version() {
+  local dcg_path="$1"
   local output=""
   local line
   local candidate
   local normalized
 
-  if [ ! -x "$DEST/dcg" ]; then
+  if [ ! -x "$dcg_path" ]; then
     return 1
   fi
 
-  output=$("$DEST/dcg" --version 2>/dev/null) || return 1
+  output=$("$dcg_path" --version 2>/dev/null) || return 1
   if [ -z "$output" ]; then
-    output=$(NO_COLOR=1 "$DEST/dcg" --version 2>&1) || return 1
+    output=$(NO_COLOR=1 "$dcg_path" --version 2>&1) || return 1
   fi
 
   while IFS= read -r line; do
@@ -804,17 +805,18 @@ check_installed_version() {
   local target_normalized
 
   target_normalized=$(normalize_version_tag "$target_version") || return 1
-  installed_version=$(get_installed_version) || return 1
+  installed_version=$(get_binary_version "$DEST/dcg") || return 1
   [ "$target_normalized" = "$installed_version" ]
 }
 
-assert_installed_version() {
-  local expected_version="${1:-}"
+assert_binary_version() {
+  local dcg_path="$1"
+  local expected_version="${2:-}"
   local reported_version
   local expected_normalized
 
-  if ! reported_version=$(get_installed_version); then
-    err "Installed dcg failed its --version check"
+  if ! reported_version=$(get_binary_version "$dcg_path"); then
+    err "The dcg binary failed its --version check"
     return 1
   fi
 
@@ -824,12 +826,12 @@ assert_installed_version() {
       return 1
     }
     if [ "$reported_version" != "$expected_normalized" ]; then
-      err "Installed dcg version mismatch: expected ${expected_normalized}, got ${reported_version}"
+      err "dcg version mismatch: expected ${expected_normalized}, got ${reported_version}"
       return 1
     fi
   fi
 
-  ok "Installed version verified: ${reported_version#v}"
+  ok "Binary version verified: ${reported_version#v}"
 }
 
 # Put the binary at $DEST/dcg with a single rename(2).
@@ -838,12 +840,22 @@ assert_installed_version() {
 # BSD alike) unlinks the target and then copies, so a hook starting during the
 # copy found no file or a partial one (bd-0zx5). The staged copy sits in $DEST,
 # so the final `mv -f` stays on one filesystem: a hook sees the old binary or
-# the new one, never neither. A staged binary that cannot report its version
-# is discarded and the installed one is left as it was.
+# the new one, never neither. Qualify the actual staged bytes before that
+# rename: a candidate with the wrong version or a failed requested self-test
+# must never replace a working guard. Failed qualification or promotion leaves
+# the incumbent's bytes and executable mode unchanged.
 install_binary_atomically() {
   local src="$1"
+  local expected_version="${2:-}"
+  local verify="${3:-0}"
   local staged
 
+  # Without this guard, mv treats an existing directory (including a symlink
+  # to one) as a container and reports success without installing $DEST/dcg.
+  if [ -d "$DEST/dcg" ]; then
+    err "Cannot replace directory at $DEST/dcg with the dcg binary"
+    return 1
+  fi
   if ! staged=$(mktemp "$DEST/.dcg.XXXXXX"); then
     err "Cannot create a temporary file in $DEST"
     return 1
@@ -853,9 +865,14 @@ install_binary_atomically() {
     err "Cannot stage the dcg binary in $DEST"
     return 1
   fi
-  if ! "$staged" --version >/dev/null 2>&1; then
+  if ! assert_binary_version "$staged" "$expected_version"; then
     rm -f "$staged"
     err "The new dcg binary failed its --version check; $DEST/dcg was not replaced"
+    return 1
+  fi
+  if [ "$verify" -eq 1 ] && ! run_install_self_test "$staged"; then
+    rm -f "$staged"
+    err "The new dcg binary failed its self-test; $DEST/dcg was not replaced"
     return 1
   fi
   if ! mv -f "$staged" "$DEST/dcg"; then
@@ -867,12 +884,17 @@ install_binary_atomically() {
 
 run_install_self_test() {
   local allow_output
-  local dcg_path
+  local dcg_path="${1:-$DEST/dcg}"
   local deny_output
   local deny_status
 
   info "Running self-test"
-  dcg_path="$(cd -- "$DEST" && pwd -P)/dcg"
+  # The probes run outside the project and with isolated user configuration.
+  # Resolve a relative staged path before changing their working directory.
+  case "$dcg_path" in
+    /*) ;;
+    *) dcg_path="$(pwd -P)/$dcg_path" ;;
+  esac
   if ! allow_output=$(cd "$TMP" && \
     HOME="$TMP/selftest-home" XDG_CONFIG_HOME="$TMP/selftest-xdg" \
     "$dcg_path" test --format json "git status" 2>&1); then
@@ -1681,7 +1703,7 @@ Options:
   --dest DIR         Install to DIR (default: ~/.local/bin)
   --system           Install to /usr/local/bin (requires sudo)
   --easy-mode        Auto-update PATH in shell rc files
-  --verify           Run self-test after install
+  --verify           Self-test the candidate before installing
   --from-source      Build from source instead of downloading binary
   --quiet            Suppress non-error output
   --offline          Skip network preflight checks
@@ -1813,7 +1835,10 @@ trap cleanup EXIT
 # Reusing an installed version still configures the active agent settings, so
 # keep that mutation under the same lock as a fresh or source installation.
 if [ "$FORCE_INSTALL" -eq 0 ] && [ "$REQUIRE_MINISIGN" -eq 0 ] && check_installed_version "$VERSION"; then
-  assert_installed_version "$VERSION" || exit 1
+  assert_binary_version "$DEST/dcg" "$VERSION" || exit 1
+  if [ "$VERIFY" -eq 1 ]; then
+    run_install_self_test "$DEST/dcg" || exit 1
+  fi
   ok "dcg $VERSION is already installed at $DEST/dcg"
   info "Use --force to reinstall"
   maybe_install_completions
@@ -1844,13 +1869,9 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   (cd "$TMP/src" && cargo build --release)
   BIN="$TMP/src/target/release/dcg"
   [ -x "$BIN" ] || { err "Build failed"; exit 1; }
-  install_binary_atomically "$BIN" || exit 1
+  install_binary_atomically "$BIN" "$VERSION" "$VERIFY" || exit 1
   ok "Installed to $DEST/dcg (source build)"
-  assert_installed_version "$VERSION" || exit 1
   maybe_add_path
-  if [ "$VERIFY" -eq 1 ]; then
-    run_install_self_test || exit 1
-  fi
   ok "Done. Binary at: $DEST/dcg"
   maybe_install_completions
   return 0
@@ -1940,14 +1961,9 @@ BIN="$TMP/dcg.extracted"
 tar -xOf "$TMP/$TAR" dcg > "$BIN" || { err "Cannot stream dcg from release archive"; exit 1; }
 [ -s "$BIN" ] || { err "Release archive contained an empty dcg binary"; exit 1; }
 chmod 0755 "$BIN"
-install_binary_atomically "$BIN" || exit 1
+install_binary_atomically "$BIN" "$VERSION" "$VERIFY" || exit 1
 ok "Installed to $DEST/dcg"
-assert_installed_version "$VERSION" || exit 1
 maybe_add_path
-
-if [ "$VERIFY" -eq 1 ]; then
-  run_install_self_test || exit 1
-fi
 
 ok "Done. Binary at: $DEST/dcg"
 maybe_install_completions

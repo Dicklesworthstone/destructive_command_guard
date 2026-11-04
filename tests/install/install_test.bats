@@ -1049,6 +1049,296 @@ write_padded_mock_dcg() {
     [ -z "$(find "$DEST" -name '.dcg.*')" ]
 }
 
+# Qualification must finish before the one rename that publishes a candidate.
+# These are local classifier fixtures: the destructive strings are arguments
+# to `test`, never shell commands that this suite executes.
+write_transaction_dcg() {
+    local path="$1" version="$2" behavior="$3" record="${4:-1}"
+    if [ "$behavior" = launch-failure ]; then
+        printf '#!/no/such/dcg-test-interpreter\n' > "$path"
+    else
+        {
+            printf '#!/bin/sh\nreported_version=%s\nbehavior=%s\nrecord=%s\n' \
+                "$version" "$behavior" "$record"
+            cat <<'MOCKEOF'
+if [ "$record" = 1 ] && [ -n "${DCG_TEST_TRANSACTION_EVENTS:-}" ]; then
+    printf 'candidate|%s|%s\n' "$0" "$*" >> "$DCG_TEST_TRANSACTION_EVENTS"
+fi
+case "$*" in
+    --version)
+        case "$behavior" in
+            wrong-version) printf 'dcg 9.9.9\n' ;;
+            malformed-version) printf 'not a dcg version\n' ;;
+            version-failure) printf 'dcg %s\n' "$reported_version"; exit 7 ;;
+            stderr-version) printf 'dcg %s\n' "$reported_version" >&2 ;;
+            *) printf 'dcg %s\n' "$reported_version" ;;
+        esac
+        ;;
+    'test --format json git status')
+        case "$behavior" in
+            safe-failure) printf '{"decision":"allow"}\n'; exit 2 ;;
+            safe-malformed) printf 'not a decision\n' ;;
+            *) printf '{"decision":"allow"}\n' ;;
+        esac
+        ;;
+    'test --format json rm -rf /')
+        case "$behavior" in
+            deny-allowed) printf '{"decision":"allow"}\n'; exit 0 ;;
+            deny-failure) printf '{"decision":"deny"}\n'; exit 2 ;;
+            deny-malformed) printf 'not a decision\n'; exit 1 ;;
+            *) printf '{"decision":"deny"}\n'; exit 1 ;;
+        esac
+        ;;
+    *) exit 2 ;;
+esac
+MOCKEOF
+        } > "$path"
+    fi
+    chmod 0755 "$path"
+}
+
+setup_install_transaction() {
+    DEST="$TEST_TMPDIR/live bin"
+    TMP="$TEST_TMPDIR/self test"
+    TRANSACTION_SOURCE="$TEST_TMPDIR/payload/dcg"
+    mkdir -p "$DEST" "$TMP" "$(dirname "$TRANSACTION_SOURCE")"
+    write_transaction_dcg "$DEST/dcg" 1.0.0 good 0
+    chmod 0751 "$DEST/dcg"
+    cp "$DEST/dcg" "$TEST_TMPDIR/incumbent-dcg"
+    export DCG_TEST_TRANSACTION_EVENTS="$TEST_TMPDIR/transaction-events"
+}
+
+assert_incumbent_preserved() {
+    cmp -s "$TEST_TMPDIR/incumbent-dcg" "$DEST/dcg"
+    [[ "$(ls -l "$DEST/dcg")" == -rwxr-x--x* ]]
+    [ -z "$(find "$DEST" -name '.dcg.*')" ]
+}
+
+@test "install_binary_atomically: rejects wrong, malformed, failed, and unlaunchable versions before promotion" {
+    setup_install_transaction
+    local behavior
+    for behavior in wrong-version malformed-version version-failure launch-failure; do
+        write_transaction_dcg "$TRANSACTION_SOURCE" 2.0.0 "$behavior"
+        run install_binary_atomically "$TRANSACTION_SOURCE" v2.0.0 0
+        [ "$status" -ne 0 ] || { echo "$behavior was accepted"; return 1; }
+        [[ "$output" == *"was not replaced"* ]]
+        assert_incumbent_preserved
+    done
+}
+
+@test "install_binary_atomically: every failed self-test keeps the incumbent bytes and mode" {
+    setup_install_transaction
+    local behavior
+    for behavior in safe-failure safe-malformed deny-allowed deny-failure deny-malformed; do
+        write_transaction_dcg "$TRANSACTION_SOURCE" 2.0.0 "$behavior"
+        run install_binary_atomically "$TRANSACTION_SOURCE" v2.0.0 1
+        [ "$status" -ne 0 ] || { echo "$behavior was accepted"; return 1; }
+        [[ "$output" == *"failed its self-test"* ]]
+        assert_incumbent_preserved
+    done
+}
+
+fail_transaction_operation() (
+    case "$1" in
+        mktemp) mktemp() { return 71; } ;;
+        cp) cp() { return 72; } ;;
+        chmod) chmod() { return 73; } ;;
+        mv) mv() { return 74; } ;;
+        *) return 2 ;;
+    esac
+    install_binary_atomically "$TRANSACTION_SOURCE" v2.0.0 1
+)
+
+@test "install_binary_atomically: staging and promotion failures preserve the live executable" {
+    setup_install_transaction
+    write_transaction_dcg "$TRANSACTION_SOURCE" 2.0.0 good
+    local operation
+    for operation in mktemp cp chmod mv; do
+        run fail_transaction_operation "$operation"
+        [ "$status" -ne 0 ] || { echo "$operation failure was ignored"; return 1; }
+        assert_incumbent_preserved
+    done
+}
+
+@test "install_binary_atomically: only a fully qualified staged candidate replaces the incumbent" {
+    setup_install_transaction
+    write_transaction_dcg "$TRANSACTION_SOURCE" 2.0.0 good
+    run install_binary_atomically "$TRANSACTION_SOURCE" v2.0.0 1
+    [ "$status" -eq 0 ]
+    cmp -s "$TRANSACTION_SOURCE" "$DEST/dcg"
+    [[ "$(ls -l "$DEST/dcg")" == -rwxr-xr-x* ]]
+    [ "$(wc -l < "$DCG_TEST_TRANSACTION_EVENTS" | tr -d ' ')" -eq 3 ]
+    local event path arguments
+    while IFS='|' read -r event path arguments; do
+        [ "$event" = candidate ]
+        [[ "$path" == "$DEST"/.dcg.* ]]
+    done < "$DCG_TEST_TRANSACTION_EVENTS"
+    [ -z "$(find "$DEST" -name '.dcg.*')" ]
+}
+
+@test "install_binary_atomically: accepts stderr versions and relative destinations with spaces" {
+    setup_install_transaction
+    DEST='relative live bin'
+    mkdir -p "$DEST"
+    write_transaction_dcg "$TRANSACTION_SOURCE" 2.0.0 stderr-version
+    run install_binary_atomically "$TRANSACTION_SOURCE" v2.0.0 1
+    [ "$status" -eq 0 ]
+    cmp -s "$TRANSACTION_SOURCE" "$DEST/dcg"
+    [ -z "$(find "$DEST" -name '.dcg.*')" ]
+}
+
+@test "install_binary_atomically: rejected fresh installs publish no executable" {
+    setup_install_transaction
+    DEST="$TEST_TMPDIR/fresh bin"
+    mkdir -p "$DEST"
+    write_transaction_dcg "$TRANSACTION_SOURCE" 2.0.0 deny-allowed
+    run install_binary_atomically "$TRANSACTION_SOURCE" v2.0.0 1
+    [ "$status" -ne 0 ]
+    [ ! -e "$DEST/dcg" ]
+    [ -z "$(find "$DEST" -name '.dcg.*')" ]
+
+    write_transaction_dcg "$TRANSACTION_SOURCE" 2.0.0 good
+    run install_binary_atomically "$TRANSACTION_SOURCE" v2.0.0 1
+    [ "$status" -eq 0 ]
+    cmp -s "$TRANSACTION_SOURCE" "$DEST/dcg"
+}
+
+@test "install_binary_atomically: directory destinations cannot turn promotion into a nested move" {
+    setup_install_transaction
+    write_transaction_dcg "$TRANSACTION_SOURCE" 2.0.0 good
+    local kind
+    for kind in directory symlink; do
+        DEST="$TEST_TMPDIR/$kind bin"
+        mkdir -p "$DEST" "$TEST_TMPDIR/$kind target"
+        if [ "$kind" = directory ]; then
+            mkdir "$DEST/dcg"
+        else
+            ln -s "$TEST_TMPDIR/$kind target" "$DEST/dcg"
+        fi
+        run install_binary_atomically "$TRANSACTION_SOURCE" v2.0.0 1
+        [ "$status" -ne 0 ]
+        [ -d "$DEST/dcg" ]
+        [ -z "$(find "$DEST" "$TEST_TMPDIR/$kind target" -name '.dcg.*')" ]
+    done
+}
+
+prepare_transaction_release() {
+    TRANSACTION_ARCHIVE="$TEST_TMPDIR/candidate.tar.gz"
+    tar -czf "$TRANSACTION_ARCHIVE" -C "$(dirname "$TRANSACTION_SOURCE")" dcg
+    if command -v sha256sum >/dev/null 2>&1; then
+        TRANSACTION_CHECKSUM=$(sha256sum "$TRANSACTION_ARCHIVE" | cut -d' ' -f1)
+    else
+        TRANSACTION_CHECKSUM=$(shasum -a 256 "$TRANSACTION_ARCHIVE" | cut -d' ' -f1)
+    fi
+    printf 'local verifier fixture, not a release signature\n' > "$TEST_TMPDIR/candidate.minisig"
+    # The transaction tests mock the verifier, not the hash or installation
+    # pipeline. Real release signatures have independent qualification tests.
+    cat > "$TEST_TMPDIR/bin/minisign" <<'MOCKEOF'
+#!/bin/sh
+printf 'signature\n' >> "$DCG_TEST_TRANSACTION_EVENTS"
+exit "${DCG_TEST_SIGNATURE_STATUS:-0}"
+MOCKEOF
+    chmod +x "$TEST_TMPDIR/bin/minisign"
+}
+
+run_transaction_release_installer() {
+    run env DCG_SELF_HEAL_HOOK=0 bash "$INSTALL_SCRIPT" \
+        --quiet --offline --no-gum --no-configure --force --verify \
+        --require-minisign --version v2.0.0 --dest "$DEST" \
+        --artifact-url "file://$TRANSACTION_ARCHIVE" \
+        --checksum "$TRANSACTION_CHECKSUM" \
+        --minisign-url "file://$TEST_TMPDIR/candidate.minisig" "$@"
+}
+
+prepare_transaction_source_build() {
+    export MOCK_TRANSACTION_SOURCE="$TRANSACTION_SOURCE"
+    cat > "$TEST_TMPDIR/bin/git" <<'MOCKEOF'
+#!/bin/sh
+[ "$1" = clone ] || exit 91
+for destination in "$@"; do :; done
+mkdir -p "$destination"
+MOCKEOF
+    cat > "$TEST_TMPDIR/bin/cargo" <<'MOCKEOF'
+#!/bin/sh
+[ "$*" = 'build --release' ] || exit 92
+mkdir -p target/release
+cp "$MOCK_TRANSACTION_SOURCE" target/release/dcg
+MOCKEOF
+    chmod +x "$TEST_TMPDIR/bin/git" "$TEST_TMPDIR/bin/cargo"
+}
+
+@test "installer: release and source version or self-test rejection preserves the previous guard" {
+    setup_install_transaction
+    prepare_transaction_source_build
+    local acquisition behavior
+    for acquisition in release source; do
+        for behavior in wrong-version deny-allowed; do
+            write_transaction_dcg "$TRANSACTION_SOURCE" 2.0.0 "$behavior"
+            if [ "$acquisition" = release ]; then
+                prepare_transaction_release
+                run_transaction_release_installer
+            else
+                run env DCG_SELF_HEAL_HOOK=0 RUSTUP_INIT_SKIP=1 bash "$INSTALL_SCRIPT" \
+                    --quiet --offline --no-gum --no-configure --force --verify \
+                    --from-source --version v2.0.0 --dest "$DEST"
+            fi
+            [ "$status" -ne 0 ] || { echo "$acquisition accepted $behavior"; return 1; }
+            assert_incumbent_preserved
+            [[ "$output" == *"was not replaced"* ]]
+        done
+    done
+}
+
+@test "installer: authentication precedes staged qualification and successful promotion" {
+    setup_install_transaction
+    write_transaction_dcg "$TRANSACTION_SOURCE" 2.0.0 good
+    prepare_transaction_release
+    run_transaction_release_installer
+    [ "$status" -eq 0 ]
+    cmp -s "$TRANSACTION_SOURCE" "$DEST/dcg"
+    [ "$(head -1 "$DCG_TEST_TRANSACTION_EVENTS")" = signature ]
+    [ "$(grep -c '^candidate|' "$DCG_TEST_TRANSACTION_EVENTS")" -eq 3 ]
+    local event path arguments
+    while IFS='|' read -r event path arguments; do
+        [ "$event" != candidate ] || [[ "$path" == "$DEST"/.dcg.* ]]
+    done < "$DCG_TEST_TRANSACTION_EVENTS"
+    [ -z "$(find "$DEST" -name '.dcg.*')" ]
+}
+
+@test "installer: checksum and signature failures never execute a candidate or alter the incumbent" {
+    setup_install_transaction
+    write_transaction_dcg "$TRANSACTION_SOURCE" 2.0.0 good
+    prepare_transaction_release
+    run_transaction_release_installer --checksum "$(printf '%064d' 0)"
+    [ "$status" -ne 0 ]
+    [ ! -e "$DCG_TEST_TRANSACTION_EVENTS" ]
+    assert_incumbent_preserved
+
+    export DCG_TEST_SIGNATURE_STATUS=1
+    run_transaction_release_installer
+    [ "$status" -ne 0 ]
+    [ "$(cat "$DCG_TEST_TRANSACTION_EVENTS")" = signature ]
+    assert_incumbent_preserved
+}
+
+@test "installer: --verify also qualifies an existing same-version installation" {
+    setup_install_transaction
+    local behavior expected
+    for behavior in good deny-allowed; do
+        write_transaction_dcg "$DEST/dcg" 2.0.0 "$behavior" 0
+        chmod 0751 "$DEST/dcg"
+        cp "$DEST/dcg" "$TEST_TMPDIR/incumbent-dcg"
+        expected=0
+        [ "$behavior" != deny-allowed ] || expected=1
+        run env DCG_SELF_HEAL_HOOK=0 bash "$INSTALL_SCRIPT" \
+            --quiet --offline --no-gum --no-configure --verify \
+            --version v2.0.0 --dest "$DEST" \
+            --artifact-url "file://$TEST_TMPDIR/must-not-download"
+        [ "$status" -eq "$expected" ]
+        assert_incumbent_preserved
+    done
+}
+
 # ============================================================================
 # Shell completions (bd-qny3)
 # ============================================================================
