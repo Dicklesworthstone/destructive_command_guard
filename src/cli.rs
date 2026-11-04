@@ -17646,10 +17646,11 @@ fn probe_codex_dcg_hook_at(
         .and_then(|raw| raw.parse::<toml::Table>().ok());
 
     let json = codex_hooks_json_events(hooks_path);
+    let mut json_registration = None;
     let mut misplaced = if let Ok(events) = &json {
         let (found, detail) = find_codex_dcg_hook(events);
         if let Some((entry_index, hook_index, command)) = found {
-            return codex_registered_probe(
+            let probe = codex_registered_probe(
                 hooks_path,
                 entry_index,
                 hook_index,
@@ -17657,6 +17658,13 @@ fn probe_codex_dcg_hook_at(
                 config.as_ref(),
                 &command_exists,
             );
+            if codex_probe_is_enabled(&probe) {
+                return probe;
+            }
+            // Codex runs the hooks of both files, so a trusted config.toml
+            // registration still guards shell commands. The installer's
+            // hooks.json entry often sits unapproved next to one.
+            json_registration = Some(probe);
         }
         detail.map(|detail| format!("in {}: {detail}", hooks_path.display()))
     } else {
@@ -17674,7 +17682,7 @@ fn probe_codex_dcg_hook_at(
     if let Some(events) = &toml_events {
         let (found, detail) = find_codex_dcg_hook(events);
         if let Some((entry_index, hook_index, command)) = found {
-            return codex_registered_probe(
+            let probe = codex_registered_probe(
                 config_path,
                 entry_index,
                 hook_index,
@@ -17682,6 +17690,11 @@ fn probe_codex_dcg_hook_at(
                 config.as_ref(),
                 &command_exists,
             );
+            // When neither file's hook runs, report the one Codex loads first.
+            return match json_registration {
+                Some(first) if !codex_probe_is_enabled(&probe) => first,
+                _ => probe,
+            };
         }
         if misplaced.is_none() {
             misplaced = detail.map(|detail| {
@@ -17693,6 +17706,10 @@ fn probe_codex_dcg_hook_at(
         }
     }
 
+    if let Some(registration) = json_registration {
+        return registration;
+    }
+
     // Neither file registers dcg. A broken hooks.json is reported first: it
     // is the likeliest reason the installer's registration is not seen.
     match (json, misplaced) {
@@ -17702,6 +17719,17 @@ fn probe_codex_dcg_hook_at(
         (Err(CodexHooksJsonError::Missing), None) => CodexHookProbe::HooksFileMissing,
         (Ok(_), None) => CodexHookProbe::NotRegistered,
     }
+}
+
+/// Whether this probe found a registration Codex will actually run.
+const fn codex_probe_is_enabled(probe: &CodexHookProbe) -> bool {
+    matches!(
+        probe,
+        CodexHookProbe::Registered {
+            state: CodexHookState::Enabled,
+            ..
+        }
+    )
 }
 
 /// Why `hooks.json` contributed no hooks.
@@ -28769,6 +28797,78 @@ command = "dcg"
         // Both register dcg: Codex loads hooks.json first.
         std::fs::write(&hooks_path, CODEX_HOOKS_DCG_FIRST).expect("write");
         assert_eq!(registered_at(probe()), json_key);
+
+        // Codex runs both, so the one the user trusted decides the report,
+        // whichever file holds it. The installer's unapproved hooks.json entry
+        // beside a trusted config.toml hook is not "NOT TRUSTED".
+        std::fs::write(
+            &config_path,
+            format!("{CODEX_TOML_DCG}\n{}", codex_state_table(&toml_key, None)),
+        )
+        .expect("write");
+        assert_eq!(
+            probe(),
+            CodexHookProbe::Registered {
+                state_key: toml_key.clone(),
+                state: CodexHookState::Enabled,
+            }
+        );
+        // A hooks.json entry the user disabled does not hide it either, and
+        // neither does one whose program is gone.
+        std::fs::write(
+            &config_path,
+            format!(
+                "{CODEX_TOML_DCG}\n{}\n{}",
+                codex_state_table(&toml_key, None),
+                codex_state_table(&json_key, Some(false))
+            ),
+        )
+        .expect("write");
+        assert_eq!(registered_at(probe()), toml_key);
+        let hooks_program_missing =
+            probe_codex_dcg_hook_at(&hooks_path, &config_path, |command| command == "dcg");
+        assert_eq!(registered_at(hooks_program_missing), toml_key);
+        // Trusted in hooks.json, disabled in config.toml: the running hook wins.
+        std::fs::write(
+            &config_path,
+            format!(
+                "{CODEX_TOML_DCG}\n{}\n{}",
+                codex_state_table(&toml_key, Some(false)),
+                codex_state_table(&json_key, None)
+            ),
+        )
+        .expect("write");
+        assert_eq!(registered_at(probe()), json_key);
+        // Disabled in both: the first file Codex loads is the one reported.
+        std::fs::write(
+            &config_path,
+            format!(
+                "{CODEX_TOML_DCG}\n{}\n{}",
+                codex_state_table(&toml_key, Some(false)),
+                codex_state_table(&json_key, Some(false))
+            ),
+        )
+        .expect("write");
+        assert_eq!(
+            probe(),
+            CodexHookProbe::Registered {
+                state_key: json_key.clone(),
+                state: CodexHookState::Disabled,
+            }
+        );
+        // Registered and unapproved in hooks.json, nothing in config.toml: as
+        // before, that is the registration reported.
+        std::fs::write(&config_path, "").expect("write");
+        assert_eq!(
+            probe(),
+            CodexHookProbe::Registered {
+                state_key: json_key.clone(),
+                state: CodexHookState::NoStateEntry,
+            }
+        );
+
+        // Later rows start from the config.toml-only registration.
+        std::fs::write(&config_path, CODEX_TOML_DCG).expect("write");
 
         // A broken hooks.json does not stop Codex from loading config.toml.
         std::fs::write(&hooks_path, "{not json").expect("write");
