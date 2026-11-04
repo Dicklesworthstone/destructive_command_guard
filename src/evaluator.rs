@@ -36730,9 +36730,11 @@ fn inline_shell_script_is_wholly_dynamic(script: &str) -> bool {
     }
 }
 
-/// Whether the program an inline script was extracted for reads it as POSIX
-/// shell source: `sh -c`/`bash -c` and their kin, and ssh's remote command,
-/// which the remote login shell runs (#607). PowerShell and cmd payloads are
+/// Whether the program an inline script was extracted for reads it as shell
+/// source a POSIX outer shell fills in first: `sh -c`/`bash -c` and their kin,
+/// ssh's remote command, which the remote login shell runs (#607), `at` and
+/// `batch`, and the runners that hand a command string to a shell (`watch`,
+/// `su -c`, `flock -c`, `mise exec -c`). PowerShell and cmd payloads are
 /// re-read as shell too, but there `$x = 1` is an assignment, not a command.
 fn inline_script_target_parses_posix_shell(target: &str) -> bool {
     let name = target.rsplit(['/', '\\']).next().unwrap_or(target);
@@ -36740,8 +36742,79 @@ fn inline_script_target_parses_posix_shell(target: &str) -> bool {
     let name = name.strip_suffix(".exe").unwrap_or(&name);
     matches!(
         name,
-        "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh" | "ash" | "ssh"
+        "sh" | "bash"
+            | "rbash"
+            | "dash"
+            | "zsh"
+            | "ksh"
+            | "ksh93"
+            | "mksh"
+            | "pdksh"
+            | "oksh"
+            | "yash"
+            | "posh"
+            | "ash"
+            | "csh"
+            | "tcsh"
+            | "fish"
+            | "busybox"
+            | "ssh"
+            | "at"
+            | "batch"
+            | "watch"
+            | "parallel"
+            | "env"
+            | "su"
+            | "sg"
+            | "runuser"
+            | "script"
+            | "nix-shell"
+            | "npx"
+            | "entr"
+            | "flock"
+            | "hyperfine"
+            | "mise"
+            | "bun"
     )
+}
+
+/// Whether an unquoted heredoc or a here-string is the source of the shell ssh
+/// runs remotely: `ssh h <<EOF`, with no remote command that takes stdin instead.
+fn stdin_source_feeds_remote_shell(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+) -> bool {
+    use crate::heredoc::HeredocType;
+    let expanded_first = match content.heredoc_type {
+        None => false,
+        Some(HeredocType::HereString) => true,
+        Some(_) => !content.quoted,
+    };
+    expanded_first
+        && content.target_command.as_deref() == Some("ssh")
+        && command
+            .get(..content.byte_range.start)
+            .and_then(|before| before.rsplit(['\n', ';', '&', '|', '(']).next())
+            .is_some_and(|receiver| {
+                matches!(
+                    pipeline_shell_input_mode(receiver),
+                    PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell)
+                )
+            })
+}
+
+/// Whether the outer shell's quote removal leaves an expansion as a command word
+/// in an inline script that is not one quoted word. Raw words such as
+/// `'cd /srv;' "$C"` reach the program joined (ssh, `watch`), and the extractor
+/// strips the outer marks of `'cd /srv; '"$C"' x'`, which close and open different
+/// quotes, so that one is read with them back. Marks inside one double-quoted word
+/// belong to the inner shell: `"cut -d';' -f1 $F"` and `"grep 'a; $X' f"` hold
+/// no such command.
+fn outer_quoting_hides_an_expansion_command(command: &str, script: &str) -> bool {
+    (!command.contains(&format!("\"{script}\""))
+        && crate::heredoc::joined_words_run_an_expansion_as_a_command(script))
+        || (command.contains(&format!("'{script}'"))
+            && crate::heredoc::joined_words_run_an_expansion_as_a_command(&format!("'{script}'")))
 }
 
 #[inline]
@@ -37097,9 +37170,12 @@ fn evaluate_heredoc(
 
         // A simple SSH body can lack language-detection syntax. Only the
         // exact quoted POSIX receiver proof may type that unknown body as
-        // Bash; its recursive evaluation keeps the remote filesystem scope.
+        // Bash; its recursive evaluation keeps the remote filesystem scope. An
+        // unquoted body is the same source, filled in by the outer shell first,
+        // and gets no literal proof.
         if content.language == crate::heredoc::ScriptLanguage::Unknown
-            && literal_bash_source_range(command, &content).is_some()
+            && (literal_bash_source_range(command, &content).is_some()
+                || stdin_source_feeds_remote_shell(command, &content))
         {
             content.language = crate::heredoc::ScriptLanguage::Bash;
         }
@@ -37231,16 +37307,25 @@ fn evaluate_heredoc(
             // shell, which splits the value into words without parsing it,
             // as a top-level `$C x` does. An expansion in argument position
             // (`bash -c "echo $C"`) or joined to a path (`"$HOME/bin/tool"`)
-            // keeps its analysis.
-            if content.heredoc_type.is_none()
-                && content.word_range.is_none()
-                && content.content_range.is_none()
-                && content
-                    .target_command
-                    .as_deref()
-                    .is_some_and(inline_script_target_parses_posix_shell)
-                && crate::heredoc::shell_script_runs_an_expansion_as_a_command(&content.content)
-            {
+            // keeps its analysis. Source given on stdin is filled in the same
+            // way when its quoting lets the outer shell expand it:
+            // `bash <<< "$C x"`, or an unquoted heredoc to `bash` or `ssh`.
+            let outer_filled_script = match content.heredoc_type {
+                None => (content.word_range.is_none() && content.content_range.is_none())
+                    .then_some(content.content.as_str()),
+                Some(crate::heredoc::HeredocType::HereString) => command
+                    .get(content.byte_range.clone())
+                    .and_then(|redirect| redirect.split_once("<<<"))
+                    .map(|(_, operand)| operand.trim_start()),
+                Some(_) => (!content.quoted).then_some(content.content.as_str()),
+            };
+            let target = content.target_command.as_deref();
+            if outer_filled_script.is_some_and(|script| {
+                target.is_some_and(inline_script_target_parses_posix_shell)
+                    && (crate::heredoc::shell_script_runs_an_expansion_as_a_command(script)
+                        || (content.heredoc_type.is_none()
+                            && outer_quoting_hides_an_expansion_command(command, script)))
+            }) {
                 if let Some(denial) = launcher_unverified_denial(
                     POSIX_INLINE_LAUNCHER_UNVERIFIED_RULE,
                     "Inline shell script cannot be statically verified: an expansion or command \
@@ -57639,12 +57724,83 @@ mod tests {
             "bash -c \"$C\"",
             "ssh h \"$C\"",
             "eval \"$C x\"",
+            // Quoting that hides a later command inside one word.
+            "bash -c 'cd /srv && '\"$C\"",
+            "bash -c 'cd /srv; '\"$C\"",
+            "bash -c 'cd /srv; '$C",
+            "bash -c \"cd /srv; \"$C",
+            "bash -c 'cd /srv; '\"$C\"' x'",
+            "ssh h 'cd /srv; '\"$C\"",
+            // ssh joins its words before the remote shell parses them.
+            "ssh h \"cd /srv;\" \"$C\"",
+            "ssh h 'cd /srv;' \"$C\"",
+            "ssh h cd /srv \\; \"$C\"",
+            "ssh h 'sudo' \"$C\"",
+            "/usr/bin/ssh h 'cd /srv;' \"$C\"",
+            "watch 'cd /srv;' \"$C\"",
+            "ssh h grep -E 'a|' \"$F\"",
+            // The command a wrapper runs.
+            "bash -c \"sudo $C x\"",
+            "bash -c \"exec $C x\"",
+            "bash -c \"time $C x\"",
+            "bash -c \"command $C x\"",
+            "bash -c \"env $C x\"",
+            "bash -c \"nohup $C x\"",
+            "bash -c \"sudo -u bob $C x\"",
+            "bash -c \"timeout 5 $C x\"",
+            "bash -c \"xargs $C x\"",
+            "ssh h \"sudo $C x\"",
+            "ssh h \"exec $C x\"",
+            // Other shells, and programs that hand a string to a shell.
+            "fish -c \"$C x\"",
+            "rbash -c \"$C x\"",
+            "yash -c \"$C x\"",
+            "ksh93 -c \"$C x\"",
+            "ash -c \"$C x\"",
+            "oksh -c \"$C x\"",
+            "tcsh -c \"$C x\"",
+            "rbash -c 'git reset --hard'",
+            "ash -c 'git reset --hard'",
+            "/bin/ash -c 'git reset --hard'",
+            "yash -c 'git reset --hard'",
+            "oksh -c 'git reset --hard'",
+            "pdksh -c 'git reset --hard'",
+            "posh -c 'git reset --hard'",
+            "csh -c 'git reset --hard'",
+            "tcsh -c 'git reset --hard'",
+            "watch \"$C x\"",
+            "parallel \"$C x\"",
+            "env -S \"$C x\"",
+            "su -c \"$C x\"",
+            "su - bob -c \"$C x\"",
+            "runuser -c \"$C x\"",
+            "script -c \"$C x\"",
+            "flock /tmp/l -c \"$C x\"",
+            "nix-shell --run \"$C x\"",
+            "sg docker -c \"$C x\"",
+            "mise exec -c \"$C x\"",
+            "bun exec \"$C x\"",
+            // Source on stdin that the outer shell fills in.
+            "bash <<< \"$C x\"",
+            "bash <<< \"$C\"",
+            "bash <<EOF\n$C x\nEOF",
+            "ssh h <<EOF\n$C x\nEOF",
+            "ssh -p 22 h <<EOF\n$C x\nEOF",
+            "cd /srv && ssh h <<EOF\n$C x\nEOF",
+            "ssh h <<< \"$C x\"",
+            "ssh h <<EOF\ngit reset --hard\nEOF",
+            "at now <<< \"$C x\"",
         ] {
             let result = evaluate(cmd);
             assert!(result.is_denied(), "{cmd:?} must be denied: {result:?}");
         }
         for cmd in [
             "bash -c \"echo $C\"",
+            // Marks inside one double-quoted word are the inner shell's.
+            "ssh h \"cut -f1 -d';' $F\"",
+            "ssh h \"grep 'a;' $F\"",
+            "bash -c \"grep 'a; $X' f\"",
+            "bash -c \"cut -f1 -d';' $F\"",
             "ssh h echo \"$C\"",
             "bash -c 'echo \"$1\"' _ \"$C\"",
             "bash -c '$1 x' _ y",
@@ -57654,6 +57810,24 @@ mod tests {
             "bash -c \"${HOME}/bin/tool --flag\"",
             "bash -c \"$? x\"",
             "$C x",
+            "bash -c \"sudo -u $USER make\"",
+            "bash -c \"timeout $T make\"",
+            "bash -c \"nice -n $N make\"",
+            "ssh h \"sudo systemctl restart $SVC\"",
+            "ssh h \"sudo -u postgres psql -c $Q\"",
+            "bash -c \"command -v $TOOL\"",
+            "ssh h 'cd /srv && make' \"$TARGET\"",
+            "ash -c 'echo hi'",
+            "rbash -c 'git status'",
+            "tcsh -c \"echo $C\"",
+            // The inner shell reads these, and splits a value into words only.
+            "bash <<< 'echo \"$C\"'",
+            "bash <<'EOF'\n$C x\nEOF",
+            "ssh h <<'EOF'\n$C x\nEOF",
+            "ssh h cat <<EOF\n$C x\nEOF",
+            "ssh h <<EOF\nls -la\nEOF",
+            "ssh h <<EOF\ncd $DIR && make\nEOF",
+            "bash <<EOF\necho $C\nEOF",
         ] {
             let result = evaluate(cmd);
             assert!(result.is_allowed(), "{cmd:?} must be allowed: {result:?}");

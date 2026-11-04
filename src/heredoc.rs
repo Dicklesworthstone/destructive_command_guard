@@ -141,11 +141,11 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 31] = [
     // Lua inline execution
     r#"\blua[0-9.]*(?:\.exe)?\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
     // Shell inline execution (sh -c, bash -c, zsh -c, fish -c, bash -lc, etc.).
-    // dash/ksh/mksh are ordinary POSIX shells: without them `dash -c "git
-    // reset --hard"` was never unwrapped, and command-position rules such as
-    // core.git never saw the payload. An option or its value may be quoted
+    // dash/ksh/mksh and the rest are ordinary shells: without them `dash -c
+    // "git reset --hard"` was never unwrapped, and command-position rules such
+    // as core.git never saw the payload. An option or its value may be quoted
     // (`bash -o 'errexit' -c`, `bash '-e' -c`); the argv is the same.
-    r#"\b(?:sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?\b["']?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\b(?:sh|bash|rbash|ash|zsh|fish|dash|ksh[0-9]*|mksh|oksh|pdksh|yash|posh|csh|tcsh)(?:\.exe)?\b["']?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
     // PowerShell inline execution (powershell -Command '...', pwsh -c "...",
     // and Windows full-path forms like
     //   "C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command '...'
@@ -203,7 +203,7 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 31] = [
     //
     // A quoted or escaped name (`\ssh`, `'ssh'`) is the same program, and a
     // descriptor duplication (`2>&1`) does not end the segment.
-    r#"(?i)(?:^|[\s;|&(/\\'"])ssh(?:\.exe)?['"]?\s(?:[^\n;|&]|[<>]&)*['"$]"#,
+    r#"(?i)(?:^|[\s;|&(/\\'"])ssh(?:\.exe)?['"]?\s(?:[^\n;|&]|[<>]&|\\[;|&])*['"$]"#,
     // `ssh`, `scp` and `sftp` hand an `-o` option's ssh_config text to ssh,
     // and `ProxyCommand`, `LocalCommand`, `KnownHostsCommand` and
     // `RemoteCommand` carry a command line, which an escape alone can spell
@@ -1185,6 +1185,14 @@ impl ScriptLanguage {
             || matches_interpreter("dash")
             || matches_interpreter("ksh")
             || matches_interpreter("mksh")
+            || matches_interpreter("rbash")
+            || matches_interpreter("ash")
+            || matches_interpreter("oksh")
+            || matches_interpreter("pdksh")
+            || matches_interpreter("yash")
+            || matches_interpreter("posh")
+            || matches_interpreter("csh")
+            || matches_interpreter("tcsh")
             // PowerShell (`powershell`, `powershell.exe`, `pwsh`) running an
             // inner command via `-Command`/`-c`. We re-check the body as a
             // shell command: destructive command names (git, rm, etc.) are
@@ -1721,7 +1729,7 @@ static INLINE_SCRIPT_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // `(?i:powershell|pwsh)` matches the Windows PowerShell host case-insensitively;
     // `["']?` after the interpreter swallows the closing quote of a quoted full
     // path (e.g. `"...\powershell.exe" -Command '...'`) before flags (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?(-[A-Za-z]*[ceECpr][A-Za-z]*)['\x22]?\s*'([^']*)'"#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|rbash(?:\.exe)?|ash(?:\.exe)?|oksh(?:\.exe)?|pdksh(?:\.exe)?|yash(?:\.exe)?|posh(?:\.exe)?|csh(?:\.exe)?|tcsh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?(-[A-Za-z]*[ceECpr][A-Za-z]*)['\x22]?\s*'([^']*)'"#)
         .expect("inline script single-quote regex compiles")
 });
 
@@ -1733,7 +1741,7 @@ static INLINE_SCRIPT_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // Supports Windows .exe extensions: python.exe, python3.11.exe, etc.
     // PowerShell host + quoted-path closing quote handled as in the single-quote
     // variant above (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?(-[A-Za-z]*[ceECpr][A-Za-z]*)['\x22]?\s*"([^"]*)""#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|rbash(?:\.exe)?|ash(?:\.exe)?|oksh(?:\.exe)?|pdksh(?:\.exe)?|yash(?:\.exe)?|posh(?:\.exe)?|csh(?:\.exe)?|tcsh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?(-[A-Za-z]*[ceECpr][A-Za-z]*)['\x22]?\s*"([^"]*)""#)
         .expect("inline script double-quote regex compiles")
 });
 
@@ -1745,7 +1753,7 @@ static INLINE_SCRIPT_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
 /// dynamic, so the evaluator fails it closed like the quoted forms (bd-vweh).
 /// Groups match the quoted patterns: (1) shell, (2) unused, (3) flag, (4) operand.
 static INLINE_SCRIPT_UNQUOTED_DYNAMIC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(concat!(r"\b(sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?()\b(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?(-[A-Za-z]*c[A-Za-z]*)['\x22]?(?:\s+", shell_option_after_c_re!(), r")*\s+(\$\{[^}\s]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?!$-]|\$\([^()]*\)|`[^`]*`)(?:\s|$|[;&|)])"))
+    Regex::new(concat!(r"\b(sh|bash|rbash|ash|zsh|fish|dash|ksh[0-9]*|mksh|oksh|pdksh|yash|posh|csh|tcsh)(?:\.exe)?()\b(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?(-[A-Za-z]*c[A-Za-z]*)['\x22]?(?:\s+", shell_option_after_c_re!(), r")*\s+(\$\{[^}\s]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?!$-]|\$\([^()]*\)|`[^`]*`)(?:\s|$|[;&|)])"))
         .expect("inline script unquoted-dynamic regex compiles")
 });
 
@@ -1758,7 +1766,7 @@ static INLINE_SCRIPT_UNQUOTED_DYNAMIC: LazyLock<Regex> = LazyLock::new(|| {
 /// patterns: (1) shell, (2) unused, (3) flag, (4) content.
 static INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
-        r"\b(sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?()\b['\x22]?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*",
+        r"\b(sh|bash|rbash|ash|zsh|fish|dash|ksh[0-9]*|mksh|oksh|pdksh|yash|posh|csh|tcsh)(?:\.exe)?()\b['\x22]?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*",
         r"\s+['\x22]?(-[A-Za-z]*c[A-Za-z]*)['\x22]?(?:\s+",
         shell_option_after_c_re!(),
         r")+\s+'([^']*)'"
@@ -1770,7 +1778,7 @@ static INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::ne
 /// string.
 static INLINE_SHELL_OPTIONS_AFTER_C_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
-        r"\b(sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?()\b['\x22]?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*",
+        r"\b(sh|bash|rbash|ash|zsh|fish|dash|ksh[0-9]*|mksh|oksh|pdksh|yash|posh|csh|tcsh)(?:\.exe)?()\b['\x22]?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*",
         r"\s+['\x22]?(-[A-Za-z]*c[A-Za-z]*)['\x22]?(?:\s+",
         shell_option_after_c_re!(),
         r")+\s+\x22([^\x22]*)\x22"
@@ -2656,7 +2664,20 @@ fn posix_shell_inline_source_start(
     launcher_name: &str,
 ) -> Option<usize> {
     let name = launcher_name.strip_suffix(".exe").unwrap_or(launcher_name);
-    if !matches!(name, "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh") {
+    if !matches!(
+        name,
+        "sh" | "bash"
+            | "rbash"
+            | "ash"
+            | "dash"
+            | "zsh"
+            | "ksh"
+            | "mksh"
+            | "oksh"
+            | "pdksh"
+            | "yash"
+            | "posh"
+    ) {
         return None;
     }
     let launcher = shell_word_around(command, launcher_start)?;
@@ -6586,34 +6607,43 @@ fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeTo
             .get(index + 1)
             .filter(|next| next.kind == NormalizeTokenKind::Word)
             .and_then(|next| next.text(command));
-        wrapped = matches!(
-            basename,
-            "sudo"
-                | "doas"
-                | "nice"
-                | "nohup"
-                | "time"
-                | "exec"
-                | "command"
-                | "builtin"
-                | "xargs"
-                | "timeout"
-                | "gtimeout"
-                | "setsid"
-                | "stdbuf"
-                | "ionice"
-                | "chrt"
-                | "busybox"
-                | "chronic"
-                | "env"
-        ) || crate::packs::core::git::unmodeled_exec_wrapper(basename, next);
+        wrapped = runs_its_arguments(basename)
+            || crate::packs::core::git::unmodeled_exec_wrapper(basename, next);
     }
     positions
 }
 
+/// Whether a command runs the command its arguments name.
+fn runs_its_arguments(basename: &str) -> bool {
+    matches!(
+        basename,
+        "sudo"
+            | "doas"
+            | "nice"
+            | "nohup"
+            | "time"
+            | "exec"
+            | "command"
+            | "builtin"
+            | "xargs"
+            | "timeout"
+            | "gtimeout"
+            | "setsid"
+            | "stdbuf"
+            | "ionice"
+            | "chrt"
+            | "busybox"
+            | "chronic"
+            | "env"
+    )
+}
+
 /// Whether a shell script runs an expansion as a command word: the first word
-/// of any of its commands is nothing but parameter expansions or command
-/// substitutions (`$C x`, `cd /srv && $C`, `X=1 "$C" --force`) (#607).
+/// of any of its commands, or the command a wrapper such as `sudo` or `exec`
+/// runs, is nothing but parameter expansions or command substitutions (`$C x`,
+/// `cd /srv && $C`, `X=1 "$C" --force`, `sudo -u bob $C x`) (#607). Quoting may
+/// hide such a command inside one word: `'cd /srv && '"$C"` reaches the shell
+/// that parses it as `cd /srv && <C>`.
 ///
 /// An inline `-c` script or ssh remote command is expanded by the outer shell
 /// before the inner shell reads it, so the inner shell parses such a value as
@@ -6624,10 +6654,34 @@ fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeTo
 /// the special parameters that hold a number or option letters (`$?`, `$#`,
 /// `$$`, `$!`, `$-`) cannot hold code.
 pub(crate) fn shell_script_runs_an_expansion_as_a_command(script: &str) -> bool {
+    script_commands_are_expansions(script, true)
+}
+
+/// The same question for raw words that are joined with blanks before a shell
+/// parses them, as ssh does with its remote command: `'cd /srv;' "$C"` reaches
+/// the remote shell as `cd /srv; <C>`, and `'sudo' "$C"` as `sudo <C>`.
+pub(crate) fn joined_words_run_an_expansion_as_a_command(raw: &str) -> bool {
+    word_without_outer_quoting(raw)
+        .is_some_and(|plain| script_commands_are_expansions(&plain, false))
+}
+
+fn script_commands_are_expansions(script: &str, read_quoted_commands: bool) -> bool {
     use crate::normalize::NormalizeTokenKind;
     let tokens = crate::normalize::tokenize_for_normalization(script);
+    let is_expansion_command = |word: &str| {
+        word_is_only_code_expansions(word)
+            || (read_quoted_commands
+                && word.contains(['\'', '"', '\\'])
+                && word_without_outer_quoting(word)
+                    .is_some_and(|plain| script_commands_are_expansions(&plain, false)))
+    };
     let mut expect_command = true;
     let mut redirect_target = false;
+    // Inside a wrapper's arguments: its name, whether the next word is an
+    // option's value, and whether the next plain word is `timeout`'s limit.
+    let mut wrapper: Option<String> = None;
+    let mut option_value = false;
+    let mut limit = false;
     for (index, token) in tokens.iter().enumerate() {
         if token.kind != NormalizeTokenKind::Word {
             if splits_fd_duplication(script, &tokens, index) {
@@ -6636,6 +6690,7 @@ pub(crate) fn shell_script_runs_an_expansion_as_a_command(script: &str) -> bool 
             }
             expect_command = true;
             redirect_target = false;
+            wrapper = None;
             continue;
         }
         let Some(text) = token.text(script) else {
@@ -6649,22 +6704,105 @@ pub(crate) fn shell_script_runs_an_expansion_as_a_command(script: &str) -> bool 
             redirect_target = redirect_operator_takes_next_word(text);
             continue;
         }
+        if let Some(name) = wrapper.as_deref() {
+            if option_value {
+                option_value = false;
+            } else if text.starts_with('-') {
+                // `command -v $TOOL` asks about a name and runs nothing.
+                if name == "command" && matches!(text, "-v" | "-V") {
+                    wrapper = None;
+                } else {
+                    option_value = wrapper_option_takes_value(name, text);
+                }
+            } else if limit {
+                limit = false;
+            } else if !crate::normalize::is_env_assignment(text) {
+                if is_expansion_command(text) {
+                    return true;
+                }
+                // The wrapper's command, which may be a wrapper in turn.
+                let executable = dequoted_executable_word(text);
+                let basename = executable.rsplit('/').next().unwrap_or(&executable);
+                limit = matches!(basename, "timeout" | "gtimeout");
+                wrapper = runs_its_arguments(basename).then(|| basename.to_string());
+            }
+            continue;
+        }
         if !expect_command {
             continue;
         }
         if matches!(
             text,
-            "{" | "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until"
+            "{" | "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "coproc"
         ) || crate::normalize::is_env_assignment(text)
         {
             continue;
         }
-        if word_is_only_code_expansions(text) {
+        if is_expansion_command(text) {
             return true;
         }
         expect_command = false;
+        let executable = dequoted_executable_word(text);
+        let basename = executable.rsplit('/').next().unwrap_or(&executable);
+        limit = matches!(basename, "timeout" | "gtimeout");
+        option_value = false;
+        wrapper = runs_its_arguments(basename).then(|| basename.to_string());
     }
     false
+}
+
+/// What the shell that parses a raw word reads once the outer shell has removed
+/// the word's quoting, with each expansion that can carry code spelled `${X}`
+/// and a literal `$` or backquote spelled `_` so it reads as plain text. `None`
+/// when a quote never closes.
+fn word_without_outer_quoting(word: &str) -> Option<String> {
+    let mut plain = String::with_capacity(word.len());
+    let mut double_quoted = false;
+    let mut rest = word;
+    while let Some(ch) = rest.chars().next() {
+        match ch {
+            '\'' if !double_quoted => {
+                let end = rest[1..].find('\'')?;
+                plain.push_str(&rest[1..=end].replace(['$', '`'], "_"));
+                rest = &rest[end + 2..];
+                continue;
+            }
+            '"' => double_quoted = !double_quoted,
+            '\\' => {
+                let next = rest[1..].chars().next()?;
+                match next {
+                    '$' | '`' => plain.push('_'),
+                    '"' | '\\' => plain.push(next),
+                    _ if double_quoted => {
+                        plain.push('\\');
+                        plain.push(next);
+                    }
+                    _ => plain.push(next),
+                }
+                rest = &rest[1 + next.len_utf8()..];
+                continue;
+            }
+            '$' | '`' => {
+                if let Some(len) = code_expansion_len(rest) {
+                    plain.push_str("${X}");
+                    rest = &rest[len..];
+                } else if matches!(rest.as_bytes(), [b'`', ..] | [b'$', b'{', ..])
+                    || (rest.starts_with("$(") && !rest.starts_with("$(("))
+                {
+                    // It never closes, so the shell rejects the word. Reading on
+                    // would rescan the rest of the word from every such `$(`.
+                    return None;
+                } else {
+                    plain.push('_');
+                    rest = &rest[1..];
+                }
+                continue;
+            }
+            _ => plain.push(ch),
+        }
+        rest = &rest[ch.len_utf8()..];
+    }
+    (!double_quoted).then_some(plain)
 }
 
 /// Whether `word` is one or more expansions that can carry code and nothing
@@ -7327,6 +7465,10 @@ fn wrapper_option_takes_value(wrapper: &str, option: &str) -> bool {
         "env" => &["-u", "-C", "-S", "--unset", "--chdir", "--split-string"],
         "nice" => &["-n", "--adjustment"],
         "timeout" | "gtimeout" => &["-s", "-k", "--signal", "--kill-after"],
+        "exec" => &["-a"],
+        "time" => &["-f", "-o", "--format", "--output"],
+        "stdbuf" => &["-i", "-o", "-e", "--input", "--output", "--error"],
+        "ionice" => &["-c", "-n", "--class", "--classdata"],
         "xargs" => &[
             "-a",
             "-d",
@@ -25046,6 +25188,30 @@ mod issue_560_masking_tests {
             "$C\\ x",
             "\"$C\"\"\" x",
             "''$C x",
+            // Quoting that hides a later command inside one word.
+            "'cd /srv && '\"$C\"",
+            "'cd /srv; '\"$C\"",
+            "'cd /srv; '$C",
+            "\"cd /srv; \"$C",
+            "'cd /srv; '\"$C\"' x'",
+            // The command a wrapper runs.
+            "sudo $C x",
+            "exec $C x",
+            "time $C x",
+            "command $C x",
+            "builtin $C x",
+            "env $C x",
+            "env FOO=1 $C x",
+            "nohup $C x",
+            "sudo -u bob $C x",
+            "sudo -- $C x",
+            "timeout 5 $C x",
+            "timeout -k 1 5 $C x",
+            "xargs $C x",
+            "xargs -n 1 $C x",
+            "sudo timeout 5 $C x",
+            "nice -n 5 nohup $C x",
+            "coproc $C x",
         ] {
             assert!(
                 shell_script_runs_an_expansion_as_a_command(script),
@@ -25069,11 +25235,52 @@ mod issue_560_masking_tests {
             "$# x",
             "$$ x",
             "$",
+            // A wrapper's option value or limit, or a word it only reads.
+            "sudo -u $USER make",
+            "sudo -g $GROUP make",
+            "timeout $T make",
+            "timeout -k $K 5 make",
+            "nice -n $N make",
+            "env -u $NAME make",
+            "sudo systemctl restart $SVC",
+            "sudo -u postgres psql -c $Q",
+            "command -v $TOOL",
+            "command -V $TOOL",
+            "exec make $TARGET",
+            "'echo $C; '",
         ] {
             assert!(
                 !shell_script_runs_an_expansion_as_a_command(script),
                 "{script}"
             );
+        }
+    }
+
+    /// ssh joins its remote words with blanks and the remote shell parses the
+    /// result, so a command can start in one word and run the next (#607).
+    #[test]
+    fn joined_remote_words_are_read_as_one_script_607() {
+        for raw in [
+            "'cd /srv;' \"$C\"",
+            "\"cd /srv;\" \"$C\"",
+            "'sudo' \"$C\"",
+            "cd /srv \\; \"$C\"",
+            "'make &&' $C x",
+            "grep -E 'a|' \"$F\"",
+        ] {
+            assert!(joined_words_run_an_expansion_as_a_command(raw), "{raw}");
+        }
+        for raw in [
+            "echo \"$C\"",
+            "'cd /srv && make' \"$C\"",
+            "grep -E 'a|b' \"$F\"",
+            "'echo $C;' done",
+            "'echo a;' echo \"$C\"",
+            "'unterminated \"$C\"",
+            "'cd /srv;' $(unterminated",
+            "'cd /srv;' `unterminated",
+        ] {
+            assert!(!joined_words_run_an_expansion_as_a_command(raw), "{raw}");
         }
     }
 }
