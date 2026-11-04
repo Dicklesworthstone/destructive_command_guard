@@ -12636,21 +12636,42 @@ fn powershell_words_begin_with_scriptblock_consumer(
     let Some(command) = powershell_unqualified_command_name(command) else {
         return false;
     };
-    matches!(
-        command.to_ascii_lowercase().as_str(),
-        "invoke-command"
-            | "icm"
-            | "start-job"
-            | "sajb"
-            | "start-threadjob"
-            | "foreach-object"
-            | "foreach"
-            | "%"
-            | "where-object"
-            | "where"
-            | "?"
-    )
+    POWERSHELL_SCRIPTBLOCK_CONSUMERS.contains(&command.to_ascii_lowercase().as_str())
 }
+
+/// Commands that run a script block given to them, at once or later, or bind it
+/// to a name that runs it (`Set-Item function:foo { … }; foo`).
+const POWERSHELL_SCRIPTBLOCK_CONSUMERS: &[&str] = &[
+    "invoke-command",
+    "icm",
+    "start-job",
+    "sajb",
+    "start-threadjob",
+    "foreach-object",
+    "foreach",
+    "%",
+    "where-object",
+    "where",
+    "?",
+    "measure-command",
+    "trace-command",
+    "new-module",
+    "nmo",
+    "register-engineevent",
+    "register-objectevent",
+    "register-wmievent",
+    "register-scheduledjob",
+    "set-psbreakpoint",
+    "sbp",
+    "set-item",
+    "si",
+    "new-item",
+    "ni",
+    "set-variable",
+    "sv",
+    "new-variable",
+    "nv",
+];
 
 fn powershell_scriptblock_consumer_tail(prefix: &str) -> Option<&str> {
     let tokens = tokenize_for_shell_dialect(prefix, ShellDialect::PowerShell);
@@ -12665,21 +12686,9 @@ fn powershell_scriptblock_consumer_tail(prefix: &str) -> Option<&str> {
             }
             token.text(prefix).is_some_and(|raw| {
                 !raw.starts_with(['\'', '"'])
-                    && [
-                        "invoke-command",
-                        "icm",
-                        "start-job",
-                        "sajb",
-                        "start-threadjob",
-                        "foreach-object",
-                        "foreach",
-                        "%",
-                        "where-object",
-                        "where",
-                        "?",
-                    ]
-                    .iter()
-                    .any(|candidate| powershell_word_equals(raw, candidate))
+                    && POWERSHELL_SCRIPTBLOCK_CONSUMERS
+                        .iter()
+                        .any(|candidate| powershell_word_equals(raw, candidate))
             })
         })
         .filter_map(|(_, token)| prefix.get(token.byte_range.start..))
@@ -12713,6 +12722,9 @@ fn powershell_prefix_executes_scriptblock(prefix: &str) -> bool {
             "end",
             "parallel",
             "remainingscripts",
+            "action",
+            "expression",
+            "value",
         ]
         .iter()
         .any(|candidate| powershell_alias_parameter(parameter, candidate))
@@ -12782,6 +12794,14 @@ fn powershell_prefix_opens_executable_block(prefix: &str) -> bool {
     {
         return true;
     }
+    // An assignment takes the value of a statement that runs its block
+    // (`$x = if ($a) { … }`, `$x = Invoke-Command { … }`).
+    if let Some((_, value)) = local.rsplit_once('=')
+        && !value.trim().is_empty()
+        && powershell_prefix_opens_executable_block(value)
+    {
+        return true;
+    }
 
     let Some(words) = decoded_powershell_segment_words(local) else {
         return false;
@@ -12829,8 +12849,13 @@ fn powershell_executable_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
 
         // Nested blocks inside an executable body are visited by the recursive
         // evaluator. Nested blocks inside an inert ScriptBlock literal must not
-        // be treated as executing merely because they contain control flow.
-        search_start = close + 1;
+        // be treated as executing merely because they contain control flow. A
+        // hashtable is no block, so the values inside it are read in turn.
+        let in_hashtable = open
+            .checked_sub(1)
+            .and_then(|before| command.as_bytes().get(before))
+            == Some(&b'@');
+        search_start = if in_hashtable { open + 1 } else { close + 1 };
     }
     Ok(bodies)
 }
@@ -12843,8 +12868,15 @@ fn powershell_executable_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
 /// `Invoke-Command $sb`, `ForEach-Object $sb`, `$b = $sb`), and even a block
 /// that is printed or turned into text can run once its output is piped on
 /// (`Write-Output $sb | ForEach-Object { & $_ }`,
-/// `[scriptblock]::Create($sb.ToString())`), so every use counts. A block
-/// that is stored and never used stays inert.
+/// `[scriptblock]::Create($sb.ToString())`), so every use counts. A use may come
+/// before the binding (`function f { & $sb }; $sb = { … }; f`) and need not carry
+/// a `$` (`Get-Variable sb`, `foo` for `$function:foo`), so any mention of the
+/// name counts too. The binding may be an element or a property
+/// (`$a = 1, { … }`, `$h.x = { … }`, `$sb = [scriptblock]{ … }`), and a block
+/// bound to something with no variable to follow, such as a hashtable key,
+/// counts as used. A block piped on (`{ … } | ForEach-Object { & $_ }`) or given
+/// to a method (`$a.ForEach({ … })`) counts too. A block that is stored and never
+/// mentioned again stays inert.
 fn powershell_block_literal_is_invoked(command: &str, open: usize, close: usize) -> bool {
     // `@{ … }` is a hashtable and `${ … }` a variable name, not a block.
     if open
@@ -12856,73 +12888,82 @@ fn powershell_block_literal_is_invoked(command: &str, open: usize, close: usize)
     }
     let after = command.get(close + 1..).unwrap_or_default();
     let member = after.trim_start_matches(|c: char| c == ')' || c.is_ascii_whitespace());
-    if member
+    // A member named by a string or a variable is still a member
+    // (`{ … }.'Invoke'()`, `{ … }.$m()`).
+    let member_named = member
         .strip_prefix('.')
         .and_then(|name| name.chars().next())
-        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        .is_some_and(|first| !first.is_ascii_whitespace() && !matches!(first, '\\' | '/' | '.'));
+    if member_named || (member.starts_with('|') && !member.starts_with("||")) {
+        return true;
+    }
+    let before = command[..open].trim_end();
+    let statement_start = before
+        .rfind([';', '\r', '\n', '|', '{', '}'])
+        .map_or(0, |at| at + 1);
+    let local = before[statement_start..].trim();
+    // An argument of a method call (`$a.ForEach({ … })`, `[Task]::Run($x, { … })`).
+    let method_argument = local.rfind('(').is_some_and(|paren| {
+        let name = local[..paren].trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_');
+        !local[paren..].contains(')') && (name.ends_with('.') || name.ends_with("::"))
+    });
+    if method_argument {
+        return true;
+    }
+    let Some(last_assignment) = local.rfind('=') else {
+        return false;
+    };
+    let names = powershell_assigned_variables(&local[..last_assignment]);
+    // Every later command reads this one without naming it.
+    if names.is_empty()
+        || names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("PSDefaultParameterValues"))
     {
         return true;
     }
-    let local = command[..open]
-        .rsplit([';', '\r', '\n', '|', '{', '}'])
-        .next()
-        .unwrap_or_default()
-        .trim();
-    let Some(name) = powershell_assigned_variable(local) else {
-        return false;
-    };
-    powershell_block_variable_is_used(after, name)
+    // Reflection names no variable at all (`gv | ForEach-Object { & $_.Value }`).
+    let earlier = &command[..statement_start];
+    ["variable", "psvariable", "gv"]
+        .iter()
+        .chain(names.iter())
+        .any(|name| {
+            powershell_name_is_mentioned(earlier, name) || powershell_name_is_mentioned(after, name)
+        })
 }
 
-/// The variable an assignment prefix binds, without its scope: `sb` for
-/// `$sb =`, `$script:sb =`, `[scriptblock]$sb =` and the inner target of
-/// `$a = $sb =`.
-fn powershell_assigned_variable(prefix: &str) -> Option<&str> {
-    let target = prefix.strip_suffix('=')?.trim_end();
-    let dollar = target.rfind('$')?;
-    let before = target[..dollar].trim_end();
-    if !(before.is_empty() || before.ends_with([']', '='])) {
-        return None;
-    }
-    let name = powershell_unscoped_variable_name(&target[dollar + 1..]);
-    let plain = name
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
-    (!name.is_empty() && plain).then_some(name)
-}
-
-/// A PowerShell variable name without its scope or drive prefix: `sb` for
-/// `script:sb`, `global:sb`, `using:sb` and `sb`.
-fn powershell_unscoped_variable_name(name: &str) -> &str {
-    let name = name.trim_end_matches(':');
-    name.rsplit_once(':').map_or(name, |(_, unscoped)| unscoped)
-}
-
-/// Whether `text` uses the variable `name`, in any scope, spelled `$name` or
-/// `${name}`, in any case.
-fn powershell_block_variable_is_used(text: &str, name: &str) -> bool {
-    let mut from = 0usize;
-    while let Some(found) = text.get(from..).and_then(|rest| rest.find('$')) {
-        let start = from + found;
-        let after_sigil = &text[start + 1..];
-        let (reference, end) = if let Some(braced) = after_sigil.strip_prefix('{') {
-            let Some(len) = braced.find('}') else {
-                return true;
-            };
-            (&braced[..len], start + 3 + len)
-        } else {
+/// Every variable named in an assignment's targets, without scope, index or
+/// member: `sb` for `$sb`, `$script:sb` and `[scriptblock]$sb`, `h` for `$h.x`
+/// and `$h['x']`, `foo` for `$function:foo`, both of `$a = $sb`.
+fn powershell_assigned_variables(targets: &str) -> Vec<&str> {
+    targets
+        .match_indices('$')
+        .filter_map(|(at, _)| {
+            let after_sigil = &targets[at + 1..];
             let len = after_sigil
                 .bytes()
                 .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
                 .count();
-            (&after_sigil[..len], start + 1 + len)
-        };
-        from = end;
-        if powershell_unscoped_variable_name(reference).eq_ignore_ascii_case(name) {
-            return true;
-        }
-    }
-    false
+            let name = after_sigil[..len].trim_end_matches(':');
+            let name = name.rsplit_once(':').map_or(name, |(_, unscoped)| unscoped);
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
+/// Whether `text` holds `name` as a whole identifier, in any case, whatever
+/// precedes it (`$sb`, `${sb}`, `$script:sb`, `Get-Variable sb`).
+fn powershell_name_is_mentioned(text: &str, name: &str) -> bool {
+    let is_identifier = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'_';
+    let text = text.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    text.match_indices(&name).any(|(at, _)| {
+        let bytes = text.as_bytes();
+        !at.checked_sub(1)
+            .and_then(|before| bytes.get(before))
+            .is_some_and(is_identifier)
+            && !bytes.get(at + name.len()).is_some_and(is_identifier)
+    })
 }
 
 /// Every PowerShell statement that runs a command through the call operator
@@ -12944,7 +12985,18 @@ fn powershell_call_operator_statements(
         let preceding = operator_text.trim_end();
         let after_newline = operator_text[preceding.len()..].contains(['\n', '\r']);
         // `a & b` runs `a` in the background; `a && b` chains; `>&` redirects.
-        let after_separator = preceding.ends_with(['&', '|', ';', '{', '('])
+        // An assignment's right side, a `return` operand and what follows a
+        // closing brace are commands too (`$x = & 'C:\…\git.exe' reset --hard`).
+        let after_keyword = preceding
+            .rsplit(|c: char| !c.is_ascii_alphanumeric())
+            .next()
+            .is_some_and(|word| {
+                ["return", "throw", "exit"]
+                    .iter()
+                    .any(|keyword| word.eq_ignore_ascii_case(keyword))
+            });
+        let after_separator = (preceding.ends_with(['&', '|', ';', '{', '(', '}', '='])
+            || after_keyword)
             && !operator_text.ends_with(['&', '>', '<']);
         let starts_statement = preceding.is_empty() || after_newline || after_separator;
         if starts_statement {
@@ -12967,6 +13019,15 @@ fn powershell_call_operator_view(command: &str) -> Option<String> {
     if !command.contains('&') && !command.contains(". ") && !command.contains(".\t") {
         return None;
     }
+    // A program name inside parentheses is the same call:
+    // `. ('C:\…\git.exe') reset --hard`.
+    static PARENTHESIZED_PROGRAM: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r#"(?m)(^\s*|[;|&{(=]\s*)[&.]\s*\(\s*('[^']*'|"[^"]*")\s*\)"#)
+            .expect("parenthesized program regex compiles")
+    });
+    let unwrapped = PARENTHESIZED_PROGRAM.replace_all(command, "$1& $2");
+    let unwrapped_any = matches!(unwrapped, Cow::Owned(_));
+    let command = unwrapped.as_ref();
     let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
     let bytes = command.as_bytes();
     // (byte offset, replacement, bytes replaced), in source order.
@@ -13008,10 +13069,15 @@ fn powershell_call_operator_view(command: &str) -> Option<String> {
         {
             edits.push((token.byte_range.start, "&", 1));
         }
-        statement_start = false;
+        // An assignment's right side and a `return` operand start a command
+        // of their own (`$x = . 'C:\…\git.exe' reset --hard`).
+        statement_start = token.text(command).is_some_and(|text| {
+            matches!(text, "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "??=")
+                || text.eq_ignore_ascii_case("return")
+        });
     }
     if edits.is_empty() {
-        return None;
+        return unwrapped_any.then(|| command.to_string());
     }
     let mut view = String::with_capacity(command.len() + edits.len());
     let mut copied = 0usize;
@@ -57881,6 +57947,47 @@ mod tests {
             "$sb = { git reset --hard }; $sb.ToString() | Invoke-Expression".to_string(),
             "$sb = { git reset --hard }; Write-Output $sb".to_string(),
             "$sb = { git reset --hard }; $sb.ToString()".to_string(),
+            // The call and dot-source operators wherever a statement or an
+            // expression can start.
+            format!("$x = & {git} reset --hard"),
+            format!("$null = & {git} reset --hard"),
+            format!("$x = &{git} reset --hard"),
+            format!("$x = . {git} reset --hard"),
+            format!("$x += & {git} reset --hard"),
+            format!("return & {git} reset --hard"),
+            format!("Get-Date; return & {git} reset --hard"),
+            format!("if ($a) {{ b }} & {git} reset --hard"),
+            format!("Get-Date; & ({git}) reset --hard"),
+            format!(". ({git}) reset --hard"),
+            // A block that a name, a member or a container keeps for later.
+            "$sb = [scriptblock]{ git reset --hard }; $sb.Invoke()".to_string(),
+            "$h = @{ x = { git reset --hard } }; & $h.x".to_string(),
+            "$h.x = { git reset --hard }; & $h.x".to_string(),
+            "$h['x'] = { git reset --hard }; & $h['x']".to_string(),
+            "$a = @({ git reset --hard }); & $a[0]".to_string(),
+            "$a = 1, { git reset --hard }; & $a[1]".to_string(),
+            "$function:foo = { git reset --hard }; foo".to_string(),
+            "${function:foo} = { git reset --hard }; foo".to_string(),
+            "Set-Item function:foo { git reset --hard }; foo".to_string(),
+            "New-Item -Path function: -Name foo -Value { git reset --hard }; foo".to_string(),
+            "$sb = { git reset --hard }; (Get-Variable sb).Value.Invoke()".to_string(),
+            "$sb = { git reset --hard }; (gv sb -ValueOnly).Invoke()".to_string(),
+            "$m = 'Invoke'; { git reset --hard }.$m()".to_string(),
+            "$\u{e9} = { git reset --hard }; & $\u{e9}".to_string(),
+            "$PSDefaultParameterValues['*:x'] = { git reset --hard }".to_string(),
+            "$sb = [scriptblock]{ git reset --hard }; & $sb".to_string(),
+            "$sb = $null; $sb ??= { git reset --hard }; & $sb".to_string(),
+            "{ git reset --hard } | ForEach-Object { & $_ }".to_string(),
+            // Methods that run a block they are given.
+            "$a.ForEach({ git reset --hard })".to_string(),
+            "$a.Where({ git reset --hard })".to_string(),
+            "[powershell]::Create().AddScript({ git reset --hard }).Invoke()".to_string(),
+            "[Threading.Tasks.Task]::Run({ git reset --hard })".to_string(),
+            // Commands that run a block they are given.
+            "Measure-Command { git reset --hard }".to_string(),
+            "New-Module -ScriptBlock { git reset --hard }".to_string(),
+            "Register-EngineEvent -SourceIdentifier x -Action { git reset --hard }".to_string(),
+            "Trace-Command -Name x -Expression { git reset --hard }".to_string(),
         ] {
             let result = evaluate(&cmd);
             assert!(result.is_denied(), "{cmd:?} must be denied: {result:?}");
@@ -57897,6 +58004,12 @@ mod tests {
             "$sb = { git status }; Write-Output $sb".to_string(),
             "$sb = { git status }; Invoke-Command -ScriptBlock $sb".to_string(),
             "$h = @{ a = 1 }; $h.Keys".to_string(),
+            "$x = 1; $y = $x + 2".to_string(),
+            format!("$x = & {git} status"),
+            "$s = 'a=b'; Write-Output $s".to_string(),
+            "Measure-Command { git status }".to_string(),
+            "$a.ForEach({ git status })".to_string(),
+            "$a.Where({ $_ -gt 1 })".to_string(),
         ] {
             let result = evaluate(&cmd);
             assert!(result.is_allowed(), "{cmd:?} must be allowed: {result:?}");
