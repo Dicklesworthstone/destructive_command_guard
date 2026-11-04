@@ -1140,11 +1140,14 @@ pub static SAFE_STRING_REGISTRY: SafeStringRegistry = SafeStringRegistry {
         SafeFlagEntry::long_multi("bd", "--reason"),
         // beads_rust (`br`) is bd's successor with the same free-text flags plus
         // `--body`; its argument bodies are documentation, not executed (#225).
-        SafeFlagEntry::long_multi("br", "--description"),
+        SafeFlagEntry::both_multi("br", "-d", "--description"),
         SafeFlagEntry::long_multi("br", "--title"),
         SafeFlagEntry::long_multi("br", "--body"),
         SafeFlagEntry::long_multi("br", "--notes"),
-        SafeFlagEntry::long_multi("br", "--reason"),
+        // `-r` is `--reason` on `br close` and `br reopen`. On `br list`, `ready`
+        // and `search` it is a switch, where masking what follows hides nothing
+        // br would run.
+        SafeFlagEntry::both_multi("br", "-r", "--reason"),
         // The rest of `br update`/`br create`/`br close`'s free-text fields
         // (#618). br stores each value; it never runs one. `--description-file`
         // names a path and stays unmasked. A value holding `$(…)` or backticks
@@ -1154,6 +1157,8 @@ pub static SAFE_STRING_REGISTRY: SafeStringRegistry = SafeStringRegistry {
         SafeFlagEntry::long_multi("br", "--acceptance-criteria"),
         SafeFlagEntry::long_multi("br", "--acceptance"),
         SafeFlagEntry::long_multi("br", "--add-acceptance"),
+        SafeFlagEntry::long_multi("br", "--check-acceptance"),
+        SafeFlagEntry::long_multi("br", "--uncheck-acceptance"),
         SafeFlagEntry::long_multi("br", "--prerequisites"),
         SafeFlagEntry::long_multi("br", "--transition-comment"),
         SafeFlagEntry::long_multi("br", "--agent-context"),
@@ -1660,7 +1665,23 @@ fn token_mask_ranges(
         }
 
         if command_query_mode {
-            // `command -v/-V` is query-only; treat all remaining args as data.
+            // `command -v/-V` is query-only; treat all remaining args as data,
+            // except a redirection the shell still opens.
+            if next_token_is_redirect_target {
+                next_token_is_redirect_target = false;
+                continue;
+            }
+            if let Some(split_pos) = glued_redirect_split_position(token_text) {
+                push_data_value(
+                    &mut mask_ranges,
+                    token_text,
+                    token.byte_range.start,
+                    token.byte_range.clone(),
+                );
+                next_token_is_redirect_target =
+                    matches!(&token_text[split_pos..], ">" | ">>" | ">|" | ">&");
+                continue;
+            }
             if !token.has_inline_code {
                 mask_ranges.push(token.byte_range.clone());
             }
@@ -1831,6 +1852,10 @@ fn token_mask_ranges(
                     let start = token.byte_range.start;
                     mask_ranges.push(start..start + split_pos);
                 }
+                // `echo x> /etc/passwd`: the operator ends the word, so the
+                // next word is its target.
+                next_token_is_redirect_target =
+                    matches!(&token_text[split_pos..], ">" | ">>" | ">|" | ">&");
                 continue;
             }
             if !token.has_inline_code {
@@ -1858,6 +1883,18 @@ fn token_mask_ranges(
             if pending.multi_value {
                 if token.has_inline_code || is_flag_token {
                     pending_safe_flag = None;
+                } else if glued_redirect_split_position(token_text).is_some() {
+                    // A redirection ends the flag's words: the shell opens its
+                    // target, and masking it would hide a write such as
+                    // `br update x --notes y > /etc/passwd` from every rule.
+                    pending_safe_flag = None;
+                    push_data_value(
+                        &mut mask_ranges,
+                        token_text,
+                        token.byte_range.start,
+                        token.byte_range.clone(),
+                    );
+                    continue;
                 } else {
                     if !token.has_inline_code {
                         mask_ranges.push(token.byte_range.clone());
@@ -1872,7 +1909,12 @@ fn token_mask_ranges(
                 pending_safe_flag = None;
                 if !token.has_inline_code && flag_data_value_is_inert(cmd, pending.flag, token_text)
                 {
-                    mask_ranges.push(token.byte_range.clone());
+                    push_data_value(
+                        &mut mask_ranges,
+                        token_text,
+                        token.byte_range.start,
+                        token.byte_range.clone(),
+                    );
                 }
                 if is_search_pattern_flag(cmd, pending.flag) {
                     search_pattern_masked = true;
@@ -1888,7 +1930,12 @@ fn token_mask_ranges(
                 && flag_data_value_is_inert(cmd, flag, &command[value_range.clone()])
             {
                 // Mask only the value portion (after '='). Keep the flag prefix for readability.
-                mask_ranges.push(value_range);
+                push_data_value(
+                    &mut mask_ranges,
+                    token_text,
+                    token.byte_range.start,
+                    value_range,
+                );
 
                 // For search tools, masking a flag-supplied pattern should prevent masking the
                 // first positional argument as a pattern.
@@ -1908,7 +1955,12 @@ fn token_mask_ranges(
             if !token.has_inline_code
                 && flag_data_value_is_inert(cmd, flag, &command[value_range.clone()])
             {
-                mask_ranges.push(value_range);
+                push_data_value(
+                    &mut mask_ranges,
+                    token_text,
+                    token.byte_range.start,
+                    value_range,
+                );
                 if is_search_pattern_flag(cmd, flag) {
                     search_pattern_masked = true;
                 }
@@ -1954,7 +2006,12 @@ fn token_mask_ranges(
                     && (search_cmd.rsplit('/').next().unwrap_or(search_cmd) != "sed"
                         || sed_script_is_maskable(token_text))
                 {
-                    mask_ranges.push(token.byte_range.clone());
+                    push_data_value(
+                        &mut mask_ranges,
+                        token_text,
+                        token.byte_range.start,
+                        token.byte_range.clone(),
+                    );
                 }
                 search_pattern_masked = true;
             }
@@ -2720,14 +2777,10 @@ enum SanitizeTokenKind {
 #[inline]
 fn glued_redirect_split_position(token: &str) -> Option<usize> {
     let bytes = token.as_bytes();
-    if bytes.len() < 2 {
-        return None;
-    }
-
     let mut i = 0usize;
     let mut in_single = false;
     let mut in_double = false;
-    while i + 1 < bytes.len() {
+    while i < bytes.len() {
         match bytes[i] {
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
@@ -2739,6 +2792,27 @@ fn glued_redirect_split_position(token: &str) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// Mask `range`, a data value inside the word `token_text` that starts at
+/// `token_start`, stopping at a redirection the shell reads in that word.
+///
+/// An unquoted `>` ends the word for the shell whatever comes before it, so in
+/// `git commit -m msg>/etc/passwd` only `msg` is the flag's value. The operator
+/// and target stay visible for the destructive-redirect rules, as they do for
+/// `echo` above.
+fn push_data_value(
+    mask_ranges: &mut SmallVec<[Range<usize>; 8]>,
+    token_text: &str,
+    token_start: usize,
+    range: Range<usize>,
+) {
+    let end = glued_redirect_split_position(token_text).map_or(range.end, |split_pos| {
+        range.end.min(token_start + split_pos)
+    });
+    if range.start < end {
+        mask_ranges.push(range.start..end);
+    }
 }
 
 /// Returns true if `token` is a Bash redirection operator that belongs

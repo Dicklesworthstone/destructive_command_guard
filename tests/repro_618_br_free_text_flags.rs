@@ -92,3 +92,122 @@ fn br_free_text_flags_do_not_hide_executed_code_issue_618() {
         denied(&format!("br update bd-x {flag} 'note'; rm -rf /"));
     }
 }
+
+/// `-d` and `-r` are `--description` and `--reason` on `br create`, `update`,
+/// `close` and `reopen`, and `--check-acceptance` takes a text selector that br
+/// matches against stored text.
+#[test]
+fn br_short_spellings_and_selectors_are_data_issue_618() {
+    for flag in ["-d", "-r", "--check-acceptance", "--uncheck-acceptance"] {
+        allowed(&format!("br update bd-x {flag} {LAUNCHER_PROSE}"));
+        denied(&format!(
+            "br update bd-x {flag} \"see $(git reset --hard)\""
+        ));
+        denied(&format!("br update bd-x {flag} 'note' && git reset --hard"));
+    }
+    allowed(&format!("br create --title t -d {LAUNCHER_PROSE} -p 2"));
+    allowed(&format!("br close bd-x -r {LAUNCHER_PROSE}"));
+    // `-r` is a switch on `br list`. It hides no redirect there either.
+    denied("br list -r > /etc/passwd");
+}
+
+/// A redirection is not the flag's value: the shell opens its target before br
+/// starts. These flags take every word up to the next flag, so without this the
+/// operator and the target were masked with the note, and no rule saw the write.
+#[test]
+fn br_free_text_flags_do_not_hide_a_redirect_target() {
+    const OLDER_FLAGS: &[&str] = &["--description", "--title", "--body", "--notes", "--reason"];
+    let flags = NEW_FREE_TEXT_FLAGS.iter().chain(OLDER_FLAGS);
+    for flag in flags {
+        for redirect in [
+            "> /etc/passwd",
+            ">/etc/passwd",
+            ">> /etc/passwd",
+            ">| /etc/passwd",
+            "&> /etc/passwd",
+            "2> /etc/passwd",
+            "> /dev/sda",
+            "> .git/config",
+            ">> .git/hooks/pre-commit",
+            "> ~/.bashrc",
+        ] {
+            denied(&format!("br update bd-x {flag} note {redirect}"));
+            denied(&format!("br update bd-x {flag} 'a note' {redirect}"));
+        }
+        // Glued to the value, and to the `--flag=value` spelling.
+        denied(&format!("br update bd-x {flag} note>/etc/passwd"));
+        denied(&format!("br update bd-x {flag} 'a note'>/etc/passwd"));
+        denied(&format!("br update bd-x {flag} note> /etc/passwd"));
+        denied(&format!("br update bd-x {flag} note>> .git/config"));
+        denied(&format!("br update bd-x {flag}=note>/etc/passwd"));
+        denied(&format!("br update bd-x {flag}='a note'>/etc/passwd"));
+    }
+    for short in ["-d", "-r"] {
+        denied(&format!("br update bd-x {short} note > /etc/passwd"));
+        denied(&format!("br update bd-x {short} note>/etc/passwd"));
+    }
+    denied("bd update bd-x --notes note > /etc/passwd");
+    denied("bd update bd-x --notes note>/etc/passwd");
+}
+
+/// The same word boundary for the flags that take one value, for `echo` when
+/// the operator ends the word, and for `command -v`, which masks its arguments.
+#[test]
+fn a_glued_redirect_is_not_part_of_a_data_value() {
+    for cmd in [
+        "git commit -m msg>/etc/passwd",
+        "git commit -m 'a msg'>/etc/passwd",
+        "git commit -m msg> /etc/passwd",
+        "git commit -m > /etc/passwd",
+        "git commit -m'a msg'>/etc/passwd",
+        "git commit --message=msg>/etc/passwd",
+        "gh issue create --title t>/etc/passwd",
+        "grep -e x>/etc/passwd",
+        "grep x>/etc/passwd",
+        "echo x> /etc/passwd",
+        "echo x>> /etc/passwd",
+        "command -v x > /etc/passwd",
+        "command -v x>/etc/passwd",
+        "command -V x >> ~/.bashrc",
+    ] {
+        denied(cmd);
+    }
+}
+
+/// Text that only looks like a redirection, and redirections to harmless
+/// targets, keep the verdict an ordinary note has.
+#[test]
+fn br_free_text_flags_keep_allowing_harmless_redirects_and_prose() {
+    for flag in NEW_FREE_TEXT_FLAGS {
+        for tail in [
+            "note > /tmp/out.log",
+            "note>/tmp/out.log",
+            "note 2>/dev/null",
+            "note 2>&1",
+            "note > /dev/null 2>&1",
+            "'x > /etc/passwd'",
+            "'x>/etc/passwd'",
+            "\"x>/etc/passwd\"",
+            "x\\>y",
+            "'rm -rf /' --json > /tmp/o.json",
+        ] {
+            allowed(&format!("br update bd-x {flag} {tail}"));
+        }
+    }
+    for cmd in [
+        "git commit -m 'a > /etc/passwd'",
+        "git commit -m msg>/tmp/out.log",
+        "git commit -m msg 2>&1",
+        "grep -e 'a>/etc/passwd' file",
+        "grep 'a>/etc/passwd' file",
+        "echo 'x> /etc/passwd'",
+        "echo x\\> /etc/passwd",
+        "echo x> /tmp/out.log 'rm -rf /'",
+        "command -v x >/dev/null 2>&1",
+        "command -v x > /dev/null",
+        "command -V 'rm -rf /' 2>/dev/null",
+        "command -v x > /tmp/out.log 'rm -rf /'",
+    ] {
+        allowed(cmd);
+    }
+}
