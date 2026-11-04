@@ -262,6 +262,16 @@ fn caller_anchored_directory(query: &str, format: PathFormat, git_dir: Option<&s
         || query == "--git-dir"
             && format == PathFormat::Default
             && git_dir.is_some_and(|root| root.starts_with('/') || contains_git_component(root))
+        // With no explicit --git-dir, Git discovers the repository from the
+        // -C directory and prints its administrative directory either as an
+        // absolute path or relative to that directory, such as `.git` at the
+        // top of a work tree (#609). The caller's shell then resolves a
+        // relative result from ITS directory, so the write lands in the
+        // caller's own `.git` instead of the queried repository's. Either way
+        // the destination is a Git administrative directory, the identity the
+        // literal `.git/...` spelling already has. This view only adds
+        // denials: it never exempts a write.
+        || git_dir.is_none() && matches!(query, "--git-dir" | "--git-common-dir")
 }
 
 fn caller_anchored_path(
@@ -617,13 +627,20 @@ mod tests {
             "git -C src -c core.hooksPath=/tmp/hooks rev-parse --git-path hooks/pre-commit",
             "git -C . rev-parse --git-path hooks/pre-commit",
             "git -C '' -C ././ rev-parse --git-common-dir",
+            // #609: with no explicit --git-dir, a relative result names the
+            // discovered administrative directory (`.git` at the top of a
+            // work tree), which the caller's shell resolves to its own.
+            "git -C src rev-parse --git-common-dir",
+            "git -C /r rev-parse --git-common-dir",
+            "git -C /r rev-parse --git-dir",
+            "git -C src -C .. rev-parse --git-dir",
+            "git -C src rev-parse --path-format=relative --git-common-dir",
         ] {
             assert!(resolve_query(source).is_some(), "{source}");
         }
         for source in [
             "git -C src -c core.hooksPath=hooks rev-parse --git-path hooks/pre-commit",
             "git -C src -c core.hooksPath=/tmp/hooks rev-parse --path-format=relative --git-path hooks/pre-commit",
-            "git -C src rev-parse --git-common-dir",
             "git -C src rev-parse --git-path hooks/pre-commit --path-format=absolute",
             "git -C src rev-parse --path-format=absolute --path-format=relative --git-path hooks/pre-commit",
             "git -C src --git-dir=/outside/admin rev-parse --path-format=relative --git-dir",

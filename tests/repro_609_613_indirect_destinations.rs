@@ -538,6 +538,11 @@ fn git_admin_queries_and_bound_values_reach_native_writer_rules() {
         "cp source \"`git rev-parse --git-dir`/config\"",
         "cp source \"$(git rev-parse --absolute-git-dir)/config\"",
         "cp source \"$(git -C /r rev-parse --path-format=absolute --git-common-dir)/hooks/pre-commit\"",
+        // A relative result after -C is resolved from the caller's directory,
+        // which still lands in a .git administrative directory.
+        "cp source \"$(git -C /r rev-parse --git-common-dir)/hooks/pre-commit\"",
+        "cp source \"$(git -C /r rev-parse --git-dir)/config\"",
+        "cp source $(git -C sub rev-parse --git-common-dir)/config",
         "cp source \"$(git rev-parse --git-path hooks)/pre-commit\"",
         "cp source \"$(git rev-parse --git-path hooks/pre-commit)\"",
         "cp source \"$(git rev-parse --git-path config)\"",
