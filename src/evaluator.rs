@@ -19237,7 +19237,9 @@ fn literal_posix_argument_atom(value: &str) -> bool {
 ///
 /// Only ordinary arguments in top-level simple commands participate. Executable
 /// words, assignments, redirections and nested source keep their own analyses.
-/// Quote each replacement so expansion output cannot become shell grammar.
+/// A value is an atom with no shell metacharacter, so it cannot become shell
+/// grammar and reads exactly as the literal word: `D=/tmp/x; rm -rf "$D"` gets
+/// the verdict of `rm -rf /tmp/x`, where a quoted `'/tmp/x'` would lose it.
 /// The caller only adopts findings; this view never grants permission.
 fn posix_literal_argument_view(
     command: &str,
@@ -19311,12 +19313,11 @@ fn posix_literal_argument_view(
             ) else {
                 continue;
             };
-            let replacement = posix_single_quote_argument(&value);
-            output_bytes = output_bytes - range.len() + replacement.len();
+            output_bytes = output_bytes - range.len() + value.len();
             if output_bytes > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
                 return Err(());
             }
-            replacements.push((range, replacement));
+            replacements.push((range, value));
         }
     }
     if replacements.is_empty() {
