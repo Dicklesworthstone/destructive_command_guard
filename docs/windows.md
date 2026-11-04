@@ -65,11 +65,13 @@ function Install-DcgRelease {
     # PowerShell 5.1 can wrap successful native stderr as NativeCommandError.
     # Decide verification from the actual process exit code, including failure
     # to start the verifier, rather than from stderr or a stale LASTEXITCODE.
-    $LASTEXITCODE = -1
+    # Native processes update the global automatic variable. An unqualified
+    # assignment here would shadow it in this function (PowerShell 5.1 and 7).
+    $global:LASTEXITCODE = -1
     $ErrorActionPreference = 'Continue'
     try {
         & $verifier -Vm $installer -x $signature -P $key
-        $signatureExit = $LASTEXITCODE
+        $signatureExit = $global:LASTEXITCODE
     } finally {
         $ErrorActionPreference = 'Stop'
     }
@@ -81,11 +83,18 @@ function Install-DcgRelease {
 
     # Allow this authenticated file under RemoteSigned without changing policy.
     Unblock-File -LiteralPath $installer -ErrorAction Stop
-    $installArgs = @{ Version = $tag; RequireMinisign = $true; Verify = $true }
-    if ($Mode -eq 'Easy') { $installArgs.EasyMode = $true }
-    $LASTEXITCODE = 0
-    & $installer @installArgs
-    if ($LASTEXITCODE -ne 0) { throw "Installer failed with exit code $LASTEXITCODE." }
+    # A PS1 invoked in-process can leave an incidental native exit code behind
+    # (including the self-test's expected denial). A child -File invocation
+    # reports the script's completion, explicit exit, or terminating exception.
+    $powerShell = (Get-Process -Id $PID -ErrorAction Stop).Path
+    $installArgs = @('-NoProfile', '-File', ('"' + $installer + '"'),
+        '-Version', $tag, '-RequireMinisign', '-Verify')
+    if ($Mode -eq 'Easy') { $installArgs += '-EasyMode' }
+    $installProcess = Start-Process -FilePath $powerShell -ArgumentList $installArgs `
+        -Wait -PassThru -NoNewWindow -ErrorAction Stop
+    if ($null -eq $installProcess.ExitCode -or $installProcess.ExitCode -ne 0) {
+        throw "Installer failed with exit code $($installProcess.ExitCode)."
+    }
 }
 ```
 <!-- verified-release-install-powershell:end -->
@@ -96,6 +105,9 @@ Then choose one mode:
 Install-DcgRelease                 # Easy mode: configure hooks and add User PATH
 # Or: Install-DcgRelease -Mode Normal
 ```
+
+The installer runs in a child PowerShell process. After Easy mode completes,
+open a new terminal to pick up the updated User `PATH`.
 
 Missing verification tools or assets, invalid signatures, or a different
 installer digest stop installation. There is no unsigned installer or source
@@ -376,6 +388,21 @@ PowerShell ports of the shell E2E suites run on `windows-latest` CI (and locally
 - **`tests/installer/*.ps1`** — per-function unit tests for the install/uninstall
   hook-merge logic (Claude/Codex/Gemini/Copilot/Cursor/Hermes, zip-slip, flags,
   local-source, checksum, agent detection, arch selection).
+- **`tests/install/test_verified_bootstrap.py`** — executes the documented
+  verified-install function and the fleet authentication/install blocks using
+  real Minisign signatures and child PowerShell processes. It covers native
+  exit status, function scoping, failed launches, invalid signatures/digests,
+  and installer failures. With Python 3 and Minisign on `PATH`, run
+  `python -B -m unittest discover -s tests/install -p test_verified_bootstrap.py -k PowerShell -v`.
+  It exercises both `powershell` and `pwsh` when available;
+  `DCG_TEST_POWERSHELL` can select an additional executable. Unix runs explicitly
+  omit Windows ACL/`Unblock-File` checks. On a native Windows release host, set
+  `DCG_TEST_NATIVE_WINDOWS_INSTALL=1` to also qualify the real public `v0.16.0`
+  installer in Normal mode with a scratch destination, `-NoConfigure`, and
+  self-healing disabled. An explicitly requested native check fails when
+  Windows or PowerShell is unavailable. Without that opt-in, published release
+  bytes can be authenticated using `DCG_TEST_RELEASE_ASSETS`, but are never
+  executed by the tests. Use the configured DSR host for native qualification.
 - **Real-Windows runtime stress (CI-gated):**
   `scripts/win_history_concurrency.ps1` (concurrent history-DB writers + killed-writer
   stale-lock recovery), `scripts/win_pending_exception_concurrency.ps1` (concurrent

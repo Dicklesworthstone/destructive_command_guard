@@ -579,11 +579,14 @@ try {
     -UserAgent 'destructive_command_guard-fleet-probe' `
     -Uri "$RepoRelease/$Version/install.ps1.minisig" -OutFile $installerSignaturePath -ErrorAction Stop
   # Continue permits normal native stderr under PowerShell 5.1; the explicit
-  # process status remains authoritative, including a failure to launch.
-  $LASTEXITCODE = -1
+  # process status remains authoritative, including a failure to launch. Native
+  # commands update the global automatic variable, even inside a function or
+  # script scope; an unqualified assignment would hide that status (#641).
+  $global:LASTEXITCODE = -1
   & $minisign -Vm $installerPath -x $installerSignaturePath -P $minisignPublicKey `
     *> (Join-Path $work 'installer-signature.log')
-  if ($LASTEXITCODE -ne 0) { throw 'invalid installer signature' }
+  $signatureExit = $global:LASTEXITCODE
+  if ($signatureExit -ne 0) { throw 'invalid installer signature' }
   $signatureLines = @(Get-Content -LiteralPath $installerSignaturePath -ErrorAction Stop)
   $expectedIdentity = "trusted comment: dsr-built destructive_command_guard $Version additional $actualInstallerSha"
   $strictIdentity = "trusted comment: dsr strict release destructive_command_guard $Version additional $actualInstallerSha"
@@ -599,19 +602,30 @@ try {
 }
 
 $log = Join-Path $work 'install.log'
+$errorLog = Join-Path $work 'install-stderr.log'
 try {
   # Unblock only authenticated bytes for RemoteSigned compatibility. This
   # leaves the host's execution policy unchanged.
   Unblock-File -LiteralPath $installerPath -ErrorAction Stop
   $ErrorActionPreference = 'Stop'
-  $LASTEXITCODE = 0
-  & $installerPath -Version $Version -Dest $dest `
-      -RequireMinisign -Verify -NoConfigure *> $log
-  if ($LASTEXITCODE -ne 0) { throw "installer exited with code $LASTEXITCODE" }
+  # An in-process PS1 can finish without setting LASTEXITCODE, or leave the
+  # status of an optional native command behind. Qualify the script's own exit
+  # status in a fresh instance of the same PowerShell engine instead.
+  $powerShell = (Get-Process -Id $PID -ErrorAction Stop).Path
+  $installerArguments = @('-NoProfile', '-NonInteractive', '-File',
+    ('"' + $installerPath + '"'), '-Version', $Version, '-Dest',
+    ('"' + $dest + '"'), '-RequireMinisign', '-Verify', '-NoConfigure')
+  $installerProcess = Start-Process -FilePath $powerShell -ArgumentList $installerArguments `
+    -Wait -PassThru -NoNewWindow -RedirectStandardOutput $log `
+    -RedirectStandardError $errorLog -ErrorAction Stop
+  if ($null -eq $installerProcess.ExitCode -or $installerProcess.ExitCode -ne 0) {
+    throw "installer exited with code $($installerProcess.ExitCode)"
+  }
   Emit 'install' 'PASS'
 } catch {
   $tail = ''
   if (Test-Path $log) { $tail = (Get-Content $log -Tail 3 -ErrorAction SilentlyContinue) -join ' ' }
+  if (Test-Path $errorLog) { $tail += ' ' + ((Get-Content $errorLog -Tail 3 -ErrorAction SilentlyContinue) -join ' ') }
   Emit 'install' 'FAIL' "$($_.Exception.Message) $tail"
 } finally {
   $ErrorActionPreference = 'Continue'
@@ -619,6 +633,7 @@ try {
 
 $logText = ''
 if (Test-Path $log) { $logText = Get-Content $log -Raw -ErrorAction SilentlyContinue }
+if (Test-Path $errorLog) { $logText += Get-Content $errorLog -Raw -ErrorAction SilentlyContinue }
 if ($logText -match '(?i)checksum') { Emit 'checksum_verified' 'PASS' } else { Emit 'checksum_verified' 'FAIL' 'no checksum evidence in installer output' }
 if ($logText -match '(?i)Signature verified \(minisign key ') { Emit 'minisign_verified' 'PASS' } else { Emit 'minisign_verified' 'FAIL' 'strict minisign key verification did not complete' }
 
