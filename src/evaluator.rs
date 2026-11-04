@@ -9274,11 +9274,22 @@ fn perl_ruby_option_word<'a>(
                 }
             }
             Letter::Value => {
-                return if rest.is_empty() {
-                    next.map(|_| (1, InterpreterOptionEffect::Nothing))
+                let value = if rest.is_empty() {
+                    next.map(String::as_str)
                 } else {
-                    Some((0, InterpreterOptionEffect::Nothing))
+                    Some(rest)
                 };
+                // ruby's `-r` loads a library before the program runs. One
+                // named by a path or stdin is a file nothing here reads, as a
+                // script operand is.
+                if language == crate::heredoc::ScriptLanguage::Ruby
+                    && letter == b'r'
+                    && !value.is_some_and(names_installed_library)
+                {
+                    return None;
+                }
+                let consumed = usize::from(rest.is_empty());
+                return value.map(|_| (consumed, InterpreterOptionEffect::Nothing));
             }
             Letter::Program => {
                 return if rest.is_empty() {
@@ -9315,6 +9326,35 @@ fn perl_ruby_option_word<'a>(
         }
     }
     Some((0, InterpreterOptionEffect::Nothing))
+}
+
+/// Whether `name` names an installed library or package (`json`,
+/// `bundler/setup`, `@babel/register`) rather than a path, a URL or a stdin
+/// device, which the interpreter would load from a file nothing here reads.
+fn names_installed_library(name: &str) -> bool {
+    let plain_byte = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.');
+    let plain_segment =
+        |segment: &str| !matches!(segment, "" | "." | "..") && segment.bytes().all(plain_byte);
+    let name = name.strip_prefix('@').unwrap_or(name);
+    !name.is_empty() && name.split('/').all(plain_segment)
+}
+
+/// Whether an interpreter option's value, or the option word that carries
+/// it, names standard input: `-c /dev/stdin`, `--env-file=/dev/stdin`, php's
+/// `php://stdin`. What the option reads, configuration or code to load, then
+/// comes from the pipe.
+fn option_value_names_stdin(text: &str) -> bool {
+    const STDIN_NAMES: &[&str] = &[
+        "/dev/stdin",
+        "/dev/fd/0",
+        "/proc/self/fd/0",
+        "php://stdin",
+        "php://fd/0",
+        "php://input",
+    ];
+    let text = text.to_ascii_lowercase();
+    classify_shell_positional(&text) == ShellPositional::StdinDevice
+        || STDIN_NAMES.iter().any(|name| text.ends_with(name))
 }
 
 /// One option word of a Perl, Ruby, Node or PHP interpreter. See
@@ -9369,16 +9409,30 @@ fn script_interpreter_option_word<'a>(
             {
                 return Some((0, Program(code)));
             }
+            // A module loaded before the program runs. One named by a path,
+            // a URL or stdin is a file nothing here reads, as a script
+            // operand is.
+            let loads_module = |name: &str| {
+                matches!(
+                    name,
+                    "-r" | "--require" | "--import" | "--loader" | "--experimental-loader"
+                )
+            };
+            if let Some((name, module)) = word.split_once('=')
+                && loads_module(name)
+            {
+                return names_installed_library(module).then_some((0, Nothing));
+            }
+            if loads_module(word) {
+                return next
+                    .filter(|module| names_installed_library(module))
+                    .map(|_| (1, Nothing));
+            }
             match word {
                 "-e" | "--eval" | "-p" | "--print" | "-pe" => value(Program),
                 "-i" | "--interactive" => Some((0, ReadsStdin)),
                 "-v" | "--version" | "-h" | "--help" | "--v8-options" => Some((0, Exits)),
-                "-r"
-                | "--require"
-                | "--import"
-                | "--loader"
-                | "--experimental-loader"
-                | "-C"
+                "-C"
                 | "--conditions"
                 | "--input-type"
                 | "--env-file"
@@ -9448,9 +9502,27 @@ fn script_interpreter_option_word<'a>(
                 }
             };
             match letter {
-                b'r' | b'R' => attached_or_next(Program),
+                // `-B` and `-E` run code before and after the `-R`/`-F`
+                // line loop, as `-R` runs it per line.
+                b'r' | b'R' | b'B' | b'E' => attached_or_next(Program),
                 b'f' | b'F' => attached_or_next(ProgramFile),
-                b'c' | b'd' | b'z' | b'B' | b'E' | b'S' | b't' => attached_or_next(|_| Nothing),
+                b'd' => {
+                    // `auto_prepend_file` and `auto_append_file` run a file
+                    // nothing here reads around the program.
+                    let setting = if rest.is_empty() {
+                        next.map(String::as_str)?
+                    } else {
+                        rest
+                    };
+                    let name = setting.split('=').next().unwrap_or_default().trim();
+                    if name.eq_ignore_ascii_case("auto_prepend_file")
+                        || name.eq_ignore_ascii_case("auto_append_file")
+                    {
+                        return None;
+                    }
+                    attached_or_next(|_| Nothing)
+                }
+                b'c' | b'z' | b'S' | b't' => attached_or_next(|_| Nothing),
                 _ if !rest.is_empty() => None,
                 b'a' => Some((0, ReadsStdin)),
                 b'h' | b'i' | b'm' | b'v' => Some((0, Exits)),
@@ -9582,8 +9654,12 @@ fn perl_may_have_eval_flag(code: &str) -> bool {
 /// interpreter uses, and an option this reader does not model leaves the
 /// stage unverified rather than guessing whether it takes a value. An inline
 /// program clears the stage only when [`piped_inline_program_is_inert`] says
-/// it does not run what it reads. A script operand, whose program nothing
-/// here reads, stays unverified; a stdin device or `-` reads the pipe.
+/// it does not run what it reads; with php's `-B`, `-R` and `-E` every one of
+/// them must. A script operand or php's `-F FILE`, whose program nothing here
+/// reads, stays unverified, and so does code loaded from a file named by path
+/// (`ruby -r ./x.rb`, `node --require ./x.js`, php's `-d auto_prepend_file=…`)
+/// or an option value that names stdin (`-c /dev/stdin`); a stdin device or
+/// `-` as the script reads the pipe.
 fn script_interpreter_pipeline_input_mode(
     executable: &str,
     args: &[String],
@@ -9642,7 +9718,16 @@ fn script_interpreter_pipeline_input_mode(
             return PipelineShellInputMode::Unverified;
         };
         match effect {
-            InterpreterOptionEffect::Nothing => {}
+            InterpreterOptionEffect::Nothing => {
+                let value = if consumed == 1 {
+                    args.get(index + 1).map(String::as_str)
+                } else {
+                    None
+                };
+                if option_value_names_stdin(word) || value.is_some_and(option_value_names_stdin) {
+                    return PipelineShellInputMode::Unverified;
+                }
+            }
             InterpreterOptionEffect::Program(code) => {
                 // A program spelled `-` or a stdin device is no program text a
                 // reader can vouch for.
@@ -9660,11 +9745,13 @@ fn script_interpreter_pipeline_input_mode(
     if forced_stdin {
         return reads_stdin;
     }
-    if program {
-        return PipelineShellInputMode::DoesNotReadStdin;
-    }
+    // php's `-F FILE` runs the file once per piped line, whatever code `-B`
+    // or `-E` add around the loop.
     if let Some(file) = program_file {
         return operand_mode(file);
+    }
+    if program {
+        return PipelineShellInputMode::DoesNotReadStdin;
     }
     // php's first operand is its script, like the other interpreters'.
     operand.map_or_else(|| reads_stdin.clone(), operand_mode)
@@ -12340,16 +12427,29 @@ fn powershell_executable_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
     Ok(bodies)
 }
 
-/// Whether the script block literal `{ … }` at `open..=close` is run by an
-/// invoke method on it, `{ … }.Invoke()` or `({ … }).InvokeReturnAsIs()`, or
-/// is bound to a variable that a later statement runs: `$sb = { … }` then
-/// `$sb.Invoke()`, `& $sb` or `. $sb` (#637). A block that is only stored or
-/// printed stays inert.
+/// Whether the script block literal `{ … }` at `open..=close` may be run
+/// later in the command (#637): through a member of the literal itself
+/// (`{ … }.Invoke()`, `({ … }).GetNewClosure().Invoke()`), or through a
+/// variable bound to it (`$sb = { … }`) that a later statement uses. Any use
+/// may hand the block to something that runs it (`$sb.Invoke()`, `& $sb`,
+/// `Invoke-Command $sb`, `ForEach-Object $sb`, `$b = $sb`), so only the uses
+/// in [`powershell_block_variable_use_is_inert`] leave it inert.
 fn powershell_block_literal_is_invoked(command: &str, open: usize, close: usize) -> bool {
+    // `@{ … }` is a hashtable and `${ … }` a variable name, not a block.
+    if open
+        .checked_sub(1)
+        .and_then(|before| command.as_bytes().get(before))
+        .is_some_and(|byte| matches!(byte, b'@' | b'$'))
+    {
+        return false;
+    }
     let after = command.get(close + 1..).unwrap_or_default();
-    if powershell_text_starts_with_invoke_method(
-        after.trim_start_matches(|c: char| c == ')' || c.is_ascii_whitespace()),
-    ) {
+    let member = after.trim_start_matches(|c: char| c == ')' || c.is_ascii_whitespace());
+    if member
+        .strip_prefix('.')
+        .and_then(|name| name.chars().next())
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+    {
         return true;
     }
     let local = command[..open]
@@ -12357,69 +12457,92 @@ fn powershell_block_literal_is_invoked(command: &str, open: usize, close: usize)
         .next()
         .unwrap_or_default()
         .trim();
-    let Some(name) = local
-        .strip_suffix('=')
-        .map(str::trim_end)
-        .and_then(|target| target.strip_prefix('$'))
-        .filter(|name| {
-            !name.is_empty()
-                && name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
-        })
-    else {
+    let Some(name) = powershell_assigned_variable(local) else {
         return false;
     };
-    powershell_variable_is_invoked(after, name)
+    powershell_block_variable_is_used(after, name)
 }
 
-/// Whether `text` starts with `.Invoke(`, `.InvokeReturnAsIs(` or
-/// `.InvokeWithContext(`, in any case.
-fn powershell_text_starts_with_invoke_method(text: &str) -> bool {
-    let Some(rest) = text.strip_prefix('.') else {
-        return false;
-    };
-    let name_len = rest.bytes().take_while(u8::is_ascii_alphanumeric).count();
-    rest[name_len..].trim_start().starts_with('(')
-        && ["invoke", "invokereturnasis", "invokewithcontext"]
-            .iter()
-            .any(|method| rest[..name_len].eq_ignore_ascii_case(method))
+/// The variable an assignment prefix binds, without its scope: `sb` for
+/// `$sb =`, `$script:sb =`, `[scriptblock]$sb =` and the inner target of
+/// `$a = $sb =`.
+fn powershell_assigned_variable(prefix: &str) -> Option<&str> {
+    let target = prefix.strip_suffix('=')?.trim_end();
+    let dollar = target.rfind('$')?;
+    let before = target[..dollar].trim_end();
+    if !(before.is_empty() || before.ends_with([']', '='])) {
+        return None;
+    }
+    let name = powershell_unscoped_variable_name(&target[dollar + 1..]);
+    let plain = name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    (!name.is_empty() && plain).then_some(name)
 }
 
-/// Whether `$name` is run anywhere in `text`: an invoke method on it, or the
-/// call or dot-source operator before it. PowerShell variable names ignore
-/// case.
-fn powershell_variable_is_invoked(text: &str, name: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    let needle = format!("${}", name.to_ascii_lowercase());
-    let bytes = lower.as_bytes();
+/// A PowerShell variable name without its scope or drive prefix: `sb` for
+/// `script:sb`, `global:sb`, `using:sb` and `sb`.
+fn powershell_unscoped_variable_name(name: &str) -> &str {
+    let name = name.trim_end_matches(':');
+    name.rsplit_once(':').map_or(name, |(_, unscoped)| unscoped)
+}
+
+/// Whether `text` uses the variable `name` (any scope, `$name` or
+/// `${name}`, in any case) other than in the ways
+/// [`powershell_block_variable_use_is_inert`] allows.
+fn powershell_block_variable_is_used(text: &str, name: &str) -> bool {
     let mut from = 0usize;
-    while let Some(found) = lower.get(from..).and_then(|rest| rest.find(&needle)) {
+    while let Some(found) = text.get(from..).and_then(|rest| rest.find('$')) {
         let start = from + found;
-        let end = start + needle.len();
-        from = end;
-        if bytes
-            .get(end)
-            .copied()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
-        {
-            continue;
-        }
-        if powershell_text_starts_with_invoke_method(&text[end..]) {
-            return true;
-        }
-        let before = text[..start].trim_end();
-        if let Some(operator) = before.strip_suffix(['&', '.']) {
-            let operator_starts_statement = operator.trim_end().is_empty()
-                || operator.ends_with(|c: char| {
-                    c.is_ascii_whitespace() || matches!(c, ';' | '(' | '{' | '|')
-                });
-            if operator_starts_statement && !operator.ends_with('&') {
+        let after_sigil = &text[start + 1..];
+        let (reference, end) = if let Some(braced) = after_sigil.strip_prefix('{') {
+            let Some(len) = braced.find('}') else {
                 return true;
-            }
+            };
+            (&braced[..len], start + 3 + len)
+        } else {
+            let len = after_sigil
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
+                .count();
+            (&after_sigil[..len], start + 1 + len)
+        };
+        from = end;
+        if powershell_unscoped_variable_name(reference).eq_ignore_ascii_case(name)
+            && !powershell_block_variable_use_is_inert(text, start, end)
+        {
+            return true;
         }
     }
     false
+}
+
+/// Whether the use of a script block variable at `start..end` of `text` only
+/// reads it as text: a whole statement `$sb.ToString()`, or `Write-Output
+/// $sb`, `Write-Host $sb` or `echo $sb` with nothing after it. Inside any
+/// other statement the value, or text made from it, may reach something that
+/// runs it (`[scriptblock]::Create($sb.ToString()).Invoke()`,
+/// `Write-Output $sb | ForEach-Object { & $_ }`).
+fn powershell_block_variable_use_is_inert(text: &str, start: usize, end: usize) -> bool {
+    let statement_start = text[..start]
+        .rfind([';', '\r', '\n'])
+        .map_or(0, |at| at + 1);
+    // A backtick before the line break continues the statement above.
+    if text[..statement_start]
+        .trim_end_matches(['\r', '\n'])
+        .ends_with('`')
+    {
+        return false;
+    }
+    let after = &text[end..];
+    let statement_end = after.find([';', '\r', '\n']).unwrap_or(after.len());
+    let before = text[statement_start..start].trim().to_ascii_lowercase();
+    let rest = after[..statement_end].trim().to_ascii_lowercase();
+    match before.as_str() {
+        "" => rest == ".tostring()",
+        "write-output" | "write-host" | "echo" => rest.is_empty(),
+        _ => false,
+    }
 }
 
 /// Every PowerShell statement that runs a command through the call operator
@@ -40531,7 +40654,13 @@ mod tests {
             "ruby --version",
             "node -pe '1+1'",
             "node --input-type=module -e 'console.log(1)'",
+            "node -r dotenv/config -e 'console.log(1)'",
+            "node --require=@babel/register -e '1'",
+            "ruby -rbundler/setup -ne 'puts 1'",
             "php -r 'echo 1;'",
+            "php -R 'echo $argn;'",
+            "php -B '$n = 0;' -R '$n++;' -E 'echo $n;'",
+            "php -d memory_limit=1G -R 'echo $argn;'",
         ] {
             assert_eq!(mode(cmd), data, "{cmd}: the program is the inline code");
         }
@@ -40555,8 +40684,6 @@ mod tests {
             "ruby -Ku",
             "node",
             "node -",
-            "node -r ./x.js",
-            "node --require ./x.js",
             "php",
             "php -c /etc/php.ini",
             "php -e",
@@ -40588,6 +40715,26 @@ mod tests {
             "ruby -e 'eval STDIN.read'",
             "ruby -ne 'puts %x(#{$_})'",
             "ruby -ne 'send(:system, $_)'",
+            // php's `-B` and `-E` code is judged like `-R`, and `-F FILE`
+            // runs a file per line whatever they hold.
+            "php -B 'eval(stream_get_contents(STDIN));' -R ';'",
+            "php -R 'echo $argn;' -E 'eval($s);'",
+            "php -B 'echo 1;' -F x.php",
+            "php -E 'echo 1;' -F x.php",
+            // Code loaded from a file named by path or stdin, or an option
+            // that reads the pipe.
+            "php -d auto_prepend_file=/dev/stdin -r 'echo 1;'",
+            "php -dauto_append_file=x.php -r 'echo 1;'",
+            "php -c /dev/stdin -r 'echo 1;'",
+            "ruby -r/dev/stdin -e '1'",
+            "ruby -r ./x.rb -ne 'puts $_'",
+            "node -r /dev/stdin -e '1'",
+            "node --require=./x.js -e '1'",
+            "node --import=/dev/stdin -e '1'",
+            "node --import data:text/javascript,1 -e '1'",
+            "node --env-file=/dev/stdin -e '1'",
+            "node -r ./x.js",
+            "node --require ./x.js",
             // An option no reader models.
             "perl --unknown",
             "node --unmodeled-option x",
@@ -40623,6 +40770,10 @@ mod tests {
             r#"cat x | node -p 'require("fs").readFileSync(0, "utf8").toUpperCase()'"#,
             "cat x | php -r 'echo strtoupper(stream_get_contents(STDIN));'",
             r#"cat x | ruby -ne 'require "json"; puts JSON.parse($_)["a"]'"#,
+            "cat x | php -R 'echo strtoupper($argn), PHP_EOL;'",
+            "cat x | php -B '$n = 0;' -R '$n++;' -E 'echo $n;'",
+            "cat x | ruby -rjson -ne 'puts JSON.parse($_).keys'",
+            "cat x | node -r dotenv/config -e 'console.log(1)'",
         ] {
             let result = evaluate(cmd);
             assert!(result.is_allowed(), "{cmd:?} must be allowed: {result:?}");
@@ -40665,6 +40816,14 @@ mod tests {
             "cat x | ruby -ne 'require $_.chomp'",
             "cat x | php -r 'eval(stream_get_contents(STDIN));'",
             "cat x | php -r '$f = \"sys\" . \"tem\"; $f(stream_get_contents(STDIN));'",
+            "cat x | php -B 'eval(stream_get_contents(STDIN));' -R ';'",
+            "cat x | php -R 'echo $argn;' -E 'eval($s);'",
+            // Code from a file nothing here reads, or from the pipe.
+            "cat x | php -E 'echo 1;' -F x.php",
+            "cat x | php -d auto_prepend_file=/dev/stdin -r 'echo 1;'",
+            "cat x | ruby -r/dev/stdin -e '1'",
+            "cat x | node -r /dev/stdin -e '1'",
+            "cat x | node --require=./x.js -e '1'",
             // No program, or one nothing here reads.
             "cat /tmp/t.txt | perl",
             "cat /tmp/t.txt | perl -",
@@ -55992,8 +56151,9 @@ mod tests {
     }
 
     /// PowerShell runs a program through the call operator after another
-    /// statement, through the dot-source operator, and through an invoke
-    /// method on a script block literal or a variable bound to one (#637).
+    /// statement, through the dot-source operator, and through a member of a
+    /// script block literal or any use of a variable bound to one that may
+    /// hand it to something that runs it (#637).
     #[test]
     fn powershell_call_dot_source_and_block_invoke_run_their_program_637() {
         let packs = ["core.git", "core.filesystem"];
@@ -56019,6 +56179,17 @@ mod tests {
             "$sb = { git reset --hard }; $SB.InvokeReturnAsIs()".to_string(),
             "$sb = { git reset --hard }; . $sb".to_string(),
             "& { git reset --hard }".to_string(),
+            // A block variable handed to anything that may run it.
+            "$sb = { git reset --hard }; Invoke-Command -ScriptBlock $sb".to_string(),
+            "$sb = { git reset --hard }; 1 | ForEach-Object $sb".to_string(),
+            "$sb = { git reset --hard }; Start-Job -ScriptBlock $sb".to_string(),
+            "$sb = { git reset --hard }; $sb.GetNewClosure().Invoke()".to_string(),
+            "{ git reset --hard }.GetNewClosure().Invoke()".to_string(),
+            "$sb = { git reset --hard }; Write-Output $sb | ForEach-Object { & $_ }".to_string(),
+            "$sb = { git reset --hard }; $b = $sb; & $b".to_string(),
+            "$sb = { git reset --hard }; & ${sb}".to_string(),
+            "$script:sb = { git reset --hard }; & $sb".to_string(),
+            "[scriptblock]$sb = { git reset --hard }; & $sb".to_string(),
         ] {
             let result = evaluate(&cmd);
             assert!(result.is_denied(), "{cmd:?} must be denied: {result:?}");
@@ -56033,6 +56204,9 @@ mod tests {
             "Get-Date; . $PROFILE".to_string(),
             "$sb = { git reset --hard }; Write-Output $sb".to_string(),
             "$sb = { git reset --hard }; $sb.ToString()".to_string(),
+            "$sb = { git reset --hard }; echo $sb".to_string(),
+            "$sb = { git status }; Invoke-Command -ScriptBlock $sb".to_string(),
+            "$h = @{ a = 1 }; $h.Keys".to_string(),
         ] {
             let result = evaluate(&cmd);
             assert!(result.is_allowed(), "{cmd:?} must be allowed: {result:?}");
