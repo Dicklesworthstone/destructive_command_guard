@@ -12323,7 +12323,9 @@ fn powershell_executable_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
         let Some(close) = find_powershell_script_block_close(command, open + 1) else {
             return Err(());
         };
-        if powershell_prefix_opens_executable_block(&command[..open]) {
+        if powershell_prefix_opens_executable_block(&command[..open])
+            || powershell_block_literal_is_invoked(command, open, close)
+        {
             if bodies.len() >= MAX_POWERSHELL_VISIBLE_STATEMENTS {
                 return Err(());
             }
@@ -12336,6 +12338,187 @@ fn powershell_executable_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
         search_start = close + 1;
     }
     Ok(bodies)
+}
+
+/// Whether the script block literal `{ … }` at `open..=close` is run by an
+/// invoke method on it, `{ … }.Invoke()` or `({ … }).InvokeReturnAsIs()`, or
+/// is bound to a variable that a later statement runs: `$sb = { … }` then
+/// `$sb.Invoke()`, `& $sb` or `. $sb` (#637). A block that is only stored or
+/// printed stays inert.
+fn powershell_block_literal_is_invoked(command: &str, open: usize, close: usize) -> bool {
+    let after = command.get(close + 1..).unwrap_or_default();
+    if powershell_text_starts_with_invoke_method(
+        after.trim_start_matches(|c: char| c == ')' || c.is_ascii_whitespace()),
+    ) {
+        return true;
+    }
+    let local = command[..open]
+        .rsplit([';', '\r', '\n', '|', '{', '}'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let Some(name) = local
+        .strip_suffix('=')
+        .map(str::trim_end)
+        .and_then(|target| target.strip_prefix('$'))
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
+        })
+    else {
+        return false;
+    };
+    powershell_variable_is_invoked(after, name)
+}
+
+/// Whether `text` starts with `.Invoke(`, `.InvokeReturnAsIs(` or
+/// `.InvokeWithContext(`, in any case.
+fn powershell_text_starts_with_invoke_method(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix('.') else {
+        return false;
+    };
+    let name_len = rest.bytes().take_while(u8::is_ascii_alphanumeric).count();
+    rest[name_len..].trim_start().starts_with('(')
+        && ["invoke", "invokereturnasis", "invokewithcontext"]
+            .iter()
+            .any(|method| rest[..name_len].eq_ignore_ascii_case(method))
+}
+
+/// Whether `$name` is run anywhere in `text`: an invoke method on it, or the
+/// call or dot-source operator before it. PowerShell variable names ignore
+/// case.
+fn powershell_variable_is_invoked(text: &str, name: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let needle = format!("${}", name.to_ascii_lowercase());
+    let bytes = lower.as_bytes();
+    let mut from = 0usize;
+    while let Some(found) = lower.get(from..).and_then(|rest| rest.find(&needle)) {
+        let start = from + found;
+        let end = start + needle.len();
+        from = end;
+        if bytes
+            .get(end)
+            .copied()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
+        {
+            continue;
+        }
+        if powershell_text_starts_with_invoke_method(&text[end..]) {
+            return true;
+        }
+        let before = text[..start].trim_end();
+        if let Some(operator) = before.strip_suffix(['&', '.']) {
+            let operator_starts_statement = operator.trim_end().is_empty()
+                || operator.ends_with(|c: char| {
+                    c.is_ascii_whitespace() || matches!(c, ';' | '(' | '{' | '|')
+                });
+            if operator_starts_statement && !operator.ends_with('&') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Every PowerShell statement that runs a command through the call operator
+/// `&`, as the span from the operator to the end of its statement (#637). The
+/// segment splitter reads every bare `&` as a separator, so such a statement's
+/// segment has lost its operator, and after another statement a quoted
+/// program path (`Set-Location x; & 'C:\…\git.exe' reset --hard`) read as an
+/// inert string.
+fn powershell_call_operator_statements(
+    command: &str,
+    segments: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let mut statements = Vec::new();
+    for &(start, end) in segments {
+        let before = command.get(..start).unwrap_or_default().trim_end();
+        let Some(operator_text) = before.strip_suffix('&') else {
+            continue;
+        };
+        let preceding = operator_text.trim_end();
+        let after_newline = operator_text[preceding.len()..].contains(['\n', '\r']);
+        // `a & b` runs `a` in the background; `a && b` chains; `>&` redirects.
+        let after_separator = preceding.ends_with(['&', '|', ';', '{', '('])
+            && !operator_text.ends_with(['&', '>', '<']);
+        let starts_statement = preceding.is_empty() || after_newline || after_separator;
+        if starts_statement {
+            statements.push((operator_text.len(), end));
+        }
+    }
+    statements
+}
+
+/// `command` with its statement-leading PowerShell call operators spelled the
+/// way the packs read them; `None` when nothing changes (#637). A dot-source
+/// operator (`. ` before a command) becomes the call operator `&`, which runs
+/// a program the same way, and a call operator written against its program
+/// (`&'C:\…\git.exe'`) gets the blank the packs expect after it. A `.` that
+/// ends a word, opens a relative path (`./x`) or accesses a member is no
+/// operator and stays. Only a literally named program is dot-rewritten: a
+/// dot-sourced variable, expression or script block (`. $PROFILE`, `. { … }`)
+/// is read by the script-block checks.
+fn powershell_call_operator_view(command: &str) -> Option<String> {
+    if !command.contains('&') && !command.contains(". ") && !command.contains(".\t") {
+        return None;
+    }
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
+    let bytes = command.as_bytes();
+    // (byte offset, replacement, bytes replaced), in source order.
+    let mut edits: Vec<(usize, &str, usize)> = Vec::new();
+    let mut statement_start = true;
+    for (index, token) in tokens.iter().enumerate() {
+        if token.kind == NormalizeTokenKind::Separator {
+            if statement_start
+                && let Some(text) = token.text(command)
+                && text.trim() == "&"
+                && let Some(at) = text.find('&')
+            {
+                let after = token.byte_range.start + at + 1;
+                if bytes
+                    .get(after)
+                    .is_some_and(|byte| !byte.is_ascii_whitespace())
+                {
+                    edits.push((after, " ", 0));
+                }
+            }
+            statement_start = true;
+            continue;
+        }
+        let names_program = || {
+            tokens
+                .get(index + 1)
+                .filter(|next| next.kind == NormalizeTokenKind::Word)
+                .and_then(|next| next.text(command))
+                .and_then(|text| text.bytes().next())
+                .is_some_and(|first| !matches!(first, b'$' | b'(' | b'{' | b'@'))
+        };
+        if statement_start
+            && token.text(command) == Some(".")
+            && command
+                .as_bytes()
+                .get(token.byte_range.end)
+                .is_some_and(u8::is_ascii_whitespace)
+            && names_program()
+        {
+            edits.push((token.byte_range.start, "&", 1));
+        }
+        statement_start = false;
+    }
+    if edits.is_empty() {
+        return None;
+    }
+    let mut view = String::with_capacity(command.len() + edits.len());
+    let mut copied = 0usize;
+    for (at, replacement, replaced) in edits {
+        view.push_str(command.get(copied..at)?);
+        view.push_str(replacement);
+        copied = at + replaced;
+    }
+    view.push_str(command.get(copied..)?);
+    Some(view)
 }
 
 /// Whether a trimmed statement prefix is the dot-source operator of the
@@ -16141,6 +16324,52 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                     == Some(extract_match_preview(&folded, span).as_str())
             {
                 info.matched_text_preview = Some(extract_match_preview(command, span));
+            }
+        }
+    }
+    // PowerShell's dot-source operator runs a program, cmdlet or script as
+    // the call operator does; only the scope a script runs in differs. Read
+    // `. 'C:\…\git.exe' reset --hard` again spelled with `& `, which every
+    // pack and the keyword gate already read as a command, and the same for
+    // `&'C:\…\git.exe' reset --hard` (#637). Deny wins, and what the user
+    // authorized as written stays authorized, as above.
+    if shell_dialect == ShellDialect::PowerShell
+        && result.decision == EvaluationDecision::Allow
+        && result.bypass_method != Some(BypassMethod::AllowOnce)
+        && let Some(as_call) = powershell_call_operator_view(command)
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
+        let alternate = if deadline_exceeded(deadline) {
+            EvaluationResult::indeterminate_due_to_budget()
+        } else {
+            evaluate_command_in_dialect_union(
+                &as_call,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path,
+                deadline,
+                shell_dialect,
+                nested_command_depth,
+                inherited_automated_stdin,
+            )
+        };
+        if matches!(
+            alternate.decision,
+            EvaluationDecision::Deny | EvaluationDecision::Indeterminate
+        ) {
+            result = alternate;
+            // A span of a view that gained blanks does not index the command.
+            if let Some(info) = result.pattern_info.as_mut() {
+                if as_call.len() != command.len() {
+                    info.matched_span = None;
+                } else if let Some(span) = info.matched_span.as_ref() {
+                    info.matched_text_preview = Some(extract_match_preview(command, span));
+                }
             }
         }
     }
@@ -27162,6 +27391,33 @@ fn evaluate_packs_with_allowlists_at_depth(
                     None,
                 ) {
                     return result;
+                }
+            }
+            // The same operator after another statement (#637):
+            // `Set-Location x; & 'C:\…\git.exe' reset --hard`. Each such
+            // statement is read on its own, operator included.
+            if shell_dialect == ShellDialect::PowerShell {
+                for (start, end) in
+                    powershell_call_operator_statements(core_git_command, &core_git_segment_ranges)
+                {
+                    if let Some(result) = evaluate_pack_destructive_patterns(
+                        pack_id,
+                        pack,
+                        &core_git_command[start..end],
+                        shell_dialect,
+                        start,
+                        original_command,
+                        core_git_offset,
+                        original_len,
+                        allowlists,
+                        project_path,
+                        &mut first_allowlist_hit,
+                        deadline,
+                        &[],
+                        None,
+                    ) {
+                        return result;
+                    }
                 }
             }
             if core_git_segment_ranges.len() > 1 {
@@ -55731,6 +55987,54 @@ mod tests {
             "$C x",
         ] {
             let result = evaluate(cmd);
+            assert!(result.is_allowed(), "{cmd:?} must be allowed: {result:?}");
+        }
+    }
+
+    /// PowerShell runs a program through the call operator after another
+    /// statement, through the dot-source operator, and through an invoke
+    /// method on a script block literal or a variable bound to one (#637).
+    #[test]
+    fn powershell_call_dot_source_and_block_invoke_run_their_program_637() {
+        let packs = ["core.git", "core.filesystem"];
+        let evaluate =
+            |cmd: &str| evaluate_with_pack_ids_in_dialect(cmd, &packs, ShellDialect::PowerShell);
+        let git = r"'C:\Program Files\Git\cmd\git.exe'";
+        for cmd in [
+            format!(r#"Set-Location "C:\Users\example\Temp\canary"; & {git} reset --hard"#),
+            format!(r#"Set-Location "C:\Users\example\Temp\canary"; . {git} reset --hard"#),
+            format!(
+                r#"& {git} -C 'C:\x\fixture' reset --hard; "after: $(Get-Content 'C:\x\t.txt')""#
+            ),
+            format!("Get-Date; &{git} reset --hard"),
+            format!("Get-Date && & {git} reset --hard"),
+            format!("Get-Date\n& {git} reset --hard"),
+            format!(". {git} reset --hard"),
+            format!("& {git} reset --hard"),
+            format!("&{git} reset --hard"),
+            format!("{{ & {git} reset --hard }}.Invoke()"),
+            "({ git reset --hard }).InvokeReturnAsIs()".to_string(),
+            "{ git reset --hard }.invoke()".to_string(),
+            "$sb = { git reset --hard }; $sb.Invoke()".to_string(),
+            "$sb = { git reset --hard }; $SB.InvokeReturnAsIs()".to_string(),
+            "$sb = { git reset --hard }; . $sb".to_string(),
+            "& { git reset --hard }".to_string(),
+        ] {
+            let result = evaluate(&cmd);
+            assert!(result.is_denied(), "{cmd:?} must be denied: {result:?}");
+        }
+        for cmd in [
+            format!(r"Set-Location C:\x; & {git} status"),
+            format!(r"Set-Location C:\x; . {git} log -1"),
+            format!(r"Set-Location C:\x; &{git} status"),
+            format!("{git} reset --hard"),
+            r"Set-Location C:\x; . 'C:\tools\build.ps1'".to_string(),
+            r". .\env.ps1; Get-ChildItem".to_string(),
+            "Get-Date; . $PROFILE".to_string(),
+            "$sb = { git reset --hard }; Write-Output $sb".to_string(),
+            "$sb = { git reset --hard }; $sb.ToString()".to_string(),
+        ] {
+            let result = evaluate(&cmd);
             assert!(result.is_allowed(), "{cmd:?} must be allowed: {result:?}");
         }
     }
