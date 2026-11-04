@@ -19588,7 +19588,17 @@ fn posix_deferred_command_views(command: &str) -> Vec<String> {
                         && !handler.is_empty()
                         && handler.as_str() != "-"
                     {
-                        views.push(format!("{prefix}{handler}"));
+                        // A handler runs after or between the commands that
+                        // follow it, so it reads what they bind:
+                        // `D=/tmp/x; trap 'rm -rf "$D"' EXIT; D=/` deletes `/`.
+                        let later = command[end..].trim_start_matches(|c: char| {
+                            c.is_whitespace() || matches!(c, ';' | '&' | '|')
+                        });
+                        if handler.contains(['$', '`']) && !later.is_empty() {
+                            views.push(format!("{prefix}{later}\n{handler}"));
+                        } else {
+                            views.push(format!("{prefix}{handler}"));
+                        }
                     }
                     break;
                 }
@@ -30672,18 +30682,7 @@ fn redirect_binding_statement_preserves_siblings(segment: &str, name: &str) -> b
 /// forms still start with a loop keyword, and `repeat`/`foreach` are zsh's
 /// own) or defines a function, whose body runs on every call.
 fn command_may_repeat_a_use(source: &str) -> bool {
-    let defines_function = {
-        let mut previous = None;
-        source
-            .chars()
-            .filter(|c| !c.is_ascii_whitespace())
-            .any(|c| {
-                let empty_parens = previous == Some('(') && c == ')';
-                previous = Some(c);
-                empty_parens
-            })
-    };
-    defines_function
+    command_defines_function(source)
         || tokenize_for_shell_dialect(source, ShellDialect::Posix)
             .iter()
             .filter(|token| token.kind == NormalizeTokenKind::Word)
@@ -30701,6 +30700,14 @@ fn command_may_repeat_a_use(source: &str) -> bool {
                         | "function"
                 )
             })
+}
+
+/// Whether shell text defines a function (`g()`, `g ()`). Parentheses inside a
+/// quoted word are text (`echo "fn()"`).
+fn command_defines_function(source: &str) -> bool {
+    tokenize_for_shell_dialect(source, ShellDialect::Posix)
+        .windows(2)
+        .any(|pair| pair[0].text(source) == Some("(") && pair[1].text(source) == Some(")"))
 }
 
 /// Whether one segment could assign or mutate `name`, or run something whose
@@ -30926,6 +30933,8 @@ fn dequoted_command_word(word: &str) -> Cow<'_, str> {
     let mut index = 0usize;
     while index < bytes.len() {
         match bytes[index] {
+            // A line continuation disappears: `tr\<newline>ap` runs `trap`.
+            b'\\' if bytes.get(index + 1) == Some(&b'\n') => index += 2,
             b'\\' if index + 1 < bytes.len() => {
                 let next = index + 1;
                 let end = word[next..]
@@ -31548,16 +31557,7 @@ fn command_may_install_trap(source: &str, segment_ranges: &[(usize, usize)]) -> 
     {
         return true;
     }
-    let defines_function = {
-        let mut compact = source.chars().filter(|c| !c.is_ascii_whitespace());
-        let mut previous = None;
-        compact.any(|c| {
-            let empty_parens = previous == Some('(') && c == ')';
-            previous = Some(c);
-            empty_parens
-        })
-    };
-    if defines_function {
+    if command_defines_function(source) {
         return true;
     }
     let tokens = tokenize_for_shell_dialect(source, ShellDialect::Posix);
@@ -62066,6 +62066,10 @@ mod tests {
             r#"D=/tmp/build/work; while :; do rm -rf "$D"; D=/etc; done"#,
             r#"D=/tmp/build/work; for i in 1 2; do rm -rf "$D"; D=/; done"#,
             "S=/tmp/x; for i in 1 2; do echo hi > $S/a; S=/etc; done",
+            // A trap handler runs after the rest of the command.
+            r#"D=/tmp/x; trap 'rm -rf "$D"' EXIT; D=/"#,
+            r#"f=a; trap 'mv "$f" d/' EXIT; f=/etc"#,
+            r#"f=a; trap 'mv "$f" d/' DEBUG; echo hi; f=/etc"#,
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,
@@ -62086,6 +62090,9 @@ mod tests {
             r#"for f in a b; do mv "$f" d/; done"#,
             r#"for f in a b; do mv "$f" d/; done; for g in x y; do echo "$g"; done"#,
             r#"for f in a b; do echo x > "$f"; done"#,
+            r#"D=$(mktemp -d); trap 'rm -rf "$D"' EXIT; make test"#,
+            r#"D=$(mktemp -d); trap 'rm -rf "$D"' EXIT; cd "$D"; make test; echo done"#,
+            r#"D=/tmp/build; trap 'rm -rf "$D"' EXIT"#,
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,
@@ -62112,6 +62119,7 @@ mod tests {
             r#"for f in a b; do mv "$f" d/; trap 'f=/etc' DEBUG; done"#,
             r#"for f in a b; do mv "$f" d/; tr''ap 'f=/etc' DEBUG; done"#,
             r#"for f in a b; do mv "$f" d/; t\rap 'f=/etc' DEBUG; done"#,
+            "for f in a b; do mv \"$f\" d/; tr\\\nap 'f=/etc' DEBUG; done",
             r#"g() { tr''ap 'f=/etc' DEBUG; }; for f in a b; do mv "$f" d/; g; done"#,
             r#"g () { :; }; for f in a b; do mv "$f" d/; done"#,
             r#"function g { :; }; for f in a b; do mv "$f" d/; g; done"#,
@@ -62128,6 +62136,7 @@ mod tests {
             r#"cd /tmp/x && for f in "a b.md" c.md; do mv "$f" archive/; done"#,
             r#"(cd /tmp/x; for f in a b; do mv "$f" source/; done)"#,
             r#"for f in trapdoor.md evaluate.md; do mv "$f" d/; done"#,
+            r#"echo "fn()"; for f in a b; do mv "$f" d/; done"#,
         ] {
             assert!(!scan(command), "{command:?}");
         }
