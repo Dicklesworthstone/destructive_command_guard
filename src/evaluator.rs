@@ -9462,36 +9462,87 @@ fn script_interpreter_option_word<'a>(
     }
 }
 
-/// Whether a Perl or Ruby inline program at the end of a pipe is shown not to
-/// run the text it reads (#611, #624).
+/// Whether a Perl, Ruby, Node or PHP inline program at the end of a pipe is
+/// shown not to run the text it reads (#611, #624).
 ///
 /// The piped text is that program's data, but a `-pe`/`-ne` filter that hands
-/// its input to a command runner or an evaluator runs it anyway. The program
-/// is cleared only when it names none of them and, for Perl, has no
-/// substitution flag `e`. Words are matched anywhere in the text, strings and
-/// comments included, so a miss costs a denial, never an allow. Node and PHP
-/// inline programs keep the reading they had before options were parsed.
+/// its input to a command runner, an evaluator or a loader runs it anyway. The
+/// program is cleared only when it names none of them, calls nothing by a
+/// computed name (`&{"…"}`, `->$m`, `send`, `method`, `$f(…)`, `globalThis[…]`)
+/// and, for Perl, has no substitution flag `e`. Words are matched anywhere in
+/// the text, strings and comments included, so an extra match costs a
+/// denial, never an allow.
 fn piped_inline_program_is_inert(language: crate::heredoc::ScriptLanguage, code: &str) -> bool {
+    use crate::heredoc::ScriptLanguage;
     static PERL_RUNNER: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"\b(?:system|exec|eval|qx|readpipe|open|sysopen|pipe|syscall|fork)\b")
-            .expect("perl runner regex compiles")
+        regex::Regex::new(concat!(
+            r"\b(?:system|exec|eval\w*|reval|qx|readpipe|open[23]?|sysopen|pipe|syscall",
+            r"|fork|require|tie|SIG)\b",
+            r"|\bdo\s*(?:[$'(\x22]|q[qw]?\s*[^\w\s])",
+            r"|(?:->|::)\s*can\b|(?:^|[^&])&\s*[{$]|->\s*\$|\*\s*\{|\bsort\s+\$",
+            r"|\buse\s+(?:Inline|Filter|IPC)\b|\b(?:Inline|Filter|IPC)::",
+        ))
+        .expect("perl runner regex compiles")
     });
     static RUBY_RUNNER: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(concat!(
             r"\b(?:system|exec|spawn|fork|syscall|open|popen\w*|capture\w*|pipeline\w*",
             r"|eval|instance_eval|class_eval|module_eval|instance_exec|class_exec",
-            r"|module_exec|send|public_send|__send__)\b|%x",
+            r"|module_exec|send|public_send|__send__|method|instance_method|define_method",
+            r"|to_proc|const_get|binding|ObjectSpace|ERB|RubyVM|Fiddle|FFI",
+            r"|require_relative|load|autoload)\b|%x",
         ))
         .expect("ruby runner regex compiles")
     });
-    let runner = match language {
-        crate::heredoc::ScriptLanguage::Perl => &*PERL_RUNNER,
-        crate::heredoc::ScriptLanguage::Ruby => &*RUBY_RUNNER,
-        _ => return true,
+    static NODE_RUNNER: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"\b(?:eval|Function|constructor|child_process|vm|worker_threads|Worker",
+            r"|WebAssembly|execSync|execFileSync|execFile|spawnSync|spawn|fork|dlopen|binding",
+            r"|_linkedBinding|import|globalThis|global|Reflect)\b",
+            r"|\bprocess\s*\[|\bset(?:Timeout|Interval|Immediate)\s*\(\s*['\x22`]",
+        ))
+        .expect("node runner regex compiles")
+    });
+    // `require` loads code. Only a call naming a package by a plain literal
+    // (`require("fs")`, `require 'json'`) loads nothing the program computed
+    // or wrote; a path, a computed name or `require` used as a value does.
+    static REQUIRE_WORD: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\brequire\b").expect("require regex compiles"));
+    static PACKAGE_REQUIRE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"(?m)\brequire(?:\s*\(\s*(?:'[\w@-][\w@/.:-]*'|\x22[\w@-][\w@/.:-]*\x22)\s*\)",
+            r"|\s+(?:'[\w@-][\w@/.:-]*'|\x22[\w@-][\w@/.:-]*\x22)[ \t]*(?:;|$))",
+        ))
+        .expect("package require regex compiles")
+    });
+    static PHP_RUNNER: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"\b(?:eval|assert|system|exec|shell_exec|passthru|popen|proc_open|pcntl_exec",
+            r"|create_function|include|include_once|require|require_once|call_user_func\w*",
+            r"|forward_static_call\w*|array_map|array_filter|array_walk\w*|array_reduce",
+            r"|usort|uasort|uksort|preg_replace_callback\w*|register_shutdown_function",
+            r"|register_tick_function|set_error_handler|set_exception_handler|ob_start",
+            r"|iterator_apply|Closure|Reflection\w*|FFI|dl|mail|mb_ereg_replace|putenv",
+            r"|unserialize|extract|spl_autoload_register|stream_filter_register",
+            r"|array_u\w+|array_\w+_u\w+|\w*callback\w*|\w*_handler)\b",
+            r"|\$\w+\s*\(|\$\{|->\s*\$|\bnew\s+\$|[)\]'\x22]\s*\(",
+        ))
+        .expect("php runner regex compiles")
+    });
+    let (runner, backtick_runs_a_command) = match language {
+        ScriptLanguage::Perl => (&*PERL_RUNNER, true),
+        ScriptLanguage::Ruby => (&*RUBY_RUNNER, true),
+        ScriptLanguage::JavaScript => (&*NODE_RUNNER, false),
+        ScriptLanguage::Php => (&*PHP_RUNNER, true),
+        _ => return false,
     };
-    !code.contains('`')
-        && !runner.is_match(code)
-        && !(language == crate::heredoc::ScriptLanguage::Perl && perl_may_have_eval_flag(code))
+    let loads_computed_code = matches!(language, ScriptLanguage::Ruby | ScriptLanguage::JavaScript)
+        && REQUIRE_WORD.find_iter(code).count() > PACKAGE_REQUIRE.find_iter(code).count();
+    let runs_input = (backtick_runs_a_command && code.contains('`'))
+        || runner.is_match(code)
+        || loads_computed_code
+        || (language == ScriptLanguage::Perl && perl_may_have_eval_flag(code));
+    !runs_input
 }
 
 /// Whether Perl text may hold a substitution with an `e` flag, which runs its
@@ -9616,7 +9667,7 @@ fn script_interpreter_pipeline_input_mode(
         return operand_mode(file);
     }
     // php's first operand is its script, like the other interpreters'.
-    operand.map_or(reads_stdin.clone(), operand_mode)
+    operand.map_or_else(|| reads_stdin.clone(), operand_mode)
 }
 
 fn powershell_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
@@ -40312,6 +40363,10 @@ mod tests {
             "cat x | ruby -pe 'gsub(/foo/, \"bar\")'",
             r"tail -n 3 some.log | perl -pe 's/\e\[[0-9;]*m//g' | cut -c1-130",
             "cat <<'EOF' | perl -pe 's/x//'\nsome data\nEOF",
+            r#"cat x | node -e 'process.stdin.on("data", (d) => console.log(String(d).length))'"#,
+            r#"cat x | node -p 'require("fs").readFileSync(0, "utf8").toUpperCase()'"#,
+            "cat x | php -r 'echo strtoupper(stream_get_contents(STDIN));'",
+            r#"cat x | ruby -ne 'require "json"; puts JSON.parse($_)["a"]'"#,
         ] {
             let result = evaluate(cmd);
             assert!(result.is_allowed(), "{cmd:?} must be allowed: {result:?}");
@@ -40340,6 +40395,20 @@ mod tests {
             "cat x | ruby -n -e 'system $_'",
             "cat x | ruby -e 'eval STDIN.read'",
             "cat <<'EOF' | perl -ne 'system $_'\ngit reset --hard\nEOF",
+            // The same through a computed name, a string evaluator or a loader.
+            r#"cat x | perl -ne '&{"sys" . "tem"}($_)'"#,
+            r#"cat x | perl -ne 'my $f = "sys" . "tem"; &$f($_)'"#,
+            "cat x | perl -ne 'evalbytes $_'",
+            "cat x | perl -MIPC::Open3 -ne 'open3(my $i, my $o, undef, $_)'",
+            r#"cat x | ruby -ne 'method("sys" + "tem").call($_)'"#,
+            r#"cat x | ruby -ne 'Kernel.public_send("sys" + "tem", $_)'"#,
+            r#"cat x | node -e 'eval(require("fs").readFileSync(0, "utf8"))'"#,
+            r#"cat x | node -e 'globalThis["ev" + "al"](require("fs").readFileSync(0, "utf8"))'"#,
+            r#"cat x | node -e 'require("child_process").execSync(require("fs").readFileSync(0, "utf8"))'"#,
+            r#"cat x | node -e 'const m = require("child_" + "process"); m["exec" + "Sync"](require("fs").readFileSync(0, "utf8"))'"#,
+            "cat x | ruby -ne 'require $_.chomp'",
+            "cat x | php -r 'eval(stream_get_contents(STDIN));'",
+            "cat x | php -r '$f = \"sys\" . \"tem\"; $f(stream_get_contents(STDIN));'",
             // No program, or one nothing here reads.
             "cat /tmp/t.txt | perl",
             "cat /tmp/t.txt | perl -",
