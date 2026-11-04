@@ -12432,8 +12432,11 @@ fn powershell_executable_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
 /// (`{ … }.Invoke()`, `({ … }).GetNewClosure().Invoke()`), or through a
 /// variable bound to it (`$sb = { … }`) that a later statement uses. Any use
 /// may hand the block to something that runs it (`$sb.Invoke()`, `& $sb`,
-/// `Invoke-Command $sb`, `ForEach-Object $sb`, `$b = $sb`), so only the uses
-/// in [`powershell_block_variable_use_is_inert`] leave it inert.
+/// `Invoke-Command $sb`, `ForEach-Object $sb`, `$b = $sb`), and even a block
+/// that is printed or turned into text can run once its output is piped on
+/// (`Write-Output $sb | ForEach-Object { & $_ }`,
+/// `[scriptblock]::Create($sb.ToString())`), so every use counts. A block
+/// that is stored and never used stays inert.
 fn powershell_block_literal_is_invoked(command: &str, open: usize, close: usize) -> bool {
     // `@{ … }` is a hashtable and `${ … }` a variable name, not a block.
     if open
@@ -12487,9 +12490,8 @@ fn powershell_unscoped_variable_name(name: &str) -> &str {
     name.rsplit_once(':').map_or(name, |(_, unscoped)| unscoped)
 }
 
-/// Whether `text` uses the variable `name` (any scope, `$name` or
-/// `${name}`, in any case) other than in the ways
-/// [`powershell_block_variable_use_is_inert`] allows.
+/// Whether `text` uses the variable `name`, in any scope, spelled `$name` or
+/// `${name}`, in any case.
 fn powershell_block_variable_is_used(text: &str, name: &str) -> bool {
     let mut from = 0usize;
     while let Some(found) = text.get(from..).and_then(|rest| rest.find('$')) {
@@ -12508,41 +12510,11 @@ fn powershell_block_variable_is_used(text: &str, name: &str) -> bool {
             (&after_sigil[..len], start + 1 + len)
         };
         from = end;
-        if powershell_unscoped_variable_name(reference).eq_ignore_ascii_case(name)
-            && !powershell_block_variable_use_is_inert(text, start, end)
-        {
+        if powershell_unscoped_variable_name(reference).eq_ignore_ascii_case(name) {
             return true;
         }
     }
     false
-}
-
-/// Whether the use of a script block variable at `start..end` of `text` only
-/// reads it as text: a whole statement `$sb.ToString()`, or `Write-Output
-/// $sb`, `Write-Host $sb` or `echo $sb` with nothing after it. Inside any
-/// other statement the value, or text made from it, may reach something that
-/// runs it (`[scriptblock]::Create($sb.ToString()).Invoke()`,
-/// `Write-Output $sb | ForEach-Object { & $_ }`).
-fn powershell_block_variable_use_is_inert(text: &str, start: usize, end: usize) -> bool {
-    let statement_start = text[..start]
-        .rfind([';', '\r', '\n'])
-        .map_or(0, |at| at + 1);
-    // A backtick before the line break continues the statement above.
-    if text[..statement_start]
-        .trim_end_matches(['\r', '\n'])
-        .ends_with('`')
-    {
-        return false;
-    }
-    let after = &text[end..];
-    let statement_end = after.find([';', '\r', '\n']).unwrap_or(after.len());
-    let before = text[statement_start..start].trim().to_ascii_lowercase();
-    let rest = after[..statement_end].trim().to_ascii_lowercase();
-    match before.as_str() {
-        "" => rest == ".tostring()",
-        "write-output" | "write-host" | "echo" => rest.is_empty(),
-        _ => false,
-    }
 }
 
 /// Every PowerShell statement that runs a command through the call operator
@@ -56190,6 +56162,13 @@ mod tests {
             "$sb = { git reset --hard }; & ${sb}".to_string(),
             "$script:sb = { git reset --hard }; & $sb".to_string(),
             "[scriptblock]$sb = { git reset --hard }; & $sb".to_string(),
+            // Printed or stringified output can still be run once piped on.
+            "$sb = { git reset --hard }\nWrite-Output $sb\n| ForEach-Object { & $_ }".to_string(),
+            "& {\n$sb = { git reset --hard }\nWrite-Output $sb\n} | ForEach-Object { & $_ }"
+                .to_string(),
+            "$sb = { git reset --hard }; $sb.ToString() | Invoke-Expression".to_string(),
+            "$sb = { git reset --hard }; Write-Output $sb".to_string(),
+            "$sb = { git reset --hard }; $sb.ToString()".to_string(),
         ] {
             let result = evaluate(&cmd);
             assert!(result.is_denied(), "{cmd:?} must be denied: {result:?}");
@@ -56202,9 +56181,8 @@ mod tests {
             r"Set-Location C:\x; . 'C:\tools\build.ps1'".to_string(),
             r". .\env.ps1; Get-ChildItem".to_string(),
             "Get-Date; . $PROFILE".to_string(),
-            "$sb = { git reset --hard }; Write-Output $sb".to_string(),
-            "$sb = { git reset --hard }; $sb.ToString()".to_string(),
-            "$sb = { git reset --hard }; echo $sb".to_string(),
+            "$sb = { git reset --hard }".to_string(),
+            "$sb = { git status }; Write-Output $sb".to_string(),
             "$sb = { git status }; Invoke-Command -ScriptBlock $sb".to_string(),
             "$h = @{ a = 1 }; $h.Keys".to_string(),
         ] {
