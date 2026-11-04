@@ -70,6 +70,55 @@ function ShouldPass([string]$zip, [string]$why) {
     Check $ok $why
 }
 
+function New-TarApplicationMock {
+    if ($env:OS -eq 'Windows_NT') {
+        $path = Join-Path $tmp 'tar-scope.cmd'
+        $body = @'
+@echo off
+if "%~1"=="-tf" goto list
+if "%~1"=="-tvf" goto details
+if "%~1"=="-xf" goto extract
+exit /b 64
+:list
+echo dcg.exe
+exit /b %DCG_MOCK_TAR_LIST_EXIT%
+:details
+echo -rw-r--r-- root/root 1 2026-01-01 00:00 dcg.exe
+exit /b %DCG_MOCK_TAR_DETAILS_EXIT%
+:extract
+echo extracted
+exit /b %DCG_MOCK_TAR_EXTRACT_EXIT%
+'@
+    } else {
+        $path = Join-Path $tmp 'tar-scope'
+        $body = @'
+#!/bin/sh
+case "$1" in
+  -tf) printf '%s\n' 'dcg.exe'; exit "$DCG_MOCK_TAR_LIST_EXIT" ;;
+  -tvf) printf '%s\n' '-rw-r--r-- root/root 1 2026-01-01 00:00 dcg.exe'; exit "$DCG_MOCK_TAR_DETAILS_EXIT" ;;
+  -xf) printf '%s\n' 'extracted'; exit "$DCG_MOCK_TAR_EXTRACT_EXIT" ;;
+  *) exit 64 ;;
+esac
+'@
+    }
+    Set-Content -LiteralPath $path -Value ($body -replace "`r`n", "`n") -Encoding ascii
+    if ($env:OS -ne 'Windows_NT') {
+        & chmod +x $path
+        if ($global:LASTEXITCODE -ne 0) { throw 'could not make mock tar executable' }
+    }
+    return $path
+}
+
+function Invoke-ArchiveInspectionFromFunction([int]$LocalExit, [int]$PreviousExit) {
+    # Only replace trusted-command lookup; listing still runs a native process.
+    function Get-TrustedTarCommand { Get-Command $tarMock -CommandType Application -ErrorAction Stop }
+    $LASTEXITCODE = $LocalExit
+    $global:LASTEXITCODE = $PreviousExit
+    $failure = $null
+    try { Assert-ZipLayoutSafe -ZipPath $scopeZip } catch { $failure = $_.Exception.Message }
+    [pscustomobject]@{ Failure = $failure }
+}
+
 try {
     ShouldPass  (New-TestZip @('dcg.exe'))                              "flat archive with dcg.exe is accepted"
     ShouldThrow (New-TestZip @('dcg-x86_64-pc-windows-msvc/dcg.exe'))   "rejects a nested dcg.exe"
@@ -83,6 +132,64 @@ try {
     ShouldThrow (New-TestZip @('C:\Windows\System32\evil.exe', 'dcg.exe')) "rejects a drive-letter path"
     ShouldThrow (New-TestZip @())                                       "rejects an empty archive"
     ShouldThrow (New-TestZip @('README.txt'))                           "rejects an archive missing dcg.exe"
+
+    Write-Host 'Native tar scope checks: plausible output never overrides a failed process'
+    $scopeZip = New-TestZip @('dcg.exe')
+    $tarMock = New-TarApplicationMock
+    $env:DCG_MOCK_TAR_LIST_EXIT = '0'
+    $env:DCG_MOCK_TAR_DETAILS_EXIT = '0'
+    $scopeSuccess = Invoke-ArchiveInspectionFromFunction -LocalExit -1 -PreviousExit 37
+    Check (-not $scopeSuccess.Failure) 'successful native inspection ignores caller-local/stale failure statuses'
+    $env:DCG_MOCK_TAR_LIST_EXIT = '19'
+    $listFailure = Invoke-ArchiveInspectionFromFunction -LocalExit 0 -PreviousExit 0
+    Check ($listFailure.Failure -ceq 'Refusing to extract: tar.exe could not inspect the archive') `
+        'dcg.exe listing from native exit 19 is rejected despite caller-local/stale success'
+    $env:DCG_MOCK_TAR_LIST_EXIT = '0'
+    $env:DCG_MOCK_TAR_DETAILS_EXIT = '23'
+    $detailsFailure = Invoke-ArchiveInspectionFromFunction -LocalExit 0 -PreviousExit 0
+    Check ($detailsFailure.Failure -ceq 'Refusing to extract: tar.exe could not inspect the archive member type') `
+        'regular-file details from native exit 23 are rejected despite caller-local/stale success'
+
+    # ConstrainedLanguage is intentionally isolated in a child host so this
+    # tests the actual extraction branch on both Windows and PowerShell Core.
+    $tarProbe = Join-Path $tmp 'tar-extraction-scope.ps1'
+    @'
+param([string]$InstallPath, [string]$TarPath, [string]$ZipPath, [string]$DestinationPath)
+$ErrorActionPreference = 'Stop'
+$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'
+. $InstallPath -LoadFunctionsOnly
+function Get-TrustedTarCommand { Get-Command $TarPath -CommandType Application -ErrorAction Stop }
+function Invoke-ScopedExtraction([int]$LocalExit, [bool]$ShouldFail) {
+    $LASTEXITCODE = $LocalExit
+    $global:LASTEXITCODE = 37
+    $failure = $null
+    try { Expand-DcgArchive -ZipPath $ZipPath -DestinationPath $DestinationPath | Out-Null }
+    catch { $failure = $_.Exception.Message }
+    if ($ShouldFail) {
+        if ($failure -cne 'tar.exe failed to extract the verified archive') {
+            throw "unexpected native extraction result: $failure"
+        }
+    } elseif ($failure) {
+        throw "successful extraction was rejected: $failure"
+    }
+}
+$env:DCG_MOCK_TAR_EXTRACT_EXIT = '0'
+Invoke-ScopedExtraction -LocalExit -1 -ShouldFail $false
+'extract-success'
+$env:DCG_MOCK_TAR_EXTRACT_EXIT = '19'
+Invoke-ScopedExtraction -LocalExit 0 -ShouldFail $true
+'extract-failure'
+'@ | Set-Content -LiteralPath $tarProbe -Encoding UTF8
+    $currentPowerShell = (Get-Process -Id $PID).Path
+    $global:LASTEXITCODE = -1
+    $extractionResults = @(& $currentPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $tarProbe `
+        -InstallPath (Join-Path $repoRoot 'install.ps1') -TarPath $tarMock -ZipPath $scopeZip `
+        -DestinationPath (Join-Path $tmp 'tar-extract'))
+    $extractionProbeExit = $global:LASTEXITCODE
+    Check (($extractionProbeExit -eq 0) -and ($extractionResults -contains 'extract-success')) `
+        'ConstrainedLanguage extraction accepts native success despite a caller-local failure status'
+    Check (($extractionProbeExit -eq 0) -and ($extractionResults -contains 'extract-failure')) `
+        'ConstrainedLanguage extraction rejects native failure despite a caller-local success status'
 
     $windowsPowerShell = Get-Command powershell.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($windowsPowerShell) {
@@ -182,6 +289,7 @@ if ($ErrorActionPreference -cne 'Stop') {
         Write-Host "  skip: Windows PowerShell 5.1 is unavailable on this host"
     }
 } finally {
+    Remove-Item Env:DCG_MOCK_TAR_LIST_EXIT, Env:DCG_MOCK_TAR_DETAILS_EXIT, Env:DCG_MOCK_TAR_EXTRACT_EXIT -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
 

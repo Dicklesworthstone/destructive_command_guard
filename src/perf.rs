@@ -1370,8 +1370,10 @@ mod tests {
             "Unix fleet installs must require a valid minisign signature"
         );
         assert!(
-            windows_probe.contains("-RequireMinisign -Verify -NoConfigure"),
-            "Windows fleet installs must require a valid minisign signature"
+            windows_probe.contains("'-RequireMinisign', '-Verify', '-NoConfigure'")
+                && windows_probe.contains("-ArgumentList $installerArguments")
+                && windows_probe.contains("-Wait -PassThru"),
+            "Windows fleet installs must require a valid minisign signature and wait for the child installer"
         );
         // #638: the installer is the selected release's own asset, checked
         // against that release's checksum and Minisign signature before it runs.

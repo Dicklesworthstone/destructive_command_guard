@@ -146,8 +146,18 @@ function Get-DcgFileSha256 {
   # Get-FileHash currently instantiates SHA256CryptoServiceProvider and is
   # rejected by WDAC ConstrainedLanguage. certutil.exe is a signed Windows
   # inbox binary and remains usable under that policy.
-  $lines = @(& certutil.exe -hashfile $Path SHA256 2>&1)
-  if ($LASTEXITCODE -eq 0) {
+  $originalErrorActionPreference = $ErrorActionPreference
+  try {
+    # A caller-local LASTEXITCODE must not turn failed hashing into success.
+    # Windows PowerShell 5.1 also surfaces native stderr as error records.
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = -1
+    $lines = @(& certutil.exe -hashfile $Path SHA256 2>&1)
+    $hashExitCode = $global:LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $originalErrorActionPreference
+  }
+  if ($hashExitCode -eq 0) {
     foreach ($line in $lines) {
       $token = ([string]$line).Trim()
       if (Test-Sha256Token $token) { return $token.ToLowerInvariant() }
@@ -838,8 +848,10 @@ function Assert-ZipLayoutSafe {
       $archive.Dispose()
     }
   } else {
+    $global:LASTEXITCODE = -1
     $entries = @(& $tar.Source -tf $ZipPath 2>&1)
-    if ($LASTEXITCODE -ne 0) {
+    $listingExitCode = $global:LASTEXITCODE
+    if ($listingExitCode -ne 0) {
       throw "Refusing to extract: tar.exe could not inspect the archive"
     }
     $entries = @($entries | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
@@ -847,8 +859,10 @@ function Assert-ZipLayoutSafe {
       throw "Refusing to extract: release archive must contain exactly one member"
     }
     $entryName = [string]$entries[0]
+    $global:LASTEXITCODE = -1
     $details = @(& $tar.Source -tvf $ZipPath 2>&1)
-    if ($LASTEXITCODE -ne 0 -or $details.Count -ne 1) {
+    $detailsExitCode = $global:LASTEXITCODE
+    if ($detailsExitCode -ne 0 -or $details.Count -ne 1) {
       throw "Refusing to extract: tar.exe could not inspect the archive member type"
     }
     $isRegular = ([string]$details[0]).TrimStart().StartsWith('-')
@@ -876,8 +890,10 @@ function Expand-DcgArchive {
     throw "Cannot extract under ConstrainedLanguage: trusted Windows tar.exe is unavailable"
   }
   New-Item -ItemType Directory -Force -Path $DestinationPath | Out-Null
+  $global:LASTEXITCODE = -1
   & $tar.Source -xf $ZipPath -C $DestinationPath
-  if ($LASTEXITCODE -ne 0) {
+  $extractionExitCode = $global:LASTEXITCODE
+  if ($extractionExitCode -ne 0) {
     throw "tar.exe failed to extract the verified archive"
   }
 }
@@ -1688,15 +1704,24 @@ function Invoke-DcgMinisignVerification {
     return
   }
 
+  # Native processes update the global automatic variable. An unqualified
+  # reset/read here could instead see a caller's function-local LASTEXITCODE.
+  # Reset before launch so an executable that cannot start never inherits a
+  # previous success. Windows PowerShell 5.1 can report successful native
+  # stderr as NativeCommandError; the native exit status decides verification.
+  $savedErrorActionPreference = $ErrorActionPreference
   try {
+    $global:LASTEXITCODE = -1
+    $ErrorActionPreference = "Continue"
     & $minisign -Vm $ArtifactPath -x $signatureFile -P $minisignPublicKey
-    $verificationSucceeded = $?
-    $verificationExitCode = $LASTEXITCODE
-    if ((-not $verificationSucceeded) -or ($verificationExitCode -ne 0)) {
+    $verificationExitCode = $global:LASTEXITCODE
+    if ($verificationExitCode -ne 0) {
       throw "minisign exited with status $verificationExitCode"
     }
   } catch {
     throw "Minisign verification failed (expected key ID ${minisignKeyId}): $($_.Exception.Message)"
+  } finally {
+    $ErrorActionPreference = $savedErrorActionPreference
   }
 
   Write-Ok "Signature verified (minisign key $minisignKeyId)"
@@ -1785,11 +1810,13 @@ function Invoke-DcgSigstoreVerification {
   $savedErrorActionPreference = $ErrorActionPreference
   try {
     $ErrorActionPreference = "Continue"
+    $global:LASTEXITCODE = -1
     $versionOutput = (& $cosign.Source version --json 2>&1 | Out-String)
-    if (($LASTEXITCODE -ne 0) -or (-not (Get-DcgCosignReportedVersion -VersionOutput $versionOutput))) {
+    if (($global:LASTEXITCODE -ne 0) -or (-not (Get-DcgCosignReportedVersion -VersionOutput $versionOutput))) {
       # Builds without usable JSON still print a `GitVersion:` line.
+      $global:LASTEXITCODE = -1
       $versionOutput = (& $cosign.Source version 2>&1 | Out-String)
-      if ($LASTEXITCODE -ne 0) { $versionOutput = "" }
+      if ($global:LASTEXITCODE -ne 0) { $versionOutput = "" }
     }
   } finally {
     $ErrorActionPreference = $savedErrorActionPreference
@@ -1822,8 +1849,9 @@ function Invoke-DcgSigstoreVerification {
   $savedErrorActionPreference = $ErrorActionPreference
   try {
     $ErrorActionPreference = "Continue"
+    $global:LASTEXITCODE = -1
     $localKeyOutput = (& $cosign.Source @localKeyArgs 2>&1 | Out-String)
-    $localKeyExitCode = $LASTEXITCODE
+    $localKeyExitCode = $global:LASTEXITCODE
   } finally {
     $ErrorActionPreference = $savedErrorActionPreference
   }
@@ -1840,8 +1868,9 @@ function Invoke-DcgSigstoreVerification {
   )
   try {
     $ErrorActionPreference = "Continue"
+    $global:LASTEXITCODE = -1
     $oidcOutput = (& $cosign.Source @oidcArgs 2>&1 | Out-String)
-    $oidcExitCode = $LASTEXITCODE
+    $oidcExitCode = $global:LASTEXITCODE
   } finally {
     $ErrorActionPreference = $savedErrorActionPreference
   }
@@ -1976,8 +2005,9 @@ function Get-DcgReportedVersion {
   $savedErrorActionPreference = $ErrorActionPreference
   try {
     $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = -1
     $output = @(& $Path --version 2>&1)
-    $status = $LASTEXITCODE
+    $status = $global:LASTEXITCODE
   } finally {
     $ErrorActionPreference = $savedErrorActionPreference
   }
@@ -2034,8 +2064,9 @@ function Invoke-DcgInstallSelfTest {
       $savedErrorActionPreference = $ErrorActionPreference
       try {
         $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = -1
         $allowOutput = @(& $resolvedPath test --format json 'git status' 2>&1)
-        $allowStatus = $LASTEXITCODE
+        $allowStatus = $global:LASTEXITCODE
       } finally {
         $ErrorActionPreference = $savedErrorActionPreference
       }
@@ -2049,8 +2080,9 @@ function Invoke-DcgInstallSelfTest {
       $savedErrorActionPreference = $ErrorActionPreference
       try {
         $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = -1
         $denyOutput = @(& $resolvedPath test --format json 'rm -rf /' 2>&1)
-        $denyStatus = $LASTEXITCODE
+        $denyStatus = $global:LASTEXITCODE
       } finally {
         $ErrorActionPreference = $savedErrorActionPreference
       }
