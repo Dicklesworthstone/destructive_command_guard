@@ -29914,70 +29914,150 @@ fn resolve_variable_bindings(
             // not a parent-shell wrapper. It cannot mutate another scalar.
             continue;
         }
-        let first = hazard_first_word(segment);
-        if !matches!(mode, VariableResolution::DenyOnlyLiteral)
-            && (first.contains(['$', '`'])
-                || first.starts_with('-')
-                || matches!(first.as_ref(), "command" | "builtin" | "time"))
-        {
-            // An expanded command word may invoke a mutating builtin, and an
-            // option-bearing wrapper is outside the simple first-word parser.
-            // Neither can establish that a prior binding remains intact.
-            return None;
-        }
-        // `Owned` means the command word carried shell quoting that had to be
-        // removed to recognise it. `printf_can_bind_variable` scans the raw
-        // source for the literal word, which a quoted spelling like `pri"ntf"`
-        // does not contain — so the argument scan would find nothing and report
-        // the segment inert. Fail closed instead, matching what that function
-        // already does for any argument list it cannot read statically.
-        let command_word_was_quoted = matches!(first, Cow::Owned(_));
-        let may_mutate_shell_variables = match first.as_ref() {
-            // Only `printf -v NAME` binds; a plain printf writes to stdout
-            // and cannot change what a later `$NAME` expands to (#422).
-            // Checked against `source`, not `segment`: printf's arguments are
-            // stripped as data before this scan, so the segment is bare.
-            "printf" => command_word_was_quoted || printf_can_bind_variable(source, name),
-            // `read` binds only the variables it names, `REPLY` when it names
-            // none, and its `-a` array (#574). Same source-level scan.
-            "read" => command_word_was_quoted || read_can_bind_variable(source, name),
-            // These invalidate permission-lifting proofs. The deny-only
-            // pass retains the earlier literal as a conservative candidate,
-            // so adding this guard cannot hide an existing sensitive target.
-            "trap" | "alias" => !matches!(mode, VariableResolution::DenyOnlyLiteral),
-            other => matches!(
-                other,
-                "readonly"
-                    | "declare"
-                    | "typeset"
-                    | "local"
-                    | "export"
-                    | "let"
-                    | "eval"
-                    | "source"
-                    | "."
-                    | "mapfile"
-                    | "readarray"
-                    | "unset"
-                    | "getopts"
-                    | "select"
-            ),
-        };
-        // A changed IFS alters how an unquoted use word-splits, which the
-        // substitution proof cannot reproduce (v0.9.1 review).
-        if may_mutate_shell_variables
-            || segment_text_may_assign(segment, name)
-            || (!matches!(
-                mode,
-                VariableResolution::ArgumentLiteral {
-                    wholly_double_quoted: true
-                }
-            ) && segment_text_may_assign(segment, "IFS"))
-        {
+        if segment_may_rebind_variable(source, segment, name, mode) {
             return None;
         }
     }
+    // A segment AFTER the use still reaches it when the use can run again:
+    // the next pass of an enclosing loop runs the use after the rest of the
+    // body, and a function body runs on every call. In
+    // `D=/tmp/a; while :; do rm -rf "$D"; D=/; done` the second pass deletes
+    // `/`, although every segment before the use binds `D` to a temp path.
+    // So when the command holds a loop or a function, every later segment
+    // must leave the name alone too. A `for` header for the name itself
+    // rebinds it on every pass, so a later assignment in that loop's own body
+    // cannot reach the use either, but it is refused here as well rather than
+    // modelled. The deny-only pass keeps its candidates, as above.
+    if values.is_some()
+        && !matches!(mode, VariableResolution::DenyOnlyLiteral)
+        && command_may_repeat_a_use(source)
+    {
+        for &(start, end) in segment_ranges {
+            if start <= segment_start {
+                continue;
+            }
+            let segment = source
+                .get(start..end)
+                .map(str::trim)?
+                .trim_start_matches(|c: char| c == '(' || c.is_ascii_whitespace());
+            if segment.is_empty() {
+                continue;
+            }
+            if posix_for_loop_binds(segment, name)
+                || segment_may_rebind_variable(source, segment, name, mode)
+            {
+                return None;
+            }
+        }
+    }
     values
+}
+
+/// Whether a use of a variable may run more than once in this command: it
+/// holds a loop (every POSIX loop ends with `done`; zsh's short and brace
+/// forms still start with a loop keyword, and `repeat`/`foreach` are zsh's
+/// own) or defines a function, whose body runs on every call.
+fn command_may_repeat_a_use(source: &str) -> bool {
+    let defines_function = {
+        let mut previous = None;
+        source
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .any(|c| {
+                let empty_parens = previous == Some('(') && c == ')';
+                previous = Some(c);
+                empty_parens
+            })
+    };
+    defines_function
+        || tokenize_for_shell_dialect(source, ShellDialect::Posix)
+            .iter()
+            .filter(|token| token.kind == NormalizeTokenKind::Word)
+            .filter_map(|token| token.text(source))
+            .any(|word| {
+                matches!(
+                    dequoted_command_word(word).as_ref(),
+                    "done"
+                        | "while"
+                        | "until"
+                        | "for"
+                        | "select"
+                        | "repeat"
+                        | "foreach"
+                        | "function"
+                )
+            })
+}
+
+/// Whether one segment could assign or mutate `name`, or run something whose
+/// effect on it cannot be read statically. Shared by the binding scan's
+/// segments before the use and, for a use that may repeat, the segments after
+/// it.
+fn segment_may_rebind_variable(
+    source: &str,
+    segment: &str,
+    name: &str,
+    mode: VariableResolution,
+) -> bool {
+    let first = hazard_first_word(segment);
+    if !matches!(mode, VariableResolution::DenyOnlyLiteral)
+        && (first.contains(['$', '`'])
+            || first.starts_with('-')
+            || matches!(first.as_ref(), "command" | "builtin" | "time"))
+    {
+        // An expanded command word may invoke a mutating builtin, and an
+        // option-bearing wrapper is outside the simple first-word parser.
+        // Neither can establish that a prior binding remains intact.
+        return true;
+    }
+    // `Owned` means the command word carried shell quoting that had to be
+    // removed to recognise it. `printf_can_bind_variable` scans the raw
+    // source for the literal word, which a quoted spelling like `pri"ntf"`
+    // does not contain — so the argument scan would find nothing and report
+    // the segment inert. Fail closed instead, matching what that function
+    // already does for any argument list it cannot read statically.
+    let command_word_was_quoted = matches!(first, Cow::Owned(_));
+    let may_mutate_shell_variables = match first.as_ref() {
+        // Only `printf -v NAME` binds; a plain printf writes to stdout
+        // and cannot change what a later `$NAME` expands to (#422).
+        // Checked against `source`, not `segment`: printf's arguments are
+        // stripped as data before this scan, so the segment is bare.
+        "printf" => command_word_was_quoted || printf_can_bind_variable(source, name),
+        // `read` binds only the variables it names, `REPLY` when it names
+        // none, and its `-a` array (#574). Same source-level scan.
+        "read" => command_word_was_quoted || read_can_bind_variable(source, name),
+        // These invalidate permission-lifting proofs. The deny-only
+        // pass retains the earlier literal as a conservative candidate,
+        // so adding this guard cannot hide an existing sensitive target.
+        "trap" | "alias" => !matches!(mode, VariableResolution::DenyOnlyLiteral),
+        other => matches!(
+            other,
+            "readonly"
+                | "declare"
+                | "typeset"
+                | "local"
+                | "export"
+                | "let"
+                | "eval"
+                | "source"
+                | "."
+                | "mapfile"
+                | "readarray"
+                | "unset"
+                | "getopts"
+                | "select"
+        ),
+    };
+    // A changed IFS alters how an unquoted use word-splits, which the
+    // substitution proof cannot reproduce (v0.9.1 review).
+    may_mutate_shell_variables
+        || segment_text_may_assign(segment, name)
+        || (!matches!(
+            mode,
+            VariableResolution::ArgumentLiteral {
+                wholly_double_quoted: true
+            }
+        ) && segment_text_may_assign(segment, "IFS"))
 }
 
 fn shell_maintained_posix_variable(name: &str) -> bool {
@@ -30668,17 +30748,56 @@ fn conditional_for_header_binds_first_body_command(
 /// A loop-bound proof reads only the segments before the use. In
 /// `for f in a b; do mv "$f" d/; trap 'f=/etc' DEBUG; done` the trap is set
 /// after the first `mv`, but bash runs a DEBUG trap before every later simple
-/// command, so the second pass moves `/etc`. `eval`, `source`, `.`, and an
-/// expanded command word can set a trap too, so each of those refuses the
-/// proof wherever it sits.
+/// command, so the second pass moves `/etc`. `eval`, `source`, `.`, `alias`,
+/// and an expanded command word can set a trap too, so each of those refuses
+/// the proof wherever it sits.
+///
+/// The word `trap` refuses in any spelling the shell reads as that word:
+/// quoted or escaped pieces (`tr''ap`, `t\rap`) are removed before the
+/// comparison. A function definition refuses outright, because its body runs
+/// wherever the function is called and its commands are not segment heads of
+/// their own. A leading `(` is not part of the command word, so it is skipped
+/// before the head is read.
 fn command_may_install_trap(source: &str, segment_ranges: &[(usize, usize)]) -> bool {
-    source
+    if source
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .any(|word| word == "trap")
-        || segment_ranges.iter().any(|&(start, end)| {
-            let first = hazard_first_word(source.get(start..end).map_or("", str::trim));
-            first.contains(['$', '`']) || matches!(first.as_ref(), "trap" | "eval" | "source" | ".")
+    {
+        return true;
+    }
+    let defines_function = {
+        let mut compact = source.chars().filter(|c| !c.is_ascii_whitespace());
+        let mut previous = None;
+        compact.any(|c| {
+            let empty_parens = previous == Some('(') && c == ')';
+            previous = Some(c);
+            empty_parens
         })
+    };
+    if defines_function {
+        return true;
+    }
+    let tokens = tokenize_for_shell_dialect(source, ShellDialect::Posix);
+    if tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(source))
+        .any(|word| matches!(dequoted_command_word(word).as_ref(), "trap" | "function"))
+    {
+        return true;
+    }
+    segment_ranges.iter().any(|&(start, end)| {
+        let segment = source
+            .get(start..end)
+            .map_or("", str::trim)
+            .trim_start_matches(|c: char| c == '(' || c.is_ascii_whitespace());
+        let first = hazard_first_word(segment);
+        first.contains(['$', '`'])
+            || matches!(
+                first.as_ref(),
+                "trap" | "eval" | "source" | "." | "alias" | "function"
+            )
+    })
 }
 
 /// Whether a segment's text could assign or mutate `NAME` in a form the
@@ -60557,6 +60676,13 @@ mod tests {
             r#"for f in a b; do mv "$f" d/; trap 'f=/etc' DEBUG; done"#,
             r#"cd /tmp/x && for f in a b; do mv "$f" d/; eval "$setup"; done"#,
             r#"for f in "a b" c; do mv "$f" d/; builtin trap 'f=/etc' DEBUG; done"#,
+            // The same trap spelled so the literal word never appears, or
+            // installed from a function body or behind a subshell `(`.
+            r#"g() { tr''ap 'f=/etc' DEBUG; }; g; for f in a b; do mv "$f" d/; done"#,
+            r#"g() { tr''ap 'f=/etc' DEBUG; }; for f in a b; do mv "$f" d/; g; done"#,
+            r#"function g { t\rap 'f=/etc' DEBUG; }; for f in a b; do mv "$f" d/; g; done"#,
+            r#"cd /tmp/x && for f in a b; do mv "$f" d/; tr""ap 'f=/etc' DEBUG; done"#,
+            r#"x=t; (ev''al "${x}rap 'f=/etc' DEBUG"; for f in a b; do mv "$f" d/; done)"#,
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,
@@ -60568,6 +60694,87 @@ mod tests {
                 "unsafe loop shape must stay denied: {command:?}: {:?}",
                 result.pattern_info
             );
+        }
+    }
+
+    #[test]
+    fn variable_proofs_refuse_a_rebinding_that_a_later_pass_reaches() {
+        // The use runs again on the next pass of an enclosing loop, or on the
+        // next call of a function, AFTER every later segment of the body.
+        for command in [
+            r#"f=a; while :; do mv "$f" d/; f=/etc; done"#,
+            r#"f=a; for i in 1 2; do mv "$f" d/; f=/etc; done"#,
+            r#"f=a; until false; do mv "$f" d/; read f; done"#,
+            r#"f=a; for i in 1 2; do mv "$f" d/; for f in /etc; do :; done; done"#,
+            r#"f=a; for i in 1 2; do mv "$f" d/; $cmd; done"#,
+            r#"f=a; g() { mv "$f" d/; }; g; f=/etc; g"#,
+            r#"D=/tmp/build/work; while :; do rm -rf "$D"; D=/etc; done"#,
+            r#"D=/tmp/build/work; for i in 1 2; do rm -rf "$D"; D=/; done"#,
+            "S=/tmp/x; for i in 1 2; do echo hi > $S/a; S=/etc; done",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "a later rebinding reaches the repeated use: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        // Without a loop or a function nothing after the use runs before it,
+        // and an ordinary loop body with no rebinding keeps its proof.
+        for command in [
+            r#"f=a; mv "$f" d/; f=/etc"#,
+            r#"f=a; mv "$f" d/; for g in x y; do echo "$g"; done"#,
+            r#"for f in a b; do mv "$f" d/; done"#,
+            r#"for f in a b; do mv "$f" d/; done; for g in x y; do echo "$g"; done"#,
+            r#"for f in a b; do echo x > "$f"; done"#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "no later rebinding can reach the use: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn variable_mv_proof_refuses_every_spelling_of_a_trap_issue_625() {
+        let scan = |command: &str| {
+            command_may_install_trap(
+                command,
+                &command_segment_ranges_in_dialect(command, ShellDialect::Posix),
+            )
+        };
+        for command in [
+            r#"for f in a b; do mv "$f" d/; trap 'f=/etc' DEBUG; done"#,
+            r#"for f in a b; do mv "$f" d/; tr''ap 'f=/etc' DEBUG; done"#,
+            r#"for f in a b; do mv "$f" d/; t\rap 'f=/etc' DEBUG; done"#,
+            r#"g() { tr''ap 'f=/etc' DEBUG; }; for f in a b; do mv "$f" d/; g; done"#,
+            r#"g () { :; }; for f in a b; do mv "$f" d/; done"#,
+            r#"function g { :; }; for f in a b; do mv "$f" d/; g; done"#,
+            r#"x=t; (ev''al "${x}rap 'f=/etc' DEBUG"; for f in a b; do mv "$f" d/; done)"#,
+            r#"( source ./setup.sh; for f in a b; do mv "$f" d/; done )"#,
+            "alias t=x\nfor f in a b; do mv \"$f\" d/; done",
+        ] {
+            assert!(scan(command), "{command:?}");
+        }
+        // Ordinary loops, including a destination named like a builtin
+        // argument and a subshell around the loop, keep the proof.
+        for command in [
+            r#"for f in a b; do mv "$f" d/; done"#,
+            r#"cd /tmp/x && for f in "a b.md" c.md; do mv "$f" archive/; done"#,
+            r#"(cd /tmp/x; for f in a b; do mv "$f" source/; done)"#,
+            r#"for f in trapdoor.md evaluate.md; do mv "$f" d/; done"#,
+        ] {
+            assert!(!scan(command), "{command:?}");
         }
     }
 
