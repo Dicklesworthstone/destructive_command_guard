@@ -9074,9 +9074,20 @@ fn parallel_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
 }
 
 fn python_pipeline_input_mode(
+    command: &str,
     args: &[String],
     language: crate::heredoc::ScriptLanguage,
 ) -> PipelineShellInputMode {
+    // `-i` reads source from stdin once the script, `-c` or `-m` ends, and so
+    // does `PYTHONINSPECT`.
+    let script_mode = |interactive: bool| {
+        if interactive || INTERPRETER_CODE_SETTING.is_match(command) {
+            PipelineShellInputMode::Unverified
+        } else {
+            PipelineShellInputMode::DoesNotReadStdin
+        }
+    };
+    let mut interactive = false;
     let mut index = 0usize;
     while let Some(argument) = args.get(index) {
         if argument == "--" {
@@ -9085,18 +9096,43 @@ fn python_pipeline_input_mode(
             {
                 PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Interpreter(language))
             } else {
-                PipelineShellInputMode::DoesNotReadStdin
+                script_mode(interactive)
             };
         }
         if argument == "-" {
             return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Interpreter(language));
         }
-        if matches!(argument.as_str(), "-c" | "-m")
-            || argument.starts_with("-c")
-            || argument.starts_with("-m")
+        if let Some(attached) = argument
+            .strip_prefix("-c")
+            .or_else(|| argument.strip_prefix("-m"))
         {
-            return PipelineShellInputMode::DoesNotReadStdin;
+            let value = if attached.is_empty() {
+                args.get(index + 1).map(String::as_str)
+            } else {
+                Some(attached)
+            };
+            let Some(value) = value else {
+                return PipelineShellInputMode::Unverified;
+            };
+            // As for the other interpreters, an inline program on a pipe must
+            // be readable and must not run what it reads (#611), and a module
+            // that is a read-eval loop runs the pipe.
+            let runs_input = if argument.starts_with("-c") {
+                !piped_inline_program_is_inert(language, value)
+                    || stage_words_hold_an_expansion(command, &[argument.as_str(), value])
+            } else {
+                matches!(
+                    value,
+                    "code" | "pdb" | "asyncio" | "idlelib" | "IPython" | "bpython" | "ptpython"
+                )
+            };
+            return if runs_input {
+                PipelineShellInputMode::Unverified
+            } else {
+                script_mode(interactive)
+            };
         }
+        interactive |= argument == "-i";
         if matches!(
             argument.as_str(),
             "-b" | "-B"
@@ -9142,7 +9178,7 @@ fn python_pipeline_input_mode(
         if argument.starts_with('-') {
             return PipelineShellInputMode::Unverified;
         }
-        return PipelineShellInputMode::DoesNotReadStdin;
+        return script_mode(interactive);
     }
     PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Interpreter(language))
 }
@@ -9251,7 +9287,12 @@ fn perl_ruby_option_word<'a>(
             Letter::Exits => return Some((0, InterpreterOptionEffect::Exits)),
             Letter::RestOfWord => return Some((0, InterpreterOptionEffect::Nothing)),
             Letter::AttachedValue => {
-                return (!rest.is_empty()).then_some((0, InterpreterOptionEffect::Nothing));
+                // perl runs `use VALUE;` with the text of the option, so only
+                // a plain module and import list is known not to hold code,
+                // and it is judged like the program (`-MIPC::Open3`, `-Mre=eval`).
+                return (perl_module_option_is_plain(rest)
+                    && piped_inline_program_is_inert(language, &format!("use {rest}")))
+                .then_some((0, InterpreterOptionEffect::Nothing));
             }
             Letter::Octal { max } => {
                 // perl's -0 counts its own `0` among the digits it reads.
@@ -9281,10 +9322,15 @@ fn perl_ruby_option_word<'a>(
                 };
                 // ruby's `-r` loads a library before the program runs. One
                 // named by a path or stdin is a file nothing here reads, as a
-                // script operand is.
+                // script operand is. `un` and `mkmf` turn the program's words
+                // into file commands (`-run -e rm`), and `rake` and `shell`
+                // give it a shell.
                 if language == crate::heredoc::ScriptLanguage::Ruby
                     && letter == b'r'
-                    && !value.is_some_and(names_installed_library)
+                    && !value.is_some_and(|name| {
+                        names_installed_library(name)
+                            && !matches!(name, "un" | "mkmf" | "rake" | "shell")
+                    })
                 {
                     return None;
                 }
@@ -9298,15 +9344,9 @@ fn perl_ruby_option_word<'a>(
                     Some((0, InterpreterOptionEffect::Program(rest)))
                 };
             }
-            Letter::PerlDebugger => {
-                at += 1;
-                if letters.get(at) == Some(&b't') {
-                    at += 1;
-                }
-                if matches!(letters.get(at), Some(b':' | b'=')) {
-                    return Some((0, InterpreterOptionEffect::Nothing));
-                }
-            }
+            // The debugger reads commands, which run as Perl, from stdin
+            // when no terminal is attached, and `-d:MOD` loads a module.
+            Letter::PerlDebugger => return None,
             Letter::RubyWarning => {
                 if rest.starts_with(':') {
                     return Some((0, InterpreterOptionEffect::Nothing));
@@ -9339,22 +9379,48 @@ fn names_installed_library(name: &str) -> bool {
     !name.is_empty() && name.split('/').all(plain_segment)
 }
 
+/// Whether the text of a perl `-M` or `-m` option, without the letter, is only
+/// a module name and a plain import list: `strict`, `-warnings`,
+/// `List::Util=sum,max`.
+fn perl_module_option_is_plain(text: &str) -> bool {
+    let (module, imports) = text.split_once('=').unwrap_or((text, ""));
+    let module = module.strip_prefix('-').unwrap_or(module);
+    !module.is_empty()
+        && module
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
+        && imports
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b',' | b'.'))
+}
+
 /// Whether an interpreter option's value, or the option word that carries
 /// it, names standard input: `-c /dev/stdin`, `--env-file=/dev/stdin`, php's
 /// `php://stdin`. What the option reads, configuration or code to load, then
-/// comes from the pipe.
+/// comes from the pipe. Paths are compared by their parts, since
+/// `/dev//stdin` and `/dev/./fd/0` name the same node.
 fn option_value_names_stdin(text: &str) -> bool {
-    const STDIN_NAMES: &[&str] = &[
-        "/dev/stdin",
-        "/dev/fd/0",
-        "/proc/self/fd/0",
-        "php://stdin",
-        "php://fd/0",
-        "php://input",
-    ];
+    const STDIN_URLS: &[&str] = &["php://stdin", "php://fd/0", "php://input"];
     let text = text.to_ascii_lowercase();
-    classify_shell_positional(&text) == ShellPositional::StdinDevice
-        || STDIN_NAMES.iter().any(|name| text.ends_with(name))
+    if classify_shell_positional(&text) == ShellPositional::StdinDevice
+        || STDIN_URLS.iter().any(|name| text.ends_with(name))
+    {
+        return true;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in text.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    matches!(
+        parts.as_slice(),
+        [.., "dev", "stdin"] | [.., "dev", "fd", _] | [.., "proc", _, "fd", _]
+    )
 }
 
 /// One option word of a Perl, Ruby, Node or PHP interpreter. See
@@ -9413,8 +9479,9 @@ fn script_interpreter_option_word<'a>(
             // a URL or stdin is a file nothing here reads, as a script
             // operand is.
             let loads_module = |name: &str| {
+                // node reads `_` in an option name as `-`.
                 matches!(
-                    name,
+                    name.replace('_', "-").as_str(),
                     "-r" | "--require" | "--import" | "--loader" | "--experimental-loader"
                 )
             };
@@ -9429,6 +9496,11 @@ fn script_interpreter_option_word<'a>(
                     .map(|_| (1, Nothing));
             }
             match word {
+                // `--print` takes the next word as code only when it does not
+                // start with `-`; alone it prints what stdin evaluates to.
+                "-p" | "--print" if next.is_none_or(|value| value.starts_with('-')) => {
+                    Some((0, Nothing))
+                }
                 "-e" | "--eval" | "-p" | "--print" | "-pe" => value(Program),
                 "-i" | "--interactive" => Some((0, ReadsStdin)),
                 "-v" | "--version" | "-h" | "--help" | "--v8-options" => Some((0, Exits)),
@@ -9507,22 +9579,32 @@ fn script_interpreter_option_word<'a>(
                 b'r' | b'R' | b'B' | b'E' => attached_or_next(Program),
                 b'f' | b'F' => attached_or_next(ProgramFile),
                 b'd' => {
-                    // `auto_prepend_file` and `auto_append_file` run a file
-                    // nothing here reads around the program.
+                    // These settings run a file nothing here reads around the
+                    // program or load one as a native extension.
                     let setting = if rest.is_empty() {
                         next.map(String::as_str)?
                     } else {
                         rest
                     };
                     let name = setting.split('=').next().unwrap_or_default().trim();
-                    if name.eq_ignore_ascii_case("auto_prepend_file")
-                        || name.eq_ignore_ascii_case("auto_append_file")
+                    if [
+                        "auto_prepend_file",
+                        "auto_append_file",
+                        "extension",
+                        "zend_extension",
+                        "ffi.preload",
+                        "opcache.preload",
+                    ]
+                    .iter()
+                    .any(|loader| name.eq_ignore_ascii_case(loader))
                     {
                         return None;
                     }
                     attached_or_next(|_| Nothing)
                 }
-                b'c' | b'z' | b'S' | b't' => attached_or_next(|_| Nothing),
+                // `-z` loads a file nothing here reads as a native extension.
+                b'z' => None,
+                b'c' | b'S' | b't' => attached_or_next(|_| Nothing),
                 _ if !rest.is_empty() => None,
                 b'a' => Some((0, ReadsStdin)),
                 b'h' | b'i' | b'm' | b'v' => Some((0, Exits)),
@@ -9538,21 +9620,28 @@ fn script_interpreter_option_word<'a>(
 /// shown not to run the text it reads (#611, #624).
 ///
 /// The piped text is that program's data, but a `-pe`/`-ne` filter that hands
-/// its input to a command runner, an evaluator or a loader runs it anyway. The
-/// program is cleared only when it names none of them, calls nothing by a
-/// computed name (`&{"…"}`, `->$m`, `send`, `method`, `$f(…)`, `globalThis[…]`)
-/// and, for Perl, has no substitution flag `e`. Words are matched anywhere in
-/// the text, strings and comments included, so an extra match costs a
-/// denial, never an allow.
+/// its input to a command runner, an evaluator or a loader runs it anyway, and
+/// one that deletes, renames or truncates the paths it reads
+/// (`cat list | perl -lne unlink`) does what `xargs rm` does. The program is
+/// cleared only when it names none of them, calls nothing by a computed name
+/// (`&{"…"}`, `->$m`, `send`, `method`, `$f(…)`, `globalThis[…]`) and, for Perl,
+/// has no substitution flag `e`. Words are matched anywhere in the text, strings
+/// and comments included, so an extra match costs a denial, and a word missing
+/// from these lists costs an allow.
 fn piped_inline_program_is_inert(language: crate::heredoc::ScriptLanguage, code: &str) -> bool {
     use crate::heredoc::ScriptLanguage;
     static PERL_RUNNER: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(concat!(
             r"\b(?:system|exec|eval\w*|reval|qx|readpipe|open[23]?|sysopen|pipe|syscall",
-            r"|fork|require|tie|SIG)\b",
-            r"|\bdo\s*(?:[$'(\x22]|q[qw]?\s*[^\w\s])",
+            r"|fork|require|tie|SIG|unlink|rmdir|rmtree|remove_tree|rename|truncate|kill)\b",
+            // `do FILE`, where only a block is safe. English `do not` is no match.
+            r"|\bdo\s*(?:[$'(\x22+\-\\<@%&!~]|q[qw]?\s*[^\w\s])",
+            r"|\bdo\s+(?:shift\b|pop\b|\w+\s*[(\x22'$])",
             r"|(?:->|::)\s*can\b|(?:^|[^&])&\s*[{$]|->\s*\$|\*\s*\{|\bsort\s+\$",
-            r"|\buse\s+(?:Inline|Filter|IPC)\b|\b(?:Inline|Filter|IPC)::",
+            r"|\buse\s+(?:Inline|Filter|IPC)\b|\b(?:Inline|Filter|IPC|Module)::",
+            // `<>` opens each word of @ARGV the two-argument way, as a command
+            // when it ends in `|`.
+            r"|@\s*ARGV\b|\$ARGV\s*\[",
         ))
         .expect("perl runner regex compiles")
     });
@@ -9560,18 +9649,32 @@ fn piped_inline_program_is_inert(language: crate::heredoc::ScriptLanguage, code:
         regex::Regex::new(concat!(
             r"\b(?:system|exec|spawn|fork|syscall|open|popen\w*|capture\w*|pipeline\w*",
             r"|eval|instance_eval|class_eval|module_eval|instance_exec|class_exec",
-            r"|module_exec|send|public_send|__send__|method|instance_method|define_method",
+            r"|module_exec|send|public_send|__send__|\w*method\w*",
             r"|to_proc|const_get|binding|ObjectSpace|ERB|RubyVM|Fiddle|FFI",
-            r"|require_relative|load|autoload)\b|%x",
+            // `IO.read("|cmd")` opens a command, and `trap` evaluates a string.
+            r"|require_relative|load|autoload|IO|trap|FileUtils|Pathname)\b|%x",
+            // `String#delete` and `Hash#delete` are everywhere, so `delete`
+            // counts only on `File` and `Dir`.
+            r"|(?:\.|::)\s*(?:unlink|rmdir|rmtree|rename|truncate|kill)\b",
+            r"|\b(?:File|Dir)\s*(?:\.|::)\s*delete\b",
         ))
         .expect("ruby runner regex compiles")
     });
     static NODE_RUNNER: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(concat!(
             r"\b(?:eval|Function|constructor|child_process|vm|worker_threads|Worker",
-            r"|WebAssembly|execSync|execFileSync|execFile|spawnSync|spawn|fork|dlopen|binding",
-            r"|_linkedBinding|import|globalThis|global|Reflect)\b",
-            r"|\bprocess\s*\[|\bset(?:Timeout|Interval|Immediate)\s*\(\s*['\x22`]",
+            r"|WebAssembly|exec[A-Z]\w*|execve|spawn\w*|fork|dlopen|binding",
+            r"|_linkedBinding|import|globalThis|global|Reflect|this|module|Module|mainModule",
+            r"|_load|createRequire|getBuiltinModule|repl|inspector|__proto__",
+            r"|unlink\w*|rm\w*|rename\w*|truncate\w*|kill)\b",
+            r"|\bset(?:Timeout|Interval|Immediate)\s*\(\s*['\x22`]",
+            // `process` used as a value or indexed rather than read by member.
+            r"|\bprocess\s*(?:[^.\s\w]|$)",
+            // A computed call, or a property name built from pieces.
+            r"|\]\s*\(|['\x22`]\s*\+\s*['\x22`]",
+            r"|\[[^\]]*\+\s*[^\d\s\]]|\[[^\]]*['\x22`]\s*\+",
+            // An identifier spelled with an escape (`eval`).
+            r"|(?:^|[\s.;(=,!&|?:{}\[])\\u",
         ))
         .expect("node runner regex compiles")
     });
@@ -9589,19 +9692,36 @@ fn piped_inline_program_is_inert(language: crate::heredoc::ScriptLanguage, code:
     });
     static PHP_RUNNER: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(concat!(
-            r"\b(?:eval|assert|system|exec|shell_exec|passthru|popen|proc_open|pcntl_exec",
+            // PHP matches function names and keywords in any case.
+            r"(?i)\b(?:eval|assert|system|exec|shell_exec|passthru|popen|proc_open|pcntl_exec",
             r"|create_function|include|include_once|require|require_once|call_user_func\w*",
             r"|forward_static_call\w*|array_map|array_filter|array_walk\w*|array_reduce",
             r"|usort|uasort|uksort|preg_replace_callback\w*|register_shutdown_function",
             r"|register_tick_function|set_error_handler|set_exception_handler|ob_start",
             r"|iterator_apply|Closure|Reflection\w*|FFI|dl|mail|mb_ereg_replace|putenv",
             r"|unserialize|extract|spl_autoload_register|stream_filter_register",
-            r"|array_u\w+|array_\w+_u\w+|\w*callback\w*|\w*_handler)\b",
+            r"|array_u\w+|array_\w+_u\w+|\w*callback\w*|\w*_handler",
+            r"|unlink|rmdir|rename|ftruncate|posix_kill)\b",
             r"|\$\w+\s*\(|\$\{|->\s*\$|\bnew\s+\$|[)\]'\x22]\s*\(",
         ))
         .expect("php runner regex compiles")
     });
+    static PYTHON_RUNNER: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"\b(?:exec|eval|__import__|importlib|runpy|subprocess|pty|ctypes|cffi|getattr",
+            r"|globals|locals|vars|__builtins__|builtins|pickle|marshal|shelve|multiprocessing",
+            r"|timeit|posix|popen\w*|spawn\w*|fork\w*|exec[lv]\w*|unsafe_load|UnsafeLoader)\b",
+            r"|\b(?:import|from)\s+code\b|(?:^|[^.\w])compile\s*\(|\.\s*system\b|\bsystem\s*\(",
+            // `list.remove` and `str.replace` are everywhere, so these count
+            // only once a module that deletes through them has been named.
+            r"|(?s:\b(?:os|shutil|pathlib|Path)\b.*\.\s*(?:remove|removedirs|unlink|rmdir",
+            r"|rmtree|rename|renames|truncate|kill|killpg)\b)",
+            r"|\bos\s*\.\s*replace\b|\bfrom\s+(?:os|shutil)\s+import\b|\bsys\s*\.\s*modules\b",
+        ))
+        .expect("python runner regex compiles")
+    });
     let (runner, backtick_runs_a_command) = match language {
+        ScriptLanguage::Python => (&*PYTHON_RUNNER, false),
         ScriptLanguage::Perl => (&*PERL_RUNNER, true),
         ScriptLanguage::Ruby => (&*RUBY_RUNNER, true),
         ScriptLanguage::JavaScript => (&*NODE_RUNNER, false),
@@ -9621,12 +9741,22 @@ fn piped_inline_program_is_inert(language: crate::heredoc::ScriptLanguage, code:
 /// replacement as code (`s/x/y/e`, `s{x}{y}ee`). Read as: a punctuation mark,
 /// then a run of substitution flag letters that includes `e` and is not
 /// followed by that same mark, which would make the run the pattern of a
-/// match such as `/needle/` rather than flags.
+/// match such as `/needle/` rather than flags. That reading misses a mark
+/// repeated after real flags (`s/x/y/e/1`, a division) and a letter used as the
+/// delimiter (`s qxqyqe`), so each `s` operator is also read through its
+/// delimiters by [`perl_substitution_flags`], which is quadratic in the worst
+/// case: text too long to read that way counts as holding a flag.
 fn perl_may_have_eval_flag(code: &str) -> bool {
     const FLAGS: &[u8] = b"msixnpodualgcer";
+    const MAX_DELIMITER_READ_BYTES: usize = 4096;
+    if code.len() > MAX_DELIMITER_READ_BYTES {
+        return true;
+    }
     let bytes = code.as_bytes();
-    bytes.iter().enumerate().any(|(at, &mark)| {
-        if !mark.is_ascii_punctuation() || mark == b'_' {
+    let flag_run_after_a_mark = bytes.iter().enumerate().any(|(at, &mark)| {
+        // A sigil opens a variable's name (`$seen{$_}++`) and, as a delimiter,
+        // is read below.
+        if !mark.is_ascii_punctuation() || matches!(mark, b'_' | b'$' | b'@' | b'%') {
             return false;
         }
         let run = bytes[at + 1..]
@@ -9639,7 +9769,145 @@ fn perl_may_have_eval_flag(code: &str) -> bool {
             && letters.iter().all(|letter| FLAGS.contains(letter))
             && after != Some(mark)
             && !after.is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    })
+    });
+    flag_run_after_a_mark
+        || code.match_indices('s').any(|(at, _)| {
+            // Not the end of a word or a variable's name (`$s`, `@s`, `%s`).
+            let starts_operator = at
+                .checked_sub(1)
+                .and_then(|before| bytes.get(before))
+                .is_none_or(|&byte| {
+                    byte.is_ascii()
+                        && !byte.is_ascii_alphanumeric()
+                        && !matches!(byte, b'_' | b'$' | b'@' | b'%' | b'&' | b'*' | b'\\')
+                });
+            starts_operator
+                && perl_substitution_flags(&code[at + 1..]).is_some_and(|flags| {
+                    flags.contains('e') && flags.bytes().all(|letter| FLAGS.contains(&letter))
+                })
+        })
+}
+
+/// The flags of the Perl substitution whose text follows its `s` (`/x/y/ge`,
+/// `{x}{y}e`, ` qxqyqe`); `None` when that text is no complete substitution. A
+/// word character opens one only after blank space, and `#` after blank space
+/// starts a comment.
+fn perl_substitution_flags(after_s: &str) -> Option<&str> {
+    let text = after_s.trim_start();
+    let spaced = text.len() != after_s.len();
+    let open = text.chars().next()?;
+    if (open == '#' && spaced) || (!spaced && (open.is_alphanumeric() || open == '_')) {
+        return None;
+    }
+    let rest = perl_delimited_end(&text[open.len_utf8()..], open)?;
+    let rest = if matches!(open, '(' | '[' | '{' | '<') {
+        // A bracketed pattern lets the replacement open its own delimiters.
+        let rest = rest.trim_start();
+        let second = rest.chars().next()?;
+        perl_delimited_end(&rest[second.len_utf8()..], second)?
+    } else {
+        perl_delimited_end(rest, open)?
+    };
+    let flags = rest.bytes().take_while(u8::is_ascii_lowercase).count();
+    Some(&rest[..flags])
+}
+
+/// The text after the closing delimiter of a Perl quote-like part that `open`
+/// opened; brackets nest and a backslash escapes the next character.
+fn perl_delimited_end(text: &str, open: char) -> Option<&str> {
+    let close = match open {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '<' => '>',
+        other => other,
+    };
+    let mut depth = 0usize;
+    let mut escaped = false;
+    for (at, ch) in text.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == close {
+            if depth == 0 {
+                return text.get(at + ch.len_utf8()..);
+            }
+            depth -= 1;
+        } else if ch == open {
+            depth += 1;
+        }
+    }
+    None
+}
+
+/// An environment setting that has an interpreter load or run code other than
+/// the program its command line names: `PERL5OPT=-M…`,
+/// `NODE_OPTIONS=--require=/dev/stdin`, `RUBYOPT=-r/dev/stdin`, a `PHPRC` holding
+/// `auto_prepend_file`, `PYTHONINSPECT=1`, which reads source from stdin once
+/// `-c` ends.
+static INTERPRETER_CODE_SETTING: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"\b(?:PERL5OPT|PERL5DB|RUBYOPT|NODE_OPTIONS|PHPRC|PHP_INI_SCAN_DIR",
+        r"|PYTHONINSPECT|PYTHONSTARTUP)=",
+    ))
+    .expect("interpreter setting regex compiles")
+});
+
+/// A pipeline stage that names an interpreter [`INTERPRETER_CODE_SETTING`] acts on.
+static STAGE_NAMES_AN_INTERPRETER: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\b(?:perl|ruby|node|nodejs|php|python[\d.]*)\b")
+        .expect("interpreter stage regex compiles")
+});
+
+/// Whether the outer shell fills in any of `words` (as read without their
+/// quotes) before the stage's interpreter sees it. A redirect target is no such
+/// word, so `… | perl -pe 's/a/b/' > "$OUT"` stays readable.
+fn stage_words_hold_an_expansion(command: &str, words: &[&str]) -> bool {
+    use crate::normalize::{NormalizeTokenKind, tokenize_for_normalization};
+    tokenize_for_normalization(command)
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(command))
+        .any(|raw| {
+            raw_word_holds_an_expansion(raw)
+                && shell_words::split(raw)
+                    .is_ok_and(|parts| parts.iter().any(|part| words.contains(&part.as_str())))
+        })
+}
+
+/// Whether a raw shell word holds an expansion that can carry text: `$NAME`,
+/// `${…}`, `$(…)`, a backquoted command, a positional parameter, `$@`, `$*`, or
+/// an ANSI-C `$'…'` or locale `$"…"` string, whose text `shell_words` reads
+/// wrongly. Single quotes keep their text literal, a backslash keeps the next
+/// byte literal, and a `$` before anything else stays a literal `$`
+/// (`"s/foo$/bar/"`).
+fn raw_word_holds_an_expansion(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    let mut double_quoted = false;
+    let mut at = 0usize;
+    while let Some(&byte) = bytes.get(at) {
+        match byte {
+            b'\\' => at += 1,
+            b'\'' if !double_quoted => {
+                let Some(len) = bytes[at + 1..].iter().position(|next| *next == b'\'') else {
+                    return true;
+                };
+                at += len + 1;
+            }
+            b'"' => double_quoted = !double_quoted,
+            b'`' => return true,
+            b'$' => match bytes.get(at + 1) {
+                Some(next) if next.is_ascii_alphanumeric() => return true,
+                Some(b'_' | b'{' | b'(' | b'@' | b'*') => return true,
+                Some(b'\'' | b'"') if !double_quoted => return true,
+                _ => {}
+            },
+            _ => {}
+        }
+        at += 1;
+    }
+    false
 }
 
 /// Whether a Perl, Ruby, Node or PHP pipeline stage reads its program from
@@ -9661,6 +9929,7 @@ fn perl_may_have_eval_flag(code: &str) -> bool {
 /// or an option value that names stdin (`-c /dev/stdin`); a stdin device or
 /// `-` as the script reads the pipe.
 fn script_interpreter_pipeline_input_mode(
+    command: &str,
     executable: &str,
     args: &[String],
     language: crate::heredoc::ScriptLanguage,
@@ -9686,6 +9955,7 @@ fn script_interpreter_pipeline_input_mode(
     let mut forced_stdin = false;
     let mut operand = None;
     let mut options_ended = false;
+    let mut option_words: Vec<&str> = Vec::new();
     let mut index = 0usize;
     while let Some(word) = args.get(index) {
         // `shell_words` keeps redirections as words; the interpreter never
@@ -9740,6 +10010,12 @@ fn script_interpreter_pipeline_input_mode(
             InterpreterOptionEffect::ReadsStdin => forced_stdin = true,
             InterpreterOptionEffect::Exits => return PipelineShellInputMode::DoesNotReadStdin,
         }
+        option_words.extend(
+            args.iter()
+                .skip(index)
+                .take(1 + consumed)
+                .map(String::as_str),
+        );
         index += 1 + consumed;
     }
     if forced_stdin {
@@ -9751,7 +10027,26 @@ fn script_interpreter_pipeline_input_mode(
         return operand_mode(file);
     }
     if program {
-        return PipelineShellInputMode::DoesNotReadStdin;
+        // Program text the outer shell fills in, or a setting that loads other
+        // code first, is nothing a reader of this command has seen. Nor is a
+        // module found through a directory the command names, or a php.ini.
+        let has_option = |prefix: &str| option_words.iter().any(|word| word.starts_with(prefix));
+        let loads_local_code = match language {
+            crate::heredoc::ScriptLanguage::Perl => {
+                has_option("-I") && (has_option("-M") || has_option("-m"))
+            }
+            crate::heredoc::ScriptLanguage::Ruby => has_option("-I") && has_option("-r"),
+            crate::heredoc::ScriptLanguage::Php => has_option("-c"),
+            _ => false,
+        };
+        return if loads_local_code
+            || stage_words_hold_an_expansion(command, &option_words)
+            || INTERPRETER_CODE_SETTING.is_match(command)
+        {
+            PipelineShellInputMode::Unverified
+        } else {
+            PipelineShellInputMode::DoesNotReadStdin
+        };
     }
     // php's first operand is its script, like the other interpreters'.
     operand.map_or_else(|| reads_stdin.clone(), operand_mode)
@@ -10461,12 +10756,12 @@ fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineSh
             return PipelineShellInputMode::NotShell;
         }
         if language == crate::heredoc::ScriptLanguage::Python {
-            return python_pipeline_input_mode(&args, language);
+            return python_pipeline_input_mode(command, &args, language);
         }
         // Each interpreter's own option grammar decides whether an option
         // supplies the program: `-pe CODE` does, `-E UTF-8` and `-p` do not
         // (#611, #612).
-        return script_interpreter_pipeline_input_mode(&executable, &args, language);
+        return script_interpreter_pipeline_input_mode(command, &executable, &args, language);
     }
 
     let mut force_stdin = false;
@@ -11664,7 +11959,19 @@ fn collect_posix_pipeline_executable_sinks(
                     continue;
                 }
                 let nonlocal_filesystem = script_segment_is_nonlocal(consumer);
-                match pipeline_shell_input_mode(consumer) {
+                let mode = match pipeline_shell_input_mode(consumer) {
+                    // A setting made by an earlier statement or around the
+                    // stage reaches the interpreter just as one on it does
+                    // (`export RUBYOPT=-r/dev/stdin; cat x | ruby -ne print`).
+                    PipelineShellInputMode::DoesNotReadStdin | PipelineShellInputMode::NotShell
+                        if INTERPRETER_CODE_SETTING.is_match(command)
+                            && STAGE_NAMES_AN_INTERPRETER.is_match(consumer) =>
+                    {
+                        PipelineShellInputMode::Unverified
+                    }
+                    mode => mode,
+                };
+                match mode {
                     PipelineShellInputMode::ReadsStdin(kind) => {
                         if leading_pipe
                             && stages.len() == 2
@@ -41429,12 +41736,37 @@ mod tests {
             "php -R 'echo $argn;'",
             "php -B '$n = 0;' -R '$n++;' -E 'echo $n;'",
             "php -d memory_limit=1G -R 'echo $argn;'",
+            // The shell's reading of the program, or of the stage, changes
+            // nothing the reader cannot see.
+            r#"perl -pe "s/foo$/bar/""#,
+            r#"perl -ne "print \$_""#,
+            "perl -pe 's/a/b/' > \"$OUT\"",
+            "perl -ne 'print' 2>\"$LOG\"",
+            "perl -ne 'print unless $seen{$_}++'",
+            "perl -lne 'print if -s $_ and $e'",
+            "perl -pe 's/do not/never/'",
+            "perl -M-strict -ne 'print'",
+            "perl -MPOSIX=strftime,floor -ne 'print'",
+            "php -r 'echo STRTOUPPER(fgets(STDIN));'",
+            r#"node -e 'console.log(x.replace(/a/g, "b"))'"#,
+            r#"node -e 'console.log(d["version"], d[k], a[i+1], x + "y")'"#,
+            "node -e 'console.log(/x/.exec(s))'",
+            "ruby -ne 'puts $_.delete(\"x\")'",
+            r#"python3 -c 'import sys,json; print(json.load(sys.stdin)["a"])'"#,
+            "python3 -c 'import re,sys; print(re.compile(\"x\").sub(\"y\", sys.stdin.read()))'",
+            "python3 -c 'import sys; print(sys.stdin.read().replace(\"a\", \"b\"))'",
+            "python3 -c 'import sys; print(sys.argv[1])' \"$ARG\"",
+            "python3 -m json.tool",
+            "python3 script.py \"$ARG\"",
         ] {
             assert_eq!(mode(cmd), data, "{cmd}: the program is the inline code");
         }
         for cmd in [
             "perl",
             "perl -",
+            "node -p",
+            "node -p --no-warnings",
+            "node --print --no-warnings",
             "perl -p",
             "perl -n",
             "perl -c",
@@ -41506,6 +41838,115 @@ mod tests {
             // An option no reader models.
             "perl --unknown",
             "node --unmodeled-option x",
+            // A substitution's flags, read through its delimiters.
+            "perl -pe 's/(.*)/$1/ee/1'",
+            "perl -pe 's,(.*),$1,ee,1'",
+            "perl -pe 's|(.*)|$1|ee|1'",
+            "perl -pe 's#(.*)#$1#ee#'",
+            "perl -pe 's x(.*)x$1xee'",
+            "perl -pe 's q(.*)q$1qee'",
+            "perl -pe 's(x) {y}e'",
+            "perl -pe 's$x$y$e'",
+            // perl: `do FILE`, the magic open of @ARGV, `use` text and the
+            // debugger.
+            r#"perl -e 'do lc("/DEV/STDIN")'"#,
+            r#"perl -e 'do +"/dev/stdin"'"#,
+            "perl -e '@ARGV=<STDIN>; print while <>'",
+            r#"perl '-Mstrict;eval join"",<STDIN>' -e 1"#,
+            "perl -Mre=eval -ne '/$_/'",
+            "perl -MIPC::Open3 -ne 'print'",
+            "perl -MModule::Load -ne 'chomp; load $_'",
+            "perl -d -e 1",
+            "perl -d:Foo -e 1",
+            "perl -I/tmp -MFoo -ne 'print'",
+            // ruby: the method family, command opens, a string trap, libraries
+            // that hand the program a shell.
+            r#"ruby -ne 'Kernel.public_method("sys"+"tem").call($_)'"#,
+            r#"ruby -ne 'Kernel.singleton_method("sys"+"tem").call($_)'"#,
+            r#"ruby -ne 'puts IO.read("|"+$_)'"#,
+            r#"ruby -ne 'puts IO.readlines("|"+$_)'"#,
+            r#"ruby -e 'trap("EXIT", STDIN.read)'"#,
+            "ruby -rrake -ne 'include FileUtils; sh $_'",
+            "ruby -run -e rm -- -rf /",
+            "ruby -I. -rfoo -ne 'puts 1'",
+            // node: computed names, loaders and the option grammar.
+            r#"node -e 'this["ev"+"al"](require("fs").readFileSync(0,"utf8"))'"#,
+            r#"node -e '[].filter["con"+"structor"](s)()'"#,
+            r#"node -e 'x[k+"or"](s)'"#,
+            r#"node -e 'require("repl").start()'"#,
+            r#"node -e 'require("module")._load("c")'"#,
+            r#"node -e 'process.execve("/bin/sh",["sh","-c",s])'"#,
+            r"node -e 'const p=process; p[k]'",
+            r"node -e 'eval(s)'",
+            "node --experimental_loader=./x.mjs -e 1",
+            "node --env-file=/dev//stdin -e 1",
+            "node --env-file=/dev/./fd/0 -e 1",
+            // php reads function names and keywords in any case, and loads
+            // native code from a file.
+            "php -r 'SYSTEM(stream_get_contents(STDIN));'",
+            "php -r 'EVAL(stream_get_contents(STDIN));'",
+            "php -R 'PassThru($argn);'",
+            r#"php -r 'INCLUDE "php://stdin";'"#,
+            "php -c /dev//stdin -r 'echo 1;'",
+            "php -c x.ini -r 'echo 1;'",
+            "php -d extension=./x.so -r 'echo 1;'",
+            "php -dzend_extension=./x.so -r 'echo 1;'",
+            "php -z ./x.so -r 'echo 1;'",
+            // Programs that delete, rename or truncate the paths they read.
+            "perl -lne 'unlink'",
+            "perl -lne 'unlink $_'",
+            "perl -MFile::Path=rmtree -lne 'rmtree($_)'",
+            r#"perl -lne 'rename $_, "/dev/null"'"#,
+            "perl -lne 'truncate $_, 0'",
+            "perl -lne 'kill 9, $_'",
+            "ruby -rfileutils -ne 'FileUtils.rm_rf($_.chomp)'",
+            "ruby -ne 'File.delete($_.chomp)'",
+            "ruby -ne 'File::delete($_.chomp)'",
+            "ruby -ne 'Process::kill(9, $_.to_i)'",
+            "ruby -ne 'File.unlink($_.chomp)'",
+            "ruby -ne 'Process.kill(9, $_.to_i)'",
+            r#"node -e 'require("fs").unlinkSync(s)'"#,
+            r#"node -e 'require("fs").rmSync(s)'"#,
+            "php -R 'unlink(trim($argn));'",
+            "php -R 'rmdir(trim($argn));'",
+            "python3 -c 'import os,sys; os.remove(sys.stdin.read())'",
+            "python3 -c 'import shutil,sys; shutil.rmtree(sys.stdin.read())'",
+            // Program text the outer shell fills in.
+            r#"perl -ne "$P""#,
+            "perl -ne $P",
+            r#"perl -ne "$(cat p.pl)""#,
+            "perl -ne `cat p.pl`",
+            r#"perl -ne "print; $P""#,
+            r#"perl -pe "s/foo/$BAR/""#,
+            r#"perl -pe 's/foo/'"$BAR"'/'"#,
+            r"perl -ne $'\x73ystem($_)'",
+            r#"ruby -ne "$P""#,
+            r"ruby -ne $'\x73ystem($_)'",
+            r#"node -e "$P""#,
+            r#"node -p "$P""#,
+            r"node -e $'\x65val(s)'",
+            r#"php -r "$P""#,
+            r#"php -R "$P""#,
+            r"php -r $'\x73ystem($s);'",
+            r#"python3 -c "print(1); $P""#,
+            // A setting that loads other code first.
+            "PERL5OPT=-Mstrict perl -e 1",
+            "RUBYOPT=-r/dev/stdin ruby -e 1",
+            "env RUBYOPT=-r/dev/stdin ruby -e 1",
+            "NODE_OPTIONS=--require=/dev/stdin node -e 1",
+            "PHPRC=/dev/stdin php -r 'echo 1;'",
+            "PYTHONINSPECT=1 python3 -c 1",
+            "PYTHONINSPECT=1 python3 script.py",
+            // python: what runs its input, or reads it once the script ends.
+            "python3 -c 'exec(input())'",
+            "python3 -c 'import sys; exec(sys.stdin.read())'",
+            "python3 -c 'import os,sys; os.system(sys.stdin.read())'",
+            "python3 -c 'import subprocess,sys; subprocess.run(sys.stdin.read(), shell=True)'",
+            "python3 -c 'import code; code.interact()'",
+            "python3 -m code",
+            "python3 -m pdb x.py",
+            "python3 -i -c 1",
+            "python3 -i script.py",
         ] {
             assert_eq!(mode(cmd), unverified, "{cmd}: must stay unverified");
         }
@@ -41542,6 +41983,18 @@ mod tests {
             "cat x | php -B '$n = 0;' -R '$n++;' -E 'echo $n;'",
             "cat x | ruby -rjson -ne 'puts JSON.parse($_).keys'",
             "cat x | node -r dotenv/config -e 'console.log(1)'",
+            // A hash key or a word holding an `s` is not a substitution.
+            "cat x | perl -ne 'print unless $seen{$_}++'",
+            "cat x | perl -ne '$s{$_}++ or print'",
+            "cat x | perl -ne 'print if /users/'",
+            "cat x | perl -pe 's/foo/bar/g'",
+            "cat x | perl -MList::Util=sum -lane 'print sum @F'",
+            "cat x | perl -MJSON::PP -ne 'print'",
+            "cat x | python3 -c 'import sys, json; print(json.load(sys.stdin))'",
+            "cat x | python3 -m json.tool",
+            "cat x | python3 -c 'import sys; a = sys.stdin.readlines(); a.remove(\"x\"); print(a)'",
+            "cat x | python3 -c 'import re, sys; print(re.compile(\"x\").sub(\"y\", sys.stdin.read()))'",
+            "cat x | python3 -c 'import sys; print(sys.stdin.read().replace(\"a\", \"b\"))'",
         ] {
             let result = evaluate(cmd);
             assert!(result.is_allowed(), "{cmd:?} must be allowed: {result:?}");
@@ -41597,6 +42050,84 @@ mod tests {
             "cat /tmp/t.txt | perl -",
             "cat /tmp/t.txt | perl -p script.pl",
             "cat /tmp/t.txt | perl -pie 's/x//'",
+            // An evaluating substitution with any delimiter or a later flag.
+            "cat x | perl -ne 's/(.*)/$1/ee/1'",
+            "cat x | perl -ne 's,(.*),$1,ee,1'",
+            "cat x | perl -ne 's|(.*)|$1|ee|1'",
+            "cat x | perl -ne 's#(.*)#$1#ee#'",
+            "cat x | perl -ne 's x(.*)x$1xee'",
+            "cat x | perl -ne 's q(.*)q$1qee'",
+            // An option that loads code or runs a debugger.
+            "cat x | perl -Mre=eval -ne '/$_/'",
+            "cat x | perl '-Mstrict;eval join\"\",<STDIN>' -e 1",
+            "cat x | perl -MModule::Load -ne 'print'",
+            "cat x | perl -d -e 1",
+            "cat x | perl -MInline=C -ne 'print'",
+            "cat x | perl -I/tmp -MFoo -ne 'print'",
+            "cat x | node -p --no-warnings",
+            "cat x | node --print --no-warnings",
+            "cat x | node --experimental_loader=./x.mjs -e 1",
+            "cat x | php -c /dev//stdin -r 'echo 1;'",
+            "cat x | php -d extension=./x.so -r 'echo 1;'",
+            "cat x | php -z ./x.so -r 'echo 1;'",
+            "cat x | node --env-file=/dev//stdin -e 1",
+            // A setting that makes the interpreter load code.
+            "cat x | PERL5OPT=-Mstrict perl -ne 'print'",
+            "cat x | RUBYOPT=-r/dev/stdin ruby -ne 'print'",
+            "cat x | env RUBYOPT=-r/dev/stdin ruby -ne 'print'",
+            "cat x | NODE_OPTIONS=--require=/dev/stdin node -e 1",
+            "cat x | PHPRC=/dev/stdin php -r 'echo 1;'",
+            "export RUBYOPT=-r/dev/stdin; cat x | ruby -ne 'print'",
+            "export NODE_OPTIONS=--require=/dev/stdin; cat x | node -e 1",
+            "RUBYOPT=-r/dev/stdin; export RUBYOPT; cat x | ruby -ne 'print'",
+            "cat x | (export RUBYOPT=-r/dev/stdin; ruby -ne 'print')",
+            "cat x | { RUBYOPT=-r/dev/stdin ruby -ne 'print'; }",
+            // A program the guard cannot read.
+            "cat x | perl -ne \"$P\"",
+            "cat x | perl -ne $P",
+            "cat x | perl -ne \"$(cat p.pl)\"",
+            "cat x | perl -ne \"print; $P\"",
+            "cat x | perl -pe \"s/foo/$BAR/\"",
+            "cat x | perl -ne $'\\x73ystem($_)'",
+            "cat x | ruby -ne \"$P\"",
+            "cat x | node -e \"$P\"",
+            "cat x | php -r \"$P\"",
+            "cat x | python3 -c \"$P\"",
+            // A program that deletes or signals what it reads.
+            "cat x | perl -lne 'unlink'",
+            "cat x | perl -MFile::Path=rmtree -lne 'rmtree $_'",
+            "cat x | perl -lne 'rename $_, \"$_.bak\"'",
+            "cat x | perl -lne 'truncate $_, 0'",
+            "cat x | perl -lne 'kill 9, $_'",
+            "cat x | ruby -ne 'File.delete($_.chomp)'",
+            "cat x | ruby -rfileutils -ne 'FileUtils.rm_rf($_.chomp)'",
+            r#"cat x | node -e 'require("fs").unlinkSync(require("fs").readFileSync(0, "utf8"))'"#,
+            "cat x | php -R 'unlink(trim($argn));'",
+            "cat x | php -R 'rmdir(trim($argn));'",
+            "cat x | python3 -c 'import os,sys; [os.remove(l.strip()) for l in sys.stdin]'",
+            "cat x | python3 -c 'import shutil,sys; [shutil.rmtree(l.strip()) for l in sys.stdin]'",
+            "cat x | python3 -c 'import sys; exec(sys.stdin.read())'",
+            "cat x | python3 -i script.py",
+            "cat x | python3 -m code",
+            // Runners the earlier lists missed.
+            "cat x | perl -ne '@ARGV=<STDIN>; print while <>'",
+            r#"cat x | perl -e 'do lc("/DEV/STDIN")'"#,
+            r#"cat x | perl -e 'do +"/dev/stdin"'"#,
+            "cat x | ruby -ne 'public_method(:system).call($_)'",
+            "cat x | ruby -ne 'singleton_method(:x).call($_)'",
+            r#"cat x | ruby -ne 'IO.read("|"+$_)'"#,
+            r#"cat x | ruby -ne 'IO.readlines("|"+$_)'"#,
+            r#"cat x | ruby -e 'trap("EXIT", STDIN.read)'"#,
+            "cat x | ruby -rrake -ne 'sh $_'",
+            r#"cat x | node -e 'this["ev"+"al"](require("fs").readFileSync(0, "utf8"))'"#,
+            r#"cat x | node -e '[].filter["con"+"structor"](require("fs").readFileSync(0, "utf8"))()'"#,
+            r#"cat x | node -e 'require("repl").start()'"#,
+            r#"cat x | node -e 'require("module")._load("child_process")'"#,
+            r#"cat x | node -e 'process.execve("/bin/sh", ["sh"])'"#,
+            r#"cat x | node -e 'const p=process; p["main"+"Module"]'"#,
+            "cat x | php -r 'SYSTEM(stream_get_contents(STDIN));'",
+            "cat x | php -r 'PassThru(stream_get_contents(STDIN));'",
+            r#"cat x | php -r 'INCLUDE "php://stdin";'"#,
         ] {
             let result = evaluate(cmd);
             assert!(result.is_denied(), "{cmd:?} must be denied: {result:?}");
