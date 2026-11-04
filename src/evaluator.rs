@@ -55505,13 +55505,12 @@ mod tests {
             &[
                 ("echo hi", &["bash -c 'echo hi'", "ssh h 'echo hi'"]),
                 ("echo $X", &["bash -c 'echo $X'"]),
+                // Only the single-quoted spelling: in `bash -c "$CMD --help"`
+                // the outer shell substitutes the value into the script, and
+                // the inner shell parses it as code (#607).
                 (
                     "$CMD --help",
-                    &[
-                        "bash -c '$CMD --help'",
-                        "bash -c \"$CMD --help\"",
-                        "ssh h '$CMD --help'",
-                    ],
+                    &["bash -c '$CMD --help'", "ssh h '$CMD --help'"],
                 ),
                 ("$X $Y", &["bash -c '$X $Y'"]),
                 ("cd $D && make", &["bash -c 'cd $D && make'"]),
@@ -55707,6 +55706,10 @@ mod tests {
             "ssh h \"$C\" --force",
             "ssh h -- \"$C\" x",
             "ssh -p 22 h \"$C\" x",
+            "bash -c \"$C\"' x'",
+            "bash -c \"$C\"\" x\"",
+            "ssh h \"$C\"' x'",
+            "bash -c \"$CMD --help\"",
             // Still denied as before.
             "bash -c \"$C\"",
             "ssh h \"$C\"",

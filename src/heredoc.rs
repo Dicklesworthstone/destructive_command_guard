@@ -6674,6 +6674,29 @@ fn word_is_only_code_expansions(word: &str) -> bool {
     let mut rest = word;
     let mut seen = false;
     while !rest.is_empty() {
+        // An empty quote pair adds nothing to the word (`$C""`, `''$C`).
+        if let Some(after) = rest
+            .strip_prefix("\"\"")
+            .or_else(|| rest.strip_prefix("''"))
+        {
+            rest = after;
+            continue;
+        }
+        // A blank or an operator that quoting or a backslash keeps in this
+        // word still ends the command word of the shell that parses it:
+        // `"$C"' x'`, `$C" x"` and `$C\ x` all reach it as `<C> x`.
+        if seen
+            && matches!(
+                rest.as_bytes(),
+                [
+                    b'\'' | b'"' | b'\\',
+                    b' ' | b'\t' | b'\n' | b';' | b'&' | b'|',
+                    ..
+                ]
+            )
+        {
+            return true;
+        }
         let quoted = rest.strip_prefix('"');
         let segment = quoted.unwrap_or(rest);
         let Some(end) = code_expansion_len(segment) else {
@@ -25016,6 +25039,13 @@ mod issue_560_masking_tests {
             "`cat cmd.txt` x",
             "\"$@\"",
             "$1 x",
+            "\"$C\"' x'",
+            "\"${C}\"' x'",
+            "$C' x'",
+            "$C\" x\"",
+            "$C\\ x",
+            "\"$C\"\"\" x",
+            "''$C x",
         ] {
             assert!(
                 shell_script_runs_an_expansion_as_a_command(script),
@@ -25028,6 +25058,9 @@ mod issue_560_masking_tests {
             "$HOME/bin/tool --flag",
             "${HOME}/bin/tool --flag",
             "\"$C\"x",
+            "\"$C\"'x'",
+            "$HOME\"/bin/tool\" --flag",
+            "'echo '\"$C\"",
             "'$C' x",
             "cd $DIR && make",
             ">$C cat",
