@@ -10712,7 +10712,7 @@ destructive_patterns:
             "{pack_level}"
         );
         assert!(
-            !pack_level.contains("have them run the command manually"),
+            !pack_level.contains("If a safer alternative reaches the same goal"),
             "{pack_level}"
         );
 
@@ -10720,11 +10720,11 @@ destructive_patterns:
         assert!(rule_level.contains("Open a pipeline run"), "{rule_level}");
         assert!(!rule_level.contains("/semaphore skill"), "{rule_level}");
 
-        // Built-in rules keep dcg's own trailer.
+        // Built-in rules keep dcg's own trailer (#615).
         let (_temp, output) = setup_custom_pack_env(pack_content, "git reset --hard");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains("have them run the command manually"),
+            stdout.contains("If a safer alternative reaches the same goal"),
             "{stdout}"
         );
     }
