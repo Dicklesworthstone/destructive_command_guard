@@ -18413,6 +18413,10 @@ fn evaluate_command_in_single_dialect_view(
             command,
             shell_dialect,
         );
+    let force_cmd_recovery = ordered_packs
+        .iter()
+        .any(|pack_id| matches!(pack_id.as_str(), "core.filesystem" | "windows.system"))
+        && crate::packs::windows::system::cmd_vssadmin_scan_required(command, shell_dialect);
     let force_cloudflare_workers = ordered_packs
         .iter()
         .any(|pack_id| pack_id == "cdn.cloudflare_workers")
@@ -18473,6 +18477,7 @@ fn evaluate_command_in_single_dialect_view(
             && !contains_shell_word_obfuscation(command, shell_dialect)
             && !force_core_git
             && !force_core_filesystem
+            && !force_cmd_recovery
             && !force_cloudflare_workers
             && !force_snowflake
             && force_literal_database_packs.is_empty()
@@ -18493,6 +18498,7 @@ fn evaluate_command_in_single_dialect_view(
         && tar_helper_sources.is_empty()
         && !force_core_git
         && !force_core_filesystem
+        && !force_cmd_recovery
         && !force_cloudflare_workers
         && !force_snowflake
         && force_literal_database_packs.is_empty()
@@ -18664,6 +18670,7 @@ fn evaluate_command_in_single_dialect_view(
         && quick_reject
         && !force_core_git
         && !force_core_filesystem
+        && !force_cmd_recovery
         && !force_cloudflare_workers
         && !force_snowflake
         && force_literal_database_packs.is_empty()
@@ -27892,6 +27899,13 @@ fn evaluate_packs_with_allowlists_at_depth(
             original_command,
             shell_dialect,
         );
+    let force_cmd_recovery = ordered_packs
+        .iter()
+        .any(|pack_id| matches!(pack_id.as_str(), "core.filesystem" | "windows.system"))
+        && crate::packs::windows::system::cmd_vssadmin_scan_required(
+            original_command,
+            shell_dialect,
+        );
 
     let force_windows_filesystem = ordered_packs
         .iter()
@@ -27955,6 +27969,11 @@ fn evaluate_packs_with_allowlists_at_depth(
                             && (pack_id != "core.filesystem" || core_filesystem_keyword_candidate)
                             || force_core_git && pack_id == "core.git"
                             || force_core_filesystem && pack_id == "core.filesystem"
+                            || force_cmd_recovery
+                                && matches!(
+                                    pack_id.as_str(),
+                                    "core.filesystem" | "windows.system"
+                                )
                             || force_cloudflare_workers && pack_id == "cdn.cloudflare_workers"
                             || force_snowflake && pack_id == "database.snowflake"
                             || force_scp_semantics
@@ -27997,6 +28016,8 @@ fn evaluate_packs_with_allowlists_at_depth(
                     if !(indexed_keyword_candidate
                         || force_core_git && pack_id == "core.git"
                         || force_core_filesystem && pack_id == "core.filesystem"
+                        || force_cmd_recovery
+                            && matches!(pack_id.as_str(), "core.filesystem" | "windows.system")
                         || force_cloudflare_workers && pack_id == "cdn.cloudflare_workers"
                         || force_snowflake && pack_id == "database.snowflake"
                         || force_scp_semantics
@@ -28177,10 +28198,14 @@ fn evaluate_packs_with_allowlists_at_depth(
     //
     // The rm_parse optimization for core.filesystem is handled inline.
     let mut first_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
-    // Set when the bounded Windows filesystem pass stopped before reading
+    // Set when a bounded native Windows pass stopped before reading
     // every statement. Only a denial may follow it; an allow becomes the
     // configured incomplete-analysis outcome below.
-    let mut windows_filesystem_analysis_incomplete = false;
+    let mut native_semantic_analysis_incomplete = false;
+    // Both packs carry the same recovery command, with independent rule
+    // grants. Parse its native source once while retaining each pack's place
+    // in the existing evaluation order.
+    let cmd_recovery_analysis = std::cell::OnceCell::new();
 
     drop(preparation_phase);
     for &pack_id in &candidate_pack_ids {
@@ -28315,6 +28340,46 @@ fn evaluate_packs_with_allowlists_at_depth(
             return result;
         }
 
+        if matches!(pack_id.as_str(), "core.filesystem" | "windows.system") {
+            match cmd_recovery_analysis.get_or_init(|| {
+                // Unknown must retain possible native Cmd quoting too.
+                // Generic dequoting can turn literal apostrophes in argv0
+                // into an executable match, so use the sanitized source.
+                crate::packs::windows::system::cmd_vssadmin_delete_spans(
+                    dialect_semantic_masked.as_ref(),
+                    shell_dialect,
+                )
+            }) {
+                Ok(spans) => {
+                    for span in spans {
+                        let mapped_span = map_span_with_offset(
+                            MatchSpan {
+                                start: span.start,
+                                end: span.end,
+                            },
+                            Some(0),
+                            original_len,
+                        );
+                        if let Some(result) = evaluate_named_pack_rule_with_span(
+                            pack_id,
+                            pack,
+                            crate::packs::windows::system::CMD_VSSADMIN_DELETE_RULE,
+                            allowlists,
+                            project_path,
+                            &mut first_allowlist_hit,
+                            original_command,
+                            mapped_span,
+                        ) {
+                            return result;
+                        }
+                    }
+                }
+                Err(_) => native_semantic_analysis_incomplete = true,
+            }
+            // A grant for this recovery rule never skips another operation
+            // protected by the same pack or a later enabled pack.
+        }
+
         if pack_id == "remote.scp" {
             match crate::packs::remote::scp::scp_semantic_decision_in_dialect(
                 scp_command,
@@ -28423,7 +28488,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                     // incomplete-analysis outcome instead of an allow — never a
                     // `windows-filesystem-semantic-unverified` finding the pass
                     // did not make (#569).
-                    windows_filesystem_analysis_incomplete = true;
+                    native_semantic_analysis_incomplete = true;
                 }
                 crate::packs::windows::filesystem::WindowsFilesystemSemanticDecision::NoMatch
                     if shell_dialect != ShellDialect::Unknown =>
@@ -29321,7 +29386,7 @@ fn evaluate_packs_with_allowlists_at_depth(
 
     // An unread remainder is not a clean one, and a rule-scoped allowlist hit
     // elsewhere does not authorize what was never analyzed.
-    if windows_filesystem_analysis_incomplete {
+    if native_semantic_analysis_incomplete {
         return EvaluationResult::indeterminate_due_to_budget();
     }
 
@@ -29633,6 +29698,45 @@ fn evaluate_named_pack_rule(
         pattern.severity,
         pattern.suggestions,
     ))
+}
+
+/// Attach a semantic command's original source span while reusing the same
+/// rule lookup, severity, guidance, and grant handling as other native passes.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_named_pack_rule_with_span(
+    pack_id: &str,
+    pack: &crate::packs::Pack,
+    pattern_name: &str,
+    allowlists: &LayeredAllowlist,
+    project_path: Option<&Path>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    original_command: &str,
+    span: Option<MatchSpan>,
+) -> Option<EvaluationResult> {
+    let first_hit_was_empty = first_allowlist_hit.is_none();
+    let mut result = evaluate_named_pack_rule(
+        pack_id,
+        pack,
+        pattern_name,
+        allowlists,
+        project_path,
+        first_allowlist_hit,
+    );
+    let annotate = |info: &mut PatternMatch| {
+        info.matched_span = span;
+        info.matched_text_preview = span
+            .as_ref()
+            .map(|span| extract_match_preview(original_command, span));
+    };
+    if let Some(info) = result
+        .as_mut()
+        .and_then(|result| result.pattern_info.as_mut())
+    {
+        annotate(info);
+    } else if first_hit_was_empty && let Some((info, _, _)) = first_allowlist_hit.as_mut() {
+        annotate(info);
+    }
+    result
 }
 
 fn posix_single_quote_argument(argument: &str) -> String {
@@ -40732,6 +40836,32 @@ fn proven_powershell_file_truncation_match(command: &str, info: &PatternMatch) -
     )
 }
 
+/// A native recovery finding owns its executable span even when Cmd quote or
+/// expansion syntax makes that word look like data to the generic scorer.
+fn proven_cmd_recovery_match(command: &str, info: &PatternMatch) -> bool {
+    if !matches!(info.source, MatchSource::Pack)
+        || !matches!(
+            info.pack_id.as_deref(),
+            Some("core.filesystem" | "windows.system")
+        )
+        || info.pattern_name.as_deref()
+            != Some(crate::packs::windows::system::CMD_VSSADMIN_DELETE_RULE)
+        || !span_addresses_command(command, info)
+    {
+        return false;
+    }
+    let Some(span) = info.matched_span else {
+        return false;
+    };
+    crate::packs::windows::system::cmd_vssadmin_delete_spans(command, ShellDialect::Cmd).is_ok_and(
+        |spans| {
+            spans
+                .iter()
+                .any(|candidate| candidate.start == span.start && candidate.end == span.end)
+        },
+    )
+}
+
 /// Apply confidence scoring to potentially downgrade a Deny to Warn.
 ///
 /// This function computes a confidence score for the pattern match and
@@ -40807,10 +40937,12 @@ pub fn apply_confidence_scoring(
         };
     }
 
-    // The semantic parser already proved this file-writer invocation executes.
-    // The generic context scorer does not model PowerShell assignment, return,
-    // or dot invocation, so it must not relabel the proven command as data.
-    if proven_powershell_file_truncation_match(command, info) {
+    // Native parsers already proved these executable spans. The generic
+    // context scorer cannot reinterpret PowerShell invocation or Cmd quote
+    // and expansion syntax as inert data after that execution proof.
+    if proven_powershell_file_truncation_match(command, info)
+        || proven_cmd_recovery_match(command, info)
+    {
         return ConfidenceResult {
             mode: current_mode,
             score: None,
@@ -60179,6 +60311,70 @@ mod tests {
                 ),
                 "data or non-truncating invocation is no proof: {command}",
             );
+        }
+    }
+
+    #[test]
+    fn cmd_recovery_confidence_requires_exact_execution_evidence() {
+        for pack_id in ["core.filesystem", "windows.system"] {
+            let result_for = |command: &str| {
+                let word = "\"vssad%EMPTY%min\"";
+                let start = command.find(word).expect("fixture command name");
+                EvaluationResult::denied_by_pack_pattern_with_span(
+                    pack_id,
+                    "vssadmin-delete-shadows",
+                    "semantic Cmd recovery deletion",
+                    None,
+                    crate::packs::Severity::High,
+                    &[],
+                    command,
+                    MatchSpan {
+                        start,
+                        end: start + word.len(),
+                    },
+                )
+            };
+            for command in [
+                "\"vssad%EMPTY%min\" delete shadows /all",
+                "call \"vssad%EMPTY%min\" del%EMPTY%ete shadows /all",
+            ] {
+                let result = result_for(command);
+                assert!(proven_cmd_recovery_match(
+                    command,
+                    result.pattern_info.as_ref().expect("finding"),
+                ));
+                let confidence = apply_effective_confidence(
+                    &confidence_config(),
+                    command,
+                    &result,
+                    crate::packs::DecisionMode::Deny,
+                );
+                assert_eq!(
+                    confidence.mode,
+                    crate::packs::DecisionMode::Deny,
+                    "{command}"
+                );
+                assert!(!confidence.downgraded, "{command}");
+            }
+            for command in [
+                "echo \"vssad%EMPTY%min\" delete shadows /all",
+                "echo \"vssad%EMPTY%min\" & \"vssad%EMPTY%min\" delete shadows /all",
+                "\"vssad%EMPTY%min\" list shadows",
+                "\"vssad%EMPTY%min\" delete shadows /?",
+            ] {
+                let result = result_for(command);
+                assert!(
+                    !proven_cmd_recovery_match(
+                        command,
+                        result.pattern_info.as_ref().expect("finding"),
+                    ),
+                    "a data or read-only span cannot borrow another command's proof: {command}",
+                );
+            }
+            let command = "\"vssad%EMPTY%min\" delete shadows /all";
+            let mut unrelated = result_for(command).pattern_info.expect("finding");
+            unrelated.pattern_name = Some("rm-rf-general".to_string());
+            assert!(!proven_cmd_recovery_match(command, &unrelated));
         }
     }
 

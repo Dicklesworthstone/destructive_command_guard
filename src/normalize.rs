@@ -2912,6 +2912,18 @@ fn cmd_line_continuation_end(bytes: &[u8], i: usize, len: usize) -> Option<usize
 }
 
 fn tokenize_cmd_raw(command: &str) -> NormalizeTokens {
+    tokenize_cmd_word_view(command, false)
+}
+
+/// An additive Cmd view in which percent references own their complete raw
+/// names before word/statement splitting. Undefined variables can remain
+/// literal at a command prompt, so callers must retain the ordinary raw view
+/// as well; this must not replace `tokenize_for_shell_dialect(Cmd)`.
+pub(crate) fn tokenize_cmd_expansion_view(command: &str) -> NormalizeTokens {
+    tokenize_cmd_word_view(command, true)
+}
+
+fn tokenize_cmd_word_view(command: &str, expansion_names: bool) -> NormalizeTokens {
     let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
@@ -2960,7 +2972,7 @@ fn tokenize_cmd_raw(command: &str) -> NormalizeTokens {
         }
 
         let start = i;
-        i = consume_cmd_word(bytes, i, len);
+        i = consume_cmd_word(bytes, i, len, expansion_names);
         if start == i {
             // Defensive progress guarantee for malformed or future syntax.
             i += 1;
@@ -3223,17 +3235,62 @@ fn powershell_pipeline_end(bytes: &[u8], i: usize, len: usize) -> Option<usize> 
     })
 }
 
-fn consume_cmd_word(bytes: &[u8], mut i: usize, len: usize) -> usize {
+/// End of one Cmd expansion beginning at `start`, before quote/caret or word
+/// splitting. Environment-variable names may contain spaces and punctuation;
+/// those bytes belong to the expansion, not to the surrounding command.
+/// A closing delimiter takes precedence over a batch parameter (`%1%` names
+/// the variable `1`, whereas `%1` is one batch argument). Doubled delimiters
+/// and unterminated ordinary names remain literal here.
+pub(crate) fn cmd_expansion_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let delimiter = *bytes.get(start)?;
+    if !matches!(delimiter, b'%' | b'!') || bytes.get(start + 1) == Some(&delimiter) {
+        return None;
+    }
+    let close = bytes
+        .get(start + 1..)?
+        .iter()
+        .position(|byte| *byte == delimiter || matches!(*byte, b'\r' | b'\n'));
+    if let Some(close) = close {
+        let close = start + 1 + close;
+        if bytes[close] == delimiter {
+            return Some(close + 1);
+        }
+    }
+    (delimiter == b'%'
+        && bytes
+            .get(start + 1)
+            .is_some_and(|next| next.is_ascii_digit() || *next == b'*'))
+    .then_some(start + 2)
+}
+
+fn consume_cmd_word(bytes: &[u8], mut i: usize, len: usize, expansion_names: bool) -> usize {
     let mut in_double_quotes = false;
 
     while i < len {
         let byte = bytes[i];
+        if expansion_names
+            && byte == b'%'
+            && let Some(end) = cmd_expansion_end(bytes, i)
+        {
+            i = end;
+            continue;
+        }
         if !in_double_quotes {
             if byte.is_ascii_whitespace() || cmd_separator_end(bytes, i, len).is_some() {
                 break;
             }
             match byte {
-                b'^' => i = consume_shell_escape(bytes, i, len),
+                b'^' => {
+                    // Percent expansion precedes caret removal. In
+                    // `vssad^%name with spaces%min` the caret does not expose
+                    // the variable name's spaces as argument boundaries.
+                    i = if expansion_names && bytes.get(i + 1) == Some(&b'%') {
+                        cmd_expansion_end(bytes, i + 1)
+                            .unwrap_or_else(|| consume_shell_escape(bytes, i, len))
+                    } else {
+                        consume_shell_escape(bytes, i, len)
+                    };
+                }
                 b'"' => {
                     in_double_quotes = true;
                     i += 1;
@@ -5533,6 +5590,41 @@ mod tests {
                 (NormalizeTokenKind::Word, "/q".to_string()),
                 (NormalizeTokenKind::Word, "C:\\src".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn cmd_expansion_view_owns_variable_names_without_replacing_raw_view() {
+        for executable in [
+            "vssad%NAME WITH SPACES%min",
+            "vssad^%NAME WITH SPACES%min",
+            "vssad%NAME&WITH|PUNCTUATION%min",
+            "vssad%NAME\\WITH\\SEPARATORS%min",
+        ] {
+            let command = format!("{executable} delete shadows /all");
+            let expanded = tokenize_cmd_expansion_view(&command);
+            assert_eq!(expanded.len(), 4, "{command}");
+            assert_eq!(expanded[0].text(&command), Some(executable));
+            assert!(
+                expanded
+                    .iter()
+                    .all(|token| token.kind == NormalizeTokenKind::Word)
+            );
+        }
+        let command = "echo %undefined & vssadmin delete shadows /all & tail%";
+        assert!(
+            tokenize_for_shell_dialect(command, ShellDialect::Cmd)
+                .iter()
+                .any(|token| {
+                    token.kind == NormalizeTokenKind::Separator && token.text(command) == Some("&")
+                }),
+            "undefined percent references must keep their raw interpretation"
+        );
+        assert!(
+            tokenize_cmd_expansion_view(command)
+                .iter()
+                .all(|token| { token.kind == NormalizeTokenKind::Word }),
+            "the additive expansion view owns punctuation in a defined variable name"
         );
     }
 

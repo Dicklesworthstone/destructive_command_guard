@@ -71,9 +71,14 @@ struct PowerShellCallOperatorAnalysis {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WindowsFilesystemWord {
-    decoded: String,
-    dynamic: bool,
+pub(super) struct WindowsFilesystemWord {
+    pub(super) decoded: String,
+    pub(super) dynamic: bool,
+    pub(super) may_split: bool,
+    // Cmd expands percent references before quote/caret processing. Retain
+    // their source-owned holes so later matching cannot mistake a quoted
+    // caret or an escaped exclamation mark for another runtime expansion.
+    cmd_fragments: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -346,7 +351,71 @@ fn decode_syntax_word(
         .map(|decoded| WindowsFilesystemWord {
             decoded: decoded.into_owned(),
             dynamic,
+            may_split: false,
+            cmd_fragments: None,
         })
+}
+
+/// Share the Windows symbolic-word matcher with native recovery commands while
+/// retaining Cmd expansion provenance from the raw word. Percent expansion
+/// precedes caret removal, and variable names themselves are opaque text.
+pub(super) fn decode_cmd_symbolic_word(
+    decoder: &mut ShellTokenDecoder,
+    raw: &str,
+) -> Option<WindowsFilesystemWord> {
+    let mut word = decode_syntax_word(decoder, raw, ShellDialect::Cmd)?;
+    let (fragments, may_split) = cmd_symbolic_fragments(raw);
+    word.dynamic |= fragments.len() > 1;
+    word.may_split = may_split;
+    word.cmd_fragments = Some(fragments);
+    Some(word)
+}
+
+fn cmd_symbolic_fragments(raw: &str) -> (Vec<String>, bool) {
+    let mut fragments = vec![String::new()];
+    let mut chars = raw.char_indices().peekable();
+    let mut double = false;
+    let mut may_split = false;
+    while let Some((index, ch)) = chars.next() {
+        if let Some(end) = crate::normalize::cmd_expansion_end(raw.as_bytes(), index) {
+            may_split |= !double;
+            fragments.push(String::new());
+            while chars.peek().is_some_and(|(at, _)| *at < end) {
+                chars.next();
+            }
+            continue;
+        }
+        match ch {
+            '"' => double = !double,
+            '^' if !double => {
+                let Some((escaped_at, escaped)) = chars.next() else {
+                    fragments.push(String::new());
+                    break;
+                };
+                if escaped == '%'
+                    && let Some(end) =
+                        crate::normalize::cmd_expansion_end(raw.as_bytes(), escaped_at)
+                {
+                    may_split = true;
+                    fragments.push(String::new());
+                    while chars.peek().is_some_and(|(at, _)| *at < end) {
+                        chars.next();
+                    }
+                } else if escaped == '\n' {
+                } else if escaped == '\r' && chars.peek().is_some_and(|(_, next)| *next == '\n') {
+                    chars.next();
+                } else if let Some(fragment) = fragments.last_mut() {
+                    fragment.push(escaped);
+                }
+            }
+            _ => {
+                if let Some(fragment) = fragments.last_mut() {
+                    fragment.push(ch);
+                }
+            }
+        }
+    }
+    (fragments, may_split)
 }
 
 fn dynamic_fragments(decoded: &str, dialect: ShellDialect) -> Vec<String> {
@@ -432,7 +501,7 @@ fn dynamic_fragments(decoded: &str, dialect: ShellDialect) -> Vec<String> {
     }
 }
 
-fn symbolic_word_may_equal(
+pub(super) fn symbolic_word_may_equal(
     word: &WindowsFilesystemWord,
     dialect: ShellDialect,
     candidate: &str,
@@ -440,9 +509,16 @@ fn symbolic_word_may_equal(
     if !word.dynamic {
         return word.decoded.eq_ignore_ascii_case(candidate);
     }
-    let decoded = word.decoded.to_ascii_lowercase();
     let candidate = candidate.to_ascii_lowercase();
-    let fragments = dynamic_fragments(&decoded, dialect);
+    let fragments = word.cmd_fragments.as_ref().map_or_else(
+        || dynamic_fragments(&word.decoded.to_ascii_lowercase(), dialect),
+        |fragments| {
+            fragments
+                .iter()
+                .map(|fragment| fragment.to_ascii_lowercase())
+                .collect()
+        },
+    );
     let Some(first) = fragments.first() else {
         return true;
     };
@@ -466,16 +542,56 @@ fn symbolic_word_may_equal(
     offset <= candidate.len().saturating_sub(last.len())
 }
 
-fn executable_word(word: WindowsFilesystemWord, dialect: ShellDialect) -> WindowsFilesystemWord {
+pub(super) fn executable_word(
+    word: WindowsFilesystemWord,
+    dialect: ShellDialect,
+) -> WindowsFilesystemWord {
     let decoded = if dialect == ShellDialect::Cmd {
         word.decoded.trim_start_matches('@')
     } else {
         word.decoded.as_str()
     };
-    let basename = decoded.rsplit(['/', '\\']).next().unwrap_or(decoded);
+    // A path separator inside an expansion is part of a variable's name, not
+    // evidence that argv0 has changed directories. Keep the symbolic spelling
+    // intact until a literal path separator establishes its basename.
+    let basename = if dialect == ShellDialect::Cmd && word.cmd_fragments.is_some() {
+        let bytes = decoded.as_bytes();
+        let mut start = 0usize;
+        let mut index = 0usize;
+        while index < bytes.len() {
+            if let Some(end) = crate::normalize::cmd_expansion_end(bytes, index) {
+                index = end;
+            } else {
+                if matches!(bytes[index], b'/' | b'\\') {
+                    start = index + 1;
+                }
+                index += 1;
+            }
+        }
+        &decoded[start..]
+    } else {
+        decoded.rsplit(['/', '\\']).next().unwrap_or(decoded)
+    };
+    let cmd_fragments = word.cmd_fragments.map(|mut fragments| {
+        if let Some(first) = fragments.first_mut() {
+            *first = first.trim_start_matches('@').to_string();
+        }
+        let last_separator = fragments
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, fragment)| fragment.rfind(['/', '\\']).map(|at| (index, at + 1)));
+        if let Some((index, start)) = last_separator {
+            fragments[index] = fragments[index][start..].to_string();
+            fragments.drain(..index);
+        }
+        fragments
+    });
     WindowsFilesystemWord {
         decoded: basename.to_string(),
         dynamic: word.dynamic,
+        may_split: word.may_split,
+        cmd_fragments,
     }
 }
 

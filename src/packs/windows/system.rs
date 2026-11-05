@@ -26,8 +26,235 @@
 //! All patterns are `(?i)` case-insensitive with stable rule ids
 //! (e.g. `windows.system:vssadmin-delete-shadows`).
 
+use crate::normalize::{
+    NormalizeToken, NormalizeTokenKind, ShellDialect, ShellTokenDecoder, cmd_expansion_end,
+    tokenize_cmd_expansion_view, tokenize_for_shell_dialect,
+};
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
+use std::ops::Range;
+
+pub(crate) const CMD_VSSADMIN_DELETE_RULE: &str = "vssadmin-delete-shadows";
+const MAX_CMD_RECOVERY_BYTES: usize = 64 * 1024;
+const MAX_CMD_RECOVERY_STATEMENTS: usize = 128;
+const MAX_CMD_RECOVERY_WORDS: usize = 512;
+
+/// A parser bound stopped the recovery-command proof. This is an incomplete
+/// analysis, not a finding about vssadmin and never proof of safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CmdRecoveryParseIncomplete {
+    Bytes,
+    Statements,
+    Words,
+}
+
+/// Source spans of Cmd invocations whose executable and first two verb roles
+/// can resolve to `vssadmin[.exe] delete shadows`.
+///
+/// Use the same source-owned words and symbolic expansion proof as the Windows
+/// filesystem parser. No expanded command is fabricated or passed to a regex;
+/// opaque argument strings cannot become additional commands or verbs. Unknown
+/// callers retain this possible Cmd execution as an additive finding.
+pub(crate) fn cmd_vssadmin_delete_spans(
+    command: &str,
+    dialect: ShellDialect,
+) -> Result<Vec<Range<usize>>, CmdRecoveryParseIncomplete> {
+    if !matches!(dialect, ShellDialect::Cmd | ShellDialect::Unknown) {
+        return Ok(Vec::new());
+    }
+    if !command.contains(['%', '!', '^'])
+        && !command
+            .as_bytes()
+            .windows(b"vssadmin".len())
+            .any(|word| word.eq_ignore_ascii_case(b"vssadmin"))
+    {
+        return Ok(Vec::new());
+    }
+    if command.len() > MAX_CMD_RECOVERY_BYTES {
+        return Err(CmdRecoveryParseIncomplete::Bytes);
+    }
+    let mut views = vec![tokenize_for_shell_dialect(command, ShellDialect::Cmd)];
+    if command.contains('%') {
+        views.push(tokenize_cmd_expansion_view(command));
+    }
+    let mut findings = Vec::new();
+    for tokens in views {
+        let mut start = 0usize;
+        let mut statements = 0usize;
+        for end in 0..=tokens.len() {
+            if end < tokens.len() && tokens[end].kind != NormalizeTokenKind::Separator {
+                continue;
+            }
+            let statement = &tokens[start..end];
+            start = end + 1;
+            if statement.is_empty() {
+                continue;
+            }
+            statements += 1;
+            if statements > MAX_CMD_RECOVERY_STATEMENTS {
+                return Err(CmdRecoveryParseIncomplete::Statements);
+            }
+            if statement.len() > MAX_CMD_RECOVERY_WORDS {
+                return Err(CmdRecoveryParseIncomplete::Words);
+            }
+            if let Some(span) = cmd_vssadmin_statement_span(command, statement) {
+                findings.push(span);
+            }
+        }
+    }
+    findings.sort_unstable_by_key(|span| (span.start, span.end));
+    findings.dedup();
+    Ok(findings)
+}
+
+/// Candidate selection must cover hidden names under each pack independently.
+/// An unfinished proof opens the gate so the evaluator can report it incomplete.
+pub(crate) fn cmd_vssadmin_scan_required(command: &str, dialect: ShellDialect) -> bool {
+    match cmd_vssadmin_delete_spans(command, dialect) {
+        Ok(spans) => !spans.is_empty(),
+        Err(_) => true,
+    }
+}
+
+fn cmd_vssadmin_statement_span(command: &str, tokens: &[NormalizeToken]) -> Option<Range<usize>> {
+    use super::filesystem::{decode_cmd_symbolic_word, executable_word, symbolic_word_may_equal};
+
+    let words = cmd_recovery_argument_ranges(command, tokens);
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Cmd);
+    let mut index = 0usize;
+    let executable = loop {
+        let range = words.get(index)?;
+        let raw = command.get(range.clone())?;
+        let word = decode_cmd_symbolic_word(&mut decoder, raw)?;
+        // A literal CALL owns its next executable. A dynamic word merely
+        // resembling CALL or an unrelated path-qualified program is not
+        // permission to promote argument data to another command.
+        if !word.dynamic
+            && !raw.contains('"')
+            && word
+                .decoded
+                .trim_start_matches('@')
+                .eq_ignore_ascii_case("call")
+        {
+            index += 1;
+            continue;
+        }
+        break executable_word(word, ShellDialect::Cmd);
+    };
+    if !["vssadmin", "vssadmin.exe"]
+        .iter()
+        .any(|name| symbolic_word_may_equal(&executable, ShellDialect::Cmd, name))
+    {
+        return None;
+    }
+    let executable_span = words.get(index)?.clone();
+    // Track possible native argv bindings, not merely two source tokens.
+    // An unquoted expansion can disappear or supply both verbs; a quoted
+    // "delete shadows" value is still one argument. State 2 has bound the
+    // destructive operation and is unaffected by its following options.
+    let mut bindings = [true, false, false];
+    for range in words.iter().skip(index + 1) {
+        let word = decode_cmd_symbolic_word(&mut decoder, command.get(range.clone())?)?;
+        if !word.dynamic && word.decoded == "/?" {
+            return None;
+        }
+        let mut next = [false, false, bindings[2]];
+        for (state, expected) in ["delete", "shadows"].iter().enumerate() {
+            if !bindings[state] {
+                continue;
+            }
+            if word.may_split && symbolic_word_may_equal(&word, ShellDialect::Cmd, "") {
+                next[state] = true;
+            }
+            if symbolic_word_may_equal(&word, ShellDialect::Cmd, expected) {
+                next[state + 1] = true;
+            }
+            if state == 0
+                && word.may_split
+                && symbolic_word_may_equal(&word, ShellDialect::Cmd, "delete shadows")
+            {
+                next[2] = true;
+            }
+        }
+        bindings = next;
+    }
+    bindings[2].then_some(executable_span)
+}
+
+/// Redirections have shell roles, not vssadmin argument roles. The native
+/// tokenizer already owns quotes, carets, expansions and statement boundaries;
+/// this pass only separates attached redirect operators from those raw words.
+/// Targets are never inspected for verbs, even when they contain command text.
+fn cmd_recovery_argument_ranges(command: &str, tokens: &[NormalizeToken]) -> Vec<Range<usize>> {
+    let mut arguments = Vec::new();
+    let mut target_next = false;
+    for token in tokens {
+        let Some(raw) = token.text(command) else {
+            continue;
+        };
+        let mut start = 0usize;
+        let mut is_target = std::mem::take(&mut target_next);
+        while let Some((word_end, operator)) = cmd_recovery_redirect(raw, start) {
+            if !is_target && word_end > start {
+                arguments.push(token.byte_range.start + start..token.byte_range.start + word_end);
+            }
+            let bytes = raw.as_bytes();
+            let mut target = operator + 1;
+            if bytes.get(target) == Some(&bytes[operator]) {
+                target += 1;
+            }
+            if bytes.get(target) == Some(&b'&') {
+                target += 1;
+            }
+            start = target;
+            is_target = true;
+        }
+        if is_target {
+            target_next = start == raw.len();
+        } else if start < raw.len() {
+            arguments.push(token.byte_range.start + start..token.byte_range.end);
+        }
+    }
+    arguments
+}
+
+fn cmd_recovery_redirect(raw: &str, start: usize) -> Option<(usize, usize)> {
+    let bytes = raw.as_bytes();
+    let mut index = start;
+    let mut double = false;
+    let mut descriptor = None;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let Some(end) = cmd_expansion_end(bytes, index)
+        {
+            index = end;
+            descriptor = None;
+            continue;
+        }
+        match bytes[index] {
+            b'"' => {
+                double = !double;
+                descriptor = None;
+            }
+            b'^' if !double => {
+                if bytes.get(index + 1) == Some(&b'%')
+                    && let Some(end) = cmd_expansion_end(bytes, index + 1)
+                {
+                    index = end;
+                } else {
+                    index = index.saturating_add(2).min(bytes.len());
+                }
+                descriptor = None;
+                continue;
+            }
+            b'<' | b'>' if !double => return Some((descriptor.unwrap_or(index), index)),
+            byte if !double && byte.is_ascii_digit() => descriptor = Some(index),
+            _ => descriptor = None,
+        }
+        index += 1;
+    }
+    None
+}
 
 const SHADOW_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
@@ -389,6 +616,126 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmd_recovery_proof_tracks_expansions_in_executable_and_verb_roles() {
+        for command in [
+            "vssadmin delete shadows /all",
+            "vssad%PATH:~0,0%min delete shadows /all",
+            "vssad^%PATH:~0,0%min delete shadows /all",
+            "vssad%PATH:~0, 0%min delete shadows /all",
+            "vssad%NAME WITH SPACES%min delete shadows /all",
+            "vssad%NÁME WITH SPACES%min delete shadows /all",
+            "vssad%NAME&WITH|PUNCTUATION%min delete shadows /all",
+            "vssad%NAME\\WITH\\SEPARATORS%min delete shadows /all",
+            "vssad%1%min delete shadows /all",
+            "vssad!EMPTY!min delete shadows /all",
+            "@vssad%EMPTY%min de%EMPTY%lete sha%EMPTY%dows /all",
+            "vssad%EMPTY%min delete%SPACE%shadows /all",
+            "vssad%EMPTY%min %EMPTY% delete shadows /all",
+            "vssad%EMPTY%min delete %EMPTY% shadows /all",
+            "vssad%EMPTY%min %OPERATION% /all",
+            r#""C:\Windows\System32\vssad%EMPTY%min.exe" DELETE SHADOWS /ALL"#,
+            "call vssad%EMPTY%min delete shadows /all",
+            "2>nul call vssad%EMPTY%min delete 2>nul shadows /all",
+            "vssad%EMPTY%min>nul delete shadows /all",
+            "vssad%EMPTY%min2>nul delete shadows /all",
+        ] {
+            for dialect in [ShellDialect::Cmd, ShellDialect::Unknown] {
+                let spans = cmd_vssadmin_delete_spans(command, dialect).expect("bounded source");
+                assert_eq!(spans.len(), 1, "{dialect:?}: {command}");
+                assert!(
+                    command
+                        .get(spans[0].clone())
+                        .is_some_and(|word| word.contains("vssad")),
+                    "finding retains argv0 source coordinates: {command}"
+                );
+                assert!(cmd_vssadmin_scan_required(command, dialect));
+            }
+        }
+    }
+
+    #[test]
+    fn cmd_recovery_proof_preserves_data_and_read_only_roles() {
+        for command in [
+            "vssad%EMPTY%min list shadows",
+            "vssad%EMPTY%min /?",
+            "vssad%EMPTY%min delete shadows /?",
+            r#"echo "vssad%EMPTY%min delete shadows /all""#,
+            r#"git commit -m "vssad%EMPTY%min delete shadows /all""#,
+            r#"vssad%EMPTY%min "delete shadows" /all"#,
+            r#"vssad%EMPTY%min "delete%SPACE%shadows" /all"#,
+            "vssad%EMPTY%min list \"delete shadows\"",
+            "notvssad%EMPTY%min delete shadows /all",
+            r"C:\tools\call vssad%EMPTY%min delete shadows /all",
+            r#""vssad%EMPTY%^min" delete shadows /all"#,
+            "vssad^!LITERAL^!%EMPTY%min delete shadows /all",
+            r#"echo okay > "vssad%EMPTY%min delete shadows""#,
+            r#"vssad%EMPTY%min list shadows > "delete shadows""#,
+        ] {
+            for dialect in [ShellDialect::Cmd, ShellDialect::Unknown] {
+                assert!(
+                    cmd_vssadmin_delete_spans(command, dialect)
+                        .expect("bounded source")
+                        .is_empty(),
+                    "{dialect:?}: {command}"
+                );
+                assert!(!cmd_vssadmin_scan_required(command, dialect));
+            }
+        }
+        for dialect in [ShellDialect::Posix, ShellDialect::PowerShell] {
+            assert!(
+                cmd_vssadmin_delete_spans("vssad%EMPTY%min delete shadows /all", dialect)
+                    .expect("other dialect")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_recovery_proof_collects_each_executed_statement() {
+        let command = "vssad%EMPTY%min list shadows & vssad%EMPTY%min delete shadows /all & \
+                       echo \"vssad%EMPTY%min delete shadows\" & vssad!EMPTY!min delete shadows /all";
+        let spans = cmd_vssadmin_delete_spans(command, ShellDialect::Cmd).expect("bounded source");
+        assert_eq!(spans.len(), 2);
+        assert_eq!(&command[spans[0].clone()], "vssad%EMPTY%min");
+        assert_eq!(&command[spans[1].clone()], "vssad!EMPTY!min");
+        assert!(spans[0].end < spans[1].start);
+
+        // An undefined interactive percent reference can remain literal. Its
+        // apparent name must not mask another command from the original view.
+        let command = "echo %undefined & vssad%EMPTY%min delete shadows /all & tail%";
+        let spans = cmd_vssadmin_delete_spans(command, ShellDialect::Cmd).expect("bounded source");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&command[spans[0].clone()], "vssad%EMPTY%min");
+    }
+
+    #[test]
+    fn cmd_recovery_bounds_cannot_certify_an_unread_tail() {
+        let statements = format!(
+            "{}vssad%EMPTY%min delete shadows /all",
+            "echo okay & ".repeat(MAX_CMD_RECOVERY_STATEMENTS)
+        );
+        let words = format!(
+            "vssad%EMPTY%min list shadows{}",
+            " extra".repeat(MAX_CMD_RECOVERY_WORDS)
+        );
+        let bytes = format!(
+            "vssad%EMPTY%min list shadows {}",
+            "x".repeat(MAX_CMD_RECOVERY_BYTES)
+        );
+        for (command, expected) in [
+            (statements, CmdRecoveryParseIncomplete::Statements),
+            (words, CmdRecoveryParseIncomplete::Words),
+            (bytes, CmdRecoveryParseIncomplete::Bytes),
+        ] {
+            assert_eq!(
+                cmd_vssadmin_delete_spans(&command, ShellDialect::Cmd),
+                Err(expected)
+            );
+            assert!(cmd_vssadmin_scan_required(&command, ShellDialect::Cmd));
+        }
+    }
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
 

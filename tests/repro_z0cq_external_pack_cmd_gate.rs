@@ -15,6 +15,7 @@
 //! Every verdict must match the verdict with no external pack. The commands
 //! are only classified; none of them runs.
 
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -269,6 +270,323 @@ fn cmd_hook_denies_split_commands_with_an_external_pack_loaded() {
         assert!(
             !cmd_hook_denies("echo \"x & git reset --hard & y\"", custom_paths),
             "cmd hook denied double-quoted data, custom_paths={custom_paths:?}"
+        );
+    }
+}
+
+const CORE_SHADOW_DELETE: &str = "core.filesystem:vssadmin-delete-shadows";
+const WINDOWS_SHADOW_DELETE: &str = "windows.system:vssadmin-delete-shadows";
+
+/// Classify recovery commands through both entrypoints with explicit recovery
+/// policy isolation. Destructive payloads below are only hook/CLI input.
+struct RecoveryFixture {
+    dir: tempfile::TempDir,
+    packs: &'static str,
+    custom_paths: String,
+}
+
+impl RecoveryFixture {
+    fn new(
+        packs: &'static str,
+        external_pack: bool,
+        rule_grants: &[&str],
+        exact_grant: Option<&str>,
+    ) -> Self {
+        let dir = tempfile::tempdir().expect("isolated recovery fixture");
+        let config_dir = dir.path().join("home/.config/dcg");
+        std::fs::create_dir_all(&config_dir).expect("fixture configuration directory");
+        // Explicit Cmd payloads enable Windows defaults independently of
+        // DCG_PACKS. Exclude that companion for a core-only policy fixture.
+        let disabled = if packs == "core.filesystem" {
+            "[\"windows.system\"]"
+        } else {
+            "[]"
+        };
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                "[packs]\ndisabled = {disabled}\n[history]\nenabled = false\n\
+                 [heredoc]\ntimeout_ms = 5000\n"
+            ),
+        )
+        .expect("fixture configuration");
+        let mut allowlist = String::new();
+        for rule in rule_grants {
+            writeln!(
+                allowlist,
+                "[[allow]]\nrule = \"{rule}\"\nreason = \"one reviewed recovery rule\""
+            )
+            .expect("write rule grant to String");
+        }
+        // Core cannot be disabled by configuration. To inspect the Windows
+        // rule alone, grant only its companion core rule. Both-pack fixtures
+        // retain exactly the caller's grants for the independence assertions.
+        if packs == "windows.system" && !rule_grants.contains(&CORE_SHADOW_DELETE) {
+            writeln!(
+                allowlist,
+                "[[allow]]\nrule = \"{CORE_SHADOW_DELETE}\"\n\
+                 reason = \"isolate Windows recovery rule from mandatory core\""
+            )
+            .expect("write companion rule grant to String");
+        }
+        if let Some(command) = exact_grant {
+            let quoted = serde_json::to_string(command).expect("quote original request");
+            writeln!(
+                allowlist,
+                "[[allow]]\nexact_command = {quoted}\nreason = \"one reviewed request\""
+            )
+            .expect("write exact-command grant to String");
+        }
+        std::fs::write(config_dir.join("allowlist.toml"), allowlist).expect("fixture allowlist");
+        let custom_paths = if external_pack {
+            write_pack(dir.path())
+        } else {
+            String::new()
+        };
+        Self {
+            dir,
+            packs,
+            custom_paths,
+        }
+    }
+
+    fn process(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dcg"));
+        isolated(
+            &mut command,
+            &self.dir.path().join("home"),
+            &self.custom_paths,
+        );
+        command
+            .env("DCG_CONFIG", self.dir.path().join("config.toml"))
+            .env("DCG_PACKS", self.packs)
+            .env("TMPDIR", self.dir.path())
+            .env("TEMP", self.dir.path())
+            .env("TMP", self.dir.path())
+            .env(
+                "DCG_PENDING_EXCEPTIONS_PATH",
+                self.dir.path().join("pending.jsonl"),
+            )
+            .env(
+                "DCG_ALLOW_ONCE_PATH",
+                self.dir.path().join("allow_once.jsonl"),
+            )
+            .current_dir(self.dir.path());
+        command
+    }
+
+    fn check(&self, command: &str, dialect: &str, expected_rule: Option<&str>) {
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": if dialect == "cmd" { "cmd.exe" } else { "Shell" },
+            "tool_use_id": "toolu_recovery_regression",
+            "tool_input": { "command": command },
+            "cwd": self.dir.path(),
+        });
+        let mut child = self
+            .process()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("recovery hook");
+        child
+            .stdin
+            .take()
+            .expect("hook stdin")
+            .write_all(payload.to_string().as_bytes())
+            .expect("hook payload");
+        let output = child.wait_with_output().expect("hook result");
+        assert!(
+            output.status.success(),
+            "{dialect} {} {command:?}: {}",
+            self.packs,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if let Some(rule) = expected_rule {
+            let json: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("hook denial JSON");
+            let hook = &json["hookSpecificOutput"];
+            assert_eq!(hook["permissionDecision"], "deny", "{command:?}: {json}");
+            assert_eq!(hook["ruleId"], rule, "{dialect} {command:?}: {json}");
+        } else {
+            assert!(
+                output.stdout.is_empty(),
+                "{dialect} {} {command:?}: {}",
+                self.packs,
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+
+        let output = self
+            .process()
+            .args([
+                "test",
+                "--with-packs",
+                self.packs,
+                "--dialect",
+                dialect,
+                "--format",
+                "json",
+                command,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .expect("recovery CLI");
+        let json: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("CLI decision JSON");
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(expected_rule.is_some())),
+            "{dialect} {} {command:?}: {json}",
+            self.packs
+        );
+        assert_eq!(
+            json["decision"],
+            if expected_rule.is_some() {
+                "deny"
+            } else {
+                "allow"
+            },
+            "{dialect} {} {command:?}: {json}",
+            self.packs
+        );
+        if let Some(rule) = expected_rule {
+            assert_eq!(json["rule_id"], rule, "{dialect} {command:?}: {json}");
+        }
+    }
+}
+
+#[test]
+fn cmd_recovery_dynamic_names_reach_each_pack_and_keyword_gate() {
+    for external_pack in [false, true] {
+        for (pack, rule) in [
+            ("core.filesystem", CORE_SHADOW_DELETE),
+            ("windows.system", WINDOWS_SHADOW_DELETE),
+        ] {
+            let fixture = RecoveryFixture::new(pack, external_pack, &[], None);
+            for dialect in ["cmd", "unknown"] {
+                for command in [
+                    "vssadmin delete shadows /all",
+                    "vssad%PATH:~0,0%min delete shadows /all",
+                    "vssad^%PATH:~0,0%min delete shadows /all",
+                    "vssad%NAME WITH SPACES%min delete shadows /all",
+                    "vssad!EMPTY!min delete shadows /all",
+                    r#""C:\Windows\System32\vssad%EMPTY%min.exe" delete shadows /all"#,
+                    "vssad%EMPTY%min de%EMPTY%lete sha%EMPTY%dows /all",
+                    "echo harmless & vssad%EMPTY%min delete shadows /all",
+                    "vssad%EMPTY%min delete%SPACE%shadows /all",
+                    "vssad%EMPTY%min %EMPTY% delete shadows /all",
+                    "vssad%EMPTY%min delete %EMPTY% shadows /all",
+                    "vssad%EMPTY%min %OPERATION% /all",
+                ] {
+                    fixture.check(command, dialect, Some(rule));
+                }
+                // These carriers already have a stricter unresolved-launcher
+                // guard. A possible recovery operation must not waive it.
+                for command in [
+                    "@vssad%EMPTY%min de%EMPTY%lete sha%EMPTY%dows /all",
+                    "call vssad%EMPTY%min delete shadows /all",
+                ] {
+                    fixture.check(command, dialect, Some("heredoc.shell:launcher-unverified"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cmd_recovery_read_only_operations_and_argument_data_stay_allowed() {
+    for external_pack in [false, true] {
+        for pack in ["core.filesystem", "windows.system"] {
+            let fixture = RecoveryFixture::new(pack, external_pack, &[], None);
+            for dialect in ["cmd", "unknown"] {
+                for command in [
+                    "vssad%PATH:~0,0%min list shadows",
+                    "vssad%EMPTY%min /?",
+                    "vssad%EMPTY%min delete shares /all",
+                    "vssadmin list shadows & 'vssad%EMPTY%min' delete shadows /all",
+                    r#"echo "vssad%EMPTY%min delete shadows /all""#,
+                    r#"git commit -m "vssad%EMPTY%min delete shadows /all""#,
+                    "notvssad%EMPTY%min delete shadows /all",
+                    r#"vssad%EMPTY%min "delete shadows" /all"#,
+                    r#"vssad%EMPTY%min "delete%SPACE%shadows" /all"#,
+                ] {
+                    fixture.check(command, dialect, None);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cmd_recovery_rule_grants_keep_pack_scope_and_independent_findings() {
+    let command = "vssad%PATH:~0,0%min delete shadows /all";
+    for external_pack in [false, true] {
+        for dialect in ["cmd", "unknown"] {
+            for (pack, grant) in [
+                ("core.filesystem", CORE_SHADOW_DELETE),
+                ("windows.system", WINDOWS_SHADOW_DELETE),
+            ] {
+                RecoveryFixture::new(pack, external_pack, &[grant], None)
+                    .check(command, dialect, None);
+            }
+            for (grant, remaining) in [
+                (CORE_SHADOW_DELETE, WINDOWS_SHADOW_DELETE),
+                (WINDOWS_SHADOW_DELETE, CORE_SHADOW_DELETE),
+            ] {
+                RecoveryFixture::new(
+                    "core.filesystem,windows.system",
+                    external_pack,
+                    &[grant],
+                    None,
+                )
+                .check(command, dialect, Some(remaining));
+            }
+        }
+    }
+}
+
+#[test]
+fn cmd_recovery_launcher_grants_keep_independent_recovery_layers() {
+    const LAUNCHER: &str = "heredoc.shell:launcher-unverified";
+    let cases: &[(&[&str], &str)] = &[
+        (&[CORE_SHADOW_DELETE, WINDOWS_SHADOW_DELETE], LAUNCHER),
+        (&[LAUNCHER], CORE_SHADOW_DELETE),
+        (&[LAUNCHER, CORE_SHADOW_DELETE], WINDOWS_SHADOW_DELETE),
+    ];
+    for command in [
+        "@vssad%EMPTY%min de%EMPTY%lete sha%EMPTY%dows /all",
+        "call vssad%EMPTY%min delete shadows /all",
+    ] {
+        for dialect in ["cmd", "unknown"] {
+            for &(grants, expected) in cases {
+                RecoveryFixture::new("core.filesystem,windows.system", false, grants, None).check(
+                    command,
+                    dialect,
+                    Some(expected),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cmd_recovery_exact_grants_remain_bound_to_original_request() {
+    let original = "vssad%PATH:~0,0%min delete shadows /all";
+    for dialect in ["cmd", "unknown"] {
+        let fixture =
+            RecoveryFixture::new("core.filesystem,windows.system", false, &[], Some(original));
+        fixture.check(original, dialect, None);
+        fixture.check(
+            "vssadmin delete shadows /all",
+            dialect,
+            Some(CORE_SHADOW_DELETE),
+        );
+        fixture.check(
+            "vssad%PATH:~0,0%min delete shadows /for=C: /oldest",
+            dialect,
+            Some(CORE_SHADOW_DELETE),
         );
     }
 }
