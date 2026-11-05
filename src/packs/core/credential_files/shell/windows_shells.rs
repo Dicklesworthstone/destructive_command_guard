@@ -47,7 +47,7 @@ use super::{
 use crate::normalize::ShellDialect;
 
 /// One lexed word plus the raw facts parameter binding needs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Arg {
     word: Word,
     /// The first raw character, when it was not quoted or escaped. A quoted
@@ -57,6 +57,16 @@ struct Arg {
     /// PowerShell only: joined to the previous word by `,`, i.e. another
     /// element of the same array argument (`Set-Content a,b`).
     comma_before: bool,
+    /// Quoted command names execute only after the call/dot operator.
+    invoked: bool,
+    /// A leading quote forms a standalone PowerShell string token. Quotes
+    /// inside a bare word instead concatenate into that generic token.
+    starts_quoted: bool,
+    /// One raw remainder following PowerShell's stop-parsing marker.
+    verbatim: bool,
+    /// Parameter names retain their raw spelling: unlike command names,
+    /// PowerShell does not remove backticks inside a parameter name.
+    parameter_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -65,21 +75,321 @@ enum Lexed {
     Write { mode: WriteMode, target: Word },
 }
 
+const MAX_LEX_DEPTH: usize = 32;
+const MAX_LEX_WORK_BYTES: usize = 1024 * 1024;
+
+/// Exhausting a parser bound is incomplete analysis, never proof of safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowsShellParseIncomplete {
+    Nesting,
+    Work,
+}
+
+struct LexBudget {
+    depth: usize,
+    remaining_work: usize,
+}
+
+impl LexBudget {
+    fn charge(&mut self, bytes: usize) -> Result<(), WindowsShellParseIncomplete> {
+        self.remaining_work = self
+            .remaining_work
+            .checked_sub(bytes)
+            .ok_or(WindowsShellParseIncomplete::Work)?;
+        Ok(())
+    }
+}
+
+/// A truncating Tee-Object destination, after PowerShell parameter binding.
+/// Keep both the actual decoded path and the volume-independent policy view;
+/// only the former can support a local filesystem proof.
+#[derive(Debug)]
+pub(crate) struct PowerShellTruncationTarget {
+    pub(crate) path: String,
+    pub(crate) policy_path: String,
+    pub(crate) literal: bool,
+    pub(crate) home_suffix: Option<String>,
+    pub(crate) span: std::ops::Range<usize>,
+}
+
+/// Collect writes from executable commands, including nested expressions.
+/// This uses exactly the lexer and binder used by credential protection.
+pub(crate) fn powershell_tee_truncation_targets(
+    source: &str,
+) -> Result<Vec<PowerShellTruncationTarget>, WindowsShellParseIncomplete> {
+    Ok(lex(source, ShellDialect::PowerShell)?
+        .into_iter()
+        .filter_map(|command| {
+            let args: Vec<_> = command
+                .into_iter()
+                .filter_map(|item| match item {
+                    Lexed::Arg(arg) => Some(arg),
+                    Lexed::Write { .. } => None,
+                })
+                .collect();
+            let (name, rest) = args.split_first()?;
+            if !tee_object_name(&name.word)
+                || (!name.invoked
+                    && source[name.word.range.clone()]
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| is_single_quote(ch) || is_double_quote(ch)))
+            {
+                return None;
+            }
+            let command = cmdlet("tee-object")?;
+            let mut bound = bind(&command, rest);
+            let mut targets = if name.word.as_string() == "tee" {
+                native_tee_operands(rest)
+                    .filter(|(mode, _)| *mode == WriteMode::Replace)
+                    .map_or_else(Vec::new, |(_, targets)| targets)
+            } else {
+                Vec::new()
+            };
+            // Splatting may supply a destination the visible argv does not
+            // name. Do not guess its keys or borrow an append exemption.
+            if bound.targets.is_empty() {
+                bound.targets.append(&mut bound.splats);
+            }
+            if !bound.binding_error && !bound.variable && !bound.append {
+                for target in bound.targets {
+                    if !targets.iter().any(|existing| {
+                        existing.text == target.text
+                            && existing.literal == target.literal
+                            && existing.range == target.range
+                    }) {
+                        targets.push(target);
+                    }
+                }
+            }
+            Some(
+                targets
+                    .into_iter()
+                    .map(|target| (target, name.word.range.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .map(|(target, span)| {
+            let path = target.as_string();
+            let home_suffix = if target.text.first() == Some(&'~')
+                && target.literal.first() == Some(&false)
+                && (target.text.len() == 1 || target.text.get(1) == Some(&'/'))
+                && target.literal[1..].iter().all(|literal| *literal)
+            {
+                Some(path[1..].trim_start_matches('/').to_string())
+            } else {
+                None
+            };
+            let literal = target.is_all_literal();
+            PowerShellTruncationTarget {
+                path,
+                policy_path: path_word(target).as_string(),
+                literal,
+                home_suffix,
+                span,
+            }
+        })
+        .collect())
+}
+
+fn tee_object_name(word: &Word) -> bool {
+    word.is_all_literal()
+        && matches!(
+            word.as_string().to_ascii_lowercase().as_str(),
+            "tee" | "tee-object" | "microsoft.powershell.utility/tee-object"
+        )
+}
+
+/// Select the filesystem pack for every decoded Tee invocation. Binding is
+/// deliberately left to the classifiers: -Append still writes credentials
+/// and Git internals, even when no general truncation target remains.
+pub(crate) fn powershell_tee_scan_required(source: &str) -> bool {
+    let Ok(commands) = lex(source, ShellDialect::PowerShell) else {
+        // Keep the pack selected so its mandatory fallible whole-command
+        // pass reports incomplete analysis instead of allowing a quick exit.
+        return true;
+    };
+    commands.into_iter().any(|command| {
+        let Some(name) = command.iter().find_map(|item| match item {
+            Lexed::Arg(arg) => Some(arg),
+            Lexed::Write { .. } => None,
+        }) else {
+            return false;
+        };
+        tee_object_name(&name.word)
+            && (name.invoked
+                || !source
+                    .get(name.word.range.clone())
+                    .and_then(|word| word.chars().next())
+                    .is_some_and(|ch| is_single_quote(ch) || is_double_quote(ch)))
+    })
+}
+
+/// Bare `tee` can be the Windows alias or the Unix executable. Only a valid
+/// native option vector contributes native targets: PowerShell's -Variable
+/// and -FilePath are errors to native tee, not file operands. Both policy
+/// passes use this viability check, so their alias readings cannot drift.
+fn native_tee_operands(args: &[Arg]) -> Option<(WriteMode, Vec<Word>)> {
+    let mut mode = WriteMode::Replace;
+    let mut targets = Vec::new();
+    let mut options = true;
+    let mut args = args.iter().peekable();
+    while let Some(arg) = args.next() {
+        let value = arg.word.as_string();
+        if value == "--%" && args.peek().is_some_and(|next| next.verbatim) {
+            // PowerShell consumes this marker before invoking a native
+            // executable; it is not an invalid GNU tee option.
+            continue;
+        }
+        if arg.verbatim {
+            if value.is_empty() {
+                continue;
+            }
+            if value
+                .chars()
+                .any(|ch| ch.is_whitespace() || is_single_quote(ch) || is_double_quote(ch))
+            {
+                // Native argv splitting varies by platform and runtime
+                // settings. An opaque remainder can still contain file
+                // operands; uncertainty must not erase a possible write.
+                targets.push(unresolved(arg.word.range.clone()));
+                continue;
+            }
+        }
+        if options && value == "--" {
+            options = false;
+        } else if options && value.starts_with("--") {
+            let (name, argument) = value[2..]
+                .split_once('=')
+                .map_or((&value[2..], None), |(name, value)| (name, Some(value)));
+            let mut candidates = [
+                "append",
+                "ignore-interrupts",
+                "output-error",
+                "help",
+                "version",
+            ]
+            .into_iter()
+            .filter(|candidate| candidate.starts_with(name));
+            let selected = candidates.next()?;
+            if candidates.next().is_some() || (argument.is_some() && selected != "output-error") {
+                return None;
+            }
+            match selected {
+                "append" => mode = WriteMode::Append,
+                "help" | "version" => return Some((WriteMode::Append, Vec::new())),
+                "output-error"
+                    if argument.is_some_and(|value| {
+                        let modes = ["warn", "warn-nopipe", "exit", "exit-nopipe"];
+                        !modes.contains(&value)
+                            && modes.iter().filter(|mode| mode.starts_with(value)).count() != 1
+                    }) =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        } else if options && value.starts_with('-') && value != "-" {
+            if !value[1..]
+                .chars()
+                .all(|flag| matches!(flag, 'a' | 'i' | 'p'))
+            {
+                return None;
+            }
+            if value[1..].contains('a') {
+                mode = WriteMode::Append;
+            }
+        } else if value != "-" {
+            targets.push(arg.word.clone());
+        }
+    }
+    Some((mode, targets))
+}
+
 pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<CredentialFileWrite> {
+    // These legacy best-effort helpers do not own the evaluator verdict.
+    // The mandatory fallible whole-command pass surfaces parser exhaustion.
     lex(segment, dialect)
+        .ok()?
         .into_iter()
         .find_map(|command| classify_command(command, dialect))
+}
+
+pub(super) fn classify_all(segment: &str, dialect: ShellDialect) -> Vec<CredentialFileWrite> {
+    // Incompleteness is reported by powershell_tee_truncation_targets, which
+    // the evaluator runs even when this best-effort collection is empty.
+    lex(segment, dialect)
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|command| classify_command_writes(command, dialect))
+        .collect()
+}
+
+/// A native tee can open several destinations in one invocation. Preserve
+/// every rule so granting a Git write cannot also grant a credential write.
+fn classify_command_writes(command: Vec<Lexed>, dialect: ShellDialect) -> Vec<CredentialFileWrite> {
+    let args: Vec<_> = command
+        .iter()
+        .filter_map(|item| match item {
+            Lexed::Arg(arg) => Some(arg.clone()),
+            Lexed::Write { .. } => None,
+        })
+        .collect();
+    let Some((name, rest)) = args.split_first() else {
+        return classify_command(command, dialect).into_iter().collect();
+    };
+    if dialect != ShellDialect::PowerShell || !tee_object_name(&name.word) {
+        return classify_command(command, dialect).into_iter().collect();
+    }
+    let mut hits: Vec<_> = command
+        .into_iter()
+        .filter_map(|item| match item {
+            Lexed::Write { mode, target } => classify_simple_command(&[Token::Write {
+                mode,
+                target: path_word(target),
+            }]),
+            Lexed::Arg(_) => None,
+        })
+        .collect();
+    if name.starts_quoted && !name.invoked {
+        return hits;
+    }
+    if name.word.as_string() == "tee"
+        && let Some((mode, targets)) = native_tee_operands(rest)
+    {
+        hits.extend(targets.into_iter().filter_map(|target| {
+            judge_file_target(
+                &path_word(target),
+                Writer {
+                    kind: Some(WriterKind::Tee),
+                    mode,
+                },
+            )
+        }));
+    }
+    if let Some(hit) = classify_cmdlet("tee-object", rest)
+        && !hits
+            .iter()
+            .any(|existing| existing.rule == hit.rule && existing.span == hit.span)
+    {
+        hits.push(hit);
+    }
+    hits
 }
 
 pub(super) fn classify_git_redirect_writes(
     segment: &str,
     dialect: ShellDialect,
 ) -> Vec<CredentialFileWrite> {
+    // Defer exhaustion to the mandatory fallible whole-command pass, as in
+    // classify_all; an empty local result is not an allow verdict.
     lex(segment, dialect)
+        .unwrap_or_default()
         .into_iter()
         .flatten()
         .filter_map(|item| match item {
-            Lexed::Write { mode, target } => super::git_redirect_write(&target, mode),
+            Lexed::Write { mode, target } => super::git_redirect_write(&path_word(target), mode),
             Lexed::Arg(_) => None,
         })
         .collect()
@@ -91,15 +401,49 @@ fn classify_command(command: Vec<Lexed>, dialect: ShellDialect) -> Option<Creden
     for item in command {
         match item {
             Lexed::Arg(arg) => {
-                tokens.push(Token::Word(arg.word.clone()));
+                tokens.push(Token::Word(path_word(arg.word.clone())));
                 args.push(arg);
             }
-            Lexed::Write { mode, target } => tokens.push(Token::Write { mode, target }),
+            Lexed::Write { mode, target } => tokens.push(Token::Write {
+                mode,
+                target: path_word(target),
+            }),
         }
     }
     // Redirects, and the native writers `pwsh` runs on Unix (`tee`, `cp`,
     // `sed -i`, …): the POSIX command judge already reads decoded words.
+    let name_is_data = dialect != ShellDialect::Cmd
+        && args
+            .first()
+            .is_some_and(|arg| arg.starts_quoted && !arg.invoked);
+    let tee_cmdlet = dialect == ShellDialect::PowerShell
+        && args.first().is_some_and(|arg| tee_object_name(&arg.word));
+    // In the PowerShell reading, tee's -Variable/-Append bind as cmdlet
+    // parameters, not native tee file operands. Redirects remain independent.
+    if tee_cmdlet || name_is_data {
+        tokens.retain(|token| matches!(token, Token::Write { .. }));
+    }
     if let Some(hit) = classify_simple_command(&tokens) {
+        return Some(hit);
+    }
+    if name_is_data {
+        return None;
+    }
+    if tee_cmdlet
+        && args
+            .first()
+            .is_some_and(|arg| arg.word.as_string() == "tee")
+        && let Some((mode, targets)) = native_tee_operands(&args[1..])
+        && let Some(hit) = targets.iter().find_map(|target| {
+            judge_file_target(
+                &path_word(target.clone()),
+                Writer {
+                    kind: Some(WriterKind::Tee),
+                    mode,
+                },
+            )
+        })
+    {
         return Some(hit);
     }
     let (name, rest) = args.split_first()?;
@@ -121,6 +465,8 @@ fn classify_command(command: Vec<Lexed>, dialect: ShellDialect) -> Option<Creden
 enum Role {
     /// The file the cmdlet opens for writing.
     Target,
+    /// A file target whose provider wildcards are literal characters.
+    LiteralTarget,
     /// The file a copy or move reads.
     Source,
     /// `New-Item -Name`, joined onto `-Path`.
@@ -144,7 +490,8 @@ const fn param(names: &'static [&'static str], role: Role) -> Param {
     Param { names, role }
 }
 
-/// The common parameters every cmdlet accepts. `WhatIf` is a preview.
+/// Common parameters, including the ShouldProcess parameters. Tee-Object
+/// does not support ShouldProcess and rejects WhatIf/Confirm at binding.
 const COMMON: &[Param] = &[
     param(&["whatif", "wi"], Role::WhatIf),
     param(&["confirm", "cf"], Role::Switch),
@@ -192,7 +539,7 @@ const OUT_FILE_PARAMS: &[Param] = &[
 
 const TEE_OBJECT_PARAMS: &[Param] = &[
     param(&["filepath", "path"], Role::Target),
-    param(&["literalpath", "pspath", "lp"], Role::Target),
+    param(&["literalpath", "pspath", "lp"], Role::LiteralTarget),
     param(&["variable"], Role::Variable),
     param(&["encoding"], Role::Value),
     param(&["inputobject"], Role::Value),
@@ -276,18 +623,34 @@ fn cmdlet(name: &str) -> Option<Cmdlet> {
 
 /// PowerShell binds a parameter by its full name, an alias, or any prefix
 /// that is unambiguous among the cmdlet's parameters (`-Pa`, `-Dest`, `-lit`).
-/// An unknown or ambiguous name is a binding error, so treating it as a
-/// switch can only shift a positional onto a word PowerShell would reject.
-fn lookup(cmdlet: &Cmdlet, name: &str) -> Role {
+/// Prefixes include aliases, and a single cmdlet parameter wins over common
+/// parameter prefixes: Tee-Object -in means InputObject, -e means Encoding,
+/// and -v means Variable. Getting arity wrong here can hide the real target.
+fn lookup<'a>(cmdlet: &'a Cmdlet, name: &str) -> Option<&'a Param> {
     let name = name.to_ascii_lowercase();
-    let all = || cmdlet.params.iter().chain(COMMON);
-    if let Some(found) = all().find(|param| param.names.contains(&name.as_str())) {
-        return found.role;
+    let all = || {
+        cmdlet.params.iter().chain(COMMON.iter().filter(|param| {
+            cmdlet.kind != WriterKind::TeeObject || !matches!(param.names[0], "whatif" | "confirm")
+        }))
+    };
+    if let Some(found) = all().find(|param| param.names[0] == name) {
+        return Some(found);
     }
-    let mut matches = all().filter(|param| param.names[0].starts_with(&name));
+    if let Some(found) = all().find(|param| param.names[1..].contains(&name.as_str())) {
+        return Some(found);
+    }
+    let matches_name = |param: &&Param| param.names.iter().any(|alias| alias.starts_with(&name));
+    let mut matches = all().filter(matches_name);
     match (matches.next(), matches.next()) {
-        (Some(found), None) => found.role,
-        _ => Role::Switch,
+        (Some(found), None) => Some(found),
+        (Some(_), Some(_)) => {
+            let mut declared = cmdlet.params.iter().filter(matches_name);
+            match (declared.next(), declared.next()) {
+                (Some(found), None) => Some(found),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -306,13 +669,24 @@ fn parameter(arg: &Arg) -> Option<(String, Option<usize>)> {
         return None;
     }
     let colon = text.iter().position(|ch| *ch == ':');
-    let name: String = text[1..colon.unwrap_or(text.len())].iter().collect();
+    let name = arg.parameter_name.clone()?;
     Some((name, colon.map(|at| at + 1)))
 }
 
-/// A switch given an explicit value: `-Append:$false` turns it off.
+/// Only a proven enabled switch may suppress a write. In particular an
+/// unresolved variable/expression might be false; its presence is no proof.
 fn switch_value(word: &Word) -> bool {
-    !word.as_string().eq_ignore_ascii_case("$false") && word.as_string() != "0"
+    let value = word.as_string();
+    if !word.is_all_literal() {
+        return matches!(value.as_str(), "$TRUE" | "$NULL");
+    }
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        return u64::from_str_radix(hex, 16).is_ok_and(|number| number != 0);
+    }
+    value.parse::<f64>().is_ok_and(|number| number != 0.0)
 }
 
 #[derive(Default)]
@@ -322,6 +696,11 @@ struct Bound {
     names: Vec<Word>,
     append: bool,
     what_if: bool,
+    variable: bool,
+    literal_target: bool,
+    append_seen: bool,
+    binding_error: bool,
+    splats: Vec<Word>,
 }
 
 fn bind(cmdlet: &Cmdlet, args: &[Arg]) -> Bound {
@@ -330,11 +709,23 @@ fn bind(cmdlet: &Cmdlet, args: &[Arg]) -> Bound {
     // The role the previous word bound to, for `,`-joined array elements.
     let mut last_role: Option<Role> = None;
     let mut index = 0usize;
+    let mut end_of_parameters = false;
+    let mut named_parameters = Vec::new();
     let store = |bound: &mut Bound, role: Role, word: Word| match role {
         Role::Target => bound.targets.push(word),
+        Role::LiteralTarget => {
+            bound.literal_target = true;
+            let mut word = word;
+            for (ch, literal) in word.text.iter().zip(&mut word.literal) {
+                if matches!(ch, '*' | '?' | '[' | ']') {
+                    *literal = true;
+                }
+            }
+            bound.targets.push(word);
+        }
         Role::Source => bound.sources.push(word),
         Role::Name => bound.names.push(word),
-        Role::Variable => bound.targets.clear(),
+        Role::Variable => bound.variable = true,
         Role::Value | Role::Switch | Role::Append | Role::WhatIf => {}
     };
     while let Some(arg) = args.get(index) {
@@ -345,12 +736,29 @@ fn bind(cmdlet: &Cmdlet, args: &[Arg]) -> Bound {
             store(&mut bound, role, arg.word.clone());
             continue;
         }
-        if arg.word.as_string() == "--%" {
-            // Stop-parsing: the rest goes to a native program verbatim.
-            break;
+        if arg.bare_first == Some('@') && arg.word.text.get(1) != Some(&'(') {
+            bound.splats.push(unresolved(arg.word.range.clone()));
+            last_role = None;
+            continue;
         }
-        if let Some((name, inline)) = parameter(arg) {
-            let role = lookup(cmdlet, &name);
+        if !end_of_parameters && arg.bare_first == Some('-') && arg.word.as_string() == "--" {
+            end_of_parameters = true;
+            continue;
+        }
+        if !end_of_parameters && let Some((name, inline)) = parameter(arg) {
+            let parameter = lookup(cmdlet, &name);
+            if parameter.is_none() && cmdlet.kind == WriterKind::TeeObject {
+                bound.binding_error = true;
+            }
+            if cmdlet.kind == WriterKind::TeeObject
+                && let Some(parameter) = parameter
+            {
+                if named_parameters.contains(&parameter.names[0]) {
+                    bound.binding_error = true;
+                }
+                named_parameters.push(parameter.names[0]);
+            }
+            let role = parameter.map_or(Role::Switch, |parameter| parameter.role);
             let value = match inline {
                 Some(offset) if offset < arg.word.text.len() => {
                     // `-Path:~/.bashrc`: the provider expands a `~` that
@@ -361,12 +769,24 @@ fn bind(cmdlet: &Cmdlet, args: &[Arg]) -> Bound {
                     }
                     Some(value)
                 }
-                Some(_) | None => None,
+                Some(_) => {
+                    index += 1;
+                    args.get(index - 1).map(|next| next.word.clone())
+                }
+                None => None,
             };
             match role {
                 Role::Switch => {}
-                Role::Append => bound.append = value.as_ref().is_none_or(switch_value),
-                Role::WhatIf => bound.what_if = value.as_ref().is_none_or(switch_value),
+                Role::Append => {
+                    if bound.append_seen {
+                        bound.binding_error = true;
+                    }
+                    bound.append_seen = true;
+                    bound.append = inline.is_none() || value.as_ref().is_some_and(switch_value);
+                }
+                Role::WhatIf => {
+                    bound.what_if = inline.is_none() || value.as_ref().is_some_and(switch_value);
+                }
                 _ => {
                     let value = value.or_else(|| {
                         index += 1;
@@ -382,6 +802,9 @@ fn bind(cmdlet: &Cmdlet, args: &[Arg]) -> Bound {
             last_role = None;
             continue;
         }
+        if cmdlet.kind == WriterKind::TeeObject && position >= cmdlet.positional.len() {
+            bound.binding_error = true;
+        }
         let role = cmdlet
             .positional
             .get(position)
@@ -391,13 +814,23 @@ fn bind(cmdlet: &Cmdlet, args: &[Arg]) -> Bound {
         store(&mut bound, role, arg.word.clone());
         last_role = Some(role);
     }
+    if cmdlet.kind == WriterKind::TeeObject
+        && (bound.targets.len() > 1
+            || bound.targets.iter().any(|target| target.text.is_empty())
+            || (bound.literal_target && bound.append_seen)
+            || (bound.variable && (!bound.targets.is_empty() || bound.append_seen)))
+    {
+        bound.binding_error = true;
+    }
     bound
 }
 
 fn classify_cmdlet(name: &str, args: &[Arg]) -> Option<CredentialFileWrite> {
     let cmdlet = cmdlet(name)?;
     let bound = bind(&cmdlet, args);
-    if bound.what_if {
+    if bound.what_if
+        || (cmdlet.kind == WriterKind::TeeObject && (bound.binding_error || bound.variable))
+    {
         return None;
     }
     let mode = match cmdlet.kind {
@@ -423,7 +856,7 @@ fn classify_cmdlet(name: &str, args: &[Arg]) -> Option<CredentialFileWrite> {
             parents.into_iter().find_map(|parent| {
                 bound.names.iter().find_map(|name| {
                     judge_file_target(
-                        &parent.map_or_else(|| name.clone(), |p| join(p, name)),
+                        &path_word(parent.map_or_else(|| name.clone(), |p| join(p, name))),
                         writer,
                     )
                 })
@@ -432,7 +865,7 @@ fn classify_cmdlet(name: &str, args: &[Arg]) -> Option<CredentialFileWrite> {
         _ => bound
             .targets
             .iter()
-            .find_map(|target| judge_file_target(target, writer)),
+            .find_map(|target| judge_file_target(&path_word(target.clone()), writer)),
     }
 }
 
@@ -469,6 +902,8 @@ fn judge_copy(
     sources: &[Word],
     destination: &Word,
 ) -> Option<CredentialFileWrite> {
+    let sources: Vec<Word> = sources.iter().cloned().map(path_word).collect();
+    let destination = path_word(destination.clone());
     if matches!(kind, WriterKind::MoveItem | WriterKind::CmdMove) {
         let removal = Writer {
             kind: Some(kind),
@@ -491,8 +926,8 @@ fn judge_copy(
         glued_paren: false,
     };
     let operands: Vec<&Word> = std::iter::once(&end_of_options)
-        .chain(sources)
-        .chain(std::iter::once(destination))
+        .chain(&sources)
+        .chain(std::iter::once(&destination))
         .collect();
     classify_copy(kind, &operands)
 }
@@ -537,7 +972,7 @@ fn classify_cmd_builtin(name: &str, args: &[Arg]) -> Option<CredentialFileWrite>
     if kind == WriterKind::CmdMklink {
         let link = operands.first()?;
         return judge_file_target(
-            &link.word,
+            &path_word(link.word.clone()),
             Writer {
                 kind: Some(kind),
                 mode: WriteMode::Replace,
@@ -624,16 +1059,92 @@ const fn is_double_quote(ch: char) -> bool {
 }
 
 /// Split a segment into simple commands of words and redirects.
-fn lex(segment: &str, dialect: ShellDialect) -> Vec<Vec<Lexed>> {
+fn lex(
+    segment: &str,
+    dialect: ShellDialect,
+) -> Result<Vec<Vec<Lexed>>, WindowsShellParseIncomplete> {
+    let mut budget = LexBudget {
+        depth: 0,
+        remaining_work: if dialect == ShellDialect::Cmd {
+            // Cmd has no recursive expression path here. Keep the existing
+            // best-effort Cmd API unchanged; the new fallible evaluator pass
+            // owns only PowerShell/Unknown work exhaustion.
+            usize::MAX
+        } else {
+            MAX_LEX_WORK_BYTES
+        },
+    };
+    lex_inner(segment, dialect, &mut budget)
+}
+
+fn lex_inner(
+    segment: &str,
+    dialect: ShellDialect,
+    budget: &mut LexBudget,
+) -> Result<Vec<Vec<Lexed>>, WindowsShellParseIncomplete> {
+    if budget.depth >= MAX_LEX_DEPTH {
+        return Err(WindowsShellParseIncomplete::Nesting);
+    }
+    // Nested slices are charged again: reparsing a deeply nested expression
+    // must not turn a small input into unbounded cumulative work.
+    budget.charge(segment.len())?;
+    budget.depth += 1;
+    let result = lex_body(segment, dialect, budget);
+    budget.depth -= 1;
+    result
+}
+
+fn lex_body(
+    segment: &str,
+    dialect: ShellDialect,
+    budget: &mut LexBudget,
+) -> Result<Vec<Vec<Lexed>>, WindowsShellParseIncomplete> {
     let powershell = dialect != ShellDialect::Cmd;
     let bytes = segment.as_bytes();
     let mut commands: Vec<Vec<Lexed>> = vec![Vec::new()];
     let mut nested: Vec<Vec<Lexed>> = Vec::new();
     let mut comma_before = false;
+    let mut invoked = false;
     let mut i = 0usize;
     while i < bytes.len() {
         let byte = bytes[i];
+        if powershell
+            && !byte.is_ascii()
+            && let Some(ch) = segment[i..].chars().next().filter(|ch| ch.is_whitespace())
+        {
+            i += ch.len_utf8();
+            continue;
+        }
         let current_is_empty = commands.last().is_none_or(Vec::is_empty);
+        if powershell
+            && current_is_empty
+            && !invoked
+            && matches!(byte, b'$' | b'[')
+            && !segment[i..].starts_with("$(")
+        {
+            let candidate = &segment[i..];
+            // Reuse the shell normalizer's assignment grammar. Charge the
+            // lookahead too: many non-assignment variable statements must
+            // not cause unbounded repeated scans of the remaining source.
+            budget.charge(candidate.len())?;
+            if let Some(rhs) = crate::normalize::powershell_assignment_rhs(candidate) {
+                let rhs_offset = candidate.trim_end().len() - rhs.len();
+                // Index/member expressions on the left also execute. Remove
+                // the assignment operator before recursion so this prefix
+                // cannot repeatedly normalize to its own empty right side.
+                if let Some(lhs) = candidate[..rhs_offset].trim_end().strip_suffix('=')
+                    && lhs.contains('(')
+                {
+                    let mut lhs_commands = lex_inner(lhs, dialect, budget)?;
+                    for command in &mut lhs_commands {
+                        shift(command, i);
+                    }
+                    nested.extend(lhs_commands);
+                }
+                i += rhs_offset;
+                continue;
+            }
+        }
         let separator = match byte {
             b'\n' | b'|' | b')' => true,
             // Grouping at a command's start; an argument expression after it.
@@ -650,6 +1161,7 @@ fn lex(segment: &str, dialect: ShellDialect) -> Vec<Vec<Lexed>> {
         if separator {
             commands.push(Vec::new());
             comma_before = false;
+            invoked = false;
             i += if matches!(byte, b'|' | b'&') && bytes.get(i + 1) == Some(&byte) {
                 2
             } else {
@@ -658,12 +1170,35 @@ fn lex(segment: &str, dialect: ShellDialect) -> Vec<Vec<Lexed>> {
             continue;
         }
         if byte == b'&' {
+            invoked = true;
+            i += 1;
+            continue;
+        }
+        if powershell
+            && current_is_empty
+            && byte == b'.'
+            && segment[i + 1..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+        {
+            invoked = true;
             i += 1;
             continue;
         }
         if byte.is_ascii_whitespace() || (!powershell && matches!(byte, b',' | b';' | b'=')) {
             i += 1;
             continue;
+        }
+        if powershell && byte == b'`' {
+            if bytes.get(i + 1) == Some(&b'\n') {
+                i += 2;
+                continue;
+            }
+            if bytes.get(i + 1..i + 3) == Some(b"\r\n") {
+                i += 3;
+                continue;
+            }
         }
         if powershell && byte == b',' {
             comma_before = true;
@@ -706,9 +1241,10 @@ fn lex(segment: &str, dialect: ShellDialect) -> Vec<Vec<Lexed>> {
             && !current_is_empty
             && let Some(open) = group_open
         {
+            let continues_array = comma_before;
             let close = matching_paren(segment, open);
             let inner = &segment[open + 1..close];
-            let mut inner_commands = lex(inner, dialect);
+            let mut inner_commands = lex_inner(inner, dialect, budget)?;
             for command in &mut inner_commands {
                 shift(command, open + 1);
             }
@@ -719,7 +1255,12 @@ fn lex(segment: &str, dialect: ShellDialect) -> Vec<Vec<Lexed>> {
                     .iter()
                     .enumerate()
                     .map(|(position, item)| match item {
-                        Lexed::Arg(arg) if position == 0 || arg.comma_before => {
+                        Lexed::Arg(arg)
+                            if (position == 0 || arg.comma_before)
+                                && (arg.bare_first.is_none()
+                                    || !arg.word.is_all_literal()
+                                    || arg.word.as_string().parse::<f64>().is_ok()) =>
+                        {
                             Some(arg.word.clone())
                         }
                         _ => None,
@@ -734,6 +1275,10 @@ fn lex(segment: &str, dialect: ShellDialect) -> Vec<Vec<Lexed>> {
                         word,
                         bare_first: None,
                         comma_before: if position == 0 { comma_before } else { true },
+                        invoked: false,
+                        starts_quoted: false,
+                        verbatim: false,
+                        parameter_name: None,
                     }));
                 }
             }
@@ -741,6 +1286,17 @@ fn lex(segment: &str, dialect: ShellDialect) -> Vec<Vec<Lexed>> {
             // The expression's own commands run too, beside the outer one.
             nested.extend(inner_commands);
             i = (close + 1).min(bytes.len());
+            if continues_array
+                && let Some(command) = commands.last_mut()
+                && let Some(tail_start) = powershell_verbatim_start(segment, command, i)
+            {
+                let tail_start = skip_powershell_horizontal_space(segment, tail_start);
+                let tail_end = powershell_stop_parsing_end(segment, tail_start);
+                command.push(Lexed::Arg(powershell_verbatim_argument(
+                    segment, tail_start, tail_end,
+                )));
+                i = tail_end;
+            }
             continue;
         }
         if let Some((kind, after)) = redirect(bytes, i, powershell) {
@@ -752,7 +1308,7 @@ fn lex(segment: &str, dialect: ShellDialect) -> Vec<Vec<Lexed>> {
             if kind == Redirect::Merge || j >= bytes.len() {
                 continue;
             }
-            let (arg, end) = read_word(segment, j, dialect);
+            let (arg, end) = read_word(segment, j, dialect, &mut nested, budget)?;
             i = end.max(j + 1);
             // An input operand is consumed so it is not read as an argument.
             if let Redirect::Output(mode) = kind
@@ -765,32 +1321,258 @@ fn lex(segment: &str, dialect: ShellDialect) -> Vec<Vec<Lexed>> {
             }
             continue;
         }
-        let (mut arg, end) = read_word(segment, i, dialect);
+        let (mut arg, end) = read_word(segment, i, dialect, &mut nested, budget)?;
+        arg.invoked = invoked && current_is_empty;
         i = end.max(i + 1);
+        let raw = &segment[arg.word.range.clone()];
+        if powershell
+            && current_is_empty
+            && !invoked
+            && ["return", "throw", "exit"]
+                .iter()
+                .any(|keyword| raw.eq_ignore_ascii_case(keyword))
+        {
+            // These statement operands are pipelines. The same words in
+            // argument position, quotes or an explicit call remain data.
+            continue;
+        }
         arg.comma_before = comma_before;
         comma_before = false;
         if let Some(command) = commands.last_mut() {
             command.push(Lexed::Arg(arg));
+            if powershell && let Some(tail_start) = powershell_verbatim_start(segment, command, i) {
+                let tail_start = skip_powershell_horizontal_space(segment, tail_start);
+                let tail_end = powershell_stop_parsing_end(segment, tail_start);
+                command.push(Lexed::Arg(powershell_verbatim_argument(
+                    segment, tail_start, tail_end,
+                )));
+                i = tail_end;
+            }
         }
     }
     commands.extend(nested);
     commands.retain(|command| !command.is_empty());
-    commands
+    Ok(commands)
+}
+
+/// PowerShell retains the marker and one verbatim argument in a cmdlet's
+/// argv. A pending InputObject/common parameter can consume the marker,
+/// leaving that remainder as a valid positional file target.
+fn powershell_verbatim_start(segment: &str, command: &[Lexed], after: usize) -> Option<usize> {
+    let mut args = command.iter().rev().filter_map(|item| match item {
+        Lexed::Arg(arg) => Some(arg),
+        Lexed::Write { .. } => None,
+    });
+    let mut marker = args.next()?;
+    while marker.comma_before {
+        marker = args.next()?;
+    }
+    if marker.bare_first.is_none()
+        && !marker.starts_quoted
+        && !segment[marker.word.range.clone()].starts_with('`')
+    {
+        // A value recovered from an expression such as ('--%') is not a
+        // command string token. Escaped generic tokens still are markers.
+        return None;
+    }
+    if !marker.word.is_all_literal() || marker.word.as_string() != "--%" {
+        return None;
+    }
+    // A colon-bound value belongs to its parameter AST, so CommandRule
+    // never treats that value as a standalone stop-parsing marker.
+    if args.next().is_some_and(|previous| {
+        previous.parameter_name.is_some() && segment[previous.word.range.clone()].ends_with(':')
+    }) {
+        return None;
+    }
+    if !marker.starts_quoted {
+        return Some(after);
+    }
+    // Quoted strings cause parser lookahead. If the next token is a
+    // parameter, PowerShell discards that token before reading the literal
+    // remainder. For example -InputObject '--%' -Append /path TRUNCATES.
+    powershell_parameter_lookahead_end(segment, after)
+}
+
+fn skip_powershell_horizontal_space(segment: &str, start: usize) -> usize {
+    segment[start..]
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace() || matches!(ch, '\r' | '\n'))
+        .map_or(segment.len(), |(offset, _)| start + offset)
+}
+
+/// The same token boundaries as PowerShell's ScanParameter: a leading
+/// letter/underscore/question mark, then a name ending before a delimiter
+/// or just after a colon. Embedded quotes make it a generic argument.
+fn powershell_parameter_lookahead_end(segment: &str, after: usize) -> Option<usize> {
+    let mut start = skip_powershell_horizontal_space(segment, after);
+    loop {
+        let rest = &segment[start..];
+        if rest.starts_with("`\r\n") || rest.starts_with("`\n") {
+            start += if rest.starts_with("`\r\n") { 3 } else { 2 };
+        } else if rest.starts_with("<#") {
+            let mut depth = 1usize;
+            start += 2;
+            while depth > 0 {
+                let rest = &segment[start..];
+                if rest.starts_with("<#") {
+                    depth += 1;
+                    start += 2;
+                } else if rest.starts_with("#>") {
+                    depth -= 1;
+                    start += 2;
+                } else {
+                    start += rest.chars().next()?.len_utf8();
+                }
+            }
+        } else {
+            break;
+        }
+        start = skip_powershell_horizontal_space(segment, start);
+    }
+    let mut chars = segment[start..].char_indices();
+    let (_, dash) = chars.next()?;
+    if !matches!(dash, '-' | '\u{2013}' | '\u{2014}' | '\u{2015}') {
+        return None;
+    }
+    let (_, first) = chars.next()?;
+    if !first.is_alphabetic() && !matches!(first, '_' | '?') {
+        return None;
+    }
+    for (offset, ch) in chars {
+        if is_single_quote(ch) || is_double_quote(ch) {
+            return None;
+        }
+        if ch == ':' {
+            return Some(start + offset + 1);
+        }
+        if ch.is_whitespace()
+            || matches!(
+                ch,
+                '{' | '}' | '(' | ')' | ';' | ',' | '|' | '&' | '.' | '['
+            )
+        {
+            return Some(start + offset);
+        }
+    }
+    Some(segment.len())
+}
+
+fn powershell_verbatim_argument(segment: &str, start: usize, end: usize) -> Arg {
+    let raw = &segment[start..end];
+    // Native programs can expand %NAME% in a stop-parsing remainder. Keep
+    // that path unresolved across platforms rather than proving it safe.
+    let percent_expansion = raw
+        .find('%')
+        .is_some_and(|first| raw[first + 1..].contains('%'));
+    let text: Vec<_> = raw
+        .chars()
+        .map(|ch| if ch == '\\' { '/' } else { ch })
+        .collect();
+    let literal = text
+        .iter()
+        .enumerate()
+        .map(|(index, ch)| {
+            !(percent_expansion || matches!(ch, '*' | '?' | '[' | ']') || index == 0 && *ch == '~')
+        })
+        .collect();
+    Arg {
+        word: Word {
+            text,
+            literal,
+            range: start..end,
+            glued_paren: false,
+        },
+        bare_first: None,
+        comma_before: false,
+        invoked: false,
+        starts_quoted: false,
+        verbatim: true,
+        parameter_name: None,
+    }
+}
+
+/// Stop-parsing preserves semicolons, escapes and redirections as argument
+/// data. Only a physical newline or an unquoted pipeline/chain resumes shell
+/// syntax; even an open quote or a backtick cannot continue past the newline.
+fn powershell_stop_parsing_end(segment: &str, start: usize) -> usize {
+    let mut double_quoted = false;
+    let mut chars = segment[start..].char_indices().peekable();
+    while let Some((offset, ch)) = chars.next() {
+        if matches!(ch, '\r' | '\n')
+            || (!double_quoted
+                && (ch == '|' || (ch == '&' && chars.peek().is_some_and(|(_, next)| *next == '&'))))
+        {
+            return start + offset;
+        }
+        if is_double_quote(ch) {
+            double_quoted = !double_quoted;
+        }
+    }
+    segment.len()
 }
 
 /// Byte index of the `)` closing the `(` at `open`, or the segment's end.
 fn matching_paren(segment: &str, open: usize) -> usize {
     let mut depth = 0usize;
     let mut quote: Option<char> = None;
-    for (offset, ch) in segment[open..].char_indices() {
+    let mut chars = segment[open..].char_indices().peekable();
+    while let Some((offset, ch)) = chars.next() {
+        if ch == '`' && !quote.is_some_and(is_single_quote) {
+            chars.next();
+            continue;
+        }
         match quote {
             Some(q)
                 if (is_single_quote(q) && is_single_quote(ch))
                     || (is_double_quote(q) && is_double_quote(ch)) =>
             {
-                quote = None;
+                if chars.peek().is_some_and(|(_, next)| {
+                    (is_single_quote(q) && is_single_quote(*next))
+                        || (is_double_quote(q) && is_double_quote(*next))
+                }) {
+                    chars.next();
+                } else {
+                    quote = None;
+                }
             }
             Some(_) => {}
+            None if ch == '#'
+                && segment[..open + offset]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|previous| {
+                        previous.is_whitespace()
+                            || matches!(previous, '(' | ';' | '|' | '&' | '{' | '}')
+                    }) =>
+            {
+                for (_, next) in chars.by_ref() {
+                    if matches!(next, '\r' | '\n') {
+                        break;
+                    }
+                }
+            }
+            None if ch == '<'
+                && crate::context::powershell_block_comment_starts_at(
+                    segment.as_bytes(),
+                    open + offset,
+                ) =>
+            {
+                chars.next();
+                let mut comment_depth = 1usize;
+                while let Some((_, next)) = chars.next() {
+                    if next == '<' && chars.peek().is_some_and(|(_, next)| *next == '#') {
+                        chars.next();
+                        comment_depth += 1;
+                    } else if next == '#' && chars.peek().is_some_and(|(_, next)| *next == '>') {
+                        chars.next();
+                        comment_depth -= 1;
+                        if comment_depth == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
             None if is_single_quote(ch) || is_double_quote(ch) => quote = Some(ch),
             None if ch == '(' => depth += 1,
             None if ch == ')' => {
@@ -853,6 +1635,10 @@ fn here_string(segment: &str, start: usize) -> Option<(Arg, usize)> {
             word: unresolved(start..end),
             bare_first: None,
             comma_before: false,
+            invoked: false,
+            starts_quoted: false,
+            verbatim: false,
+            parameter_name: None,
         },
         end,
     ))
@@ -904,12 +1690,23 @@ enum Redirect {
 }
 
 /// Decode one word. Returns it with the byte offset just past it.
-fn read_word(segment: &str, start: usize, dialect: ShellDialect) -> (Arg, usize) {
+fn read_word(
+    segment: &str,
+    start: usize,
+    dialect: ShellDialect,
+    nested: &mut Vec<Vec<Lexed>>,
+    budget: &mut LexBudget,
+) -> Result<(Arg, usize), WindowsShellParseIncomplete> {
     let powershell = dialect != ShellDialect::Cmd;
     let mut text: Vec<char> = Vec::new();
     let mut literal: Vec<bool> = Vec::new();
     let mut quote: Option<char> = None;
     let mut bare_first = None;
+    let starts_quoted = powershell
+        && segment[start..]
+            .chars()
+            .next()
+            .is_some_and(|ch| is_single_quote(ch) || is_double_quote(ch));
     let mut end = segment.len();
     let mut chars = segment[start..].char_indices().peekable();
 
@@ -938,6 +1735,10 @@ fn read_word(segment: &str, start: usize, dialect: ShellDialect) -> (Arg, usize)
                         push(&mut text, &mut literal, '\'', true);
                     } else {
                         quote = None;
+                        if starts_quoted {
+                            end = here + ch.len_utf8();
+                            break;
+                        }
                     }
                 } else {
                     push(&mut text, &mut literal, ch, true);
@@ -950,13 +1751,25 @@ fn read_word(segment: &str, start: usize, dialect: ShellDialect) -> (Arg, usize)
                         push(&mut text, &mut literal, '"', true);
                     } else {
                         quote = None;
+                        if starts_quoted {
+                            end = here + ch.len_utf8();
+                            break;
+                        }
                     }
                 } else if powershell && ch == '`' {
                     if let Some((_, escaped)) = chars.next() {
                         push(&mut text, &mut literal, escaped, true);
                     }
                 } else if powershell && ch == '$' {
-                    powershell_expansion(&mut chars, &mut text, &mut literal);
+                    powershell_expansion(
+                        &mut chars,
+                        &mut text,
+                        &mut literal,
+                        segment,
+                        start,
+                        nested,
+                        budget,
+                    )?;
                 } else if !powershell && matches!(ch, '%' | '!') {
                     cmd_expansion(ch, &mut chars, &mut text, &mut literal);
                 } else {
@@ -968,8 +1781,11 @@ fn read_word(segment: &str, start: usize, dialect: ShellDialect) -> (Arg, usize)
                     quote = Some(ch);
                     continue;
                 }
-                let terminator = ch.is_ascii_whitespace()
-                    || matches!(ch, '|' | '&' | '<' | '>' | '(' | ')')
+                let terminator = (if powershell {
+                    ch.is_whitespace()
+                } else {
+                    ch.is_ascii_whitespace()
+                }) || matches!(ch, '|' | '&' | '<' | '>' | '(' | ')')
                     || (powershell && matches!(ch, ';' | ',' | '{' | '}'))
                     || (!powershell && matches!(ch, ',' | ';' | '='));
                 if terminator && offset > 0 {
@@ -985,7 +1801,15 @@ fn read_word(segment: &str, start: usize, dialect: ShellDialect) -> (Arg, usize)
                         Some((_, '\n')) | None => {}
                         Some((_, escaped)) => push(&mut text, &mut literal, escaped, true),
                     },
-                    '$' if powershell => powershell_expansion(&mut chars, &mut text, &mut literal),
+                    '$' if powershell => powershell_expansion(
+                        &mut chars,
+                        &mut text,
+                        &mut literal,
+                        segment,
+                        start,
+                        nested,
+                        budget,
+                    )?,
                     '%' | '!' if !powershell => {
                         cmd_expansion(ch, &mut chars, &mut text, &mut literal);
                     }
@@ -994,21 +1818,39 @@ fn read_word(segment: &str, start: usize, dialect: ShellDialect) -> (Arg, usize)
             }
         }
     }
-    strip_volume_prefix(&mut text, &mut literal);
     let word = Word {
         text,
         literal,
         range: start..end,
         glued_paren: false,
     };
-    (
+    let parameter_name = bare_first
+        .filter(|ch| matches!(ch, '-' | '\u{2013}' | '\u{2014}' | '\u{2015}'))
+        .and_then(|dash| {
+            let name = segment[start + dash.len_utf8()..end]
+                .split(':')
+                .next()
+                .unwrap_or_default();
+            // Quoted fragments make this an argument, e.g. -File'notes'
+            // names the literal positional file -Filenotes. Backticks in a
+            // parameter name, by contrast, remain part of its invalid name.
+            (!name
+                .chars()
+                .any(|ch| is_single_quote(ch) || is_double_quote(ch)))
+            .then(|| name.to_string())
+        });
+    Ok((
         Arg {
             word,
             bare_first,
             comma_before: false,
+            invoked: false,
+            starts_quoted,
+            verbatim: false,
+            parameter_name,
         },
         end,
-    )
+    ))
 }
 
 /// Emit an expansion as the POSIX judge understands it: a known home or
@@ -1039,21 +1881,26 @@ fn powershell_expansion(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     text: &mut Vec<char>,
     literal: &mut Vec<bool>,
-) {
+    source: &str,
+    word_start: usize,
+    nested: &mut Vec<Vec<Lexed>>,
+    budget: &mut LexBudget,
+) -> Result<(), WindowsShellParseIncomplete> {
     let name = match chars.peek().map(|(_, next)| *next) {
         Some('(') => {
-            let mut depth = 0usize;
-            for (_, inner) in chars.by_ref() {
-                match inner {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
+            let open = word_start + chars.peek().expect("opening parenthesis").0;
+            let close = matching_paren(source, open);
+            let mut commands =
+                lex_inner(&source[open + 1..close], ShellDialect::PowerShell, budget)?;
+            for command in &mut commands {
+                shift(command, open + 1);
+            }
+            nested.extend(commands);
+            while chars
+                .peek()
+                .is_some_and(|(offset, _)| word_start + offset <= close)
+            {
+                chars.next();
             }
             String::new()
         }
@@ -1087,12 +1934,21 @@ fn powershell_expansion(
         _ => {
             text.push('$');
             literal.push(true);
-            return;
+            return Ok(());
         }
     };
     // `$HOME` is an automatic variable; `$env:X` is the environment. Any
     // other scope (`$global:x`, a script variable) is unknown text.
     let lower = name.to_ascii_lowercase();
+    if matches!(lower.as_str(), "true" | "false" | "null") {
+        text.push('$');
+        literal.push(false);
+        for ch in lower.to_ascii_uppercase().chars() {
+            text.push(ch);
+            literal.push(false);
+        }
+        return Ok(());
+    }
     let resolved = if lower == "home" {
         "HOME"
     } else if let Some(env) = lower.strip_prefix("env:") {
@@ -1101,6 +1957,7 @@ fn powershell_expansion(
         ""
     };
     emit_variable(resolved, text, literal);
+    Ok(())
 }
 
 /// `%NAME%` — or `!NAME!`, delayed expansion, which a script can switch on —
@@ -1178,6 +2035,14 @@ fn strip_volume_prefix(text: &mut Vec<char>, literal: &mut Vec<bool>) {
         text.drain(..2);
         literal.drain(..2);
     }
+}
+
+/// Credential roots are volume-independent. Keep the original decoded path
+/// until this policy boundary: truncation's local existence proof must not
+/// confuse C:/Users/... with /Users/... on a different host.
+fn path_word(mut word: Word) -> Word {
+    strip_volume_prefix(&mut word.text, &mut word.literal);
+    word
 }
 
 #[cfg(test)]
@@ -1486,5 +2351,641 @@ mod tests {
         assert!(!names_writer("cargo build --release"));
         assert!(!names_writer("git commit -m 'accept'"));
         assert!(!names_writer("npm run copy-assets"));
+    }
+
+    /// The reported bypass and native parameter-binding equivalents. Input
+    /// data and common-parameter values must not displace the file operand.
+    #[test]
+    fn powershell_tee_truncation_binds_targets_issue_642() {
+        for command in [
+            "Get-Date | Tee-Object -FilePath /var/lib/important.txt",
+            "Get-Date | Tee-Object /var/lib/important.txt",
+            "Get-Date | tee /var/lib/important.txt",
+            "Get-Date | tEe-ObJeCt -fIlEpAtH /var/lib/important.txt",
+            "Tee-Object -Path /var/lib/important.txt",
+            "Tee-Object -pa /var/lib/important.txt",
+            "Tee-Object -f /var/lib/important.txt",
+            "Tee-Object -LiteralPath /var/lib/important.txt",
+            "Tee-Object -PSPath /var/lib/important.txt",
+            "Tee-Object -ps /var/lib/important.txt",
+            "Tee-Object -LP /var/lib/important.txt",
+            "Tee-Object -lit /var/lib/important.txt",
+            "Tee-Object -InputObject '/tmp/input' /var/lib/important.txt",
+            "Tee-Object -in '/tmp/input' /var/lib/important.txt",
+            "Tee-Object -i '/tmp/input' /var/lib/important.txt",
+            "Tee-Object -e utf8 /var/lib/important.txt",
+            "Tee-Object -Encoding utf8 /var/lib/important.txt",
+            "Tee-Object -ErrorVariable errors /var/lib/important.txt",
+            "Tee-Object -ev errors /var/lib/important.txt",
+            "Tee-Object -OutVariable '-Append' /var/lib/important.txt",
+            "Tee-Object -InputObject '-WhatIf' /var/lib/important.txt",
+            "Tee-Object -vb /var/lib/important.txt",
+            "Tee-Object -Debug:$false /var/lib/important.txt",
+            "Tee-Object -- /var/lib/important.txt",
+            "Tee-Object -InputObject x -- /var/lib/important.txt",
+            "Tee-Object -FilePath:/var/lib/important.txt",
+            "Tee-Object -FilePath: /var/lib/important.txt",
+            "Tee-Object -FilePath:'/var/lib/important.txt'",
+            "Tee-Object -FilePath: '/var/lib/important.txt'",
+            "Tee-Object ('/var/lib/important.txt')",
+            "Tee-Object -FilePath:('/var/lib/important.txt')",
+            "Tee-Object -FilePath: ('/var/lib/important.txt')",
+            "Tee-Object -FilePath('/var/lib/important.txt')",
+            "Tee-Object -FilePath:/var/lib/important'.txt'",
+            "Tee-Object \u{2013}FilePath /var/lib/important.txt",
+            "Tee-Object -FilePath \u{2018}/var/lib/important.txt\u{2019}",
+            "Microsoft.PowerShell.Utility\\Tee-Object /var/lib/important.txt",
+            "Tee-Ob`ject /var/lib/important.txt",
+            "Tee-Object `\n -FilePath /var/lib/important.txt",
+            "Tee-Object `\r\n -FilePath /var/lib/important.txt",
+        ] {
+            let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "target binding: {command}: {targets:?}");
+            assert_eq!(targets[0].path, "/var/lib/important.txt", "{command}");
+            assert!(targets[0].literal, "{command}");
+            assert_eq!(targets[0].home_suffix, None, "{command}");
+        }
+    }
+
+    #[test]
+    fn powershell_tee_truncation_preserves_actual_and_policy_paths_issue_642() {
+        for (command, path, policy_path) in [
+            (
+                r"Get-Date | Tee-Object -FilePath 'C:\Users\me\important.txt'",
+                "C:/Users/me/important.txt",
+                "/Users/me/important.txt",
+            ),
+            (
+                r"Get-Date | Tee-Object 'C:\Users\me\important.txt'",
+                "C:/Users/me/important.txt",
+                "/Users/me/important.txt",
+            ),
+            (
+                r"Tee-Object -FilePath 'FileSystem::C:\Users\me\important.txt'",
+                "FileSystem::C:/Users/me/important.txt",
+                "/Users/me/important.txt",
+            ),
+            (
+                "Tee-Object -FilePath '/var/lib/important file.txt'",
+                "/var/lib/important file.txt",
+                "/var/lib/important file.txt",
+            ),
+            (
+                "Tee-Object /var/lib/important` file.txt",
+                "/var/lib/important file.txt",
+                "/var/lib/important file.txt",
+            ),
+            (
+                "Tee-Object '/var/lib/it''s important.txt'",
+                "/var/lib/it's important.txt",
+                "/var/lib/it's important.txt",
+            ),
+        ] {
+            let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}: {targets:?}");
+            assert_eq!(targets[0].path, path, "actual path: {command}");
+            assert_eq!(
+                targets[0].policy_path, policy_path,
+                "policy path: {command}"
+            );
+            assert!(targets[0].literal, "{command}");
+        }
+    }
+
+    /// PowerShell recognizes these Unicode spaces between tokens. An ASCII
+    /// lexer would read the entire cmdlet and destination as one safe word.
+    #[test]
+    fn powershell_tee_truncation_accepts_unicode_whitespace_issue_642() {
+        for whitespace in [
+            '\u{0085}', '\u{00a0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}',
+            '\u{2004}', '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}',
+            '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}',
+        ] {
+            let command =
+                format!("Tee-Object{whitespace}-FilePath{whitespace}/var/lib/important.txt");
+            let targets = powershell_tee_truncation_targets(&command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "PowerShell whitespace: {whitespace:?}");
+            assert_eq!(targets[0].path, "/var/lib/important.txt");
+            assert_eq!(&command[targets[0].span.clone()], "Tee-Object");
+        }
+    }
+
+    #[test]
+    fn powershell_tee_truncation_requires_proven_append_issue_642() {
+        for value in [
+            "$false",
+            "${false}",
+            "0",
+            "0.0",
+            "0x0",
+            "$flag",
+            "($false)",
+            " ( $false )",
+            "$($false)",
+            "$(0)",
+            "(!$true)",
+            " $false",
+        ] {
+            let command = format!("Tee-Object /var/lib/important.txt -Append:{value}");
+            let targets = powershell_tee_truncation_targets(&command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "possibly truncating: {command}");
+            assert_eq!(targets[0].path, "/var/lib/important.txt", "{command}");
+        }
+        for flag in [
+            "-Append",
+            "-a",
+            "-Append:$true",
+            "-Append:${true}",
+            "-Append:$null",
+            "-Append:1",
+            "-Append:2",
+            "-Append:0.5",
+            "-Append:0x1",
+            "-Append: $true",
+            "-Append:($true)",
+        ] {
+            let command = format!("Tee-Object /var/lib/important.txt {flag}");
+            assert!(
+                powershell_tee_truncation_targets(&command)
+                    .expect("bounded fixture")
+                    .is_empty(),
+                "proven append: {command}"
+            );
+        }
+    }
+
+    /// Tee has disjoint File, LiteralFile and Variable sets. In particular,
+    /// WhatIf is unsupported; allowing its binding error is not a preview.
+    #[test]
+    fn powershell_tee_truncation_respects_variable_and_binding_errors_issue_642() {
+        for command in [
+            "Tee-Object -Variable captured",
+            "Tee-Object -v captured",
+            "Tee-Object -Variable '/var/lib/important.txt'",
+            "Tee-Object -Variable captured @options",
+            "Tee-Object @options -Variable captured",
+            "Tee-Object /var/lib/important.txt -WhatIf",
+            "Tee-Object /var/lib/important.txt -WhatIf:$false",
+            "Tee-Object /var/lib/important.txt -wi",
+            "Tee-Object /var/lib/important.txt -Confirm:$false",
+            "Tee-Object -p /var/lib/important.txt",
+            "Tee-Object -File`Path /var/lib/important.txt",
+            "Tee-Object -File'Path' /var/lib/important.txt",
+            "Tee-Object -Fi\"lePath\" /var/lib/important.txt",
+            "Tee-Object '' -FilePath /var/lib/important.txt",
+            "Tee-Object /var/lib/important.txt -Variable captured",
+            "Tee-Object -Variable captured -FilePath /var/lib/important.txt",
+            "Tee-Object -LiteralPath /var/lib/important.txt -Append",
+            "Tee-Object /var/lib/important.txt -Append -Append:$false",
+            "Tee-Object -FilePath /tmp/a -Path /var/lib/important.txt",
+        ] {
+            let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+            assert!(
+                targets.is_empty(),
+                "no file operation: {command}: {targets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_tee_truncation_keeps_parameter_looking_filename_data_issue_642() {
+        for (command, path) in [
+            ("Tee-Object '-Append'", "-Append"),
+            ("Tee-Object '-Variable'", "-Variable"),
+            ("Tee-Object '--'", "--"),
+            ("Tee-Object '--%'", "--%"),
+            ("Tee-Object -- -Append", "-Append"),
+            ("Tee-Object -- -Variable", "-Variable"),
+            ("Tee-Object -InputObject x -- -Append", "-Append"),
+            ("Tee-Object -File'Path'", "-FilePath"),
+            ("Tee-Object -FilePath'file.txt'", "-FilePathfile.txt"),
+            ("Tee-Object -FilePath\"file.txt\"", "-FilePathfile.txt"),
+            (
+                "Tee-Object -FilePath'/path/file.txt'",
+                "-FilePath/path/file.txt",
+            ),
+            ("Tee-Object -Append'$false'", "-Append$false"),
+            ("Tee-Object -Append''", "-Append"),
+        ] {
+            let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "literal operand: {command}");
+            assert_eq!(targets[0].path, path, "{command}");
+            assert!(targets[0].literal, "{command}");
+        }
+    }
+
+    #[test]
+    fn powershell_tee_truncation_distinguishes_wildcards_and_literalpath_issue_642() {
+        for (parameter, literal) in [
+            ("-FilePath", false),
+            ("-Path", false),
+            ("-LiteralPath", true),
+            ("-PSPath", true),
+            ("-LP", true),
+        ] {
+            let command = format!("Tee-Object {parameter} '/var/lib/file[1].txt'");
+            let targets = powershell_tee_truncation_targets(&command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}");
+            assert_eq!(targets[0].path, "/var/lib/file[1].txt", "{command}");
+            assert_eq!(targets[0].literal, literal, "{command}");
+        }
+        for command in [
+            "Tee-Object -LiteralPath $destination",
+            "Tee-Object -LiteralPath \"$destination/file[1].txt\"",
+        ] {
+            let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}");
+            assert!(
+                !targets[0].literal,
+                "expansion survives LiteralPath: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_tee_truncation_carries_home_and_unknown_paths_issue_642() {
+        for command in [
+            "Tee-Object ~/important.txt",
+            "Tee-Object '~/important.txt'",
+            "Tee-Object -FilePath:~/important.txt",
+            "Tee-Object -LiteralPath '~/important.txt'",
+        ] {
+            let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}");
+            assert_eq!(targets[0].path, "~/important.txt", "{command}");
+            assert!(!targets[0].literal, "{command}");
+            assert_eq!(targets[0].home_suffix.as_deref(), Some("important.txt"));
+        }
+        for command in [
+            "Tee-Object $destination",
+            "Tee-Object -FilePath ($destination)",
+            "Tee-Object -FilePath $(Get-Target)",
+            "Tee-Object @options",
+            "Tee-Object -InputObject x @options",
+            "Tee-Object -Append:$flag @options",
+        ] {
+            let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "unresolved target: {command}");
+            assert!(!targets[0].literal, "{command}");
+            assert_eq!(targets[0].home_suffix, None, "{command}");
+        }
+    }
+
+    #[test]
+    fn powershell_tee_truncation_distinguishes_invocation_from_data_issue_642() {
+        for command in [
+            "Write-Output 'Tee-Object /var/lib/important.txt'",
+            "Write-Output Tee-Object -FilePath /var/lib/important.txt",
+            "'Tee-Object'",
+            "\"Tee-Object\"",
+            "# Tee-Object /var/lib/important.txt",
+            "Write-Output x # Tee-Object /var/lib/important.txt",
+            "Write-Output @'\nTee-Object /var/lib/important.txt\n'@",
+            "/usr/bin/tee /var/lib/important.txt",
+            "./tee /var/lib/important.txt",
+            "C:\\tools\\tee.exe /var/lib/important.txt",
+            "Other.Module\\Tee-Object /var/lib/important.txt",
+        ] {
+            assert!(
+                powershell_tee_truncation_targets(command)
+                    .expect("bounded fixture")
+                    .is_empty(),
+                "not an executable Tee-Object cmdlet: {command}"
+            );
+        }
+        for (command, command_word) in [
+            ("& 'Tee-Object' /var/lib/important.txt", "'Tee-Object'"),
+            ("& \"Tee-Object\" /var/lib/important.txt", "\"Tee-Object\""),
+            (". 'Tee-Object' /var/lib/important.txt", "'Tee-Object'"),
+            ("'x' | & Tee-Object /var/lib/important.txt", "Tee-Object"),
+        ] {
+            let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}");
+            assert_eq!(targets[0].path, "/var/lib/important.txt", "{command}");
+            assert_eq!(&command[targets[0].span.clone()], command_word, "{command}");
+        }
+    }
+
+    /// Append/Variable/binding failures on an outer or neighboring command
+    /// do not erase the independently executing nested writer's destination.
+    #[test]
+    fn powershell_tee_truncation_nested_writes_keep_command_spans_issue_642() {
+        for command in [
+            "Write-Output (Tee-Object -InputObject x /var/lib/important.txt)",
+            "Tee-Object -Variable captured -InputObject (Tee-Object -InputObject x /var/lib/important.txt)",
+            "Tee-Object -WhatIf -InputObject (Tee-Object -InputObject x /var/lib/important.txt)",
+            "Tee-Object /tmp/log -Append -InputObject (Tee-Object -InputObject x /var/lib/important.txt)",
+            "Tee-Object /tmp/log -Append; Tee-Object /var/lib/important.txt",
+            "Tee-Object -Variable captured; Tee-Object /var/lib/important.txt",
+        ] {
+            let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "independent nested write: {command}");
+            assert_eq!(targets[0].path, "/var/lib/important.txt", "{command}");
+            assert_eq!(&command[targets[0].span.clone()], "Tee-Object", "{command}");
+            assert_eq!(
+                targets[0].span.start,
+                command
+                    .rfind("Tee-Object")
+                    .expect("fixture contains command"),
+                "nested offsets must be relative to the full command: {command}"
+            );
+        }
+    }
+
+    /// Candidate selection must still reach credential policy when decoded
+    /// -Append removes every general truncation target and no raw writer or
+    /// credential-directory keyword survives the backtick escapes.
+    #[test]
+    fn powershell_tee_append_keeps_credential_semantic_gate_issue_642() {
+        for command in [
+            r"'key' | T`ee-Object -Append C:\Users\me\.s`sh\authorized_keys",
+            r"'key' | t`ee -a C:\Users\me\.s`sh\authorized_keys",
+            r"'key' | Microsoft.PowerShell.Utility\T`ee-Object -Append C:\Users\me\.s`sh\authorized_keys",
+        ] {
+            assert!(
+                powershell_tee_truncation_targets(command)
+                    .expect("bounded fixture")
+                    .is_empty(),
+                "append is not general truncation: {command}"
+            );
+            assert!(
+                crate::packs::core::filesystem::filesystem_semantic_scan_required(
+                    command,
+                    ShellDialect::PowerShell,
+                ),
+                "append still reaches credential policy: {command}"
+            );
+            let hit = ps(command).unwrap_or_else(|| panic!("must protect credentials: {command}"));
+            assert_eq!(hit.rule, CREDENTIAL_FILE_WRITE_NAME, "{command}");
+        }
+        for command in [
+            "Tee-Object -Variable captured",
+            "Tee-Object -Append /tmp/log",
+            "& 'Tee-Object' -Append /tmp/log",
+            "tee --append /tmp/log",
+        ] {
+            assert!(powershell_tee_scan_required(command), "{command}");
+        }
+        for command in [
+            "Write-Output 'Tee-Object -Append /etc/hosts'",
+            "Write-Output Tee-Object -Append /etc/hosts",
+            "'Tee-Object'",
+            "Get-Date # Tee-Object -Append /etc/hosts",
+        ] {
+            assert!(!powershell_tee_scan_required(command), "{command}");
+        }
+    }
+
+    /// Both expression paths must share the recursion cap and surface the
+    /// error through the candidate gate instead of silently dropping writes.
+    #[test]
+    fn powershell_tee_parser_bounds_nested_expressions_issue_642() {
+        for opener in ["(", "$("] {
+            let mut command = "Tee-Object /var/lib/important.txt".to_string();
+            for _ in 1..MAX_LEX_DEPTH {
+                command = format!("Write-Output {opener}{command})");
+            }
+            let targets = powershell_tee_truncation_targets(&command)
+                .expect("the maximum supported depth remains inspectable");
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].path, "/var/lib/important.txt");
+
+            // Exercise the quoted expansion path as well as ordinary groups.
+            let command = format!("Write-Output \"$({command})\"");
+            assert_eq!(
+                powershell_tee_truncation_targets(&command).expect_err("exceeds nesting cap"),
+                WindowsShellParseIncomplete::Nesting,
+            );
+            assert!(powershell_tee_scan_required(&command));
+        }
+    }
+
+    #[test]
+    fn powershell_tee_parser_bounds_cumulative_work_issue_642() {
+        let mut command = format!("Write-Output '{}'", "x".repeat(MAX_LEX_WORK_BYTES / 16));
+        for _ in 0..16 {
+            command = format!("Write-Output ({command})");
+        }
+        assert!(command.len() < MAX_LEX_WORK_BYTES);
+        assert_eq!(
+            powershell_tee_truncation_targets(&command).expect_err("repeated work exceeds cap"),
+            WindowsShellParseIncomplete::Work,
+        );
+        assert!(powershell_tee_scan_required(&command));
+
+        let oversized = "x".repeat(MAX_LEX_WORK_BYTES + 1);
+        assert_eq!(
+            powershell_tee_truncation_targets(&oversized).expect_err("input exceeds work cap"),
+            WindowsShellParseIncomplete::Work,
+        );
+        assert!(powershell_tee_scan_required(&oversized));
+        assert!(
+            powershell_tee_truncation_targets("Write-Output 'ordinary data'")
+                .expect("bounded command")
+                .is_empty()
+        );
+        assert!(!powershell_tee_scan_required(
+            "Write-Output 'ordinary data'"
+        ));
+    }
+
+    #[test]
+    fn powershell_native_tee_output_error_mode_prefixes_keep_writes_issue_642() {
+        for option in [
+            "--output-error=warn",
+            "--output-error=warn-n",
+            "--out=warn-nop",
+            "--output-error=exit",
+            "--output-e=exit-n",
+        ] {
+            let command = format!("tee {option} /var/lib/important.txt");
+            let targets = powershell_tee_truncation_targets(&command).expect("bounded fixture");
+            assert!(
+                targets
+                    .iter()
+                    .any(|target| target.path == "/var/lib/important.txt"),
+                "valid native option must retain its file operand: {command}"
+            );
+            let credential = format!("tee {option} ~/.ssh/authorized_keys");
+            let hit = ps(&credential).unwrap_or_else(|| panic!("must deny: {credential}"));
+            assert_eq!(hit.rule, CREDENTIAL_FILE_WRITE_NAME, "{credential}");
+        }
+        for value in ["", "w", "e", "wrong"] {
+            let command = format!("tee --output-error={value} ~/.ssh/authorized_keys");
+            assert!(
+                ps(&command).is_none(),
+                "invalid native mode does not write: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_tee_stop_parsing_preserves_file_binding_issue_642() {
+        for command in [
+            "Tee-Object -InputObject --% /etc/hosts",
+            "Tee-Object -InputObject `--% /etc/hosts",
+            "Tee-Object -InputObject --`% /etc/hosts",
+            "Tee-Object -InputObject --'%' /etc/hosts",
+            "Tee-Object -InputObject '--%' -FilePath /etc/hosts",
+            "Tee-Object -InputObject \"--%\" -FilePath /etc/hosts",
+            "Tee-Object -InputObject '--%' -Append /etc/hosts",
+            "Tee-Object -InputObject '--%' -Variable /etc/hosts",
+            "Tee-Object -InputObject '--%' -WhatIf /etc/hosts",
+            "Tee-Object -InputObject '--%' -Confirm /etc/hosts",
+            "Tee-Object -InputObject '--%' -Unknown /etc/hosts",
+            "Tee-Object -InputObject '--%' -App`end /etc/hosts",
+            "Tee-Object -InputObject '--%',1 -Append /etc/hosts",
+            "Tee-Object -InputObject '--%',(1) -Append /etc/hosts",
+            "Tee-Object -InputObject '--%',$false -Append /etc/hosts",
+            "Tee-Object -InputObject NEW -OutVariable --% /etc/hosts",
+            "Tee-Object -InputObject NEW -PipelineVariable --% /etc/hosts",
+            "Tee-Object -InputObject 'NEW'-FilePath /etc/hosts",
+        ] {
+            let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}");
+            assert_eq!(targets[0].path, "/etc/hosts", "{command}");
+            assert!(targets[0].literal, "{command}");
+        }
+        for switch in ["-Append", "-Variable", "-WhatIf"] {
+            let command = format!("Tee-Object -InputObject '--%' {switch} ~/.ssh/id_rsa");
+            assert!(
+                ps(&command).is_some(),
+                "discarded switch cannot exempt credentials: {command}"
+            );
+        }
+        let command = "Tee-Object -InputObject --% %DESTINATION%";
+        let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+        assert_eq!(targets.len(), 1);
+        assert!(
+            !targets[0].literal,
+            "native environment expansion is unresolved"
+        );
+    }
+
+    #[test]
+    fn powershell_tee_stop_parsing_keeps_append_and_binding_errors_issue_642() {
+        for command in [
+            "Tee-Object --%",
+            "Tee-Object --% inert",
+            "Tee-Object -FilePath /etc/hosts --%",
+            "Tee-Object -FilePath /etc/hosts --% inert",
+            "Tee-Object -InputObject --%",
+            "Tee-Object -InputObject NEW -FilePath /etc/hosts '--%'",
+            "Tee-Object -InputObject '--%' '-Append' /etc/hosts",
+            "Tee-Object -InputObject:'--%' -Append /etc/hosts",
+            "Tee-Object -InputObject:--% -Append /etc/hosts",
+            "Tee-Object -InputObject: '--%' -Append /etc/hosts",
+            "Tee-Object -InputObject ('--%') -Append /etc/hosts",
+            "Tee-Object -InputObject ('--%'),(1) -Append /etc/hosts",
+            "Tee-Object -Append -InputObject '--%' /etc/hosts",
+            "Tee-Object -InputObject '-'\"\"'-%' -FilePath /etc/hosts",
+        ] {
+            assert!(
+                powershell_tee_truncation_targets(command)
+                    .expect("bounded fixture")
+                    .is_empty(),
+                "{command}"
+            );
+        }
+        let command = "Tee-Object '--%' ; Tee-Object /etc/hosts";
+        let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].path, "--%");
+        assert_eq!(targets[1].path, "/etc/hosts");
+    }
+
+    #[test]
+    fn powershell_tee_stop_parsing_resumes_at_real_boundaries_issue_642() {
+        for marker in ["--%", "`--%", "--`%", "--'%'", "''--%"] {
+            let command = format!("Write-Output {marker} ; Tee-Object /etc/hosts");
+            assert!(
+                powershell_tee_truncation_targets(&command)
+                    .expect("bounded fixture")
+                    .is_empty(),
+                "the semicolon is literal: {command}"
+            );
+        }
+        for marker in ["'--%'", "\"--%\"", "'--'%", "'-'\"\"'-%'"] {
+            let command = format!("Write-Output {marker} ; Tee-Object /etc/hosts");
+            let targets = powershell_tee_truncation_targets(&command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}");
+            assert_eq!(targets[0].path, "/etc/hosts", "{command}");
+        }
+        for boundary in ["\n", "\r\n", "`\n", " | ", " && "] {
+            let command = format!("Write-Output --% inert{boundary}Tee-Object /etc/hosts");
+            let targets = powershell_tee_truncation_targets(&command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}");
+            assert_eq!(targets[0].path, "/etc/hosts", "{command}");
+        }
+    }
+
+    #[test]
+    fn powershell_quoted_names_are_data_in_both_credential_collectors_issue_642() {
+        for command in [
+            "'Tee-Object' -FilePath ~/.ssh/id_rsa",
+            "\"Tee-Object\" -FilePath ~/.ssh/id_rsa",
+            "'tee' ~/.ssh/id_rsa",
+        ] {
+            assert!(ps(command).is_none(), "{command}");
+            assert!(
+                classify_all(command, ShellDialect::PowerShell).is_empty(),
+                "{command}"
+            );
+        }
+        for command in [
+            "& 'Tee-Object' -FilePath ~/.ssh/id_rsa",
+            ". 'Tee-Object' -FilePath ~/.ssh/id_rsa",
+            "'ordinary string data' > ~/.ssh/id_rsa",
+        ] {
+            assert!(ps(command).is_some(), "{command}");
+            assert!(
+                !classify_all(command, ShellDialect::PowerShell).is_empty(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_assignment_prefixes_preserve_nested_writes_issue_642() {
+        for command in [
+            "$(Tee-Object /etc/hosts); $x = 1",
+            "$items[(Tee-Object /etc/hosts)] = 1",
+            "$items[(Tee-Object /etc/hosts)] += 1",
+        ] {
+            let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}");
+            assert_eq!(targets[0].path, "/etc/hosts", "{command}");
+            assert_eq!(&command[targets[0].span.clone()], "Tee-Object", "{command}");
+        }
+    }
+
+    #[test]
+    fn powershell_native_tee_stop_parsing_keeps_possible_writes_issue_642() {
+        let targets =
+            powershell_tee_truncation_targets("tee --% /etc/hosts").expect("bounded fixture");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].path, "/etc/hosts");
+        assert!(targets[0].literal);
+
+        for command in ["tee --%", "tee -a --% /etc/hosts"] {
+            assert!(
+                powershell_tee_truncation_targets(command)
+                    .expect("bounded fixture")
+                    .is_empty(),
+                "{command}"
+            );
+        }
+        // Native argv splitting is opaque here, so a possible operand must
+        // survive even when the remainder is not a single decoded path.
+        for command in [
+            "tee --% -a /etc/hosts",
+            "tee --% /etc/hosts /tmp/log",
+            "tee --% \"/etc/hosts\"",
+            "tee --% %DESTINATION%",
+        ] {
+            let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+            assert!(!targets.is_empty(), "{command}");
+            assert!(targets.iter().any(|target| !target.literal), "{command}");
+        }
     }
 }

@@ -33330,6 +33330,126 @@ fn redirect_targets_are_new_home_files(command: &str, dialect: ShellDialect) -> 
         .is_some_and(|home| redirect_targets_are_new_home_files_with_home(command, dialect, &home))
 }
 
+/// Apply the truncating-redirect policy to Tee-Object's bound file operand.
+/// No synthetic shell command is constructed: quoting, parameter arity and
+/// append/variable selection have already been decided by the shared parser.
+fn powershell_tee_truncation_hits(
+    source: &str,
+) -> Result<
+    Vec<crate::packs::core::credential_files::CredentialFileWrite>,
+    crate::packs::core::credential_files::WindowsShellParseIncomplete,
+> {
+    use crate::packs::core::credential_files::{
+        CredentialFileWrite, PowerShellTruncationTarget, powershell_tee_truncation_targets,
+    };
+
+    Ok(powershell_tee_truncation_targets(source)?
+        .into_iter()
+        .filter_map(|target: PowerShellTruncationTarget| {
+            // Credential and .git writes retain their stronger, independent
+            // rule identities, including append writes. Their classifier ran
+            // first; this pass supplies only general truncation protection.
+            let path = target.policy_path.as_str();
+            // Remove only a known filesystem provider for path interpretation.
+            // A provider must not conceal a drive-relative or UNC destination;
+            // preserve the drive and share themselves for local path proofs.
+            let lower_path = target.path.to_ascii_lowercase();
+            let filesystem_path = ["microsoft.powershell.core/filesystem::", "filesystem::"]
+                .iter()
+                .find(|prefix| lower_path.starts_with(**prefix))
+                .map_or(target.path.as_str(), |prefix| &target.path[prefix.len()..]);
+            let provider_home = filesystem_path == "~" || filesystem_path.starts_with("~/");
+            let home_suffix = target.home_suffix.as_deref().or_else(|| {
+                (provider_home && target.literal)
+                    .then(|| filesystem_path[1..].trim_start_matches('/'))
+            });
+            let home = home_suffix.is_some()
+                || provider_home
+                || path == "$HOME"
+                || path.starts_with("$HOME/");
+            let components: Vec<_> = path.split('/')
+                .filter(|part| !part.is_empty() && *part != ".")
+                .collect();
+            let sensitive = home
+                || (path.starts_with('/')
+                    && (components.is_empty()
+                        || components.first().is_some_and(|part| {
+                            matches!(
+                                part.to_ascii_lowercase().as_str(),
+                                "etc" | "usr" | "bin" | "sbin" | "root" | "boot"
+                                    | "lib" | "lib64" | "var" | "home" | "users"
+                                    | "sys" | "proc" | "dev" | "opt" | "windows"
+                                    | "program files" | "program files (x86)" | "programdata"
+                            )
+                        })));
+            // A provider or drive-relative path cannot be resolved from its
+            // visible spelling. Parent traversal can leave a benign prefix.
+            let unknown_provider = filesystem_path.contains(':')
+                && !(filesystem_path.as_bytes().get(1) == Some(&b':')
+                    && filesystem_path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                    && filesystem_path.as_bytes().get(2) == Some(&b'/'));
+            let windows_volume = filesystem_path.starts_with("//")
+                || (filesystem_path.as_bytes().get(1) == Some(&b':')
+                    && filesystem_path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic));
+            // Win32 can discard trailing dots and spaces in components.
+            // Such spellings cannot prove that a benign-looking root is safe.
+            let ambiguous_windows_component = windows_volume
+                && components.iter().any(|part| part.ends_with(['.', ' ']));
+            let unresolved = (!target.literal && home_suffix.is_none())
+                || unknown_provider
+                || filesystem_path.starts_with("//")
+                || ambiguous_windows_component
+                || components.contains(&"..");
+            // These literal paths have the same disposable-output carve-out
+            // as redirects. Dynamic suffixes and traversal never qualify.
+            let temporary = target.literal
+                && !unresolved
+                && (["/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/"]
+                    .iter()
+                    .any(|prefix| filesystem_path.starts_with(prefix))
+                    || crate::packs::core::filesystem::windows_literal_user_temp_subpath(filesystem_path));
+            let device = target.literal
+                && matches!(filesystem_path, "/dev/null" | "/dev/zero" | "/dev/full" | "/dev/tty" | "/dev/kmsg");
+            if temporary || device || (!sensitive && !unresolved) {
+                return None;
+            }
+            let rule = if sensitive {
+                "redirect-truncate-root-home"
+            } else {
+                "redirect-truncate-dynamic-path"
+            };
+            if sensitive && !unresolved {
+                // Reuse the existing absent-home proof, including symlink,
+                // parent, .git and remote-filesystem checks. Never stat a
+                // volume-stripped Windows path as a local Unix path.
+                if let Some(home) = crate::config::home_dir() {
+                    let local = home_suffix.map_or_else(
+                        || PathBuf::from(filesystem_path),
+                        |suffix| home.join(suffix),
+                    );
+                    if local.is_absolute() && path_is_new_file_under_home(&local, &home) {
+                        return None;
+                    }
+                }
+                let rule_id = format!("core.filesystem:{rule}");
+                if let Some(glob) = crate::config::rule_target_exemption(&rule_id, &target.path) {
+                    crate::config::note_rule_target_suppression(&rule_id, &glob, &target.path);
+                    return None;
+                }
+            }
+            Some(CredentialFileWrite {
+                span: target.span,
+                reason: if unresolved {
+                    "Tee-Object without a proven enabled -Append may truncate a sensitive file at an unresolved destination. Resolve and inspect the path first.".to_string()
+                } else {
+                    format!("Tee-Object without -Append overwrites `{}`; the existing sensitive file contents would be lost. Use -Append to preserve them or choose a scratch file.", target.path)
+                },
+                rule,
+            })
+        })
+        .collect())
+}
+
 thread_local! {
     /// Nested evaluation is synchronous. A scoped value carries filesystem
     /// provenance through all recursive shell and indirect-input paths without
@@ -33704,6 +33824,8 @@ fn evaluate_core_filesystem_pack(
     let mut embedded_credential_scanned = false;
     // Likewise for the whole-command PowerShell protected-write read below.
     let mut powershell_credential_scanned = false;
+    let mut powershell_truncation_scanned = false;
+    let mut powershell_analysis_incomplete = false;
     // What normalization stripped ahead of the command, e.g. `env -C ~/.ssh `
     // (#480): it still decides the directory the first segment runs in.
     let stripped_prefix = normalized_offset
@@ -33801,14 +33923,13 @@ fn evaluate_core_filesystem_pack(
         // segment holds both the writer and its path (#477). The PowerShell
         // lexer splits commands and reads such groups itself, and its spans
         // already refer to the original command.
-        let protected_hits: Vec<_> = if shell_dialect == ShellDialect::PowerShell {
+        let mut protected_hits: Vec<_> = if shell_dialect == ShellDialect::PowerShell {
             if powershell_credential_scanned {
                 Vec::new()
             } else {
                 powershell_credential_scanned = true;
-                crate::packs::core::credential_files::classify_credential_file_write(
+                crate::packs::core::credential_files::classify_powershell_credential_writes(
                     original_command,
-                    shell_dialect,
                 )
                 .into_iter()
                 .chain(
@@ -33866,6 +33987,46 @@ fn evaluate_core_filesystem_pack(
                 .map(|hit| (hit, segment_start, normalized_offset))
                 .collect()
         };
+        if shell_dialect == ShellDialect::Unknown && !powershell_credential_scanned {
+            powershell_credential_scanned = true;
+            // Keep the existing POSIX findings and add every PowerShell
+            // reading. Native tee may open several protected destinations
+            // in one invocation, so an earlier allowlisted Git operand must
+            // not conceal a later credential operand. The sanitized source
+            // preserves the caller's proof that heredoc/program data is inert.
+            protected_hits.extend(
+                crate::packs::core::credential_files::classify_powershell_credential_writes(
+                    dialect_source,
+                )
+                .into_iter()
+                .chain(
+                    crate::packs::core::credential_files::classify_git_redirect_writes(
+                        dialect_source,
+                        ShellDialect::PowerShell,
+                    ),
+                )
+                .map(|hit| (hit, 0, normalized_offset)),
+            );
+        }
+        if !powershell_truncation_scanned
+            && matches!(
+                shell_dialect,
+                ShellDialect::PowerShell | ShellDialect::Unknown
+            )
+        {
+            powershell_truncation_scanned = true;
+            let (tee_source, tee_offset) = if shell_dialect == ShellDialect::PowerShell {
+                (original_command, Some(0))
+            } else {
+                // Unknown is a union of readings, but must not restore text
+                // already proven to be inert heredoc/program data.
+                (dialect_source, normalized_offset)
+            };
+            match powershell_tee_truncation_hits(tee_source) {
+                Ok(hits) => protected_hits.extend(hits.into_iter().map(|hit| (hit, 0, tee_offset))),
+                Err(_) => powershell_analysis_incomplete = true,
+            }
+        }
         // Embedded interpreter code is delivered out-of-band, so no single
         // segment holds both the interpreter and its code: a heredoc body is
         // split off by the newlines that separate commands, a pipeline puts the
@@ -33900,7 +34061,11 @@ fn evaluate_core_filesystem_pack(
             // The hit names its own rule: Git writers, Git truncation, Git
             // append, and credentials keep independent grants (#457, #492).
             let rule = hit.rule;
-            let severity = crate::packs::Severity::Critical;
+            let severity = pack
+                .destructive_patterns
+                .iter()
+                .find(|pattern| pattern.name == Some(rule))
+                .map_or(crate::packs::Severity::Critical, |pattern| pattern.severity);
             let (explanation, suggestions) = pack.rule_guidance(rule);
             let span = MatchSpan {
                 start: hit.span.start + credential_span_base,
@@ -34351,7 +34516,12 @@ fn evaluate_core_filesystem_pack(
         }
     }
 
-    None
+    // Concrete findings above retain their rule identity. If no rule decided
+    // the request, exhausting the semantic parser is still not an allow.
+    powershell_analysis_incomplete.then(|| EvaluationResult {
+        decision: EvaluationDecision::Indeterminate,
+        ..EvaluationResult::allowed()
+    })
 }
 
 /// `view`, a byte-aligned slice of a pack's command that starts at
@@ -39824,6 +39994,32 @@ where
     best
 }
 
+/// Confirm execution using the same bounded parser that emitted a semantic
+/// Tee finding. Its command-word span is distinct from redirect regex spans;
+/// a nearby Tee mention or a quoted data string supplies no such evidence.
+fn proven_powershell_tee_truncation_match(command: &str, info: &PatternMatch) -> bool {
+    if !matches!(info.source, MatchSource::Pack)
+        || info.pack_id.as_deref() != Some("core.filesystem")
+        || !matches!(
+            info.pattern_name.as_deref(),
+            Some("redirect-truncate-root-home" | "redirect-truncate-dynamic-path")
+        )
+        || !span_addresses_command(command, info)
+    {
+        return false;
+    }
+    let Some(span) = info.matched_span else {
+        return false;
+    };
+    crate::packs::core::credential_files::powershell_tee_truncation_targets(command).is_ok_and(
+        |targets| {
+            targets
+                .iter()
+                .any(|target| target.span.start == span.start && target.span.end == span.end)
+        },
+    )
+}
+
 /// Apply confidence scoring to potentially downgrade a Deny to Warn.
 ///
 /// This function computes a confidence score for the pattern match and
@@ -39892,6 +40088,17 @@ pub fn apply_confidence_scoring(
             .severity
             .is_some_and(|s| s == crate::packs::Severity::Critical)
     {
+        return ConfidenceResult {
+            mode: current_mode,
+            score: None,
+            downgraded: false,
+        };
+    }
+
+    // The semantic parser already proved this Tee invocation executes. The
+    // generic context scorer does not model PowerShell assignment, return,
+    // or dot invocation, so it must not relabel the proven command as data.
+    if proven_powershell_tee_truncation_match(command, info) {
         return ConfidenceResult {
             mode: current_mode,
             score: None,
@@ -52157,6 +52364,109 @@ mod tests {
         assert!(!info.suggestions.is_empty(), "suggestions are attached");
     }
 
+    #[test]
+    fn powershell_tee_unknown_union_keeps_independent_credential_rules_issue_642() {
+        for (command, grant, expected) in [
+            (
+                "tee -a .git/config ~/.ssh/authorized_keys",
+                "core.filesystem:git-internals-write",
+                "credential-file-write",
+            ),
+            (
+                "tee --append .git/config ~/.ssh/authorized_keys",
+                "core.filesystem:git-internals-write",
+                "credential-file-write",
+            ),
+            (
+                "tee -a ~/.ssh/authorized_keys .git/config",
+                "core.filesystem:credential-file-write",
+                "git-internals-write",
+            ),
+        ] {
+            let allowlists = project_allowlists_for_rule(grant, "only this rule is approved");
+            let result = evaluate_with_pack_ids_and_allowlists_at_path(
+                command,
+                &["core.filesystem"],
+                &allowlists,
+                None,
+            );
+            assert!(result.is_denied(), "{command}: {result:?}");
+            assert_eq!(
+                result.pattern_info.and_then(|info| info.pattern_name),
+                Some(expected.to_string()),
+                "granting {grant} must not grant the other destination: {command}",
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_tee_unknown_union_preserves_data_masks_and_posix_hits_issue_642() {
+        for command in [
+            "cat <<'DATA'\ntee -a .git/config ~/.ssh/authorized_keys\nDATA",
+            "printf '%s\\n' 'Tee-Object -Append ~/.ssh/authorized_keys'",
+            "git commit -m 'tee -a .git/config ~/.ssh/authorized_keys'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Unknown,
+            );
+            assert!(result.is_allowed(), "inert data: {command}: {result:?}");
+        }
+
+        // POSIX removes this backslash; PowerShell treats it as a directory
+        // separator. The additional PowerShell read must retain the POSIX hit.
+        let command = r"echo x | tee -a ~/.ss\h/authorized_keys";
+        let result =
+            evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], ShellDialect::Unknown);
+        assert!(result.is_denied(), "POSIX reading: {result:?}");
+        assert_eq!(
+            result.pattern_info.and_then(|info| info.pattern_name),
+            Some("credential-file-write".to_string()),
+        );
+    }
+
+    #[test]
+    fn powershell_tee_parser_exhaustion_reaches_indeterminate_issue_642() {
+        // No writer or protected-path keyword selects the pack. Exhausting
+        // the shared parser must itself keep both keyword-gating paths open.
+        let mut command = "1".to_string();
+        for _ in 0..40 {
+            command = format!("Write-Output ({command})");
+        }
+        let enabled_packs = std::collections::HashSet::from(["core.filesystem".to_string()]);
+        let ordered_packs = crate::packs::REGISTRY.expand_enabled_ordered(&enabled_packs);
+        let index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let keywords = crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let mut config = default_config();
+        config.heredoc.timeout_ms = Some(5_000);
+        let settings = config.heredoc_settings();
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+            for use_index in [false, true] {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    &command,
+                    &keywords,
+                    &ordered_packs,
+                    if use_index { index.as_ref() } else { None },
+                    &compiled,
+                    &allowlists,
+                    &settings,
+                    None,
+                    None,
+                    None,
+                    dialect,
+                );
+                assert!(
+                    result.is_indeterminate() && !result.skipped_due_to_budget,
+                    "semantic parser cap, {dialect:?}, index={use_index}: {result:?}",
+                );
+                assert!(!result.quick_rejected);
+            }
+        }
+    }
+
     /// #337 / #390: the truncation hazard exists only for a target that
     /// already exists. A literal absent file with an existing parent under
     /// the home directory is creation, not truncation, whether or not a VCS
@@ -58794,6 +59104,60 @@ mod tests {
         config.confidence.enabled = true;
         config.confidence.warn_threshold = 0.7;
         config
+    }
+
+    #[test]
+    fn powershell_tee_confidence_requires_exact_execution_evidence_issue_642() {
+        let result_for = |command: &str| {
+            let start = command.find("Tee-Object").expect("fixture command name");
+            EvaluationResult::denied_by_pack_pattern_with_span(
+                "core.filesystem",
+                "redirect-truncate-dynamic-path",
+                "semantic Tee truncation",
+                None,
+                crate::packs::Severity::High,
+                &[],
+                command,
+                MatchSpan {
+                    start,
+                    end: start + "Tee-Object".len(),
+                },
+            )
+        };
+        let command = "$x = Tee-Object $target";
+        let result = result_for(command);
+        assert!(proven_powershell_tee_truncation_match(
+            command,
+            result.pattern_info.as_ref().expect("finding"),
+        ));
+        let config = confidence_config();
+        let confidence =
+            apply_effective_confidence(&config, command, &result, crate::packs::DecisionMode::Deny);
+        assert_eq!(confidence.mode, crate::packs::DecisionMode::Deny);
+        assert!(!confidence.downgraded);
+        let configured =
+            apply_effective_confidence(&config, command, &result, crate::packs::DecisionMode::Ask);
+        assert_eq!(configured.mode, crate::packs::DecisionMode::Ask);
+
+        for command in [
+            "Write-Output 'Tee-Object $target'",
+            "Write-Output 'Tee-Object data'; Tee-Object $target",
+            "Tee-Object -Variable captured",
+            "Tee-Object $target -Append",
+            "Tee-Object $target -WhatIf",
+        ] {
+            let result = result_for(command);
+            assert!(
+                !proven_powershell_tee_truncation_match(
+                    command,
+                    result.pattern_info.as_ref().expect("finding"),
+                ),
+                "data or non-truncating invocation is no proof: {command}",
+            );
+        }
+        let mut unrelated = result.pattern_info.expect("finding");
+        unrelated.pattern_name = Some("rm-rf-general".to_string());
+        assert!(!proven_powershell_tee_truncation_match(command, &unrelated));
     }
 
     fn rm_rf_result(measured_on: &str, span: MatchSpan) -> EvaluationResult {

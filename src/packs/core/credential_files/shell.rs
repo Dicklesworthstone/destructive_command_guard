@@ -31,6 +31,11 @@ use std::ops::Range;
 pub(super) mod indirection;
 mod windows_shells;
 
+pub(crate) use windows_shells::{
+    PowerShellTruncationTarget, WindowsShellParseIncomplete, powershell_tee_scan_required,
+    powershell_tee_truncation_targets,
+};
+
 /// Rule name under `core.filesystem`. The pattern entry in
 /// `filesystem::create_destructive_patterns` carries the static reason shown
 /// by `dcg rules` and the generated docs; every evaluator hit carries its own
@@ -162,6 +167,16 @@ pub(crate) fn classify_credential_file_write(
             .or_else(|| windows_shells::classify(segment, ShellDialect::PowerShell))
             .or_else(|| windows_shells::classify(segment, ShellDialect::Cmd)),
     }
+}
+
+/// PowerShell is scanned as a whole source, retaining every command's write
+/// and every native tee destination. Granting a Git write must not hide a
+/// credential write in the same invocation or a later command.
+pub(crate) fn classify_powershell_credential_writes(source: &str) -> Vec<CredentialFileWrite> {
+    if !may_name_protected_path(source) {
+        return Vec::new();
+    }
+    windows_shells::classify_all(source, ShellDialect::PowerShell)
 }
 
 /// All Git redirect writes, retaining the existing truncate and append rule
