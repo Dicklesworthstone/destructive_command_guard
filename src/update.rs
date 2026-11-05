@@ -4,6 +4,7 @@
 //! by querying the GitHub Releases API. Results are cached to avoid API spam.
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::thread;
@@ -159,12 +160,30 @@ fn generate_unique_backup_name(dir: &Path, version: &str, timestamp: u64) -> Str
     format!("{base}-{nanos_suffix:09}-overflow")
 }
 
-/// List all available backup versions, sorted by creation time (newest first).
+/// List this installation's backup versions, newest first.
 ///
 /// # Errors
 ///
 /// Returns `VersionCheckError::BackupError` if the backup directory cannot be read.
 pub fn list_backups() -> Result<Vec<BackupEntry>, VersionCheckError> {
+    let current_exe = std::env::current_exe().map_err(|e| {
+        VersionCheckError::BackupError(format!("Failed to get current executable path: {e}"))
+    })?;
+    Ok(list_all_backups()?
+        .into_iter()
+        .filter(|entry| backup_belongs_to_installation(entry, &current_exe))
+        .collect())
+}
+
+fn backup_belongs_to_installation(entry: &BackupEntry, installation: &Path) -> bool {
+    entry.original_path == installation
+        || fs::canonicalize(&entry.original_path)
+            .ok()
+            .zip(fs::canonicalize(installation).ok())
+            .is_some_and(|(original, current)| original == current)
+}
+
+fn list_all_backups() -> Result<Vec<BackupEntry>, VersionCheckError> {
     let dir = backup_dir().ok_or_else(|| {
         VersionCheckError::BackupError("Could not determine backup directory".to_string())
     })?;
@@ -206,112 +225,244 @@ pub fn list_backups() -> Result<Vec<BackupEntry>, VersionCheckError> {
 ///
 /// Returns `VersionCheckError::BackupError` if the backup cannot be created.
 pub fn create_backup() -> Result<PathBuf, VersionCheckError> {
-    create_backup_preserving(None)
+    let current_exe = std::env::current_exe().map_err(|e| {
+        VersionCheckError::BackupError(format!("Failed to get current executable path: {e}"))
+    })?;
+    create_backup_for(&current_exe, current_version())
 }
 
-fn create_backup_preserving(
-    preserve_artifact_name: Option<&str>,
+/// Snapshot the binary that the installer will actually replace. The caller
+/// supplies that binary's version, which may differ from the running program
+/// when an explicit installation destination was requested.
+///
+/// Creating a recovery point never prunes older backups: only a successful
+/// replacement may commit retention changes.
+pub(crate) fn create_backup_for(
+    binary: &Path,
+    version: &str,
 ) -> Result<PathBuf, VersionCheckError> {
     let dir = backup_dir().ok_or_else(|| {
         VersionCheckError::BackupError("Could not determine backup directory".to_string())
     })?;
+    create_backup_in(&dir, binary, version)
+}
 
-    // Ensure backup directory exists
-    fs::create_dir_all(&dir).map_err(|e| {
+/// Probe a local executable without enabling hook repair, update checks, or
+/// ambient output modes. A reported version is usable only after native exit 0.
+pub(crate) fn reported_binary_version(binary: &Path) -> Result<String, VersionCheckError> {
+    let output = std::process::Command::new(binary)
+        .arg("--version")
+        .env("DCG_SELF_HEAL_HOOK", "0")
+        .env("DCG_NO_UPDATE_CHECK", "1")
+        .env("NO_COLOR", "1")
+        .env("DCG_NO_COLOR", "1")
+        .env_remove("DCG_ROBOT")
+        .env_remove("DCG_QUIET")
+        .env_remove("DCG_FORMAT")
+        .output()
+        .map_err(|error| {
+            VersionCheckError::BackupError(format!(
+                "Could not identify existing {}: {error}",
+                binary.display()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(VersionCheckError::BackupError(format!(
+            "Refusing to replace {} without an identifiable recovery version (status {})",
+            binary.display(),
+            output.status
+        )));
+    }
+    parse_binary_version(&output.stdout, &output.stderr).ok_or_else(|| {
+        VersionCheckError::BackupError(format!(
+            "Could not identify recovery version for {}: expected an unambiguous SemVer",
+            binary.display()
+        ))
+    })
+}
+
+pub(crate) fn parse_binary_version(stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    let stdout = std::str::from_utf8(stdout).ok()?;
+    let stderr = std::str::from_utf8(stderr).ok()?;
+    let mut found = None;
+    for line in stdout.lines().chain(stderr.lines()) {
+        let candidate = line.trim();
+        let candidate = candidate
+            .strip_prefix("dcg")
+            .filter(|suffix| suffix.starts_with(char::is_whitespace))
+            .map_or(candidate, str::trim_start);
+        let candidate = candidate.strip_prefix('v').unwrap_or(candidate);
+        if let Ok(version) = semver::Version::parse(candidate) {
+            let version = version.to_string();
+            if found.as_ref().is_some_and(|previous| previous != &version) {
+                return None;
+            }
+            found = Some(version);
+        }
+    }
+    found
+}
+
+fn copy_to_new_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let mut input = fs::File::open(source)?;
+    let metadata = input.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "backup source is not a regular file",
+        ));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(destination)?;
+    let result = (|| {
+        std::io::copy(&mut input, &mut output)?;
+        output.set_permissions(metadata.permissions())?;
+        output.sync_all()
+    })();
+    drop(output);
+    if result.is_err() {
+        // Only this call's exclusively created, incomplete file is removed.
+        let _ = fs::remove_file(destination);
+    }
+    result
+}
+
+fn create_backup_in(
+    dir: &Path,
+    binary: &Path,
+    version: &str,
+) -> Result<PathBuf, VersionCheckError> {
+    let version = semver::Version::parse(version)
+        .map_err(|e| VersionCheckError::BackupError(format!("Invalid backup version: {e}")))?;
+    let version = version.to_string();
+    fs::create_dir_all(dir).map_err(|e| {
         VersionCheckError::BackupError(format!("Failed to create backup directory: {e}"))
     })?;
 
-    // Get current executable path
-    let current_exe = std::env::current_exe().map_err(|e| {
-        VersionCheckError::BackupError(format!("Failed to get current executable path: {e}"))
-    })?;
-
-    let version = current_version();
     let timestamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|e| VersionCheckError::BackupError(format!("Failed to get timestamp: {e}")))?
         .as_secs();
 
-    let backup_name = generate_unique_backup_name(&dir, version, timestamp);
+    let backup_name = generate_unique_backup_name(dir, &version, timestamp);
     let backup_path = dir.join(&backup_name);
     let metadata_path = dir.join(format!("{backup_name}.json"));
 
-    // Copy current binary to backup location
-    fs::copy(&current_exe, &backup_path).map_err(|e| {
+    copy_to_new_file(binary, &backup_path).map_err(|e| {
         VersionCheckError::BackupError(format!("Failed to copy binary to backup: {e}"))
     })?;
 
     // Write metadata
     let entry = BackupEntry {
-        version: version.to_string(),
+        version,
         created_at: timestamp,
         artifact_name: Some(backup_name.clone()),
-        original_path: current_exe,
+        original_path: binary.to_path_buf(),
     };
 
     let metadata_content = serde_json::to_string_pretty(&entry).map_err(|e| {
         VersionCheckError::BackupError(format!("Failed to serialize backup metadata: {e}"))
     })?;
 
-    fs::write(&metadata_path, metadata_content).map_err(|e| {
-        VersionCheckError::BackupError(format!("Failed to write backup metadata: {e}"))
+    let mut metadata = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&metadata_path)
+        .map_err(|e| {
+            VersionCheckError::BackupError(format!("Failed to create backup metadata: {e}"))
+        })?;
+    metadata
+        .write_all(metadata_content.as_bytes())
+        .map_err(|e| {
+            VersionCheckError::BackupError(format!("Failed to write backup metadata: {e}"))
+        })?;
+    metadata.sync_all().map_err(|e| {
+        VersionCheckError::BackupError(format!("Failed to flush backup metadata: {e}"))
     })?;
-
-    prune_old_backups_preserving(preserve_artifact_name)?;
 
     Ok(backup_path)
 }
 
-fn backup_names_to_prune(
-    backups: &[BackupEntry],
-    preserve_artifact_name: Option<&str>,
-) -> Vec<String> {
+fn backup_names_to_prune(backups: &[BackupEntry], preserve_artifact_names: &[&str]) -> Vec<String> {
     let mut sorted = backups.to_vec();
     sorted.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
 
-    let mut retained_total = 0;
+    // Reserve the recovery points first, including snapshots created in the
+    // same timestamp second and an explicitly selected older rollback target.
+    let mut retained_total = sorted
+        .iter()
+        .filter(|entry| preserve_artifact_names.contains(&backup_artifact_name(entry).as_str()))
+        .count();
     let mut prune_names = Vec::new();
 
     for backup in sorted {
         let backup_name = backup_artifact_name(&backup);
+
+        if preserve_artifact_names.contains(&backup_name.as_str()) {
+            continue;
+        }
 
         if retained_total < MAX_BACKUPS {
             retained_total += 1;
             continue;
         }
 
-        if preserve_artifact_name != Some(backup_name.as_str()) {
-            prune_names.push(backup_name);
-        }
+        prune_names.push(backup_name);
     }
 
     prune_names
 }
 
-fn prune_old_backups_preserving(
-    preserve_artifact_name: Option<&str>,
-) -> Result<(), VersionCheckError> {
-    let backups = list_backups()?;
-
-    let prune_names = backup_names_to_prune(&backups, preserve_artifact_name);
-    if prune_names.is_empty() {
-        return Ok(());
-    }
-
+/// Compute a retention plan before handing off an authenticated installer.
+/// Deferred workers receive these exact paths and remove them only on success.
+pub(crate) fn backup_files_to_prune(
+    installation: &Path,
+    preserve_paths: &[&Path],
+) -> Result<Vec<PathBuf>, VersionCheckError> {
+    // The data directory can be shared by multiple installations. Updating one
+    // must neither choose nor prune another installation's recovery points.
+    let backups: Vec<_> = list_all_backups()?
+        .into_iter()
+        .filter(|entry| backup_belongs_to_installation(entry, installation))
+        .collect();
     let dir = backup_dir().ok_or_else(|| {
         VersionCheckError::BackupError("Could not determine backup directory".to_string())
     })?;
-
-    // During rollback, the selected restore target must survive even if it is
-    // older than the retention window. A later normal backup can restore the cap.
+    let preserve_names: Vec<_> = preserve_paths
+        .iter()
+        .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+        .collect();
+    let prune_names = backup_names_to_prune(&backups, &preserve_names);
+    let mut paths = Vec::with_capacity(prune_names.len() * 2);
     for backup_name in prune_names {
-        let backup_path = dir.join(&backup_name);
-        let metadata_path = dir.join(format!("{backup_name}.json"));
-
-        let _ = fs::remove_file(&backup_path);
-        let _ = fs::remove_file(&metadata_path);
+        if !is_valid_backup_artifact_name(&backup_name) {
+            return Err(VersionCheckError::BackupError(
+                "Invalid backup artifact name in retention metadata".to_string(),
+            ));
+        }
+        paths.push(dir.join(&backup_name));
+        paths.push(dir.join(format!("{backup_name}.json")));
     }
+    Ok(paths)
+}
 
+pub(crate) fn prune_backup_files(paths: &[PathBuf]) -> Result<(), VersionCheckError> {
+    for path in paths {
+        if let Err(error) = fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(VersionCheckError::BackupError(format!(
+                    "Failed to prune {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -361,6 +512,11 @@ pub fn rollback(target_version: Option<&str>) -> Result<String, VersionCheckErro
     })?;
 
     let backup_name = backup_artifact_name(backup);
+    if !is_valid_backup_artifact_name(&backup_name) {
+        return Err(VersionCheckError::BackupError(
+            "Invalid backup artifact name".to_string(),
+        ));
+    }
     let backup_path = dir.join(&backup_name);
 
     if !backup_path.exists() {
@@ -375,23 +531,11 @@ pub fn rollback(target_version: Option<&str>) -> Result<String, VersionCheckErro
         VersionCheckError::BackupError(format!("Failed to get current executable path: {e}"))
     })?;
 
-    // Create a backup of the current version before rollback without pruning the
-    // restore target we already validated above.
-    create_backup_preserving(Some(&backup_name))?;
-
-    // Replace current binary with backup
-    // On Unix, we can directly copy over the executable (it's memory-mapped)
-    // On Windows, the self_update crate handles the complexity
-    #[cfg(unix)]
-    {
-        fs::copy(&backup_path, &current_exe).map_err(|e| {
-            VersionCheckError::BackupError(format!("Failed to restore backup: {e}"))
-        })?;
-    }
-
-    #[cfg(windows)]
-    {
-        swap_running_executable(&current_exe, &backup_path)?;
+    let recovery_backup = create_backup()?;
+    let prune_paths = backup_files_to_prune(&current_exe, &[&backup_path, &recovery_backup])?;
+    swap_running_executable(&current_exe, &backup_path, &backup.version)?;
+    if let Err(error) = prune_backup_files(&prune_paths) {
+        eprintln!("Rollback succeeded, but older backups were retained: {error}");
     }
 
     Ok(format!(
@@ -401,30 +545,90 @@ pub fn rollback(target_version: Option<&str>) -> Result<String, VersionCheckErro
     ))
 }
 
-/// Windows-only: atomically replace the running executable with a backup.
+/// Copy and qualify a backup beside the current executable before replacing it.
 ///
-/// On Windows the running `.exe` is file-locked and cannot be overwritten in
-/// place, so this renames the current binary aside (`<name>.exe.old`), copies the
-/// backup into the original path, and — if the copy fails — renames the old
-/// binary back so the install is never left broken. The `.exe.old` is removed on
-/// success. Extracted from `rollback` so the swap/restore semantics are
-/// unit-testable (see the `#[cfg(windows)]` test below).
-#[cfg(windows)]
+/// Unix rename replaces the directory entry atomically without trying to
+/// truncate the running inode (which Linux rejects with ETXTBSY). Windows must
+/// first move its locked executable aside, then publish the completed staged
+/// file, restoring the incumbent if publication fails. The source backup is
+/// never consumed.
 fn swap_running_executable(
-    current_exe: &std::path::Path,
-    backup_path: &std::path::Path,
+    current_exe: &Path,
+    backup_path: &Path,
+    expected_version: &str,
 ) -> Result<(), VersionCheckError> {
-    let backup_old = current_exe.with_extension("exe.old");
-    fs::rename(current_exe, &backup_old).map_err(|e| {
-        VersionCheckError::BackupError(format!("Failed to move current executable: {e}"))
+    if !current_exe.is_file() {
+        return Err(VersionCheckError::BackupError(
+            "Current executable is not a regular file".to_string(),
+        ));
+    }
+    let parent = current_exe.parent().ok_or_else(|| {
+        VersionCheckError::BackupError("Executable has no parent directory".to_string())
     })?;
-    fs::copy(backup_path, current_exe).map_err(|e| {
-        // Restore the old binary on failure so we never leave a missing exe.
-        let _ = fs::rename(&backup_old, current_exe);
-        VersionCheckError::BackupError(format!("Failed to restore backup: {e}"))
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|e| VersionCheckError::BackupError(format!("Failed to get timestamp: {e}")))?
+        .as_nanos();
+    let expected_version = semver::Version::parse(
+        expected_version
+            .strip_prefix('v')
+            .unwrap_or(expected_version),
+    )
+    .map_err(|error| {
+        VersionCheckError::BackupError(format!("Invalid rollback version in metadata: {error}"))
+    })?
+    .to_string();
+    // The explicit executable suffix also permits a native Windows version
+    // probe. The stage remains beside the destination for the final rename.
+    let staged = parent.join(format!(".dcg-rollback-{}-{nanos}.exe", std::process::id()));
+    copy_to_new_file(backup_path, &staged).map_err(|e| {
+        VersionCheckError::BackupError(format!("Failed to stage rollback backup: {e}"))
     })?;
-    let _ = fs::remove_file(&backup_old);
-    Ok(())
+
+    let result = (|| {
+        let reported_version = reported_binary_version(&staged)?;
+        if reported_version != expected_version {
+            return Err(VersionCheckError::BackupError(format!(
+                "Rollback backup version mismatch: expected {expected_version}, got {reported_version}"
+            )));
+        }
+        publish_staged_executable(current_exe, &staged)
+    })();
+    // A successfully published file has already moved out of this path.
+    let _ = fs::remove_file(&staged);
+    result
+}
+
+fn publish_staged_executable(current_exe: &Path, staged: &Path) -> Result<(), VersionCheckError> {
+    #[cfg(not(windows))]
+    let result = fs::rename(staged, current_exe).map_err(|e| {
+        VersionCheckError::BackupError(format!("Failed to publish rollback backup: {e}"))
+    });
+
+    #[cfg(windows)]
+    let result = (|| {
+        let backup_old = staged.with_extension("old");
+        fs::rename(current_exe, &backup_old).map_err(|e| {
+            VersionCheckError::BackupError(format!("Failed to move current executable: {e}"))
+        })?;
+        if let Err(error) = fs::rename(staged, current_exe) {
+            if let Err(restore_error) = fs::rename(&backup_old, current_exe) {
+                return Err(VersionCheckError::BackupError(format!(
+                    "Failed to publish rollback backup ({error}) and restore the incumbent \
+                     ({restore_error}); original executable remains at {}",
+                    backup_old.display()
+                )));
+            }
+            return Err(VersionCheckError::BackupError(format!(
+                "Failed to publish rollback backup: {error}"
+            )));
+        }
+        // Windows may retain the mapped incumbent until this process exits.
+        let _ = fs::remove_file(&backup_old);
+        Ok(())
+    })();
+
+    result
 }
 
 /// Format backup list for display.
@@ -1066,33 +1270,168 @@ mod tests {
         }
     }
 
-    /// win-test-rollback-bom: the Windows rename-then-copy executable swap must
-    /// replace the binary on success and restore the original on failure (the
-    /// running exe is locked on Windows, so it can never be left missing).
-    #[cfg(windows)]
+    /// Exercise publication and restore-on-failure on both platforms. The CLI
+    /// integration tests also qualify and replace a mapped, running executable.
     #[test]
-    fn swap_running_executable_replaces_and_restores() {
+    fn publish_staged_executable_replaces_and_restores() {
         let dir = tempfile::tempdir().expect("tempdir");
         let current = dir.path().join("dcg.exe");
         let backup = dir.path().join("backup.exe");
+        let staged = dir.path().join("stage.exe");
         std::fs::write(&current, b"OLD").unwrap();
         std::fs::write(&backup, b"NEW").unwrap();
 
-        // Success: current becomes the backup's contents; `.exe.old` cleaned up.
-        swap_running_executable(&current, &backup).expect("swap should succeed");
+        copy_to_new_file(&backup, &staged).unwrap();
+        publish_staged_executable(&current, &staged).expect("swap should succeed");
         assert_eq!(std::fs::read(&current).unwrap(), b"NEW");
-        assert!(!current.with_extension("exe.old").exists());
+        assert_eq!(std::fs::read(&backup).unwrap(), b"NEW");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
 
         // Failure (missing backup source): current must be restored, not lost.
         std::fs::write(&current, b"OLD2").unwrap();
         let missing = dir.path().join("does-not-exist.exe");
-        let err = swap_running_executable(&current, &missing);
+        let err = publish_staged_executable(&current, &missing);
         assert!(err.is_err(), "missing backup source must error");
         assert_eq!(
             std::fs::read(&current).unwrap(),
             b"OLD2",
-            "current executable must be restored on copy failure"
+            "current executable must be restored on publication failure"
         );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn swap_running_executable_publication_failure_preserves_source_and_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("occupied");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("incumbent"), b"OLD").unwrap();
+        let backup = dir.path().join("backup");
+        std::fs::write(&backup, b"NEW").unwrap();
+
+        assert!(swap_running_executable(&target, &backup, "0.15.0").is_err());
+        assert_eq!(std::fs::read(target.join("incumbent")).unwrap(), b"OLD");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"NEW");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_qualifies_the_completed_stage_before_publishing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("dcg");
+        let backup = dir.path().join("backup");
+        let payload = b"#!/bin/sh\ncase \"$0\" in */.dcg-rollback-*.exe) ;; *) exit 77;; esac\nprintf 'dcg v0.15.0\\n' >&2\n";
+        std::fs::write(&current, b"incumbent").unwrap();
+        std::fs::write(&backup, payload).unwrap();
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o751)).unwrap();
+
+        swap_running_executable(&current, &backup, "0.15.0").unwrap();
+        assert_eq!(std::fs::read(&current).unwrap(), payload);
+        assert_eq!(std::fs::read(&backup).unwrap(), payload);
+        assert_eq!(
+            std::fs::metadata(&current).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_rejects_unqualified_stages_without_touching_incumbent_or_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for payload in [
+            "",
+            "not an executable",
+            "#!/bin/sh\nprintf '0.14.0\\n'\n",
+            "#!/bin/sh\nprintf '0.15.0\\n'\nexit 23\n",
+            "#!/bin/sh\nprintf '0.15.0\\n'\nprintf '0.14.0\\n' >&2\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let current = dir.path().join("dcg");
+            let backup = dir.path().join("backup");
+            std::fs::write(&current, b"incumbent").unwrap();
+            std::fs::write(&backup, payload).unwrap();
+            std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o751)).unwrap();
+
+            assert!(swap_running_executable(&current, &backup, "0.15.0").is_err());
+            assert_eq!(std::fs::read(&current).unwrap(), b"incumbent");
+            assert_eq!(std::fs::read(&backup).unwrap(), payload.as_bytes());
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        }
+    }
+
+    #[test]
+    fn exclusive_backup_copy_never_truncates_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let target = dir.path().join("target");
+        std::fs::write(&source, b"NEW").unwrap();
+        std::fs::write(&target, b"RECOVERY").unwrap();
+        let error = copy_to_new_file(&source, &target).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"RECOVERY");
+    }
+
+    #[test]
+    fn creating_a_backup_preserves_bytes_metadata_and_prior_recovery_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("dcg");
+        std::fs::write(&source, b"installed binary").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o751)).unwrap();
+        }
+        let backups = dir.path().join("backups");
+        let mut snapshots = Vec::new();
+        for _ in 0..MAX_BACKUPS + 2 {
+            snapshots.push(create_backup_in(&backups, &source, "0.15.0").unwrap());
+        }
+        assert_eq!(
+            std::fs::read_dir(&backups).unwrap().count(),
+            snapshots.len() * 2
+        );
+        for snapshot in snapshots {
+            assert_eq!(std::fs::read(&snapshot).unwrap(), b"installed binary");
+            let metadata_path = snapshot.with_file_name(format!(
+                "{}.json",
+                snapshot.file_name().unwrap().to_str().unwrap()
+            ));
+            let metadata: BackupEntry =
+                serde_json::from_slice(&std::fs::read(metadata_path).unwrap()).unwrap();
+            assert_eq!(metadata.version, "0.15.0");
+            assert_eq!(metadata.original_path, source);
+            assert_eq!(
+                backup_artifact_name(&metadata),
+                snapshot.file_name().unwrap().to_str().unwrap()
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(snapshot).unwrap().permissions().mode() & 0o777,
+                    0o751
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_backup_creation_leaves_the_installation_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("dcg");
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&source, b"installed binary").unwrap();
+        std::fs::write(&blocked, b"existing data").unwrap();
+        assert!(create_backup_in(&blocked, &source, "0.15.0").is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"installed binary");
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"existing data");
+        assert!(create_backup_in(&dir.path().join("unused"), &source, "../bad").is_err());
+        assert!(!dir.path().join("unused").exists());
     }
 
     #[test]
@@ -1264,14 +1603,12 @@ mod tests {
         ];
         let rollback_target = backup_artifact_name(&backups[3]);
 
-        let normal_prune = backup_names_to_prune(&backups, None);
+        let normal_prune = backup_names_to_prune(&backups, &[]);
         assert_eq!(normal_prune, vec![rollback_target.clone()]);
 
-        let rollback_prune = backup_names_to_prune(&backups, Some(&rollback_target));
-        assert!(
-            rollback_prune.is_empty(),
-            "rollback must not prune the selected restore target"
-        );
+        let rollback_prune = backup_names_to_prune(&backups, &[&rollback_target]);
+        assert_eq!(rollback_prune, vec!["dcg-0.2.11-300"]);
+        assert!(!rollback_prune.contains(&rollback_target));
     }
 
     #[test]
@@ -1285,8 +1622,8 @@ mod tests {
         ];
         let rollback_target = backup_artifact_name(&backups[4]);
 
-        let rollback_prune = backup_names_to_prune(&backups, Some(&rollback_target));
-        assert_eq!(rollback_prune, vec!["dcg-0.2.11-300".to_string()]);
+        let rollback_prune = backup_names_to_prune(&backups, &[&rollback_target]);
+        assert_eq!(rollback_prune, vec!["dcg-0.2.12-400", "dcg-0.2.11-300"]);
         assert!(!rollback_prune.contains(&rollback_target));
     }
 
@@ -1300,9 +1637,25 @@ mod tests {
         ];
         let rollback_target = backup_artifact_name(&backups[1]);
 
-        let rollback_prune = backup_names_to_prune(&backups, Some(&rollback_target));
+        let rollback_prune = backup_names_to_prune(&backups, &[&rollback_target]);
         assert_eq!(rollback_prune, vec!["dcg-0.2.10-200".to_string()]);
         assert!(!rollback_prune.contains(&rollback_target));
+    }
+
+    #[test]
+    fn backup_retention_protects_new_recovery_point_when_timestamps_tie() {
+        let backups = vec![
+            backup_entry("0.2.13", 500),
+            backup_entry("0.2.12", 500),
+            backup_entry("0.2.11", 500),
+            backup_entry("0.2.10", 500),
+        ];
+        let recovery = backup_artifact_name(&backups[3]);
+        let restored = backup_artifact_name(&backups[2]);
+        assert_eq!(
+            backup_names_to_prune(&backups, &[&recovery, &restored]),
+            vec!["dcg-0.2.12-500"]
+        );
     }
 
     #[test]

@@ -1,16 +1,15 @@
 #!/usr/bin/env pwsh
-# `dcg update --rollback` e2e (.7.2). Runs on windows-latest CI.
+# `dcg update --rollback` e2e, for local and native Windows qualification.
 #
 # Rollback ALWAYS restores the backup over current_exe() — the RUNNING, file-locked
-# binary. On Windows that goes through swap_running_executable (rename current to
-# <name>.exe.old, copy the backup in, restore-on-failure) — the exact path the bead
-# wants validated. (On Unix the same op is a direct fs::copy which Linux refuses
-# with ETXTBSY on a running binary; that is the Unix path, not what we validate.)
+# binary. Unix stages a complete sibling copy and atomically renames it over the
+# running inode. Windows stages first, moves the incumbent aside, and restores it
+# if publishing the completed stage fails.
 #
 # Hermetic (NO network): we fabricate a backup under data_dir()\dcg\backups and run
 # `dcg update --rollback`. Cross-platform parts (backup discovery, metadata parse,
-# graceful behavior, binary stays intact) are checked everywhere; the actual
-# running-binary swap success is asserted only on Windows.
+# graceful behavior, and successful running-binary replacement) are required on
+# every platform where this qualification runs.
 #
 # The real network `dcg update` shells to `powershell -NoProfile -ExecutionPolicy
 # Bypass -File install.ps1`; that install path is covered by the install.ps1
@@ -53,38 +52,47 @@ $dest = Join-Path $work "bin"; New-Item -ItemType Directory -Path $dest | Out-Nu
 $destBin = Join-Path $dest $exeName
 Copy-Item $srcBin $destBin -Force
 
-# Fabricate a backup of an "older" version (a copy of the same binary so --version
-# still works after the swap). data_dir(): %APPDATA% on Windows, $XDG_DATA_HOME (or
-# ~/.local/share) on Linux — set both so the sandbox applies on either platform.
-$ts = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 100  # culture-independent
-$artname = "dcg-0.0.1-$ts"
-Copy-Item $srcBin (Join-Path $bdir $artname) -Force
-[pscustomobject]@{ version = "0.0.1"; created_at = $ts; original_path = $destBin } |
-    ConvertTo-Json -Compress | Set-Content -Path (Join-Path $bdir "$artname.json") -Encoding utf8
-
+# data_dir(): %APPDATA% on Windows, $XDG_DATA_HOME (or ~/.local/share) on
+# Linux. Keep all probes and backup writes inside the scratch installation.
 $savedAppData = $env:APPDATA; $savedXdg = $env:XDG_DATA_HOME; $savedHome = $env:HOME; $savedUserProfile = $env:USERPROFILE
+$savedSelfHeal = $env:DCG_SELF_HEAL_HOOK; $savedUpdateCheck = $env:DCG_NO_UPDATE_CHECK
 $env:APPDATA = $data
 $env:XDG_DATA_HOME = $data
 $env:HOME = $work
 $env:USERPROFILE = $work
+$env:DCG_SELF_HEAL_HOOK = '0'
+$env:DCG_NO_UPDATE_CHECK = '1'
 
 function Run-Dcg([string[]]$CmdArgs, [string]$Stdin = "") {
     $o = Join-Path $work "o.txt"; $e = Join-Path $work "e.txt"
     $inFile = $null
     if ($Stdin) { $inFile = Join-Path $work "i.txt"; Set-Content -Path $inFile -Value $Stdin -Encoding utf8 }
-    $sp = @{ FilePath = $destBin; ArgumentList = $CmdArgs; RedirectStandardOutput = $o; RedirectStandardError = $e; PassThru = $true; NoNewWindow = $true }
+    $sp = @{ FilePath = $destBin; ArgumentList = $CmdArgs; RedirectStandardOutput = $o; RedirectStandardError = $e; PassThru = $true; NoNewWindow = $true; Wait = $true }
     if ($inFile) { $sp.RedirectStandardInput = $inFile }
     $p = Start-Process @sp
-    [void]$p.WaitForExit(60000)
     $out = ((Get-Content -Raw $o -ErrorAction SilentlyContinue) + "`n" + (Get-Content -Raw $e -ErrorAction SilentlyContinue))
     [pscustomobject]@{ Code = $p.ExitCode; Out = $out }
 }
 
 try {
+    # Seed a previous snapshot with its actual native version. Rollback must
+    # reject a runnable binary mislabeled as a different release.
+    $reported = Run-Dcg @('--version')
+    $versionMatch = [regex]::Match($reported.Out, '(?m)^\s*(?:dcg\s+)?v?([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)\s*$')
+    if ($reported.Code -ne 0 -or -not $versionMatch.Success) {
+        throw "Could not identify native fixture version: exit $($reported.Code), out=$($reported.Out.Trim())"
+    }
+    $fixtureVersion = $versionMatch.Groups[1].Value
+    $ts = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 100
+    $artname = "dcg-$fixtureVersion-$ts"
+    Copy-Item $srcBin (Join-Path $bdir $artname) -Force
+    $metadata = [pscustomobject]@{ version = $fixtureVersion; created_at = $ts; original_path = $destBin } | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText((Join-Path $bdir "$artname.json"), $metadata, [Text.UTF8Encoding]::new($false))
+
     Write-Host ""
     Write-Host "=== Phase 1: backup discovery (cross-platform) ==="
     $lv = Run-Dcg @("update", "--list-versions")
-    if ($lv.Code -eq 0 -and $lv.Out -match 'v?0\.0\.1') { Pass "fabricated backup discovered by 'update --list-versions' (v0.0.1)" }
+    if ($lv.Code -eq 0 -and $lv.Out -match ([regex]::Escape($fixtureVersion))) { Pass "snapshot discovered by 'update --list-versions' (v$fixtureVersion)" }
     else { Fail "backup not discovered: exit $($lv.Code), out=$($lv.Out.Trim())" }
 
     Write-Host ""
@@ -92,22 +100,19 @@ try {
     $rb = Run-Dcg @("update", "--rollback") "y`n"
     if ($onWindows) {
         if ($rb.Code -eq 0 -and $rb.Out -match 'rolled back|Successfully') {
-            Pass "Windows: 'update --rollback' replaced the running, file-locked binary (rename-then-copy swap)"
+            Pass "Windows: 'update --rollback' replaced the running, file-locked binary from a completed stage"
         } else { Fail "Windows rollback failed: exit $($rb.Code), out=$($rb.Out.Trim())" }
         if (Test-Path $destBin) { $v = Run-Dcg @("--version"); if ($v.Code -eq 0) { Pass "rolled-back binary still runs (--version OK)" } else { Fail "rolled-back binary does not run" } }
         else { Fail "binary missing after rollback" }
         $stale = Get-ChildItem -Path $dest -Filter '*.old' -ErrorAction SilentlyContinue
-        if (-not $stale) { Pass "no stale <name>.exe.old left behind after a successful swap" } else { Note "NOTE: leftover $($stale.Name) (cleaned on next run)" }
+        if (-not $stale) { Pass "no prior executable left behind after a successful swap" } else { Note "NOTE: retained prior executable $($stale.Name)" }
     } else {
-        # Unix: fs::copy onto the running binary is refused (ETXTBSY) — this is the
-        # Unix path, NOT the validated Windows swap. Assert it fails GRACEFULLY and
-        # leaves the binary intact (rollback's restore-on-failure / atomicity).
-        if ($rb.Code -ne 0 -and $rb.Out -match 'Text file busy|os error 26|Rollback failed') {
-            Pass "Unix: rollback of the running binary fails gracefully (ETXTBSY) — the Windows rename-then-copy path is what CI validates"
-        } else { Note "Unix rollback returned exit $($rb.Code) (out=$($rb.Out.Trim().Substring(0,[Math]::Min(120,$rb.Out.Trim().Length))))" }
+        if ($rb.Code -eq 0 -and $rb.Out -match 'rolled back|Successfully') {
+            Pass "Unix: rollback atomically replaced the running binary"
+        } else { Fail "Unix rollback failed: exit $($rb.Code), out=$($rb.Out.Trim())" }
         $v = Run-Dcg @("--version")
-        if ($v.Code -eq 0) { Pass "binary remains intact + runnable after the failed Unix rollback (not corrupted)" }
-        else { Fail "binary corrupted after failed rollback" }
+        if ($v.Code -eq 0) { Pass "rolled-back binary is runnable (--version OK)" }
+        else { Fail "rolled-back binary does not run" }
     }
 
     Write-Host ""
@@ -120,6 +125,7 @@ try {
 }
 finally {
     $env:APPDATA = $savedAppData; $env:XDG_DATA_HOME = $savedXdg; $env:HOME = $savedHome; $env:USERPROFILE = $savedUserProfile
+    $env:DCG_SELF_HEAL_HOOK = $savedSelfHeal; $env:DCG_NO_UPDATE_CHECK = $savedUpdateCheck
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }
 

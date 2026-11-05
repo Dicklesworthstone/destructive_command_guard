@@ -548,3 +548,384 @@ fn test_version_parsing_with_build_metadata() {
     assert_eq!(version.patch, 0);
     assert_eq!(version.build.as_str(), "build.456");
 }
+
+// These tests invoke the real CLI from an isolated copied installation. Calling
+// rollback in this test process would replace Cargo's test executable instead
+// of exercising the user's running dcg path.
+struct RunningRollbackFixture {
+    home: TempDir,
+    binary: PathBuf,
+    data: PathBuf,
+    backups: PathBuf,
+}
+
+impl RunningRollbackFixture {
+    fn new() -> Self {
+        let home = TempDir::new().unwrap();
+        let binary = home
+            .path()
+            .join("bin")
+            .join(if cfg!(windows) { "dcg.exe" } else { "dcg" });
+        fs::create_dir(binary.parent().unwrap()).unwrap();
+        fs::copy(env!("CARGO_BIN_EXE_dcg"), &binary).unwrap();
+        let data = if cfg!(target_os = "macos") {
+            home.path().join("Library").join("Application Support")
+        } else {
+            home.path().join("data")
+        };
+        let backups = data.join("dcg").join("backups");
+        fs::create_dir_all(&backups).unwrap();
+        Self {
+            home,
+            binary,
+            data,
+            backups,
+        }
+    }
+
+    fn command(&self, binary: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let mut command = std::process::Command::new(binary);
+        command
+            .args(args)
+            .current_dir(self.home.path())
+            .env_clear()
+            .env("HOME", self.home.path())
+            .env("USERPROFILE", self.home.path())
+            .env("APPDATA", &self.data)
+            .env("LOCALAPPDATA", self.home.path().join("local"))
+            .env("XDG_DATA_HOME", &self.data)
+            .env("XDG_CONFIG_HOME", self.home.path().join("config"))
+            .env("XDG_CACHE_HOME", self.home.path().join("cache"))
+            .env("TMPDIR", self.home.path())
+            .env("TEMP", self.home.path())
+            .env("DCG_SELF_HEAL_HOOK", "0")
+            .env("DCG_NO_UPDATE_CHECK", "1")
+            .env("DCG_HISTORY_DISABLED", "1")
+            .env("NO_COLOR", "1");
+        for name in ["SYSTEMROOT", "WINDIR"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command.output().unwrap()
+    }
+
+    fn seed(
+        &self,
+        version: &str,
+        timestamp: u64,
+        original: &std::path::Path,
+        bytes: Option<&[u8]>,
+    ) -> PathBuf {
+        let artifact_name = format!("dcg-{version}-{timestamp}");
+        let backup = self.backups.join(&artifact_name);
+        if let Some(bytes) = bytes {
+            fs::write(&backup, bytes).unwrap();
+        }
+        fs::write(
+            self.backups.join(format!("{artifact_name}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "version": version,
+                "created_at": timestamp,
+                "artifact_name": artifact_name,
+                "original_path": original,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        backup
+    }
+
+    fn entries(&self) -> Vec<destructive_command_guard::update::BackupEntry> {
+        fs::read_dir(&self.backups)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .map(|entry| serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap())
+            .collect()
+    }
+}
+
+fn rollback_diagnostics(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn binary_digest(path: &std::path::Path) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut input = fs::File::open(path).unwrap();
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = input.read(&mut buffer).unwrap();
+        if read == 0 {
+            return digest.finalize().into();
+        }
+        digest.update(&buffer[..read]);
+    }
+}
+
+#[test]
+fn cli_rollback_replaces_running_binary_and_keeps_both_recovery_points() {
+    let fixture = RunningRollbackFixture::new();
+    let original = binary_digest(&fixture.binary);
+    let selected_version = env!("CARGO_PKG_VERSION");
+    let selected = fixture.seed(selected_version, 1, &fixture.binary, None);
+    fs::copy(&fixture.binary, &selected).unwrap();
+    // ELF and PE permit a data overlay, giving this runnable fixture distinct
+    // bytes without building or fetching a second executable.
+    if cfg!(any(target_os = "linux", windows)) {
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&selected)
+            .unwrap()
+            .write_all(b"dcg rollback regression fixture\n")
+            .unwrap();
+    }
+    let restored = binary_digest(&selected);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&selected, fs::Permissions::from_mode(0o751)).unwrap();
+    }
+    for index in 2..=4 {
+        fixture.seed(
+            &format!("0.0.{index}"),
+            index,
+            &fixture.binary,
+            Some(b"older recovery bytes"),
+        );
+    }
+    let output = fixture.command(
+        &fixture.binary,
+        &["update", "--rollback", &format!("v{selected_version}")],
+    );
+    assert!(output.status.success(), "{}", rollback_diagnostics(&output));
+    assert_eq!(binary_digest(&fixture.binary), restored);
+    assert_eq!(binary_digest(&selected), restored);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&fixture.binary).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+    }
+    let entries = fixture.entries();
+    assert_eq!(entries.len(), 3);
+    let recovery = entries
+        .iter()
+        .find(|entry| entry.version == selected_version && entry.created_at > 4)
+        .expect("rollback must save the incumbent before replacing it");
+    assert_eq!(recovery.original_path, fixture.binary);
+    assert_eq!(
+        binary_digest(
+            &fixture
+                .backups
+                .join(recovery.artifact_name.as_ref().unwrap())
+        ),
+        original
+    );
+    let version = fixture.command(&fixture.binary, &["--version"]);
+    assert!(
+        version.status.success(),
+        "{}",
+        rollback_diagnostics(&version)
+    );
+}
+
+#[test]
+fn cli_rollback_failure_retains_incumbent_and_all_prior_backups() {
+    for source_is_directory in [false, true] {
+        let fixture = RunningRollbackFixture::new();
+        let original = binary_digest(&fixture.binary);
+        let selected = fixture.seed("0.0.1", 1, &fixture.binary, None);
+        if source_is_directory {
+            fs::create_dir(&selected).unwrap();
+        }
+        let older: Vec<_> = (2..=4)
+            .map(|index| {
+                fixture.seed(
+                    &format!("0.0.{index}"),
+                    index,
+                    &fixture.binary,
+                    Some(b"prior recovery bytes"),
+                )
+            })
+            .collect();
+        let output = fixture.command(&fixture.binary, &["update", "--rollback", "0.0.1"]);
+        assert!(
+            !output.status.success(),
+            "{}",
+            rollback_diagnostics(&output)
+        );
+        assert_eq!(binary_digest(&fixture.binary), original);
+        for backup in older {
+            assert_eq!(fs::read(backup).unwrap(), b"prior recovery bytes");
+        }
+        assert_eq!(
+            fixture.entries().len(),
+            if source_is_directory { 5 } else { 4 }
+        );
+        let version = fixture.command(&fixture.binary, &["--version"]);
+        assert!(
+            version.status.success(),
+            "{}",
+            rollback_diagnostics(&version)
+        );
+    }
+}
+
+#[test]
+fn cli_rollback_scopes_selection_listing_and_retention_to_current_installation() {
+    let fixture = RunningRollbackFixture::new();
+    let original = binary_digest(&fixture.binary);
+    let selected_version = env!("CARGO_PKG_VERSION");
+    let selected = fixture.seed(selected_version, 1, &fixture.binary, None);
+    fs::copy(&fixture.binary, &selected).unwrap();
+    fs::set_permissions(
+        &selected,
+        fs::metadata(&fixture.binary).unwrap().permissions(),
+    )
+    .unwrap();
+    let other_binary = fixture
+        .home
+        .path()
+        .join("other-bin")
+        .join(fixture.binary.file_name().unwrap());
+    fs::create_dir(other_binary.parent().unwrap()).unwrap();
+    fs::copy(&fixture.binary, &other_binary).unwrap();
+    let foreign: Vec<_> = (2..=5)
+        .map(|index| {
+            fixture.seed(
+                &format!("0.0.{index}"),
+                index,
+                &other_binary,
+                Some(b"other installation recovery"),
+            )
+        })
+        .collect();
+
+    let listing = fixture.command(&fixture.binary, &["update", "--list-versions"]);
+    assert!(
+        listing.status.success(),
+        "{}",
+        rollback_diagnostics(&listing)
+    );
+    assert!(rollback_diagnostics(&listing).contains(selected_version));
+    assert!(!rollback_diagnostics(&listing).contains("0.0.5"));
+
+    let wrong_target = fixture.command(&fixture.binary, &["update", "--rollback", "0.0.5"]);
+    assert!(!wrong_target.status.success());
+    assert!(rollback_diagnostics(&wrong_target).contains("No backup found for version"));
+    assert_eq!(binary_digest(&fixture.binary), original);
+
+    let rollback = fixture.command(&fixture.binary, &["update", "--rollback"]);
+    assert!(
+        rollback.status.success(),
+        "{}",
+        rollback_diagnostics(&rollback)
+    );
+    assert!(
+        rollback_diagnostics(&rollback)
+            .contains(&format!("rolled back to version {selected_version}"))
+    );
+    for backup in foreign {
+        assert_eq!(fs::read(backup).unwrap(), b"other installation recovery");
+    }
+    assert_eq!(binary_digest(&other_binary), original);
+    assert_eq!(fixture.entries().len(), 6);
+}
+
+fn assert_rejected_rollback_backup(payload: Option<&[u8]>, metadata_version: &str) {
+    let fixture = RunningRollbackFixture::new();
+    let original = binary_digest(&fixture.binary);
+    let selected = fixture.seed(metadata_version, 1, &fixture.binary, payload);
+    if payload.is_none() {
+        fs::copy(&fixture.binary, &selected).unwrap();
+    }
+    fs::set_permissions(
+        &selected,
+        fs::metadata(&fixture.binary).unwrap().permissions(),
+    )
+    .unwrap();
+    let source_digest = binary_digest(&selected);
+    let older: Vec<_> = (2..=4)
+        .map(|index| {
+            fixture.seed(
+                &format!("0.0.{index}"),
+                index,
+                &fixture.binary,
+                Some(b"prior recovery bytes"),
+            )
+        })
+        .collect();
+
+    let output = fixture.command(&fixture.binary, &["update", "--rollback", metadata_version]);
+    assert!(
+        !output.status.success(),
+        "{}",
+        rollback_diagnostics(&output)
+    );
+    assert_eq!(binary_digest(&fixture.binary), original);
+    assert_eq!(binary_digest(&selected), source_digest);
+    for backup in older {
+        assert_eq!(fs::read(backup).unwrap(), b"prior recovery bytes");
+    }
+    let entries = fixture.entries();
+    assert_eq!(
+        entries.len(),
+        5,
+        "failed qualification must not prune backups"
+    );
+    let recovery = entries
+        .iter()
+        .find(|entry| entry.version == env!("CARGO_PKG_VERSION") && entry.created_at > 4)
+        .expect("the incumbent recovery point must also survive");
+    assert_eq!(
+        binary_digest(
+            &fixture
+                .backups
+                .join(recovery.artifact_name.as_ref().unwrap())
+        ),
+        original
+    );
+    assert_eq!(
+        fs::read_dir(fixture.binary.parent().unwrap())
+            .unwrap()
+            .count(),
+        1,
+        "rejected stages must be cleaned without touching the incumbent"
+    );
+    let version = fixture.command(&fixture.binary, &["--version"]);
+    assert!(
+        version.status.success(),
+        "{}",
+        rollback_diagnostics(&version)
+    );
+}
+
+#[test]
+fn cli_rollback_rejects_empty_corrupt_and_wrong_version_backups() {
+    assert_rejected_rollback_backup(Some(b""), env!("CARGO_PKG_VERSION"));
+    assert_rejected_rollback_backup(Some(b"not an executable"), env!("CARGO_PKG_VERSION"));
+    // A runnable native executable is still rejected when its version does not
+    // match the selected backup metadata.
+    assert_rejected_rollback_backup(None, "0.0.0");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_rollback_rejects_matching_version_from_a_failed_native_probe() {
+    let payload = format!(
+        "#!/bin/sh\nprintf '{}\\n'\nexit 23\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_rejected_rollback_backup(Some(payload.as_bytes()), env!("CARGO_PKG_VERSION"));
+}

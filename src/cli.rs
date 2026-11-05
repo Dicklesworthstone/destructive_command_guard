@@ -1781,7 +1781,7 @@ pub struct UpdateCommand {
     #[arg(long)]
     from_source: bool,
 
-    /// Run self-test after install
+    /// Verify the candidate before installing
     #[arg(long)]
     verify: bool,
 
@@ -20191,15 +20191,95 @@ fn unix_update_installer_arguments(update: &UpdateCommand, normalized_tag: &str)
     args
 }
 
-fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
+fn update_destination(
+    explicit: Option<&std::path::Path>,
+    system: bool,
+    current_exe: &std::path::Path,
+    working_directory: &std::path::Path,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let destination = if let Some(path) = explicit {
+        if path.as_os_str().is_empty() {
+            return Err("Update destination must not be empty".into());
+        }
+        path.to_path_buf()
+    } else if system {
+        std::path::PathBuf::from("/usr/local/bin")
+    } else {
+        current_exe
+            .parent()
+            .ok_or("Current executable has no installation directory")?
+            .to_path_buf()
+    };
+    let destination = if destination.is_absolute() {
+        destination
+    } else {
+        working_directory.join(destination)
+    };
+    if destination.to_str().is_none() {
+        return Err(
+            "Update destination is not valid Unicode; refusing to pass a different path to the installer"
+                .into(),
+        );
+    }
+    Ok(destination)
+}
+
+fn prepare_update_destination(
+    update: &mut UpdateCommand,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let destination = update_destination(
+        update.dest.as_deref(),
+        update.system,
+        &std::env::current_exe()?,
+        &std::env::current_dir()?,
+    )?;
+    // A detached Windows worker has a different working directory. Make every
+    // explicit destination absolute, and make a normal update target the
+    // installation that is running instead of the installer's default path.
+    if update.dest.is_some() || !update.system {
+        update.dest = Some(destination.clone());
+    }
+    let binary_name = if cfg!(windows) { "dcg.exe" } else { "dcg" };
+    Ok(destination.join(binary_name))
+}
+
+fn prepare_update_backup(
+    target: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, Box<dyn std::error::Error>> {
+    match std::fs::metadata(target) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(format!("Update target is not a file: {}", target.display()).into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let version =
+        if std::fs::canonicalize(target)? == std::fs::canonicalize(std::env::current_exe()?)? {
+            crate::update::current_version().to_string()
+        } else {
+            // --dest/--system can select a different existing installation. Do not
+            // label its recovery bytes with the running program's version.
+            crate::update::reported_binary_version(target)?
+        };
+    crate::update::create_backup_for(target, &version)
+        .map(Some)
+        .map_err(Into::into)
+}
+
+fn self_update_unix(mut update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
     // Archive verification inside an installer cannot repair an unauthenticated
     // handoff. Require both its SHA256 sidecar and a current-key DSR signature
     // bound to the resolved release before invoking any downloaded script.
     let normalized_tag = update_installer_tag(update.version.as_deref())?;
+    let target = prepare_update_destination(&mut update)?;
     eprintln!("dcg update: downloading and authenticating install.sh from {normalized_tag}.");
     let args = unix_update_installer_arguments(&update, &normalized_tag);
 
     let (_temp_dir, script_path) = download_verified_installer(&normalized_tag, "install.sh")?;
+    let backup = prepare_update_backup(&target)?;
+    let prune_paths = match &backup {
+        Some(path) => crate::update::backup_files_to_prune(&target, &[path])?,
+        None => Vec::new(),
+    };
 
     let status = std::process::Command::new("bash")
         .arg(&script_path)
@@ -20208,6 +20288,9 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
 
     if !status.success() {
         return Err(format!("Installer failed with status {status}").into());
+    }
+    if let Err(error) = crate::update::prune_backup_files(&prune_paths) {
+        eprintln!("Update succeeded, but older backups were retained: {error}");
     }
 
     Ok(())
@@ -20238,6 +20321,7 @@ function Add-DcgUpdateLog {
     [AllowEmptyString()]
     [string]$Message
   )
+  $ErrorActionPreference = 'Stop'
   $line = $Message + [Environment]::NewLine
   [IO.File]::AppendAllText($logPath, $line, [Text.UTF8Encoding]::new($false))
 }
@@ -20253,17 +20337,36 @@ try {
     $parentProcess | Wait-Process -ErrorAction SilentlyContinue
   }
 
-  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installerPath @installerArguments 2>&1 |
-    ForEach-Object { Add-DcgUpdateLog ([string]$_) }
-  $exitCode = $LASTEXITCODE
+  # Windows PowerShell 5.1 can turn successful native stderr into a terminating
+  # NativeCommandError. Judge the child process by its exit status, while keeping
+  # log-write failures fatal and failed launches distinct from a stale zero.
+  $savedErrorActionPreference = $ErrorActionPreference
+  $global:LASTEXITCODE = -1
+  try {
+    $ErrorActionPreference = 'Continue'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installerPath @installerArguments 2>&1 |
+      ForEach-Object { Add-DcgUpdateLog ([string]$_) } -ErrorAction Stop
+    $exitCode = $global:LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+  }
   if ($exitCode -eq 0) {
+    foreach ($backupFile in $configuration.prune_backup_files) {
+      try {
+        if (Test-Path -LiteralPath ([string]$backupFile)) {
+          Remove-Item -LiteralPath ([string]$backupFile) -Force -ErrorAction Stop
+        }
+      } catch {
+        Add-DcgUpdateLog "Update succeeded, but could not prune backup: $($_.Exception.Message)"
+      }
+    }
     Add-DcgUpdateLog 'dcg update completed successfully.'
   } else {
     Add-DcgUpdateLog "dcg update installer exited with code $exitCode."
   }
 } catch {
-  Add-DcgUpdateLog "dcg update failed: $($_.Exception.Message)"
   $exitCode = 1
+  Add-DcgUpdateLog "dcg update failed: $($_.Exception.Message)"
 } finally {
   Remove-Item -LiteralPath $cleanupDirectory -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -20427,7 +20530,7 @@ fn launch_windows_update_worker(
     }
 }
 
-fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
+fn self_update_windows(mut update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
     if update.system || update.from_source || update.quiet || update.no_gum || update.force {
         return Err(
             "Windows updater supports only --version, --dest, --easy-mode, --verify, and \
@@ -20439,11 +20542,17 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
     // Authenticate before even staging the deferred worker. It must never
     // inherit an installer that only passed a same-origin checksum check.
     let normalized_tag = update_installer_tag(update.version.as_deref())?;
+    let target = prepare_update_destination(&mut update)?;
     eprintln!("dcg update: downloading and authenticating install.ps1 from {normalized_tag}.");
 
     let args = windows_update_installer_arguments(&update, &normalized_tag);
 
     let (temp_dir, script_path) = download_verified_installer(&normalized_tag, "install.ps1")?;
+    let backup = prepare_update_backup(&target)?;
+    let prune_paths = match &backup {
+        Some(path) => crate::update::backup_files_to_prune(&target, &[path])?,
+        None => Vec::new(),
+    };
     let runner_path = temp_dir.path().join("run-update-after-exit.ps1");
     let configuration_path = temp_dir.path().join("runner-config.json");
     std::fs::write(&runner_path, WINDOWS_UPDATE_RUNNER)?;
@@ -20458,6 +20567,7 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
         "installer_arguments": args,
         "cleanup_directory": temp_dir.path(),
         "log_path": log_path,
+        "prune_backup_files": prune_paths,
     });
     std::fs::write(&configuration_path, serde_json::to_vec(&configuration)?)?;
 
@@ -27456,6 +27566,120 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     }
 
     #[test]
+    fn update_destination_defaults_to_current_install_and_resolves_relative_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let installation = temp.path().join("custom bin").join("dcg");
+        let cwd = temp.path().join("work");
+        assert_eq!(
+            update_destination(None, false, &installation, &cwd).unwrap(),
+            installation.parent().unwrap()
+        );
+        assert_eq!(
+            update_destination(
+                Some(std::path::Path::new("relative bin")),
+                false,
+                &installation,
+                &cwd,
+            )
+            .unwrap(),
+            cwd.join("relative bin")
+        );
+        assert!(
+            update_destination(Some(std::path::Path::new("")), false, &installation, &cwd).is_err()
+        );
+    }
+
+    #[test]
+    fn normal_update_passes_current_installation_to_both_installers() {
+        let Some(Command::Update(mut update)) = Cli::parse_from(["dcg", "update"]).command else {
+            unreachable!("Expected Update command");
+        };
+        let current = std::env::current_exe().unwrap();
+        let directory = current.parent().unwrap();
+        let target = prepare_update_destination(&mut update).unwrap();
+        assert_eq!(target.parent().unwrap(), directory);
+        for (args, flag) in [
+            (
+                unix_update_installer_arguments(&update, "v0.16.0"),
+                "--dest",
+            ),
+            (
+                windows_update_installer_arguments(&update, "v0.16.0"),
+                "-Dest",
+            ),
+        ] {
+            let index = args.iter().position(|argument| argument == flag).unwrap();
+            assert_eq!(std::path::Path::new(&args[index + 1]), directory);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_destination_preserves_system_and_explicit_destination_precedence() {
+        let installation = std::path::Path::new("/opt/custom/dcg");
+        let cwd = std::path::Path::new("/work");
+        assert_eq!(
+            update_destination(None, true, installation, cwd).unwrap(),
+            std::path::Path::new("/usr/local/bin")
+        );
+        assert_eq!(
+            update_destination(Some(std::path::Path::new("other")), true, installation, cwd)
+                .unwrap(),
+            std::path::Path::new("/work/other")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_destination_rejects_paths_that_installer_arguments_cannot_represent() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"bin-\xff".to_vec()));
+        std::fs::create_dir(&directory).unwrap();
+        let installed = directory.join("dcg");
+        std::fs::write(&installed, b"incumbent").unwrap();
+        for explicit in [None, Some(directory.as_path())] {
+            let error = update_destination(explicit, false, &installed, temp.path()).unwrap_err();
+            assert!(error.to_string().contains("not valid Unicode"));
+        }
+        assert_eq!(std::fs::read(&installed).unwrap(), b"incumbent");
+        // An explicit, representable destination still takes precedence over
+        // the running executable's directory.
+        assert_eq!(
+            update_destination(Some(temp.path()), false, &installed, temp.path()).unwrap(),
+            temp.path()
+        );
+    }
+
+    #[test]
+    fn update_recovery_version_accepts_native_stderr_and_rejects_ambiguity() {
+        for (stdout, stderr) in [
+            ("0.15.0\n", "human banner\n"),
+            ("", "human banner\ndcg v0.15.0\nBuilt: 2026-01-01\n"),
+            ("dcg\t0.15.0\n", "0.15.0\n"),
+        ] {
+            assert_eq!(
+                crate::update::parse_binary_version(stdout.as_bytes(), stderr.as_bytes()),
+                Some("0.15.0".to_string())
+            );
+        }
+        for (stdout, stderr) in [
+            ("0.15.0\n", "dcg 0.14.0\n"),
+            ("dcg0.15.0\n", ""),
+            ("failure mentioning 0.15.0\n", ""),
+            ("version: 0.15.0\n", ""),
+        ] {
+            assert_eq!(
+                crate::update::parse_binary_version(stdout.as_bytes(), stderr.as_bytes()),
+                None
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "requires DCG_TEST_SIGNED_INSTALLER_DIR (v0.16.0 scripts/signatures) and DCG_TEST_MINISIGN"]
     fn update_installer_real_minisign_authenticates_both_platform_scripts() {
         let fixtures = std::path::PathBuf::from(
@@ -27509,6 +27733,7 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         // run alongside ordinary libtest threads as well as under nextest.
         if let Ok(mode) = std::env::var("DCG_TEST_UPDATER_CHILD_MODE") {
             let tag = std::env::var("DCG_TEST_UPDATER_TAG").unwrap();
+            let destination = std::env::var("DCG_TEST_UPDATER_DESTINATION").unwrap();
             let mut argv = vec!["dcg", "update", "--version", &tag];
             match mode.as_str() {
                 "normal" => {}
@@ -27517,6 +27742,7 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
                 "source" => argv.push("--from-source"),
                 _ => panic!("unexpected child fixture mode: {mode}"),
             }
+            argv.extend(["--dest", &destination]);
             let Some(Command::Update(update)) = Cli::parse_from(argv).command else {
                 unreachable!("Expected Update command");
             };
@@ -27544,6 +27770,32 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
             ("valid-easy", "easy", None),
             ("valid-system", "system", None),
             ("valid-source", "source", None),
+            ("valid-stderr-version", "normal", None),
+            (
+                "bad-incumbent-version",
+                "normal",
+                Some("Could not identify recovery version"),
+            ),
+            (
+                "failed-incumbent-version",
+                "normal",
+                Some("without an identifiable recovery version"),
+            ),
+            (
+                "backup-unwritable",
+                "normal",
+                Some("Failed to create backup directory"),
+            ),
+            (
+                "installer-failed",
+                "normal",
+                Some("Installer failed with status"),
+            ),
+            (
+                "installer-launch-failed",
+                "normal",
+                Some("No such file or directory"),
+            ),
             ("modified", "normal", Some("sha256 verification failed")),
             ("rehashed", "normal", Some("Minisign verification failed")),
             (
@@ -27592,8 +27844,53 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
             let directory = temp_dir.path().join(scenario);
             let server = directory.join("server");
             let binaries = directory.join("bin");
+            let destination = directory.join("installation with spaces");
+            let installed = destination.join("dcg");
+            let home = directory.join("home");
+            let data = if cfg!(target_os = "macos") {
+                home.join("Library").join("Application Support")
+            } else {
+                home.join("data")
+            };
+            let backup_dir = data.join("dcg").join("backups");
             std::fs::create_dir_all(&server).unwrap();
             std::fs::create_dir(&binaries).unwrap();
+            std::fs::create_dir(&destination).unwrap();
+            let incumbent = match scenario {
+                "valid-stderr-version" => "#!/bin/sh\nprintf 'human banner\\ndcg v0.15.0\\n' >&2\n",
+                "bad-incumbent-version" => "#!/bin/sh\nprintf 'not a version\\n'\n",
+                "failed-incumbent-version" => "#!/bin/sh\nprintf '0.15.0\\n'\nexit 17\n",
+                _ => "#!/bin/sh\nprintf '0.15.0\\n'\n",
+            };
+            std::fs::write(&installed, incumbent).unwrap();
+            std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o751)).unwrap();
+            std::fs::create_dir_all(backup_dir.parent().unwrap()).unwrap();
+            if scenario == "backup-unwritable" {
+                std::fs::write(&backup_dir, b"existing data").unwrap();
+            } else {
+                std::fs::create_dir(&backup_dir).unwrap();
+                for index in 1..=5 {
+                    let artifact = format!("old-{index}");
+                    let original = if index == 5 {
+                        directory.join("another-installation").join("dcg")
+                    } else {
+                        installed.clone()
+                    };
+                    std::fs::write(backup_dir.join(&artifact), format!("old bytes {index}"))
+                        .unwrap();
+                    std::fs::write(
+                        backup_dir.join(format!("{artifact}.json")),
+                        serde_json::to_vec(&serde_json::json!({
+                            "version": format!("0.0.{index}"),
+                            "created_at": index,
+                            "artifact_name": artifact,
+                            "original_path": original,
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }
+            }
             let mut payload = script.clone();
             if matches!(scenario, "modified" | "rehashed") {
                 payload.extend_from_slice(b"\n# Changed after release signing.\n");
@@ -27666,12 +27963,23 @@ fi
                 symlink(&minisign, binaries.join("minisign")).unwrap();
             }
             let executor = binaries.join("bash");
-            std::fs::write(
-                &executor,
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$DCG_TEST_UPDATER_MARKER\"\n",
-            )
-            .unwrap();
-            std::fs::set_permissions(&executor, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if scenario != "installer-launch-failed" {
+                std::fs::write(
+                    &executor,
+                    r#"#!/bin/sh
+printf '%s\n' "$@" > "$DCG_TEST_UPDATER_MARKER"
+found=false
+for snapshot in "$DCG_TEST_UPDATER_BACKUPS"/dcg-0.15.0-*.json; do
+  [ -f "$snapshot" ] && found=true
+done
+[ "$found" = true ] || exit 97
+[ "$DCG_TEST_UPDATER_FAILURE" != installer-failed ] || exit 23
+"#,
+                )
+                .unwrap();
+                std::fs::set_permissions(&executor, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
 
             let marker = directory.join("installer-was-invoked");
             let tag = if matches!(scenario, "wrong-release" | "forged-release-comment") {
@@ -27689,11 +27997,19 @@ fi
                 .env_clear()
                 .env("PATH", &binaries)
                 .env("TMPDIR", &directory)
+                .env("HOME", &home)
+                .env("XDG_DATA_HOME", &data)
+                .env("XDG_CONFIG_HOME", home.join("config"))
+                .env("XDG_CACHE_HOME", home.join("cache"))
+                .env("DCG_SELF_HEAL_HOOK", "0")
+                .env("DCG_NO_UPDATE_CHECK", "1")
                 .env("DCG_TEST_UPDATER_CHILD_MODE", mode)
                 .env("DCG_TEST_UPDATER_TAG", tag)
                 .env("DCG_TEST_UPDATER_SERVER", &server)
                 .env("DCG_TEST_UPDATER_MARKER", &marker)
                 .env("DCG_TEST_UPDATER_FAILURE", scenario)
+                .env("DCG_TEST_UPDATER_DESTINATION", &destination)
+                .env("DCG_TEST_UPDATER_BACKUPS", &backup_dir)
                 .env(
                     "DCG_TEST_UPDATER_BASE",
                     format!(
@@ -27713,9 +28029,10 @@ fi
                     "{scenario}: unexpectedly succeeded: {diagnostics}"
                 );
                 assert!(diagnostics.contains(expected), "{scenario}: {diagnostics}");
-                assert!(
-                    !marker.exists(),
-                    "{scenario}: unauthenticated installer reached Bash"
+                assert_eq!(
+                    marker.exists(),
+                    scenario == "installer-failed",
+                    "{scenario}: unexpected installer execution boundary"
                 );
             } else {
                 assert!(output.status.success(), "{scenario}: {diagnostics}");
@@ -27727,10 +28044,65 @@ fi
                 match mode {
                     "easy" => expected.push("--easy-mode"),
                     "system" => expected.push("--system"),
-                    "source" => expected.push("--from-source"),
                     _ => {}
                 }
+                expected.extend(["--dest", destination.to_str().unwrap()]);
+                if mode == "source" {
+                    expected.push("--from-source");
+                }
                 assert_eq!(arguments.lines().skip(1).collect::<Vec<_>>(), expected);
+            }
+            assert_eq!(std::fs::read(&installed).unwrap(), incumbent.as_bytes());
+            if scenario == "backup-unwritable" {
+                assert_eq!(std::fs::read(&backup_dir).unwrap(), b"existing data");
+            } else {
+                let entries: Vec<crate::update::BackupEntry> = std::fs::read_dir(&backup_dir)
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .filter(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "json")
+                    })
+                    .map(|entry| {
+                        serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap()
+                    })
+                    .collect();
+                let recovery = entries.iter().find(|entry| entry.version == "0.15.0");
+                let has_recovery = expected_error.is_none()
+                    || matches!(scenario, "installer-failed" | "installer-launch-failed");
+                assert_eq!(recovery.is_some(), has_recovery, "{scenario}");
+                if let Some(recovery) = recovery {
+                    assert_eq!(recovery.original_path, installed);
+                    let snapshot = backup_dir.join(recovery.artifact_name.as_ref().unwrap());
+                    assert_eq!(std::fs::read(&snapshot).unwrap(), incumbent.as_bytes());
+                    assert_eq!(
+                        std::fs::metadata(snapshot).unwrap().permissions().mode() & 0o777,
+                        0o751
+                    );
+                }
+                assert!(
+                    backup_dir.join("old-5").exists(),
+                    "other installation was pruned"
+                );
+                if expected_error.is_some() {
+                    for index in 1..=4 {
+                        assert!(
+                            backup_dir.join(format!("old-{index}")).exists(),
+                            "{scenario}: pruned on failure"
+                        );
+                    }
+                    assert_eq!(entries.len(), if has_recovery { 6 } else { 5 });
+                } else {
+                    assert_eq!(
+                        entries.len(),
+                        4,
+                        "three for this installation plus the unrelated backup"
+                    );
+                    assert!(!backup_dir.join("old-1").exists());
+                    assert!(!backup_dir.join("old-2").exists());
+                }
             }
             eprintln!("{scenario}: authenticated handoff boundary passed");
         }
@@ -27799,6 +28171,104 @@ if ($errors.Count -ne 0) {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_runner_commits_retention_only_after_real_child_success() {
+        let powershell = std::path::PathBuf::from(std::env::var_os("SYSTEMROOT").unwrap())
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        for (scenario, body, succeeds) in [
+            (
+                "stderr-success",
+                "[Console]::Error.WriteLine('successful native stderr'); Write-Output ''; exit 0",
+                true,
+            ),
+            ("installer-failure", "exit 23", false),
+            (
+                "installer-throw",
+                "throw 'installer fixture failure'",
+                false,
+            ),
+            ("failed-launch", "exit 0", false),
+            ("log-failure", "exit 0", false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let worker = temp.path().join("worker");
+            std::fs::create_dir(&worker).unwrap();
+            let runner = worker.join("runner.ps1");
+            let installer = worker.join("installer.ps1");
+            let marker = temp.path().join("installer-marker");
+            let old_backup = temp.path().join("old-backup");
+            let recovery = temp.path().join("recovery-backup");
+            let log = temp.path().join("update.log");
+            std::fs::write(&old_backup, b"old recovery").unwrap();
+            std::fs::write(&recovery, b"current recovery").unwrap();
+            std::fs::write(&runner, WINDOWS_UPDATE_RUNNER).unwrap();
+            std::fs::write(
+                &installer,
+                format!(
+                    "param([string]$Dest)\n[IO.File]::WriteAllText($env:DCG_TEST_WORKER_MARKER, $Dest)\n{body}\n"
+                ),
+            )
+            .unwrap();
+            if scenario == "log-failure" {
+                std::fs::create_dir(&log).unwrap();
+            }
+            std::fs::write(
+                worker.join("runner-config.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "parent_process_id": u32::MAX,
+                    "installer_path": installer,
+                    "installer_arguments": ["-Dest", "directory with spaces"],
+                    "cleanup_directory": worker,
+                    "log_path": log,
+                    "prune_backup_files": [old_backup],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let mut command = std::process::Command::new(&powershell);
+            command
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$global:LASTEXITCODE = 0; & $env:DCG_TEST_WORKER_RUNNER",
+                ])
+                .env("DCG_TEST_WORKER_RUNNER", &runner)
+                .env("DCG_TEST_WORKER_MARKER", &marker);
+            if scenario == "failed-launch" {
+                // Invoke the parent through its absolute path, but make the
+                // child's native powershell.exe lookup fail after a stale zero.
+                command.env("PATH", temp.path());
+            }
+            let output = command.output().unwrap();
+            assert_eq!(
+                output.status.success(),
+                succeeds,
+                "{scenario}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(old_backup.exists(), !succeeds, "{scenario}");
+            assert_eq!(std::fs::read(&recovery).unwrap(), b"current recovery");
+            if succeeds {
+                assert_eq!(
+                    std::fs::read_to_string(&marker).unwrap(),
+                    "directory with spaces"
+                );
+                let log = std::fs::read_to_string(&log).unwrap();
+                assert!(log.contains("successful native stderr"));
+                assert!(log.contains("dcg update completed successfully."));
+            } else if scenario != "log-failure" {
+                let log = std::fs::read_to_string(&log).unwrap();
+                assert!(!log.contains("dcg update completed successfully."));
+            }
+        }
     }
 
     #[test]
