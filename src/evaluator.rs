@@ -9716,9 +9716,11 @@ fn piped_inline_program_is_inert(language: crate::heredoc::ScriptLanguage, code:
             r"|\bset(?:Timeout|Interval|Immediate)\s*\(\s*['\x22`]",
             // `process` used as a value or indexed rather than read by member.
             r"|\bprocess\s*(?:[^.\s\w]|$)",
-            // A computed call, or a property name built from pieces.
+            // A computed call, or a property name built from pieces. A `[`
+            // after a backslash is a regex's or a string's literal bracket
+            // (`/\[(.+?)\]/`): no index opens there.
             r"|\]\s*\(|['\x22`]\s*\+\s*['\x22`]",
-            r"|\[[^\]]*\+\s*[^\d\s\]]|\[[^\]]*['\x22`]\s*\+",
+            r"|(?:^|[^\\])\[[^\]]*\+\s*[^\d\s\]]|(?:^|[^\\])\[[^\]]*['\x22`]\s*\+",
             // An identifier spelled with an escape (`eval`).
             r"|(?:^|[\s.;(=,!&|?:{}\[])\\u",
         ))
@@ -9754,9 +9756,16 @@ fn piped_inline_program_is_inert(language: crate::heredoc::ScriptLanguage, code:
     });
     static PYTHON_RUNNER: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(concat!(
-            r"\b(?:exec|eval|__import__|importlib|runpy|subprocess|pty|ctypes|cffi|getattr",
+            // `\w*` before a runner's name reaches `os.posix_spawn` and
+            // `asyncio.create_subprocess_shell`.
+            r"\b(?:exec|eval|__import__|importlib|runpy|\w*subprocess\w*|pty|ctypes|cffi|getattr",
             r"|globals|locals|vars|__builtins__|builtins|pickle|marshal|shelve|multiprocessing",
-            r"|timeit|posix|popen\w*|spawn\w*|fork\w*|exec[lv]\w*|unsafe_load|UnsafeLoader)\b",
+            r"|timeit|posix|popen\w*|\w*spawn\w*|fork\w*|exec[lv]\w*|unsafe_load|UnsafeLoader",
+            // A name looked up at run time (`os.__dict__["sys" + "tem"]`), and
+            // a console or debugger that reads its commands from stdin.
+            r"|__dict__|__getattribute__|__globals__|__subclasses__|attrgetter|methodcaller",
+            r"|pdb|breakpoint|interact|InteractiveConsole|InteractiveInterpreter|IPython",
+            r"|bpython|ptpython)\b",
             r"|\b(?:import|from)\s+code\b|(?:^|[^.\w])compile\s*\(|\.\s*system\b|\bsystem\s*\(",
             // `list.remove` and `str.replace` are everywhere, so these count
             // only once a module that deletes through them has been named.
@@ -9905,6 +9914,47 @@ static STAGE_NAMES_AN_INTERPRETER: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"\b(?:perl|ruby|node|nodejs|php|python[\d.]*)\b")
         .expect("interpreter stage regex compiles")
 });
+
+/// Whether a pipeline stage is one plain text filter that only names an
+/// interpreter as data (`NODE_OPTIONS=… npm run build 2>&1 | grep -i node`).
+/// It starts no interpreter, so no setting reaches one through it. Only a
+/// filter named as the stage's first word counts, with no wrapper, and none of
+/// whose options runs another program (so not `sort`, `rg` or `less`). An
+/// unquoted expansion, glob, grouping, redirection or second statement, a
+/// function the command defines and an `alias` all keep the stage counted.
+fn stage_is_a_plain_text_filter(command: &str, consumer: &str) -> bool {
+    const TEXT_FILTERS: &[&str] = &[
+        "grep", "egrep", "fgrep", "head", "tail", "wc", "uniq", "cut", "tr", "tee", "cat", "nl",
+    ];
+    let mut quote = None;
+    let mut escaped = false;
+    for byte in consumer.bytes() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, byte) {
+            (Some(b'\''), b'\'') | (Some(b'"'), b'"') => quote = None,
+            (Some(b'\''), _) => {}
+            (_, b'\\') => escaped = true,
+            (Some(_), b'$' | b'`') => return false,
+            (Some(_), _) => {}
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (None, byte) if b"$`(){};&|<>*?[~#\r\n".contains(&byte) => return false,
+            (None, _) => {}
+        }
+    }
+    if quote.is_some() || escaped || command_defines_function(command) || command.contains("alias")
+    {
+        return false;
+    }
+    shell_words::split(consumer).is_ok_and(|words| {
+        words
+            .iter()
+            .find(|word| !is_shell_assignment(word))
+            .is_some_and(|program| TEXT_FILTERS.contains(&program.as_str()))
+    })
+}
 
 /// Whether the outer shell fills in any of `words` (as read without their
 /// quotes) before the stage's interpreter sees it. A redirect target is no such
@@ -12040,7 +12090,8 @@ fn collect_posix_pipeline_executable_sinks(
                     // (`export RUBYOPT=-r/dev/stdin; cat x | ruby -ne print`).
                     PipelineShellInputMode::DoesNotReadStdin | PipelineShellInputMode::NotShell
                         if INTERPRETER_CODE_SETTING.is_match(command)
-                            && STAGE_NAMES_AN_INTERPRETER.is_match(consumer) =>
+                            && STAGE_NAMES_AN_INTERPRETER.is_match(consumer)
+                            && !stage_is_a_plain_text_filter(command, consumer) =>
                     {
                         PipelineShellInputMode::Unverified
                     }
@@ -43509,6 +43560,95 @@ mod tests {
         }
     }
 
+    /// A Node regex literal that matches a bracketed word (`/\[(.+?)\]/`) has
+    /// a `+` after a `[`, but that `[` is escaped and opens no computed index;
+    /// a real index built from pieces still keeps the stage unverified.
+    #[test]
+    fn node_escaped_bracket_is_no_computed_index_611() {
+        use std::mem::discriminant;
+        let mode = |cmd: &str| discriminant(&pipeline_shell_input_mode(cmd));
+        let data = discriminant(&PipelineShellInputMode::DoesNotReadStdin);
+        let unverified = discriminant(&PipelineShellInputMode::Unverified);
+        for cmd in [
+            r#"node -e 'const s=require("fs").readFileSync(0,"utf8"); console.log(s.replace(/\[(.+?)\]/g, "$1"))'"#,
+            r#"node -e 'console.log(require("fs").readFileSync(0,"utf8").match(/\[(\w+)\]/g))'"#,
+            r#"node -e 'console.log(require("fs").readFileSync(0,"utf8").replace(/\[x+\]/g, ""))'"#,
+            r#"node -e 'console.log(require("fs").readFileSync(0,"utf8").split(/\["+/))'"#,
+        ] {
+            assert_eq!(mode(cmd), data, "{cmd}: the escaped bracket is regex text");
+        }
+        for cmd in [
+            r"node -e 'const r = /\[/, f = d[k + v]; f(s)'",
+            r#"node -e 'const r = /\[/, f = d["ex" + k]; f(s)'"#,
+        ] {
+            assert_eq!(mode(cmd), unverified, "{cmd}: must stay unverified");
+        }
+    }
+
+    /// A Python program on a pipe that runs what it reads through a runner
+    /// whose name sits inside a longer one, through a name looked up at run
+    /// time, or through a console or debugger that reads stdin, stays
+    /// unverified like `exec` and `-m code` do (#611).
+    #[test]
+    fn python_pipe_runner_inside_a_name_or_looked_up_611() {
+        use std::mem::discriminant;
+        let mode = |cmd: &str| discriminant(&pipeline_shell_input_mode(cmd));
+        let data = discriminant(&PipelineShellInputMode::DoesNotReadStdin);
+        let unverified = discriminant(&PipelineShellInputMode::Unverified);
+        for cmd in [
+            "python3 -c 'import sys, json; print(json.dumps(json.load(sys.stdin), indent=2))'",
+            "python3 -c 'import sys, collections; print(collections.Counter(sys.stdin).most_common(3))'",
+        ] {
+            assert_eq!(mode(cmd), data, "{cmd}: the program only reads its input");
+        }
+        for cmd in [
+            r#"python3 -c 'import os,sys; os.posix_spawn("/bin/sh", ["sh", "-c", sys.stdin.read()], os.environ)'"#,
+            "python3 -c 'import asyncio,sys; asyncio.run(asyncio.create_subprocess_shell(sys.stdin.read()))'",
+            r#"python3 -c 'import os,sys; os.__dict__["sys" + "tem"](sys.stdin.read())'"#,
+            r#"python3 -c 'import operator,os,sys; operator.attrgetter("sys" + "tem")(os)(sys.stdin.read())'"#,
+            r#"python3 -c '[c for c in ().__class__.__base__.__subclasses__() if c.__name__ == "_wrap_close"][0].__init__.__globals__["sys" + "tem"](input())'"#,
+            "python3 -c 'import sys, code; code.interact()'",
+            "python3 -c 'import pdb; pdb.set_trace()'",
+            "python3 -c 'breakpoint()'",
+        ] {
+            assert_eq!(mode(cmd), unverified, "{cmd}: must stay unverified");
+        }
+    }
+
+    /// An interpreter setting reaches no interpreter through a stage that only
+    /// filters text and names one as data (`… 2>&1 | grep -i node`), while a
+    /// stage that may still start one stays unverified (#611).
+    #[test]
+    fn interpreter_setting_spares_a_plain_text_filter_naming_it_611() {
+        let config = default_config();
+        let pack_ids: Vec<String> = config.enabled_pack_ids().into_iter().collect();
+        let pack_ids: Vec<&str> = pack_ids.iter().map(String::as_str).collect();
+        let evaluate =
+            |cmd: &str| evaluate_with_pack_ids_in_dialect(cmd, &pack_ids, ShellDialect::Posix);
+        for cmd in [
+            "NODE_OPTIONS=--max-old-space-size=8192 npm run build 2>&1 | grep -i node",
+            "export NODE_OPTIONS=--max-old-space-size=4096; npm ls 2>&1 | grep -c node",
+            "RUBYOPT=-W0 bundle exec rspec 2>&1 | grep -v ruby",
+            "export PYTHONSTARTUP=~/.pythonrc; pip list | grep -i python",
+            r#"NODE_OPTIONS=--max-old-space-size=8192 npm test 2>&1 | grep -E "node:|FAIL""#,
+            "export NODE_OPTIONS=--enable-source-maps; docker logs app 2>&1 | grep 'node' | tail -n 20",
+        ] {
+            let result = evaluate(cmd);
+            assert!(result.is_allowed(), "{cmd:?} must be allowed: {result:?}");
+        }
+        for cmd in [
+            "export NODE_OPTIONS=--require=/dev/stdin; cat x | grep node | node -e 1",
+            "export NODE_OPTIONS=--require=/dev/stdin; cat x | grep \"$(node -e 1)\"",
+            "export NODE_OPTIONS=--require=/dev/stdin; cat x | sort --compress-program=node",
+            "export NODE_OPTIONS=--require=/dev/stdin; cat x | timeout 5 node -e 1",
+            "grep() { node; }; export NODE_OPTIONS=--require=/dev/stdin; cat x | grep node",
+            "export RUBYOPT=-r/dev/stdin; cat x | { grep ruby; ruby -e 1; }",
+        ] {
+            let result = evaluate(cmd);
+            assert!(result.is_denied(), "{cmd:?} must be denied: {result:?}");
+        }
+    }
+
     /// The verdicts behind #611, #612 and #624 under the default packs: a
     /// filter whose program is inline code is judged by that code, and a
     /// program that comes from the pipe or may run what it reads is denied.
@@ -43540,6 +43680,7 @@ mod tests {
             "cat x | php -B '$n = 0;' -R '$n++;' -E 'echo $n;'",
             "cat x | ruby -rjson -ne 'puts JSON.parse($_).keys'",
             "cat x | node -r dotenv/config -e 'console.log(1)'",
+            r#"cat x.txt | node -e 'const s=require("fs").readFileSync(0,"utf8"); console.log(s.replace(/\[(.+?)\]/g, "$1"))'"#,
             // A hash key or a word holding an `s` is not a substitution.
             "cat x | perl -ne 'print unless $seen{$_}++'",
             "cat x | perl -ne '$s{$_}++ or print'",
@@ -43666,6 +43807,8 @@ mod tests {
             "cat x | python3 -c 'import sys; exec(sys.stdin.read())'",
             "cat x | python3 -i script.py",
             "cat x | python3 -m code",
+            "cat x | python3 -c 'import asyncio,sys; asyncio.run(asyncio.create_subprocess_shell(sys.stdin.read()))'",
+            r#"cat x | python3 -c 'import os,sys; os.__dict__["sys" + "tem"](sys.stdin.read())'"#,
             // Runners the earlier lists missed.
             "cat x | perl -ne '@ARGV=<STDIN>; print while <>'",
             r#"cat x | perl -e 'do lc("/DEV/STDIN")'"#,
