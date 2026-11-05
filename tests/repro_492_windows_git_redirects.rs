@@ -166,6 +166,28 @@ impl Fixture {
             "[{dialect}] {command:?}: {full}"
         );
     }
+
+    fn cli_denied_by_rule(&self, dialect: &str, command: &str, rule: &str) {
+        let output = self
+            .process()
+            .args([
+                "test",
+                "--with-packs",
+                "core.filesystem",
+                "--dialect",
+                dialect,
+                "--format",
+                "json",
+                command,
+            ])
+            .output()
+            .expect("dcg test JSON");
+        let json: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("complete CLI decision JSON");
+        assert_eq!(output.status.code(), Some(1), "{dialect} {command}: {json}");
+        assert_eq!(json["decision"], "deny", "{dialect} {command}: {json}");
+        assert_eq!(json["rule_id"], rule, "{dialect} {command}: {json}");
+    }
 }
 
 #[test]
@@ -460,6 +482,51 @@ fn issue_642_tee_option_terminator_preserves_positional_filename_binding() {
         // parameter names. None belongs to the sensitive path policy.
         fixture.allowed("PowerShell", command);
     }
+}
+
+#[test]
+fn issue_642_pending_inputobject_terminator_cannot_borrow_safe_switches() {
+    let fixture = Fixture::new(&[]);
+    let target = fixture.dir.path().join("home/important.txt");
+    std::fs::write(&target, "keep this content").expect("existing protected home file");
+    for cmdlet in ["Tee-Object", "Out-File"] {
+        for input in ["-Append", "-NoClobber", "-WhatIf"] {
+            // Native PowerShell skips the terminator while binding the
+            // pending InputObject. The next word is DATA; the final word
+            // binds the file target, so each command overwrites that file.
+            let command = format!("{cmdlet} -InputObject -- {input} ~/important.txt");
+            for tool in ["PowerShell", "Shell"] {
+                fixture.denied(tool, &command, HOME_TRUNCATE);
+            }
+            for dialect in ["powershell", "unknown"] {
+                fixture.cli_denied(dialect, &command, "redirect-truncate-root-home");
+            }
+        }
+        // A quoted -- stays data in both readings. In a proven PowerShell
+        // reading, escaping either dash also leaves Append as a switch.
+        for tool in ["PowerShell", "Shell"] {
+            fixture.allowed(
+                tool,
+                &format!("{cmdlet} -InputObject '--' -Append ~/important.txt"),
+            );
+        }
+        for input in ["`--", "-`-"] {
+            let command = format!("{cmdlet} -InputObject {input} -Append ~/important.txt");
+            fixture.allowed("PowerShell", &command);
+            // Without a declared dialect, the same backtick is unresolved
+            // POSIX syntax. Keep that independent fail-closed policy.
+            fixture.denied("Shell", &command, "heredoc.posix:substitution-unverified");
+            fixture.cli_denied_by_rule(
+                "unknown",
+                &command,
+                "heredoc.posix:substitution-unverified",
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(target).expect("unexecuted fixture target"),
+        "keep this content"
+    );
 }
 
 #[test]
@@ -799,7 +866,12 @@ fn issue_642_stop_parsing_cannot_borrow_discarded_safe_parameters() {
         // whitespace before the next parameter.
         "Tee-Object -InputObject 'NEW'-FilePath /etc/hosts",
     ] {
-        fixture.denied("PowerShell", command, HOME_TRUNCATE);
+        for tool in ["PowerShell", "Shell"] {
+            fixture.denied(tool, command, HOME_TRUNCATE);
+        }
+        for dialect in ["powershell", "unknown"] {
+            fixture.cli_denied(dialect, command, "redirect-truncate-root-home");
+        }
     }
 }
 
@@ -1120,4 +1192,335 @@ $completed.Add('literalpath_glob')
         assert!(cases.iter().any(|case| case == "windows_tee_alias"));
     }
     eprintln!("Native Tee-Object semantics: {report}");
+}
+
+#[test]
+fn outfile_named_positional_and_encoding_binding_keep_truncation_verdicts() {
+    let fixture = Fixture::new(&[]);
+    for command in [
+        "Out-File -FilePath /etc/hosts",
+        "Out-File -InputObject NEW -FilePath /etc/hosts",
+        "Out-File -InputObject: -WhatIf -FilePath /etc/hosts",
+        // A separate stop-parsing InputObject discards the following
+        // parameter; its apparent safety switch never reaches the binder.
+        "Out-File -InputObject '--%' -Append /etc/hosts",
+        "Out-File -InputObject '--%' -NoClobber /etc/hosts",
+        "Out-File -InputObject '--%' -WhatIf /etc/hosts",
+        "Out-File -InputObject '--%' -FilePath /etc/hosts",
+        "Out-File -InputObject --% /etc/hosts",
+        "'NEW' | Out-File /etc/hosts",
+        "'NEW' | Out-File /etc/hosts utf8",
+        "'NEW' | Out-File -FilePath /etc/hosts utf8",
+        "'NEW' | Out-File utf8 -FilePath /etc/hosts",
+        "'NEW' | Out-File -Encoding utf8 /etc/hosts",
+        "'NEW' | Out-File utf8 -LiteralPath /etc/hosts",
+        "'NEW' | Out-File -Path /etc/hosts",
+        "'NEW' | Out-File -fi /etc/hosts",
+        "'NEW' | Out-File -PSPath /etc/hosts",
+        "'NEW' | Out-File -LP /etc/hosts",
+        "'NEW' | Out-File -- /etc/hosts utf8",
+        "'NEW' | OUT-FILE -FilePath '/etc/hosts'",
+        r"'NEW' | Microsoft.PowerShell.Utility\Out-File /etc/hosts",
+        "'NEW' | & ('Out-'+'File') -FilePath /etc/hosts",
+        "'NEW' | . ('Out-'+'File') -LiteralPath /etc/hosts",
+        "'NEW' | Out-File '/etc/it''s important.txt'",
+        "'NEW' | Out-File /etc/hosts -Append:$false",
+        "'NEW' | Out-File /etc/hosts -NoClobber:$false",
+        "'NEW' | Out-File /etc/hosts -WhatIf:$false",
+    ] {
+        for tool in ["PowerShell", "Shell"] {
+            fixture.denied(tool, command, HOME_TRUNCATE);
+        }
+        for dialect in ["powershell", "unknown"] {
+            fixture.cli_denied(dialect, command, "redirect-truncate-root-home");
+        }
+    }
+    for command in [
+        "'NEW' | Out`-File /etc/hosts",
+        "'NEW' | Out-File /etc/important` file.txt",
+    ] {
+        fixture.denied("PowerShell", command, HOME_TRUNCATE);
+        fixture.cli_denied("powershell", command, "redirect-truncate-root-home");
+        // Native PowerShell proof does not establish an Unknown caller's
+        // dialect. Unresolved alternate POSIX syntax remains independently
+        // blocked, without borrowing the file policy's rule identity.
+        fixture.denied("Shell", command, "heredoc.posix:substitution-unverified");
+        fixture.cli_denied_by_rule("unknown", command, "heredoc.posix:substitution-unverified");
+    }
+    for value in ["-Append", "-NoClobber", "-WhatIf"] {
+        let command = format!("Out-File -InputObject '{value}' /etc/hosts");
+        for tool in ["PowerShell", "Shell"] {
+            fixture.denied(tool, &command, HOME_TRUNCATE);
+        }
+    }
+}
+
+#[test]
+fn outfile_safe_switches_and_binding_errors_do_not_claim_truncation() {
+    let fixture = Fixture::new(&[]);
+    for tool in ["PowerShell", "Shell"] {
+        for command in [
+            "'NEW' | Out-File /etc/hosts -Append",
+            "'NEW' | Out-File -LiteralPath /etc/hosts -Append",
+            "'NEW' | Out-File /etc/hosts -Append:$true",
+            "'NEW' | Out-File /etc/hosts -Append:$null",
+            "'NEW' | Out-File /etc/hosts -NoClobber",
+            "'NEW' | Out-File /etc/hosts -NoOverwrite",
+            "'NEW' | Out-File /etc/hosts -NoClobber -Force",
+            "'NEW' | Out-File /etc/hosts -NoClobber:$true",
+            "'NEW' | Out-File /etc/hosts -NoClobber:$null",
+            "Out-File -Append -InputObject '--%' /etc/hosts",
+            "Out-File -NoClobber -InputObject '--%' /etc/hosts",
+            "'NEW' | Out-File /etc/hosts -WhatIf",
+            "'NEW' | Out-File /etc/hosts -WhatIf:$true",
+            "'NEW' | Out-File .ssh/authorized_keys -WhatIf",
+            "'NEW' | Out-File /etc/hosts -Append -Append:$false",
+            "'NEW' | Out-File /etc/hosts -Variable captured",
+            "'NEW' | Out-File /etc/hosts -Width",
+            "Out-File -InputObject -WhatIf -FilePath /etc/hosts",
+            "'NEW' | Out-File -FilePath /etc/hosts -LiteralPath /etc/profile",
+            "'NEW' | Out-File notes.txt",
+            "'NEW' | Out-File -FilePath '$target'",
+            "'NEW' | Out-File /tmp/dcg-outfile-notes.txt",
+            "Write-Output 'Out-File /etc/hosts'",
+            "Write-Output ('Out-'+'File') -FilePath /etc/hosts",
+            r"'NEW' | & ('Other.Module\Out-File') -FilePath /etc/hosts",
+        ] {
+            fixture.allowed(tool, command);
+        }
+    }
+}
+
+#[test]
+fn outfile_home_unresolved_paths_and_dynamic_switches_fail_closed() {
+    let fixture = Fixture::new(&[]);
+    let target = fixture.dir.path().join("home/important.txt");
+    std::fs::write(&target, "keep this content").expect("existing home target");
+    for tool in ["PowerShell", "Shell"] {
+        for command in [
+            "'NEW' | Out-File ~/important.txt",
+            "'NEW' | Out-File -LiteralPath '~/important.txt'",
+            "'NEW' | Out-File /./etc/hosts",
+            r"'NEW' | Out-File 'C:\.\Users\me\important.txt'",
+            "'NEW' | Out-File /etc/hosts -Append:$append",
+            "'NEW' | Out-File /etc/hosts -NoClobber:$protect",
+            "'NEW' | Out-File /etc/hosts -WhatIf:$preview",
+        ] {
+            fixture.denied(tool, command, HOME_TRUNCATE);
+        }
+        for command in [
+            "'NEW' | Out-File -FilePath $target",
+            "'NEW' | Out-File -LiteralPath (Get-Location)",
+            "'NEW' | Out-File @options",
+            "'NEW' | Out-File ../important.txt",
+            r"'NEW' | Out-File '\\server\share\important.txt'",
+        ] {
+            fixture.denied(tool, command, DYNAMIC);
+        }
+        fixture.allowed(tool, "'NEW' | Out-File ~/new-notes.txt");
+    }
+    assert_eq!(
+        std::fs::read_to_string(target).expect("unexecuted home target"),
+        "keep this content"
+    );
+}
+
+#[test]
+fn outfile_safe_outer_writes_and_rule_grants_do_not_hide_independent_writes() {
+    let fixture = Fixture::new(&[]);
+    for tool in ["PowerShell", "Shell"] {
+        for command in [
+            "'NEW' | Out-File notes.txt -Append; Out-File /etc/hosts",
+            "'NEW' | Out-File /etc/profile -NoClobber; Out-File /etc/hosts",
+            "'NEW' | Out-File /etc/profile -WhatIf; Out-File /etc/hosts",
+            "Out-File -FilePath notes.txt -WhatIf -InputObject $(Out-File /etc/hosts)",
+        ] {
+            fixture.denied(tool, command, HOME_TRUNCATE);
+        }
+        for suffix in ["-Append", "-NoClobber"] {
+            fixture.denied(
+                tool,
+                &format!("'NEW' | Out-File .ssh/authorized_keys {suffix}"),
+                CREDENTIAL,
+            );
+            fixture.denied(
+                tool,
+                &format!("'NEW' | Out-File .git/config {suffix}"),
+                GIT_WRITE,
+            );
+        }
+    }
+    let home = "Out-File /etc/hosts";
+    let credential = "Out-File .ssh/authorized_keys";
+    let git = "Out-File .git/config";
+    for (grant, sibling, expected) in [
+        (HOME_TRUNCATE, credential, CREDENTIAL),
+        (CREDENTIAL, home, HOME_TRUNCATE),
+        (GIT_WRITE, credential, CREDENTIAL),
+        (CREDENTIAL, git, GIT_WRITE),
+    ] {
+        let granted = match grant {
+            HOME_TRUNCATE => home,
+            CREDENTIAL => credential,
+            GIT_WRITE => git,
+            _ => unreachable!(),
+        };
+        let fixture = Fixture::new(&[grant]);
+        for tool in ["PowerShell", "Shell"] {
+            fixture.allowed(tool, granted);
+            for command in [
+                format!("{granted}; {sibling}"),
+                format!("{sibling}; {granted}"),
+            ] {
+                fixture.denied(tool, &command, expected);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires native PowerShell 7 (pwsh)"]
+fn native_outfile_and_pending_inputobject_binding_preserve_file_semantics() {
+    let dir = tempfile::tempdir().expect("native Out-File fixture");
+    let report_path = dir.path().join("native-report.json");
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'PowerShell 7 is required' }
+$root = $env:DCG_OUTFILE_NATIVE_ROOT
+$results = [System.Collections.Generic.List[object]]::new()
+$cases = @(
+    @{ Name='named'; Expected="NEW`n"; Body={ param($file) Out-File -InputObject NEW -FilePath $file } },
+    @{ Name='positional'; Expected="NEW`n"; Body={ param($file) 'NEW' | Out-File $file } },
+    @{ Name='named_later_encoding'; Expected="NEW`n"; Body={ param($file) 'NEW' | Out-File utf8 -FilePath $file } },
+    @{ Name='literal_encoding'; Expected="NEW`n"; Body={ param($file) 'NEW' | Out-File utf8 -LiteralPath $file } },
+    @{ Name='no_input'; Expected=''; Body={ param($file) Out-File -FilePath $file } },
+    @{ Name='append_true'; Expected="OLD`nNEW`n"; Body={ param($file) 'NEW' | Out-File $file -Append } },
+    @{ Name='append_false'; Expected="NEW`n"; Body={ param($file) 'NEW' | Out-File $file -Append:$false } },
+    @{ Name='literal_append'; Expected="OLD`nNEW`n"; Body={ param($file) 'NEW' | Out-File -LiteralPath $file -Append } },
+    @{ Name='noclobber_true'; Expected="OLD`n"; Error='NoClobber,*'; Body={ param($file) 'NEW' | Out-File $file -NoClobber } },
+    @{ Name='nooverwrite'; Expected="OLD`n"; Error='NoClobber,*'; Body={ param($file) 'NEW' | Out-File $file -NoOverwrite } },
+    @{ Name='noclobber_false'; Expected="NEW`n"; Body={ param($file) 'NEW' | Out-File $file -NoClobber:$false } },
+    @{ Name='whatif_true'; Expected="OLD`n"; Body={ param($file) 'NEW' | Out-File $file -WhatIf } },
+    @{ Name='whatif_false'; Expected="NEW`n"; Body={ param($file) 'NEW' | Out-File $file -WhatIf:$false } },
+    @{ Name='variable_error'; Expected="OLD`n"; Error='NamedParameterNotFound,*'; Body={ param($file) 'NEW' | Out-File $file -Variable captured } },
+    @{ Name='duplicate_append_error'; Expected="OLD`n"; Error='ParameterAlreadyBound,*'; Body={ param($file) 'NEW' | Out-File $file -Append -Append:$false } },
+    @{ Name='missing_width_error'; Expected="OLD`n"; Error='MissingArgument,*'; Body={ param($file) 'NEW' | Out-File $file -Width } },
+    @{ Name='outfile_pending_append'; Expected="-Append`n"; Body={ param($file) Out-File -InputObject -- -Append $file } },
+    @{ Name='outfile_pending_noclobber'; Expected="-NoClobber`n"; Body={ param($file) Out-File -InputObject -- -NoClobber $file } },
+    @{ Name='outfile_pending_whatif'; Expected="-WhatIf`n"; Body={ param($file) Out-File -InputObject -- -WhatIf $file } },
+    @{ Name='tee_pending_append'; Expected="-Append`n"; Body={ param($file) Tee-Object -InputObject -- -Append $file } },
+    @{ Name='tee_pending_noclobber'; Expected="-NoClobber`n"; Body={ param($file) Tee-Object -InputObject -- -NoClobber $file } },
+    @{ Name='tee_pending_whatif'; Expected="-WhatIf`n"; Body={ param($file) Tee-Object -InputObject -- -WhatIf $file } },
+    @{ Name='outfile_quoted_terminator'; Expected="OLD`n--`n"; Body={ param($file) Out-File -InputObject '--' -Append $file } },
+    @{ Name='tee_quoted_terminator'; Expected="OLD`n--`n"; Body={ param($file) Tee-Object -InputObject '--' -Append $file } },
+    @{ Name='outfile_first_escaped_terminator'; Expected="OLD`n--`n"; Body={ param($file) Out-File -InputObject `-- -Append $file } },
+    @{ Name='outfile_second_escaped_terminator'; Expected="OLD`n--`n"; Body={ param($file) Out-File -InputObject -`- -Append $file } },
+    @{ Name='tee_first_escaped_terminator'; Expected="OLD`n--`n"; Body={ param($file) Tee-Object -InputObject `-- -Append $file } },
+    @{ Name='tee_second_escaped_terminator'; Expected="OLD`n--`n"; Body={ param($file) Tee-Object -InputObject -`- -Append $file } }
+)
+foreach ($case in $cases) {
+    $caseDir = Join-Path $root $case.Name
+    $ssh = Join-Path $caseDir '.ssh'
+    [IO.Directory]::CreateDirectory($ssh) | Out-Null
+    $file = Join-Path $ssh 'authorized_keys'
+    [IO.File]::WriteAllText($file, "OLD`n")
+    $errorId = $null
+    Push-Location -LiteralPath $caseDir
+    try { & $case.Body $file | Out-Null } catch { $errorId = $_.FullyQualifiedErrorId }
+    finally { Pop-Location }
+    $actual = [IO.File]::ReadAllText($file).Replace("`r`n", "`n")
+    $errorMatches = if ($case.Error) { $errorId -like $case.Error } else { $null -eq $errorId }
+    $results.Add([pscustomobject]@{
+        name=$case.Name
+        expected=$case.Expected
+        actual=$actual
+        error_id=$errorId
+        expected_error=$case.Error
+        passed=($errorMatches -and $actual -ceq $case.Expected)
+    })
+}
+$changed = @($results | Where-Object { $_.actual -cne "OLD`n" }).Count
+$failed = @($results | Where-Object { -not $_.passed }).Count
+$report = @{
+    version=$PSVersionTable.PSVersion.ToString()
+    case_count=$results.Count
+    changed_count=$changed
+    unchanged_count=($results.Count - $changed)
+    failed_count=$failed
+    cases=$results.ToArray()
+} | ConvertTo-Json -Depth 4 -Compress
+# WhatIf emits host text outside the success pipeline. Keep an exact report
+# separately instead of mistaking that diagnostic output for JSON.
+[IO.File]::WriteAllText($env:DCG_OUTFILE_NATIVE_REPORT, $report)
+Write-Output $report
+if ($failed -ne 0) { exit 1 }
+"#;
+    let output = Command::new("pwsh")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("DCG_OUTFILE_NATIVE_ROOT", dir.path())
+        .env("DCG_OUTFILE_NATIVE_REPORT", &report_path)
+        .env("HOME", dir.path())
+        .env("USERPROFILE", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_CACHE_HOME", dir.path().join("cache"))
+        .env("APPDATA", dir.path().join("appdata"))
+        .env("LOCALAPPDATA", dir.path().join("localappdata"))
+        .env("TMPDIR", dir.path())
+        .env("TEMP", dir.path())
+        .env("TMP", dir.path())
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run native PowerShell; put pwsh 7 on PATH");
+    assert!(
+        output.status.success(),
+        "native Out-File fixture failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report_path).expect("native report file"))
+            .expect("complete native report JSON");
+    let cases = report["cases"].as_array().expect("native case results");
+    let expected = [
+        "named",
+        "positional",
+        "named_later_encoding",
+        "literal_encoding",
+        "no_input",
+        "append_true",
+        "append_false",
+        "literal_append",
+        "noclobber_true",
+        "nooverwrite",
+        "noclobber_false",
+        "whatif_true",
+        "whatif_false",
+        "variable_error",
+        "duplicate_append_error",
+        "missing_width_error",
+        "outfile_pending_append",
+        "outfile_pending_noclobber",
+        "outfile_pending_whatif",
+        "tee_pending_append",
+        "tee_pending_noclobber",
+        "tee_pending_whatif",
+        "outfile_quoted_terminator",
+        "tee_quoted_terminator",
+        "outfile_first_escaped_terminator",
+        "outfile_second_escaped_terminator",
+        "tee_first_escaped_terminator",
+        "tee_second_escaped_terminator",
+    ];
+    assert_eq!(cases.len(), expected.len(), "{report}");
+    for (case, name) in cases.iter().zip(expected) {
+        assert_eq!(case["name"], name, "{report}");
+        assert_eq!(case["actual"], case["expected"], "{case}");
+        assert_eq!(case["passed"], true, "{case}");
+    }
+    assert_eq!(report["case_count"], 28);
+    assert_eq!(report["changed_count"], 22);
+    assert_eq!(report["unchanged_count"], 6);
+    assert_eq!(report["failed_count"], 0);
+    println!("Native Out-File and InputObject binding semantics: {report}");
 }

@@ -33,8 +33,8 @@ mod windows_shells;
 
 pub(crate) use windows_shells::{
     PowerShellInvokedCommand, PowerShellTruncationTarget, WindowsShellParseIncomplete,
-    powershell_literal_invocations, powershell_tee_scan_required,
-    powershell_tee_truncation_targets,
+    powershell_file_truncation_targets, powershell_file_writer_scan_required,
+    powershell_literal_invocations,
 };
 
 /// Rule name under `core.filesystem`. The pattern entry in

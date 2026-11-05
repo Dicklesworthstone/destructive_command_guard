@@ -1925,13 +1925,13 @@ fn segment_names_semantic_writer(segment: &str) -> bool {
 /// index result before deciding to skip the pack.
 pub(crate) fn filesystem_semantic_scan_required(command: &str, dialect: ShellDialect) -> bool {
     rm_semantic_scan_required(command, dialect)
-        // General Tee truncation has no credential-path anchor. Reuse the
+        // General file-output truncation has no credential-path anchor. Reuse the
         // dialect lexer here as well, including Unicode whitespace and
         // escaped command names that the keyword tokenizer cannot see.
         // Append still needs credential and Git protection, so candidate
         // selection must not depend on a truncating target being present.
         || (matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown)
-            && super::credential_files::powershell_tee_scan_required(command))
+            && super::credential_files::powershell_file_writer_scan_required(command))
         || (dialect == ShellDialect::Cmd
             && command.contains('>')
             && command.contains(['%', '!', '^']))

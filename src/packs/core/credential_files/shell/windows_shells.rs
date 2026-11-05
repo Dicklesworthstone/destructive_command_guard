@@ -138,7 +138,7 @@ impl LexBudget {
     }
 }
 
-/// A truncating Tee-Object destination, after PowerShell parameter binding.
+/// A truncating file-output destination, after PowerShell parameter binding.
 /// Keep both the actual decoded path and the volume-independent policy view;
 /// only the former can support a local filesystem proof.
 #[derive(Debug)]
@@ -152,7 +152,7 @@ pub(crate) struct PowerShellTruncationTarget {
 
 /// Collect writes from executable commands, including nested expressions.
 /// This uses exactly the lexer and binder used by credential protection.
-pub(crate) fn powershell_tee_truncation_targets(
+pub(crate) fn powershell_file_truncation_targets(
     source: &str,
 ) -> Result<Vec<PowerShellTruncationTarget>, WindowsShellParseIncomplete> {
     Ok(lex(source, ShellDialect::PowerShell)?
@@ -166,16 +166,16 @@ pub(crate) fn powershell_tee_truncation_targets(
                 })
                 .collect();
             let (name, rest) = args.split_first()?;
-            if !tee_object_name(&name.word)
-                || (!name.invoked
-                    && source[name.word.range.clone()]
-                        .chars()
-                        .next()
-                        .is_some_and(|ch| is_single_quote(ch) || is_double_quote(ch)))
+            let cmdlet_name = truncating_file_cmdlet_name(&name.word)?;
+            if !name.invoked
+                && source[name.word.range.clone()]
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| is_single_quote(ch) || is_double_quote(ch))
             {
                 return None;
             }
-            let command = cmdlet("tee-object")?;
+            let command = cmdlet(cmdlet_name)?;
             let mut bound = bind(&command, rest);
             let mut targets = if name.word.as_string() == "tee" {
                 native_tee_operands(rest)
@@ -186,10 +186,17 @@ pub(crate) fn powershell_tee_truncation_targets(
             };
             // Splatting may supply a destination the visible argv does not
             // name. Do not guess its keys or borrow an append exemption.
-            if bound.targets.is_empty() {
+            if bound.targets.is_empty()
+                || (command.kind == WriterKind::OutFile && !bound.named_file_target)
+            {
                 bound.targets.append(&mut bound.splats);
             }
-            if !bound.binding_error && !bound.variable && !bound.append {
+            if !bound.binding_error
+                && !bound.variable
+                && !bound.append
+                && !bound.what_if
+                && !bound.no_clobber
+            {
                 for target in bound.targets {
                     if !targets.iter().any(|existing| {
                         existing.text == target.text
@@ -232,17 +239,24 @@ pub(crate) fn powershell_tee_truncation_targets(
 }
 
 fn tee_object_name(word: &Word) -> bool {
-    word.is_all_literal()
-        && matches!(
-            word.as_string().to_ascii_lowercase().as_str(),
-            "tee" | "tee-object" | "microsoft.powershell.utility/tee-object"
-        )
+    truncating_file_cmdlet_name(word) == Some("tee-object")
 }
 
-/// Select the filesystem pack for every decoded Tee invocation. Binding is
-/// deliberately left to the classifiers: -Append still writes credentials
-/// and Git internals, even when no general truncation target remains.
-pub(crate) fn powershell_tee_scan_required(source: &str) -> bool {
+fn truncating_file_cmdlet_name(word: &Word) -> Option<&'static str> {
+    if !word.is_all_literal() {
+        return None;
+    }
+    match word.as_string().to_ascii_lowercase().as_str() {
+        "tee" | "tee-object" | "microsoft.powershell.utility/tee-object" => Some("tee-object"),
+        "out-file" | "microsoft.powershell.utility/out-file" => Some("out-file"),
+        _ => None,
+    }
+}
+
+/// Select the filesystem pack for every decoded file-output invocation.
+/// Binding is deliberately left to the classifiers: -Append and -NoClobber
+/// can still write credentials and Git internals without truncating a file.
+pub(crate) fn powershell_file_writer_scan_required(source: &str) -> bool {
     let Ok(commands) = lex(source, ShellDialect::PowerShell) else {
         // Keep the pack selected so its mandatory fallible whole-command
         // pass reports incomplete analysis instead of allowing a quick exit.
@@ -255,7 +269,7 @@ pub(crate) fn powershell_tee_scan_required(source: &str) -> bool {
         }) else {
             return false;
         };
-        tee_object_name(&name.word)
+        truncating_file_cmdlet_name(&name.word).is_some()
             && (name.invoked
                 || !source
                     .get(name.word.range.clone())
@@ -355,7 +369,7 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
 }
 
 pub(super) fn classify_all(segment: &str, dialect: ShellDialect) -> Vec<CredentialFileWrite> {
-    // Incompleteness is reported by powershell_tee_truncation_targets, which
+    // Incompleteness is reported by powershell_file_truncation_targets, which
     // the evaluator runs even when this best-effort collection is empty.
     lex(segment, dialect)
         .unwrap_or_default()
@@ -513,6 +527,8 @@ enum Role {
     Value,
     Switch,
     Append,
+    /// Out-File may create a new file but cannot replace an existing one.
+    NoClobber,
     WhatIf,
     /// `Tee-Object -Variable`: the copy goes to a variable, not a file.
     Variable,
@@ -565,13 +581,13 @@ const CONTENT_PARAMS: &[Param] = &[
 
 const OUT_FILE_PARAMS: &[Param] = &[
     param(&["filepath", "path"], Role::Target),
-    param(&["literalpath", "pspath", "lp"], Role::Target),
+    param(&["literalpath", "pspath", "lp"], Role::LiteralTarget),
     param(&["encoding"], Role::Value),
     param(&["width"], Role::Value),
     param(&["inputobject"], Role::Value),
     param(&["append"], Role::Append),
     param(&["force"], Role::Switch),
-    param(&["noclobber", "nooverwrite"], Role::Switch),
+    param(&["noclobber", "nooverwrite"], Role::NoClobber),
     param(&["nonewline"], Role::Switch),
 ];
 
@@ -627,7 +643,11 @@ fn cmdlet(name: &str) -> Option<Cmdlet> {
         // read as Set-Content it only ever matters for a protected target.
         "set-content" | "sc" => (WriterKind::SetContent, CONTENT_PARAMS, &[Role::Target]),
         "clear-content" | "clc" => (WriterKind::ClearContent, CONTENT_PARAMS, &[Role::Target]),
-        "out-file" => (WriterKind::OutFile, OUT_FILE_PARAMS, &[Role::Target]),
+        "out-file" => (
+            WriterKind::OutFile,
+            OUT_FILE_PARAMS,
+            &[Role::Target, Role::Value],
+        ),
         "tee-object" | "tee" => (WriterKind::TeeObject, TEE_OBJECT_PARAMS, &[Role::Target]),
         "new-item" | "ni" => (WriterKind::NewItem, NEW_ITEM_PARAMS, &[Role::Target]),
         "copy-item" | "copy" | "cp" | "cpi" => (
@@ -711,6 +731,14 @@ fn parameter(arg: &Arg) -> Option<(String, Option<usize>)> {
     Some((name, colon.map(|at| at + 1)))
 }
 
+/// Only the raw `--` token ends parameter binding. Decoding also turns
+/// `-` followed by an escaped dash into `--`, but that remains input data.
+fn ends_parameters(arg: &Arg) -> bool {
+    arg.bare_first == Some('-')
+        && arg.parameter_name.as_deref() == Some("-")
+        && arg.word.as_string() == "--"
+}
+
 /// Only a proven enabled switch may suppress a write. In particular an
 /// unresolved variable/expression might be false; its presence is no proof.
 fn switch_value(word: &Word) -> bool {
@@ -733,9 +761,11 @@ struct Bound {
     sources: Vec<Word>,
     names: Vec<Word>,
     append: bool,
+    no_clobber: bool,
     what_if: bool,
     variable: bool,
     literal_target: bool,
+    named_file_target: bool,
     append_seen: bool,
     binding_error: bool,
     splats: Vec<Word>,
@@ -743,9 +773,17 @@ struct Bound {
 
 fn bind(cmdlet: &Cmdlet, args: &[Arg]) -> Bound {
     let mut bound = Bound::default();
+    let out_file = cmdlet.kind == WriterKind::OutFile;
+    let strict = matches!(cmdlet.kind, WriterKind::TeeObject | WriterKind::OutFile);
     let mut position = 0usize;
+    // Out-File assigns positional values only after named binding, even
+    // when the named parameter appears later: `utf8 -FilePath target`
+    // binds utf8 to Encoding, not to a second file. A splat may also fill
+    // that file slot, so the collector keeps its unresolved target.
+    let mut out_file_positionals = Vec::new();
     // The role the previous word bound to, for `,`-joined array elements.
     let mut last_role: Option<Role> = None;
+    let mut last_named_parameter = None;
     let mut index = 0usize;
     let mut end_of_parameters = false;
     let mut named_parameters = Vec::new();
@@ -764,39 +802,51 @@ fn bind(cmdlet: &Cmdlet, args: &[Arg]) -> Bound {
         Role::Source => bound.sources.push(word),
         Role::Name => bound.names.push(word),
         Role::Variable => bound.variable = true,
-        Role::Value | Role::Switch | Role::Append | Role::WhatIf => {}
+        Role::Value | Role::Switch | Role::Append | Role::NoClobber | Role::WhatIf => {}
     };
     while let Some(arg) = args.get(index) {
         index += 1;
         if arg.comma_before
             && let Some(role) = last_role
         {
+            if out_file && matches!(last_named_parameter, Some("encoding" | "width")) {
+                bound.binding_error = true;
+            }
             store(&mut bound, role, arg.word.clone());
+            continue;
+        }
+        if out_file && arg.comma_before {
+            // Both positional parameters are scalar; a comma joins this
+            // word to the preceding value instead of supplying a new slot.
+            bound.binding_error = true;
             continue;
         }
         if arg.bare_first == Some('@') && arg.word.text.get(1) != Some(&'(') {
             bound.splats.push(unresolved(arg.word.range.clone()));
             last_role = None;
+            last_named_parameter = None;
             continue;
         }
-        if !end_of_parameters && arg.bare_first == Some('-') && arg.word.as_string() == "--" {
+        if !end_of_parameters && ends_parameters(arg) {
             end_of_parameters = true;
             continue;
         }
         if !end_of_parameters && let Some((name, inline)) = parameter(arg) {
-            let parameter = lookup(cmdlet, &name);
-            if parameter.is_none() && cmdlet.kind == WriterKind::TeeObject {
+            let matched_parameter = lookup(cmdlet, &name);
+            if matched_parameter.is_none() && strict {
                 bound.binding_error = true;
             }
-            if cmdlet.kind == WriterKind::TeeObject
-                && let Some(parameter) = parameter
-            {
+            if strict && let Some(parameter) = matched_parameter {
                 if named_parameters.contains(&parameter.names[0]) {
                     bound.binding_error = true;
+                } else {
+                    named_parameters.push(parameter.names[0]);
                 }
-                named_parameters.push(parameter.names[0]);
             }
-            let role = parameter.map_or(Role::Switch, |parameter| parameter.role);
+            let role = matched_parameter.map_or(Role::Switch, |parameter| parameter.role);
+            if matches!(role, Role::Target | Role::LiteralTarget) {
+                bound.named_file_target = true;
+            }
             let value = match inline {
                 Some(offset) if offset < arg.word.text.len() => {
                     // `-Path:~/.bashrc`: the provider expands a `~` that
@@ -813,6 +863,9 @@ fn bind(cmdlet: &Cmdlet, args: &[Arg]) -> Bound {
                 }
                 None => None,
             };
+            if strict && inline.is_some() && value.is_none() {
+                bound.binding_error = true;
+            }
             match role {
                 Role::Switch => {}
                 Role::Append => {
@@ -822,22 +875,51 @@ fn bind(cmdlet: &Cmdlet, args: &[Arg]) -> Bound {
                     bound.append_seen = true;
                     bound.append = inline.is_none() || value.as_ref().is_some_and(switch_value);
                 }
+                Role::NoClobber => {
+                    bound.no_clobber = inline.is_none() || value.as_ref().is_some_and(switch_value);
+                }
                 Role::WhatIf => {
                     bound.what_if = inline.is_none() || value.as_ref().is_some_and(switch_value);
                 }
                 _ => {
                     let value = value.or_else(|| {
+                        // `-InputObject -- -Append path` binds literal
+                        // -Append as the input value; it is not a switch.
+                        // Keep the end-of-parameters state for later argv.
+                        if !end_of_parameters && args.get(index).is_some_and(ends_parameters) {
+                            end_of_parameters = true;
+                            index += 1;
+                        }
+                        if strict
+                            && !end_of_parameters
+                            && args
+                                .get(index)
+                                .is_some_and(|next| parameter(next).is_some())
+                        {
+                            bound.binding_error = true;
+                            return None;
+                        }
                         index += 1;
                         args.get(index - 1).map(|next| next.word.clone())
                     });
                     if let Some(value) = value {
                         store(&mut bound, role, value);
+                    } else if strict {
+                        bound.binding_error = true;
                     }
                     last_role = Some(role);
+                    last_named_parameter = matched_parameter.map(|parameter| parameter.names[0]);
                     continue;
                 }
             }
             last_role = None;
+            last_named_parameter = None;
+            continue;
+        }
+        if out_file {
+            out_file_positionals.push(arg.word.clone());
+            last_role = None;
+            last_named_parameter = None;
             continue;
         }
         if cmdlet.kind == WriterKind::TeeObject && position >= cmdlet.positional.len() {
@@ -851,11 +933,29 @@ fn bind(cmdlet: &Cmdlet, args: &[Arg]) -> Bound {
         position += 1;
         store(&mut bound, role, arg.word.clone());
         last_role = Some(role);
+        last_named_parameter = None;
+    }
+    if out_file {
+        let mut file_bound = bound.named_file_target;
+        let mut encoding_bound = named_parameters.contains(&"encoding");
+        for word in out_file_positionals {
+            if !file_bound {
+                bound.targets.push(word);
+                file_bound = true;
+            } else if !encoding_bound {
+                encoding_bound = true;
+            } else {
+                bound.binding_error = true;
+            }
+        }
+    }
+    if strict
+        && (bound.targets.len() > 1 || bound.targets.iter().any(|target| target.text.is_empty()))
+    {
+        bound.binding_error = true;
     }
     if cmdlet.kind == WriterKind::TeeObject
-        && (bound.targets.len() > 1
-            || bound.targets.iter().any(|target| target.text.is_empty())
-            || (bound.literal_target && bound.append_seen)
+        && ((bound.literal_target && bound.append_seen)
             || (bound.variable && (!bound.targets.is_empty() || bound.append_seen)))
     {
         bound.binding_error = true;
@@ -867,7 +967,8 @@ fn classify_cmdlet(name: &str, args: &[Arg]) -> Option<CredentialFileWrite> {
     let cmdlet = cmdlet(name)?;
     let bound = bind(&cmdlet, args);
     if bound.what_if
-        || (cmdlet.kind == WriterKind::TeeObject && (bound.binding_error || bound.variable))
+        || (matches!(cmdlet.kind, WriterKind::TeeObject | WriterKind::OutFile)
+            && (bound.binding_error || bound.variable))
     {
         return None;
     }
@@ -2217,6 +2318,12 @@ fn path_word(mut word: Word) -> Word {
 mod tests {
     use super::super::{CREDENTIAL_FILE_WRITE_NAME, GIT_INTERNALS_WRITE_NAME};
     use super::*;
+    // Preserve the original issue-642 fixture names while exercising the
+    // generalized collector and candidate gate with those same commands.
+    use super::{
+        powershell_file_truncation_targets as powershell_tee_truncation_targets,
+        powershell_file_writer_scan_required as powershell_tee_scan_required,
+    };
 
     fn ps(command: &str) -> Option<CredentialFileWrite> {
         super::super::classify_credential_file_write(command, ShellDialect::PowerShell)
@@ -3324,6 +3431,285 @@ mod tests {
         assert_eq!(
             powershell_literal_invocations(&nested).expect_err("shared nesting bound"),
             WindowsShellParseIncomplete::Nesting
+        );
+    }
+
+    #[test]
+    fn powershell_out_file_binds_named_and_unbound_positional_targets() {
+        for command in [
+            "'NEW' | Out-File /etc/hosts",
+            "Out-File -InputObject NEW -FilePath /etc/hosts",
+            "Out-File -FilePath /etc/hosts",
+            "Out-File -Path /etc/hosts",
+            "Out-File -fi /etc/hosts",
+            "Out-File -LiteralPath /etc/hosts",
+            "Out-File -PSPath /etc/hosts",
+            "Out-File -LP /etc/hosts",
+            "Out-File /etc/hosts utf8",
+            "Out-File -FilePath /etc/hosts utf8",
+            "Out-File utf8 -FilePath /etc/hosts",
+            "Out-File -LiteralPath /etc/hosts utf8",
+            "Out-File utf8 -LiteralPath /etc/hosts",
+            "Out-File -Encoding utf8 /etc/hosts",
+            "Out-File /etc/hosts -Encoding utf8",
+            "Out-File -InputObject '/tmp/data' -Width 80 -ErrorVariable errors /etc/hosts",
+            "Out-File -OutVariable '-NoClobber' /etc/hosts",
+            "Out-File -FilePath:'/etc/hosts'",
+            "Out-File -FilePath: '/etc/hosts'",
+            "Out-File -FilePath('/etc/hosts')",
+            "Out-File -InputObject: -WhatIf -FilePath /etc/hosts",
+            "Out-File -- /etc/hosts utf8",
+            "Out-File -LP /etc/hosts -Append:$false",
+            "Out-File \u{2013}FilePath /etc/hosts",
+            "Out-File\u{00a0}-FilePath\u{00a0}/etc/hosts",
+            "Out-File -FilePath \u{2018}/etc/hosts\u{2019}",
+            "Out-F`ile -FilePath /etc/hosts",
+            "Microsoft.PowerShell.Utility\\Out-File -FilePath /etc/hosts",
+            "& ('Out-'+'File') -FilePath /etc/hosts",
+            ". (('Out-')+('File')) -FilePath /etc/hosts",
+            "& ('Microsoft.PowerShell.Utility\\Out-'+'File') -FilePath /etc/hosts",
+        ] {
+            let targets = powershell_file_truncation_targets(command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}: {targets:?}");
+            assert_eq!(targets[0].path, "/etc/hosts", "{command}");
+            assert!(targets[0].literal, "{command}");
+            assert!(powershell_file_writer_scan_required(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn powershell_out_file_preserves_switches_and_binding_failures() {
+        for tail in [
+            "-Append",
+            "-Append:$true",
+            "-Append:$null",
+            "-NoClobber",
+            "-NoClobber:$true",
+            "-NoOverwrite",
+            "-noc",
+            "-noo",
+            "-NoClobber -Force",
+            "-WhatIf",
+            "-WhatIf:$true",
+            "-wi",
+            "-Append -Append:$false",
+            "-NoClobber -NoOverwrite:$false",
+            "-WhatIf -wi:$false",
+            "-Variable x",
+            "-Width",
+            "-Encoding",
+            "-InputObject -Width 80",
+            "-Encoding -Append",
+            "-Encoding utf8 -e ascii",
+            "-Width 1,2",
+            "-Encoding utf8,ascii",
+            "-LiteralPath /tmp/other",
+            "-Path /tmp/other",
+            "utf8 ascii",
+        ] {
+            let command = format!("Out-File -FilePath /etc/hosts {tail}");
+            assert!(
+                powershell_file_truncation_targets(&command)
+                    .expect("bounded fixture")
+                    .is_empty(),
+                "{command}"
+            );
+        }
+        for command in [
+            "Out-File -f /etc/hosts",
+            "Out-File -FilePath /etc/hosts -no",
+            "Out-File -FilePath /etc/hosts,/tmp/other",
+            "Out-File /etc/hosts,/tmp/other",
+            "Out-File -LiteralPath /etc/hosts -Append",
+            "Out-File -InputObject '--' -Append /etc/hosts",
+        ] {
+            assert!(
+                powershell_file_truncation_targets(command)
+                    .expect("bounded fixture")
+                    .is_empty(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_out_file_exemptions_require_proven_enabled_switches() {
+        for switch in ["Append", "NoClobber", "NoOverwrite", "WhatIf"] {
+            for value in ["$false", "0", "$enabled", "($enabled)"] {
+                let command = format!("Out-File -FilePath /etc/hosts -{switch}:{value}");
+                let targets =
+                    powershell_file_truncation_targets(&command).expect("bounded fixture");
+                assert_eq!(targets.len(), 1, "{command}: {targets:?}");
+                assert_eq!(targets[0].path, "/etc/hosts", "{command}");
+            }
+        }
+    }
+
+    #[test]
+    fn powershell_file_output_pending_value_keeps_end_of_parameters_state() {
+        for writer in ["Out-File", "Tee-Object"] {
+            for data in ["-Append", "-NoClobber", "-WhatIf"] {
+                let command = format!("{writer} -InputObject -- {data} /etc/hosts");
+                let targets =
+                    powershell_file_truncation_targets(&command).expect("bounded fixture");
+                assert_eq!(targets.len(), 1, "{command}: {targets:?}");
+                assert_eq!(targets[0].path, "/etc/hosts", "{command}");
+            }
+            for marker in ["'--'", "\"--\"", "`--", "-`-"] {
+                let command = format!("{writer} -InputObject {marker} -Append /etc/hosts");
+                assert!(
+                    powershell_file_truncation_targets(&command)
+                        .expect("bounded fixture")
+                        .is_empty(),
+                    "quoted or escaped marker is input data: {command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn powershell_file_output_stop_parsing_does_not_restore_discarded_switches() {
+        for writer in ["Tee-Object", "Out-File"] {
+            for marker in ["--%", "`--%", "--`%"] {
+                let command = format!("{writer} -InputObject {marker} /etc/hosts");
+                let targets =
+                    powershell_file_truncation_targets(&command).expect("bounded fixture");
+                assert_eq!(targets.len(), 1, "{command}: {targets:?}");
+                assert_eq!(targets[0].path, "/etc/hosts", "{command}");
+            }
+            for marker in ["'--%'", "\"--%\""] {
+                for discarded in ["Append", "NoClobber", "WhatIf", "FilePath"] {
+                    let command = format!("{writer} -InputObject {marker} -{discarded} /etc/hosts");
+                    let targets =
+                        powershell_file_truncation_targets(&command).expect("bounded fixture");
+                    assert_eq!(targets.len(), 1, "{command}: {targets:?}");
+                    assert_eq!(targets[0].path, "/etc/hosts", "{command}");
+                    assert!(targets[0].literal, "{command}");
+                }
+            }
+            let command = format!("{writer} -Append -InputObject '--%' /etc/hosts");
+            assert!(
+                powershell_file_truncation_targets(&command)
+                    .expect("bounded fixture")
+                    .is_empty(),
+                "preceding switch remains bound: {command}"
+            );
+        }
+        let command = "Out-File -NoClobber -InputObject '--%' /etc/hosts";
+        assert!(
+            powershell_file_truncation_targets(command)
+                .expect("bounded fixture")
+                .is_empty(),
+            "preceding NoClobber remains bound"
+        );
+    }
+
+    #[test]
+    fn powershell_out_file_distinguishes_literal_paths_and_unresolved_targets() {
+        let wildcard = "Out-File -FilePath '/tmp/[scratch].txt'";
+        let targets = powershell_file_truncation_targets(wildcard).expect("bounded fixture");
+        assert_eq!(targets.len(), 1);
+        assert!(!targets[0].literal, "FilePath expands provider wildcards");
+        for parameter in ["LiteralPath", "PSPath", "LP"] {
+            let command = format!("Out-File -{parameter} '/tmp/[scratch].txt'");
+            let targets = powershell_file_truncation_targets(&command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}: {targets:?}");
+            assert_eq!(targets[0].path, "/tmp/[scratch].txt");
+            assert!(targets[0].literal, "{command}");
+        }
+        for command in [
+            "Out-File -FilePath $destination",
+            "Out-File -FilePath ($destination)",
+            "Out-File @parameters",
+            "Out-File @parameters utf8",
+        ] {
+            let targets = powershell_file_truncation_targets(command).expect("bounded fixture");
+            assert!(
+                targets.iter().any(|target| !target.literal),
+                "{command}: {targets:?}"
+            );
+        }
+        let command = "Out-File @parameters -FilePath /tmp/report.txt";
+        let targets = powershell_file_truncation_targets(command).expect("bounded fixture");
+        assert_eq!(
+            targets.len(),
+            1,
+            "named target cannot be rebound by a splat"
+        );
+        assert_eq!(targets[0].path, "/tmp/report.txt");
+        assert!(targets[0].literal);
+    }
+
+    #[test]
+    fn powershell_out_file_requires_actual_cmdlet_execution() {
+        for command in [
+            "Write-Output 'Out-File -FilePath /etc/hosts'",
+            "Write-Output ('Out-'+'File') -FilePath /etc/hosts",
+            "'Out-File' -FilePath /etc/hosts",
+            "('Out-File') -FilePath /etc/hosts",
+            "& '/usr/bin/Out-File' -FilePath /etc/hosts",
+            "Other.Module\\Out-File -FilePath /etc/hosts",
+            "& 'Out-File'[0] -FilePath /etc/hosts",
+        ] {
+            assert!(
+                powershell_file_truncation_targets(command)
+                    .expect("bounded fixture")
+                    .is_empty(),
+                "{command}"
+            );
+            assert!(!powershell_file_writer_scan_required(command), "{command}");
+        }
+        for command in [
+            "& ('Ou'+'t-Fi'+'le') -FilePath $destination",
+            ". (('Ou')+('t-Fi')+('le')) -FilePath $destination",
+            "Out-F`ile -FilePath $destination",
+        ] {
+            for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+                assert!(
+                    crate::packs::core::filesystem::filesystem_semantic_scan_required(
+                        command, dialect,
+                    ),
+                    "decoded writer must select the pack before keyword rejection: {command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn powershell_out_file_outer_exemptions_keep_nested_writes_and_spans() {
+        for exemption in ["WhatIf", "Append", "NoClobber"] {
+            let command = format!(
+                "Out-File -{exemption} -FilePath /tmp/safe -InputObject (Out-File -FilePath /etc/hosts)"
+            );
+            let targets = powershell_file_truncation_targets(&command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}: {targets:?}");
+            assert_eq!(targets[0].path, "/etc/hosts");
+            assert_eq!(&command[targets[0].span.clone()], "Out-File");
+            assert_eq!(targets[0].span.start, command.rfind("Out-File").unwrap());
+        }
+    }
+
+    #[test]
+    fn powershell_out_file_no_clobber_keeps_credential_creation_policy() {
+        for switch in ["Append", "NoClobber", "NoOverwrite"] {
+            let command = format!("Out-File -{switch} -FilePath ~/.ssh/authorized_keys");
+            assert!(
+                powershell_file_truncation_targets(&command)
+                    .expect("bounded fixture")
+                    .is_empty()
+            );
+            assert!(
+                classify(&command, ShellDialect::PowerShell).is_some(),
+                "{command}"
+            );
+            assert!(powershell_file_writer_scan_required(&command), "{command}");
+        }
+        assert!(
+            classify(
+                "Out-File -WhatIf -FilePath ~/.ssh/authorized_keys",
+                ShellDialect::PowerShell,
+            )
+            .is_none()
         );
     }
 }

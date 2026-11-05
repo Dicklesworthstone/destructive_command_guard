@@ -28523,6 +28523,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                 pack_id,
                 pack,
                 core_filesystem_command,
+                dialect_semantic_masked.as_ref(),
                 shell_dialect,
                 &core_filesystem_segment_ranges,
                 original_command,
@@ -34036,20 +34037,20 @@ fn redirect_targets_are_new_home_files(command: &str, dialect: ShellDialect) -> 
         .is_some_and(|home| redirect_targets_are_new_home_files_with_home(command, dialect, &home))
 }
 
-/// Apply the truncating-redirect policy to Tee-Object's bound file operand.
+/// Apply the truncating-redirect policy to a PowerShell writer's bound file operand.
 /// No synthetic shell command is constructed: quoting, parameter arity and
 /// append/variable selection have already been decided by the shared parser.
-fn powershell_tee_truncation_hits(
+fn powershell_file_truncation_hits(
     source: &str,
 ) -> Result<
     Vec<crate::packs::core::credential_files::CredentialFileWrite>,
     crate::packs::core::credential_files::WindowsShellParseIncomplete,
 > {
     use crate::packs::core::credential_files::{
-        CredentialFileWrite, PowerShellTruncationTarget, powershell_tee_truncation_targets,
+        CredentialFileWrite, PowerShellTruncationTarget, powershell_file_truncation_targets,
     };
 
-    Ok(powershell_tee_truncation_targets(source)?
+    Ok(powershell_file_truncation_targets(source)?
         .into_iter()
         .filter_map(|target: PowerShellTruncationTarget| {
             // Credential and .git writes retain their stronger, independent
@@ -34146,9 +34147,9 @@ fn powershell_tee_truncation_hits(
             Some(CredentialFileWrite {
                 span: target.span,
                 reason: if unresolved {
-                    "Tee-Object without a proven enabled -Append may truncate a sensitive file at an unresolved destination. Resolve and inspect the path first.".to_string()
+                    "This PowerShell file writer may truncate a sensitive file at an unresolved destination. Resolve and inspect the path first.".to_string()
                 } else {
-                    format!("Tee-Object without -Append overwrites `{}`; the existing sensitive file contents would be lost. Use -Append to preserve them or choose a scratch file.", target.path)
+                    format!("This PowerShell file writer overwrites `{}`; the existing sensitive file contents would be lost. Use -Append to preserve them or choose a scratch file.", target.path)
                 },
                 rule,
             })
@@ -34469,6 +34470,7 @@ fn evaluate_core_filesystem_pack(
     pack_id: &str,
     pack: &crate::packs::Pack,
     command_for_packs: &str,
+    native_semantic_source: &str,
     shell_dialect: crate::normalize::ShellDialect,
     segment_ranges: &[(usize, usize)],
     original_command: &str,
@@ -34700,18 +34702,20 @@ fn evaluate_core_filesystem_pack(
             // in one invocation, so an earlier allowlisted Git operand must
             // not conceal a later credential operand. The sanitized source
             // preserves the caller's proof that heredoc/program data is inert.
+            // Keep its native quotes and module separator: generic dequoting
+            // can split one computed name or erase a qualified cmdlet name.
             protected_hits.extend(
                 crate::packs::core::credential_files::classify_powershell_credential_writes(
-                    dialect_source,
+                    native_semantic_source,
                 )
                 .into_iter()
                 .chain(
                     crate::packs::core::credential_files::classify_git_redirect_writes(
-                        dialect_source,
+                        native_semantic_source,
                         ShellDialect::PowerShell,
                     ),
                 )
-                .map(|hit| (hit, 0, normalized_offset)),
+                .map(|hit| (hit, 0, Some(0))),
             );
         }
         if !powershell_truncation_scanned
@@ -34721,15 +34725,17 @@ fn evaluate_core_filesystem_pack(
             )
         {
             powershell_truncation_scanned = true;
-            let (tee_source, tee_offset) = if shell_dialect == ShellDialect::PowerShell {
+            let (writer_source, writer_offset) = if shell_dialect == ShellDialect::PowerShell {
                 (original_command, Some(0))
             } else {
                 // Unknown is a union of readings, but must not restore text
                 // already proven to be inert heredoc/program data.
-                (dialect_source, normalized_offset)
+                (native_semantic_source, Some(0))
             };
-            match powershell_tee_truncation_hits(tee_source) {
-                Ok(hits) => protected_hits.extend(hits.into_iter().map(|hit| (hit, 0, tee_offset))),
+            match powershell_file_truncation_hits(writer_source) {
+                Ok(hits) => {
+                    protected_hits.extend(hits.into_iter().map(|hit| (hit, 0, writer_offset)));
+                }
                 Err(_) => powershell_analysis_incomplete = true,
             }
         }
@@ -40701,9 +40707,9 @@ where
 }
 
 /// Confirm execution using the same bounded parser that emitted a semantic
-/// Tee finding. Its command-word span is distinct from redirect regex spans;
-/// a nearby Tee mention or a quoted data string supplies no such evidence.
-fn proven_powershell_tee_truncation_match(command: &str, info: &PatternMatch) -> bool {
+/// file-writer finding. Its command-word span is distinct from redirect regex
+/// spans; a nearby writer mention or quoted data supplies no such evidence.
+fn proven_powershell_file_truncation_match(command: &str, info: &PatternMatch) -> bool {
     if !matches!(info.source, MatchSource::Pack)
         || info.pack_id.as_deref() != Some("core.filesystem")
         || !matches!(
@@ -40717,7 +40723,7 @@ fn proven_powershell_tee_truncation_match(command: &str, info: &PatternMatch) ->
     let Some(span) = info.matched_span else {
         return false;
     };
-    crate::packs::core::credential_files::powershell_tee_truncation_targets(command).is_ok_and(
+    crate::packs::core::credential_files::powershell_file_truncation_targets(command).is_ok_and(
         |targets| {
             targets
                 .iter()
@@ -40801,10 +40807,10 @@ pub fn apply_confidence_scoring(
         };
     }
 
-    // The semantic parser already proved this Tee invocation executes. The
-    // generic context scorer does not model PowerShell assignment, return,
+    // The semantic parser already proved this file-writer invocation executes.
+    // The generic context scorer does not model PowerShell assignment, return,
     // or dot invocation, so it must not relabel the proven command as data.
-    if proven_powershell_tee_truncation_match(command, info) {
+    if proven_powershell_file_truncation_match(command, info) {
         return ConfidenceResult {
             mode: current_mode,
             score: None,
@@ -60079,7 +60085,7 @@ mod tests {
         };
         let command = "$x = Tee-Object $target";
         let result = result_for(command);
-        assert!(proven_powershell_tee_truncation_match(
+        assert!(proven_powershell_file_truncation_match(
             command,
             result.pattern_info.as_ref().expect("finding"),
         ));
@@ -60101,7 +60107,7 @@ mod tests {
         ] {
             let result = result_for(command);
             assert!(
-                !proven_powershell_tee_truncation_match(
+                !proven_powershell_file_truncation_match(
                     command,
                     result.pattern_info.as_ref().expect("finding"),
                 ),
@@ -60110,7 +60116,70 @@ mod tests {
         }
         let mut unrelated = result.pattern_info.expect("finding");
         unrelated.pattern_name = Some("rm-rf-general".to_string());
-        assert!(!proven_powershell_tee_truncation_match(command, &unrelated));
+        assert!(!proven_powershell_file_truncation_match(
+            command, &unrelated
+        ));
+    }
+
+    #[test]
+    fn powershell_out_file_confidence_requires_exact_execution_evidence() {
+        let result_for = |command: &str| {
+            let start = command.find("Out-File").expect("fixture command name");
+            EvaluationResult::denied_by_pack_pattern_with_span(
+                "core.filesystem",
+                "redirect-truncate-dynamic-path",
+                "semantic Out-File truncation",
+                None,
+                crate::packs::Severity::High,
+                &[],
+                command,
+                MatchSpan {
+                    start,
+                    end: start + "Out-File".len(),
+                },
+            )
+        };
+        for command in [
+            "$x = Out-File $target",
+            ". Out-File $target",
+            "return Out-File $target",
+            "Out-File $target -NoClobber:$false",
+            "Out-File $target -WhatIf:$false",
+        ] {
+            let result = result_for(command);
+            assert!(proven_powershell_file_truncation_match(
+                command,
+                result.pattern_info.as_ref().expect("finding"),
+            ));
+            let confidence = apply_effective_confidence(
+                &confidence_config(),
+                command,
+                &result,
+                crate::packs::DecisionMode::Deny,
+            );
+            assert_eq!(
+                confidence.mode,
+                crate::packs::DecisionMode::Deny,
+                "{command}"
+            );
+            assert!(!confidence.downgraded, "{command}");
+        }
+        for command in [
+            "Write-Output 'Out-File $target'",
+            "Write-Output 'Out-File data'; Out-File $target",
+            "Out-File $target -Append",
+            "Out-File $target -NoClobber",
+            "Out-File $target -WhatIf",
+        ] {
+            let result = result_for(command);
+            assert!(
+                !proven_powershell_file_truncation_match(
+                    command,
+                    result.pattern_info.as_ref().expect("finding"),
+                ),
+                "data or non-truncating invocation is no proof: {command}",
+            );
+        }
     }
 
     fn rm_rf_result(measured_on: &str, span: MatchSpan) -> EvaluationResult {
