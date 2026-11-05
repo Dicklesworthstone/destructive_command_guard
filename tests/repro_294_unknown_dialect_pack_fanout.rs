@@ -12,6 +12,9 @@
 //! tests pin both the added denials and, just as importantly, the false
 //! positives the replay must *not* import.
 
+use std::io::Write;
+use std::process::{Command, Stdio};
+
 use destructive_command_guard::evaluator::evaluate_command_with_pack_order_at_path_in_dialect;
 use destructive_command_guard::normalize::ShellDialect;
 use destructive_command_guard::packs::REGISTRY;
@@ -27,6 +30,14 @@ fn evaluate_all_packs(command: &str, dialect: ShellDialect) -> EvaluationResult 
         .into_iter()
         .map(str::to_string)
         .collect();
+    evaluate_enabled_packs(command, dialect, enabled)
+}
+
+fn evaluate_enabled_packs(
+    command: &str,
+    dialect: ShellDialect,
+    enabled: std::collections::HashSet<String>,
+) -> EvaluationResult {
     let ordered = REGISTRY.expand_enabled_ordered(&enabled);
     let keywords = REGISTRY.collect_enabled_keywords(&enabled);
     let index = REGISTRY.build_enabled_keyword_index(&ordered);
@@ -55,6 +66,226 @@ fn rule_id(result: &EvaluationResult) -> Option<String> {
             info.pattern_name.as_deref().unwrap_or("<none>")
         )
     })
+}
+
+/// Check the real hook and CLI without ambient configuration or bypasses.
+fn assert_computed_git_entrypoints(command: &str, expected: &str) {
+    assert_computed_git_entrypoints_with_exact_grant(command, expected, None);
+}
+
+fn assert_computed_git_entrypoints_with_exact_grant(
+    command: &str,
+    expected: &str,
+    exact_grant: Option<&str>,
+) {
+    let fixture = tempfile::tempdir().expect("computed Git fixture");
+    let home = fixture.path().join("home");
+    std::fs::create_dir_all(home.join("config/dcg")).expect("fixture configuration directory");
+    let config = fixture.path().join("config.toml");
+    std::fs::write(&config, "[history]\nenabled = false\n").expect("fixture configuration");
+    if let Some(granted) = exact_grant {
+        let quoted = serde_json::to_string(granted).expect("quote exact command");
+        std::fs::write(
+            home.join("config/dcg/allowlist.toml"),
+            format!(
+                "[[allow]]\nexact_command = {quoted}\nreason = \"reviewed original request\"\n"
+            ),
+        )
+        .expect("exact-command grant");
+    }
+    let process = || {
+        let mut process = Command::new(env!("CARGO_BIN_EXE_dcg"));
+        process
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("APPDATA", home.join("appdata"))
+            .env("LOCALAPPDATA", home.join("localappdata"))
+            .env("DCG_CONFIG", &config)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .env(
+                "DCG_PENDING_EXCEPTIONS_PATH",
+                fixture.path().join("pending.jsonl"),
+            )
+            .env(
+                "DCG_ALLOW_ONCE_PATH",
+                fixture.path().join("allow_once.jsonl"),
+            )
+            .env("DCG_SELF_HEAL_HOOK", "0")
+            .env("DCG_HOOK_TIMEOUT_MS", "5000")
+            .current_dir(fixture.path());
+        process
+    };
+    for (tool, dialect) in [("PowerShell", "powershell"), ("Shell", "unknown")] {
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+            "tool_use_id": "toolu_computed_git",
+            "tool_input": { "command": command },
+            "cwd": fixture.path(),
+        });
+        let mut child = process()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("computed Git hook");
+        child
+            .stdin
+            .take()
+            .expect("hook stdin")
+            .write_all(payload.to_string().as_bytes())
+            .expect("hook payload");
+        let output = child.wait_with_output().expect("hook output");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{tool}: {command:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let hook = if output.stdout.is_empty() {
+            serde_json::json!({ "permissionDecision": "allow" })
+        } else {
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("complete hook JSON")
+                ["hookSpecificOutput"]
+                .clone()
+        };
+        assert_eq!(
+            hook["permissionDecision"], expected,
+            "{tool}: {command:?}: {hook}"
+        );
+        if expected == "deny" {
+            assert_eq!(
+                hook["ruleId"], "core.git:reset-hard",
+                "{tool}: {command:?}: {hook}"
+            );
+        }
+
+        let output = process()
+            .args([
+                "test",
+                "--with-packs",
+                "core.git",
+                "--dialect",
+                dialect,
+                "--format",
+                "json",
+                command,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .expect("computed Git CLI");
+        let result: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "{dialect}: {command:?}: invalid CLI JSON: {error}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        assert_eq!(
+            result["decision"], expected,
+            "{dialect}: {command:?}: {result}"
+        );
+    }
+}
+
+#[test]
+fn computed_powershell_git_invocations_reach_unknown_and_real_entrypoints() {
+    // bd-ps-cross-dialect-gaps-ewf3: the explicit PowerShell view could see
+    // these commands while generic Shell hooks skipped that interpretation.
+    for command in [
+        "& ('gi'+'t') reset --hard",
+        ". ('gi'+'t') reset --hard",
+        "& ('git') reset --hard",
+        "& ((('git'))) reset --hard",
+        "& (('gi') + ('t')) reset --hard",
+        "& ('g' + ('it')) reset --hard",
+        r#"& ("gi`u{74}") reset --hard"#,
+    ] {
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+            let result = evaluate_all_packs(command, dialect);
+            assert!(
+                result.is_denied(),
+                "{command:?} must deny under {dialect:?}: {result:?}"
+            );
+            assert_eq!(
+                rule_id(&result).as_deref(),
+                Some("core.git:reset-hard"),
+                "{command:?}: {dialect:?}: {result:?}"
+            );
+        }
+        assert_computed_git_entrypoints(command, "deny");
+    }
+}
+
+#[test]
+fn computed_powershell_git_calls_preserve_reads_and_inert_data() {
+    for command in [
+        "& ('gi'+'t') status",
+        ". ('gi'+'t') status",
+        "Write-Output ('gi'+'t') reset --hard",
+        "Write-Output ('git') reset --hard",
+        "('gi'+'t')",
+        r#"Write-Output "& ('gi'+'t') reset --hard""#,
+        r#"git commit -m "& ('gi'+'t') reset --hard""#,
+        r#""& ('gi'+'t') reset --hard""#,
+        // PowerShell treats a computed name as one argument to the call
+        // operator. It does not execute a command line stored in that name.
+        "& ('git reset --hard')",
+        "& ('git ' + 'reset --hard')",
+        ". ('git reset --hard')",
+    ] {
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+            let result = evaluate_all_packs(command, dialect);
+            assert!(
+                result.is_allowed(),
+                "{command:?} must remain allowed under {dialect:?}: {result:?}"
+            );
+        }
+        assert_computed_git_entrypoints(command, "allow");
+    }
+}
+
+#[test]
+fn computed_git_bounds_fail_closed_with_only_the_git_pack_enabled() {
+    let mut commands = Vec::new();
+    for depth in [25, 64] {
+        commands.push(format!(
+            "& ({}'git'{}) reset --hard",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        ));
+    }
+    // A large but otherwise simple literal expression exceeds the shared
+    // static decoder's byte budget without changing the command it names.
+    commands.push(format!("& ({}'git') reset --hard", " ".repeat(65_536)));
+    for command in commands {
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+            let result = evaluate_enabled_packs(
+                &command,
+                dialect,
+                std::collections::HashSet::from(["core.git".to_string()]),
+            );
+            assert!(
+                !result.is_allowed(),
+                "the filesystem pack must not be needed to protect this call: \
+                 {dialect:?}, {} bytes: {result:?}",
+                command.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn computed_git_exact_grants_bind_to_original_request_bytes() {
+    let original = "& ('gi'+'t') reset --hard";
+    let reconstructed = "& 'git' reset --hard";
+    assert_computed_git_entrypoints_with_exact_grant(original, "allow", Some(original));
+    assert_computed_git_entrypoints_with_exact_grant(original, "deny", Some(reconstructed));
+    assert_computed_git_entrypoints_with_exact_grant(reconstructed, "deny", Some(original));
 }
 
 /// The issue's headline repro: the single quote is never closed, so POSIX

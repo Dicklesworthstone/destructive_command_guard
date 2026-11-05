@@ -2529,6 +2529,23 @@ fn codex_allow_once_unknown_dialect_round_trip() {
 }
 
 #[test]
+fn codex_allow_once_unknown_computed_command_round_trip() {
+    // Only the concrete PowerShell replay resolves this callee. Its derived
+    // command spelling must neither borrow nor consume the original grant.
+    assert_codex_allow_once_round_trip(
+        "launch-process",
+        "& ('gi'+'t') reset --hard HEAD~1",
+        &[
+            "& ('gi'+'t') reset --hard HEAD~2",
+            "& 'git' reset --hard HEAD~1",
+            "git reset --hard HEAD~1",
+        ],
+        &[],
+        &["--single-use"],
+    );
+}
+
+#[test]
 fn codex_allow_once_preserves_raw_diagnostic_prefix() {
     // Diagnostic text is masked during rule matching. The grant still binds
     // to the entire raw input, including the inert diagnostic arguments.

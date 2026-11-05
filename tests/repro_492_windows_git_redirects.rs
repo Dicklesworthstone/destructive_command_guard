@@ -885,6 +885,93 @@ fn issue_642_parser_depth_exhaustion_cannot_produce_an_allow() {
 }
 
 #[test]
+fn computed_powershell_tee_commands_keep_hook_and_cli_truncation_verdicts() {
+    let fixture = Fixture::new(&[]);
+    // bd-ps-cross-dialect-gaps-ewf3: these native-confirmed calls previously
+    // bypassed either both dialects or the generic Shell hook alone.
+    for invocation in [
+        "& ('Tee-Object')",
+        "& ('Tee-'+'Object')",
+        ". ('Tee-'+'Object')",
+        "& ((('Tee-Object')))",
+        "& (('Tee-') + ('Object'))",
+        r"& ('Microsoft.PowerShell.Utility\Tee-'+'Object')",
+        r#"& ("Tee`u{2d}Object")"#,
+        r#"& "Tee`u{2d}Object""#,
+    ] {
+        let command = format!("{invocation} -InputObject NEW -FilePath /etc/hosts");
+        for tool in ["PowerShell", "Shell"] {
+            fixture.denied(tool, &command, HOME_TRUNCATE);
+        }
+        for dialect in ["powershell", "unknown"] {
+            fixture.cli_denied(dialect, &command, "redirect-truncate-root-home");
+        }
+    }
+}
+
+#[test]
+fn computed_powershell_tee_commands_keep_binding_and_data_controls() {
+    let fixture = Fixture::new(&[]);
+    for tool in ["PowerShell", "Shell"] {
+        for invocation in ["& ('Tee-'+'Object')", ". ((('Tee-Object')))"] {
+            fixture.denied(
+                tool,
+                &format!("{invocation} -InputObject NEW -FilePath /etc/hosts -Append:$false"),
+                HOME_TRUNCATE,
+            );
+            fixture.denied(
+                tool,
+                &format!("{invocation} -InputObject NEW -FilePath .ssh/authorized_keys -Append"),
+                CREDENTIAL,
+            );
+            for arguments in [
+                "-InputObject NEW -FilePath /etc/hosts -Append",
+                "-InputObject NEW -Variable result",
+                "-InputObject NEW -Variable .ssh/authorized_keys",
+                "-InputObject NEW -FilePath /etc/hosts -WhatIf",
+                "-InputObject NEW -FilePath notes.txt",
+            ] {
+                fixture.allowed(tool, &format!("{invocation} {arguments}"));
+            }
+        }
+        for command in [
+            "Write-Output ('Tee-'+'Object') -FilePath /etc/hosts",
+            "Write-Output ('Tee-Object') -FilePath /etc/hosts",
+            "('Tee-'+'Object')",
+            r#"Write-Output "& ('Tee-'+'Object') -FilePath /etc/hosts""#,
+            // A resolved callee is one command name, even when it contains
+            // spaces or looks like a command line.
+            "& ('Tee-Object /etc/hosts')",
+            "& ('Tee-Object ' + '/etc/hosts')",
+            r"& ('Other.Module\Tee-Object') -InputObject NEW -FilePath /etc/hosts",
+            // These postfixes change the callee value. The quoted prefix
+            // alone cannot establish a Tee-Object invocation.
+            "& 'Tee-Object'[0] -InputObject NEW -FilePath /etc/hosts",
+            "& 'Tee-Object'.Length -InputObject NEW -FilePath /etc/hosts",
+        ] {
+            fixture.allowed(tool, command);
+        }
+    }
+}
+
+#[test]
+fn computed_powershell_tee_depth_bounds_cannot_produce_an_allow() {
+    let fixture = Fixture::new(&[]);
+    for depth in [25, 64] {
+        let callee = format!("{}'Tee-Object'{}", "(".repeat(depth), ")".repeat(depth));
+        let command = format!("& {callee} -InputObject NEW -FilePath /etc/hosts");
+        for tool in ["PowerShell", "Shell"] {
+            let verdict = fixture.judge(tool, &command);
+            assert!(
+                matches!(verdict.0.as_str(), "ask" | "deny"),
+                "{tool}: a computed writer at depth {depth} must not allow: {verdict:?}"
+            );
+            fixture.allowed(tool, &format!("Write-Output \"{command}\""));
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires native PowerShell"]
 fn issue_642_native_powershell_confirms_tee_file_semantics() {
     let dir = tempfile::tempdir().expect("native Tee-Object fixtures");
@@ -906,8 +993,28 @@ $cases = @(
         'NEW' | Tee-Object -Variable captured
         if ($captured -cne 'NEW') { throw 'Tee-Object did not set the variable' }
     } },
-    @{ Name='whatif_error'; Expected="OLD`n"; ExpectError=$true; Body={ param($file) 'NEW' | Tee-Object $file -WhatIf } }
+    @{ Name='whatif_error'; Expected="OLD`n"; ExpectError=$true; Body={ param($file) 'NEW' | Tee-Object $file -WhatIf } },
+    @{ Name='computed_parenthesized'; Expected="NEW`n"; Body={ param($file) & ('Tee-Object') -InputObject NEW -FilePath $file } },
+    @{ Name='computed_concat'; Expected="NEW`n"; Body={ param($file) & ('Tee-'+'Object') -InputObject NEW -FilePath $file } },
+    @{ Name='computed_dot'; Expected="NEW`n"; Body={ param($file) . ('Tee-'+'Object') -InputObject NEW -FilePath $file } },
+    @{ Name='computed_nested'; Expected="NEW`n"; Body={ param($file) & ((('Tee-Object'))) -InputObject NEW -FilePath $file } },
+    @{ Name='computed_grouped_concat'; Expected="NEW`n"; Body={ param($file) & (('Tee-') + ('Object')) -InputObject NEW -FilePath $file } },
+    @{ Name='computed_module'; Expected="NEW`n"; Body={ param($file) & ('Microsoft.PowerShell.Utility\Tee-'+'Object') -InputObject NEW -FilePath $file } },
+    @{ Name='computed_append_true'; Expected="OLD`nNEW`n"; Body={ param($file) & ('Tee-'+'Object') -InputObject NEW -FilePath $file -Append } },
+    @{ Name='computed_append_false'; Expected="NEW`n"; Body={ param($file) & ('Tee-'+'Object') -InputObject NEW -FilePath $file -Append:$false } },
+    @{ Name='computed_variable'; Expected="OLD`n"; Body={
+        param($file)
+        & ('Tee-'+'Object') -InputObject NEW -Variable captured
+        if ($captured -cne 'NEW') { throw 'Computed Tee-Object did not set the variable' }
+    } },
+    @{ Name='computed_whatif_error'; Expected="OLD`n"; ExpectError=$true; Body={ param($file) & ('Tee-'+'Object') -InputObject NEW -FilePath $file -WhatIf } },
+    @{ Name='computed_inert_argument'; Expected="OLD`n"; Body={ param($file) Write-Output ('Tee-'+'Object') -FilePath $file } },
+    @{ Name='computed_inert_expression'; Expected="OLD`n"; Body={ param($file) ('Tee-'+'Object') } }
 )
+$unicodeCalleeTested = $PSVersionTable.PSVersion.Major -ge 7
+if ($unicodeCalleeTested) {
+    $cases += @{ Name='computed_unicode'; Expected="NEW`n"; Body={ param($file) & ("Tee`u{2d}Object") -InputObject NEW -FilePath $file } }
+}
 if ($IsWindows) {
     if ((Get-Alias tee).Definition -ne 'Tee-Object') { throw 'Expected the native Windows tee alias' }
     $cases += @{ Name='windows_tee_alias'; Expected="NEW`n"; Body={ param($file) 'NEW' | tee $file } }
@@ -941,6 +1048,7 @@ $completed.Add('literalpath_glob')
 @{
     version=$PSVersionTable.PSVersion.ToString()
     windows_alias_tested=[bool]$IsWindows
+    unicode_callee_tested=[bool]$unicodeCalleeTested
     cases=$completed.ToArray()
 } | ConvertTo-Json -Compress
 "#;
@@ -967,6 +1075,18 @@ $completed.Add('literalpath_glob')
         "append_false",
         "variable",
         "whatif_error",
+        "computed_parenthesized",
+        "computed_concat",
+        "computed_dot",
+        "computed_nested",
+        "computed_grouped_concat",
+        "computed_module",
+        "computed_append_true",
+        "computed_append_false",
+        "computed_variable",
+        "computed_whatif_error",
+        "computed_inert_argument",
+        "computed_inert_expression",
         "filepath_glob",
         "literalpath_glob",
     ];
@@ -976,7 +1096,25 @@ $completed.Add('literalpath_glob')
             "missing {name}: {report}"
         );
     }
-    assert_eq!(cases.len(), expected.len() + usize::from(cfg!(windows)));
+    let unicode_callee_tested = report["unicode_callee_tested"]
+        .as_bool()
+        .expect("Unicode callee availability");
+    let native_major = report["version"]
+        .as_str()
+        .expect("native PowerShell version")
+        .split('.')
+        .next()
+        .expect("native major version")
+        .parse::<u32>()
+        .expect("numeric native major version");
+    assert_eq!(unicode_callee_tested, native_major >= 7);
+    assert_eq!(
+        cases.len(),
+        expected.len() + usize::from(cfg!(windows)) + usize::from(unicode_callee_tested)
+    );
+    if unicode_callee_tested {
+        assert!(cases.iter().any(|case| case == "computed_unicode"));
+    }
     assert_eq!(report["windows_alias_tested"], cfg!(windows));
     if cfg!(windows) {
         assert!(cases.iter().any(|case| case == "windows_tee_alias"));
