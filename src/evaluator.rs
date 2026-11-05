@@ -36846,20 +36846,21 @@ fn inline_script_target_parses_posix_shell(target: &str) -> bool {
     )
 }
 
-/// Whether an unquoted heredoc or a here-string is the source of the shell ssh
-/// runs remotely: `ssh h <<EOF`, with no remote command that takes stdin instead.
-fn stdin_source_feeds_remote_shell(
-    command: &str,
-    content: &crate::heredoc::ExtractedContent,
-) -> bool {
+/// Whether a heredoc or here-string is the source of a shell whose name language
+/// detection does not know: the job `at` and `batch` run later (`at now <<'EOF'`),
+/// or the shell ssh runs remotely (`ssh h <<EOF`), with no remote command that
+/// takes stdin instead. A quoted ssh body has its own receiver proof.
+fn stdin_source_feeds_a_shell(command: &str, content: &crate::heredoc::ExtractedContent) -> bool {
     use crate::heredoc::HeredocType;
-    let expanded_first = match content.heredoc_type {
-        None => false,
-        Some(HeredocType::HereString) => true,
-        Some(_) => !content.quoted,
+    let Some(kind) = content.heredoc_type else {
+        return false;
     };
-    expanded_first
-        && content.target_command.as_deref() == Some("ssh")
+    let receiver_counts = match content.target_command.as_deref() {
+        Some("at" | "batch") => true,
+        Some("ssh") => matches!(kind, HeredocType::HereString) || !content.quoted,
+        _ => false,
+    };
+    receiver_counts
         && command
             .get(..content.byte_range.start)
             .and_then(|before| before.rsplit(['\n', ';', '&', '|', '(']).next())
@@ -37240,10 +37241,10 @@ fn evaluate_heredoc(
         // exact quoted POSIX receiver proof may type that unknown body as
         // Bash; its recursive evaluation keeps the remote filesystem scope. An
         // unquoted body is the same source, filled in by the outer shell first,
-        // and gets no literal proof.
+        // and gets no literal proof. So is the job `at` or `batch` reads.
         if content.language == crate::heredoc::ScriptLanguage::Unknown
             && (literal_bash_source_range(command, &content).is_some()
-                || stdin_source_feeds_remote_shell(command, &content))
+                || stdin_source_feeds_a_shell(command, &content))
         {
             content.language = crate::heredoc::ScriptLanguage::Bash;
         }
@@ -57860,6 +57861,10 @@ mod tests {
             "ssh h <<< \"$C x\"",
             "ssh h <<EOF\ngit reset --hard\nEOF",
             "at now <<< \"$C x\"",
+            "at now <<EOF\n$C x\nEOF",
+            "batch <<EOF\n$C x\nEOF",
+            "at now <<'EOF'\ngit reset --hard\nEOF",
+            "batch <<'EOF'\ngit reset --hard\nEOF",
         ] {
             let result = evaluate(cmd);
             assert!(result.is_denied(), "{cmd:?} must be denied: {result:?}");
@@ -57895,6 +57900,9 @@ mod tests {
             "bash <<'EOF'\n$C x\nEOF",
             "ssh h <<'EOF'\n$C x\nEOF",
             "ssh h cat <<EOF\n$C x\nEOF",
+            "at now <<'EOF'\n$C x\nEOF",
+            "at now <<EOF\necho done\nEOF",
+            "at -f job.sh now <<EOF\n$C x\nEOF",
             "ssh h <<EOF\nls -la\nEOF",
             "ssh h <<EOF\ncd $DIR && make\nEOF",
             "bash <<EOF\necho $C\nEOF",
