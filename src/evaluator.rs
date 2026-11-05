@@ -9764,8 +9764,10 @@ fn piped_inline_program_is_inert(language: crate::heredoc::ScriptLanguage, code:
             // A name looked up at run time (`os.__dict__["sys" + "tem"]`), and
             // a console or debugger that reads its commands from stdin.
             r"|__dict__|__getattribute__|__globals__|__subclasses__|attrgetter|methodcaller",
-            r"|pdb|breakpoint|interact|InteractiveConsole|InteractiveInterpreter|IPython",
+            r"|breakpoint|interact|InteractiveConsole|InteractiveInterpreter|IPython",
             r"|bpython|ptpython)\b",
+            // `pdb` after a `.` is a file name's suffix (`open("model.pdb")`).
+            r"|(?:^|[^.\w])pdb\b",
             r"|\b(?:import|from)\s+code\b|(?:^|[^.\w])compile\s*\(|\.\s*system\b|\bsystem\s*\(",
             // `list.remove` and `str.replace` are everywhere, so these count
             // only once a module that deletes through them has been named.
@@ -9921,7 +9923,9 @@ static STAGE_NAMES_AN_INTERPRETER: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// filter named as the stage's first word counts, with no wrapper, and none of
 /// whose options runs another program (so not `sort`, `rg` or `less`). An
 /// unquoted expansion, glob, grouping, redirection or second statement, a
-/// function the command defines and an `alias` all keep the stage counted.
+/// function the command defines, an `alias`, and anything else that may rebind
+/// the filter's name ([`crate::heredoc::shell_name_may_be_rebound`]) all keep
+/// the stage counted.
 fn stage_is_a_plain_text_filter(command: &str, consumer: &str) -> bool {
     const TEXT_FILTERS: &[&str] = &[
         "grep", "egrep", "fgrep", "head", "tail", "wc", "uniq", "cut", "tr", "tee", "cat", "nl",
@@ -9944,7 +9948,14 @@ fn stage_is_a_plain_text_filter(command: &str, consumer: &str) -> bool {
             (None, _) => {}
         }
     }
-    if quote.is_some() || escaped || command_defines_function(command) || command.contains("alias")
+    // `BASH_ALIASES[grep]=…` and `BASH_CMDS[grep]=…` rebind a name as `alias`
+    // and `hash -p` do.
+    if quote.is_some()
+        || escaped
+        || command_defines_function(command)
+        || command.contains("alias")
+        || command.contains("BASH_ALIASES")
+        || command.contains("BASH_CMDS")
     {
         return false;
     }
@@ -9952,7 +9963,13 @@ fn stage_is_a_plain_text_filter(command: &str, consumer: &str) -> bool {
         words
             .iter()
             .find(|word| !is_shell_assignment(word))
-            .is_some_and(|program| TEXT_FILTERS.contains(&program.as_str()))
+            .is_some_and(|program| {
+                // `function grep { env "$@"; }`, `hash -p /usr/bin/env grep`,
+                // a quoted `al''ias`, a `PATH` change, `eval` or `source` can
+                // make the filter's name start an interpreter.
+                TEXT_FILTERS.contains(&program.as_str())
+                    && !crate::heredoc::shell_name_may_be_rebound(command, program)
+            })
     })
 }
 
@@ -43646,6 +43663,65 @@ mod tests {
         ] {
             let result = evaluate(cmd);
             assert!(result.is_denied(), "{cmd:?} must be denied: {result:?}");
+        }
+    }
+
+    /// A filter's name that the command may rebind is no plain text filter:
+    /// with `grep` made to run `env`, `… | grep node` starts node, and the
+    /// interpreter setting reaches it. A rebinding of another name changes
+    /// nothing (#611).
+    #[test]
+    fn interpreter_setting_spares_no_filter_whose_name_may_be_rebound_611() {
+        let config = default_config();
+        let pack_ids: Vec<String> = config.enabled_pack_ids().into_iter().collect();
+        let pack_ids: Vec<&str> = pack_ids.iter().map(String::as_str).collect();
+        let evaluate =
+            |cmd: &str| evaluate_with_pack_ids_in_dialect(cmd, &pack_ids, ShellDialect::Posix);
+        for cmd in [
+            "hash -p /usr/bin/gcc cc; NODE_OPTIONS=--max-old-space-size=8192 npm run build 2>&1 | grep -i node",
+            "function build { npm run build; }; export NODE_OPTIONS=--max-old-space-size=8192; build 2>&1 | grep -i node",
+        ] {
+            let result = evaluate(cmd);
+            assert!(result.is_allowed(), "{cmd:?} must be allowed: {result:?}");
+        }
+        let setting = "export NODE_OPTIONS=--require=/dev/stdin";
+        let allowed: Vec<String> = [
+            format!(r#"function grep {{ env "$@"; }}; {setting}; cat x | grep node"#),
+            format!("function grep {{ env \"$@\"; }}\n{setting}\ncat x | grep node"),
+            format!("hash -p /usr/bin/env grep; {setting}; cat x | grep node"),
+            format!("a\\lias grep=env\n{setting}; cat x | grep node"),
+            format!("al''ias grep=env\n{setting}; cat x | grep node"),
+            format!("BASH_ALIASES[grep]=env\n{setting}; cat x | grep node"),
+            format!("BASH_CMDS[grep]=/usr/bin/env; {setting}; cat x | grep node"),
+            format!("export PATH=/opt/shim:$PATH; {setting}; cat x | grep node"),
+            format!("{setting}; cat x | PATH=/opt/shim grep node"),
+            format!(r#"eval 'gr''ep() {{ env "$@"; }}'; {setting}; cat x | grep node"#),
+            format!(". ./helpers.sh; {setting}; cat x | grep node"),
+            format!("enable -f ./x.so grep; {setting}; cat x | grep node"),
+            "hash -p /usr/bin/nice wc; export PERL5OPT=-Mstrict; cat x | wc perl".to_string(),
+        ]
+        .into_iter()
+        .filter(|cmd| !evaluate(cmd).is_denied())
+        .collect();
+        assert!(allowed.is_empty(), "must be denied: {allowed:#?}");
+    }
+
+    /// `pdb` is a debugger only as a name of its own: `model.pdb` is a file
+    /// (#611).
+    #[test]
+    fn python_pdb_file_suffix_is_no_debugger_611() {
+        use std::mem::discriminant;
+        let mode = |cmd: &str| discriminant(&pipeline_shell_input_mode(cmd));
+        let data = discriminant(&PipelineShellInputMode::DoesNotReadStdin);
+        let unverified = discriminant(&PipelineShellInputMode::Unverified);
+        let cmd = r#"python3 -c 'import sys; print(len(open("model.pdb").read()))'"#;
+        assert_eq!(mode(cmd), data, "{cmd}: the program only reads a file");
+        for cmd in [
+            "python3 -c 'import pdb; pdb.set_trace()'",
+            "python3 -c 'from pdb import set_trace; set_trace()'",
+            "python3 -c 'import sys,pdb; pdb.run(sys.stdin.read())'",
+        ] {
+            assert_eq!(mode(cmd), unverified, "{cmd}: must stay unverified");
         }
     }
 
