@@ -13013,20 +13013,60 @@ fn powershell_call_operator_statements(
 /// a program the same way, and a call operator written against its program
 /// (`&'C:\…\git.exe'`) gets the blank the packs expect after it. A `.` that
 /// ends a word, opens a relative path (`./x`) or accesses a member is no
-/// operator and stays. Only a literally named program is dot-rewritten: a
-/// dot-sourced variable, expression or script block (`. $PROFILE`, `. { … }`)
-/// is read by the script-block checks.
-fn powershell_call_operator_view(command: &str) -> Option<String> {
-    if !command.contains('&') && !command.contains(". ") && !command.contains(".\t") {
-        return None;
+/// operator and stays. The shared bounded parser also resolves literal
+/// expressions such as `. ('gi' + 't')`; dynamic targets and script blocks
+/// remain owned by their existing checks.
+fn powershell_call_operator_view(
+    command: &str,
+) -> Result<Option<String>, crate::packs::core::credential_files::WindowsShellParseIncomplete> {
+    if !command.contains(['&', '.']) {
+        return Ok(None);
     }
-    // A program name inside parentheses is the same call:
-    // `. ('C:\…\git.exe') reset --hard`.
-    static PARENTHESIZED_PROGRAM: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r#"(?m)(^\s*|[;|&{(=]\s*)[&.]\s*\(\s*('[^']*'|"[^"]*")\s*\)"#)
-            .expect("parenthesized program regex compiles")
-    });
-    let unwrapped = PARENTHESIZED_PROGRAM.replace_all(command, "$1& $2");
+    let invocations =
+        crate::packs::core::credential_files::powershell_literal_invocations(command)?;
+    Ok(powershell_resolved_call_operator_view(command, invocations))
+}
+
+fn powershell_resolved_call_operator_view(
+    command: &str,
+    mut invocations: Vec<crate::packs::core::credential_files::PowerShellInvokedCommand>,
+) -> Option<String> {
+    // Only parser-proven call operands are rewritten. Quote the decoded name
+    // as ONE PowerShell word, keeping its original argument tail untouched;
+    // a name containing spaces or shell punctuation is never source code.
+    invocations.sort_unstable_by_key(|invocation| invocation.operator_span.start);
+    let mut reconstructed = String::new();
+    let mut copied = 0;
+    for invocation in invocations {
+        let start = invocation.operator_span.start;
+        let end = invocation.span.end;
+        if start < copied {
+            continue;
+        }
+        let mut replacement = String::from("& '");
+        for character in invocation.name.chars() {
+            if matches!(
+                character,
+                '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}'
+            ) {
+                replacement.push(character);
+            }
+            replacement.push(character);
+        }
+        replacement.push('\'');
+        if command.get(start..end)? == replacement {
+            continue;
+        }
+        reconstructed.push_str(command.get(copied..start)?);
+        reconstructed.push_str(&replacement);
+        copied = end;
+    }
+    let unwrapped = if copied == 0 {
+        Cow::Borrowed(command)
+    } else {
+        reconstructed.push_str(command.get(copied..)?);
+        Cow::Owned(reconstructed)
+    };
     let unwrapped_any = matches!(unwrapped, Cow::Owned(_));
     let command = unwrapped.as_ref();
     let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
@@ -16454,6 +16494,28 @@ fn unknown_dialect_fanout_candidate(
     })
 }
 
+/// A literal call target can hide an enabled keyword in an expression that
+/// the POSIX reading treats as data. Use the shared invocation proof, not a
+/// scan for command-shaped text in quotes. This is requested lazily once per
+/// unknown-dialect evaluation and reused at both replay gates.
+fn powershell_invocation_reaches_pack_keyword(
+    command: &str,
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+) -> bool {
+    if !command.contains(['&', '.']) {
+        return false;
+    }
+    match crate::packs::core::credential_files::powershell_literal_invocations(command) {
+        Ok(invocations) => invocations.iter().any(|invocation| {
+            keyword_index
+                .is_none_or(|index| index.has_any_keyword(&invocation.name.to_ascii_lowercase()))
+        }),
+        // An exhausted proof cannot close a gate. The concrete view retains
+        // its normal analysis limits and incomplete-analysis handling.
+        Err(_) => true,
+    }
+}
+
 /// Whether `view`'s own decode of `command` reveals an enabled-pack keyword
 /// that the raw text does not (dcg#294).
 ///
@@ -16796,11 +16858,11 @@ fn dialect_view_may_expose_hidden_execution(
 ///
 /// Two guards keep the cost bounded and the polarity honest:
 /// [`unknown_dialect_fanout_candidate`] requires a dialect-divergent byte plus a
-/// live enabled-pack keyword before any replay runs at all, and each replay
-/// additionally requires [`dialect_view_may_expose_hidden_execution`] so that a
-/// dialect's quote-blindness can only add a deny when its parse exposes an
-/// execution POSIX could not see, never when it merely reveals quoted argument
-/// text as command-shaped bytes.
+/// live enabled-pack keyword, and each replay additionally requires
+/// [`dialect_view_may_expose_hidden_execution`]. A bounded, parser-proven
+/// PowerShell invocation naming an enabled keyword can satisfy both guards;
+/// that proof is computed lazily once and cannot come from quoted argument
+/// data. A replay must expose execution the POSIX reading could not see.
 ///
 /// Recursion is impossible: the replays pass a concrete dialect, and the
 /// fan-out is confined to top-level evaluation (`nested_command_depth == 0`).
@@ -16906,39 +16968,48 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     if shell_dialect == ShellDialect::PowerShell
         && result.decision == EvaluationDecision::Allow
         && result.bypass_method != Some(BypassMethod::AllowOnce)
-        && let Some(as_call) = powershell_call_operator_view(command)
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
     {
-        let alternate = if deadline_exceeded(deadline) {
-            EvaluationResult::indeterminate_due_to_budget()
-        } else {
-            evaluate_command_in_dialect_union(
-                &as_call,
-                enabled_keywords,
-                ordered_packs,
-                keyword_index,
-                compiled_overrides,
-                allowlists,
-                heredoc_settings,
-                None,
-                project_path,
-                deadline,
-                shell_dialect,
-                nested_command_depth,
-                inherited_automated_stdin,
-            )
-        };
-        if matches!(
-            alternate.decision,
-            EvaluationDecision::Deny | EvaluationDecision::Indeterminate
-        ) {
-            result = alternate;
-            // A span of a view that gained blanks does not index the command.
-            if let Some(info) = result.pattern_info.as_mut() {
-                if as_call.len() != command.len() {
-                    info.matched_span = None;
-                } else if let Some(span) = info.matched_span.as_ref() {
-                    info.matched_text_preview = Some(extract_match_preview(command, span));
+        match powershell_call_operator_view(command) {
+            Err(_) => {
+                // Parser exhaustion cannot establish safety, including when
+                // the filesystem pack (which uses the same lexer) is disabled.
+                result = EvaluationResult {
+                    decision: EvaluationDecision::Indeterminate,
+                    ..EvaluationResult::allowed()
+                };
+            }
+            Ok(None) => {}
+            Ok(Some(as_call)) => {
+                let alternate = if deadline_exceeded(deadline) {
+                    EvaluationResult::indeterminate_due_to_budget()
+                } else {
+                    evaluate_command_in_dialect_union(
+                        &as_call,
+                        enabled_keywords,
+                        ordered_packs,
+                        keyword_index,
+                        compiled_overrides,
+                        allowlists,
+                        heredoc_settings,
+                        None,
+                        project_path,
+                        deadline,
+                        shell_dialect,
+                        nested_command_depth,
+                        inherited_automated_stdin,
+                    )
+                };
+                if matches!(
+                    alternate.decision,
+                    EvaluationDecision::Deny | EvaluationDecision::Indeterminate
+                ) {
+                    result = alternate;
+                    // A reconstructed callee has no byte-for-byte mapping to
+                    // its source, even if several edits preserve total length.
+                    if let Some(info) = result.pattern_info.as_mut() {
+                        info.matched_span = None;
+                    }
                 }
             }
         }
@@ -17054,20 +17125,33 @@ fn evaluate_command_in_dialect_union(
     if shell_dialect != ShellDialect::Unknown
         || nested_command_depth != 0
         || primary.decision != EvaluationDecision::Allow
-        || !unknown_dialect_fanout_candidate(command, keyword_index)
+    {
+        return primary;
+    }
+
+    let literal_call_proof = std::cell::OnceCell::new();
+    let has_protected_powershell_call = || {
+        *literal_call_proof
+            .get_or_init(|| powershell_invocation_reaches_pack_keyword(command, keyword_index))
+    };
+    if !unknown_dialect_fanout_candidate(command, keyword_index) && !has_protected_powershell_call()
     {
         return primary;
     }
 
     for view in [ShellDialect::Cmd, ShellDialect::PowerShell] {
-        if !dialect_view_may_expose_hidden_execution(command, view, keyword_index, ordered_packs) {
+        if !dialect_view_may_expose_hidden_execution(command, view, keyword_index, ordered_packs)
+            && !(view == ShellDialect::PowerShell && has_protected_powershell_call())
+        {
             continue;
         }
         // An exhausted budget is never proof that the un-run views are clean.
         if deadline_exceeded(deadline) {
             return EvaluationResult::indeterminate_due_to_budget();
         }
-        let alternate = evaluate_command_in_single_dialect_view(
+        // Run the concrete dialect's complete entry path, including its
+        // semantic call-operand view. Concrete views never fan out again.
+        let alternate = evaluate_command_with_pack_order_deadline_at_path_inner(
             command,
             enabled_keywords,
             ordered_packs,
@@ -63810,6 +63894,71 @@ mod tests {
             None
         ));
         assert!(!unknown_dialect_fanout_candidate("echo hello", None));
+    }
+
+    #[test]
+    fn powershell_literal_call_replay_requires_an_executable_name() {
+        let ordered =
+            crate::packs::REGISTRY.expand_enabled_ordered(&["core.git".to_string()].into());
+        let index = crate::packs::REGISTRY
+            .build_enabled_keyword_index(&ordered)
+            .expect("keyword index");
+        for command in [
+            "& ('gi' + 't') reset --hard",
+            ". ('gi' + 't') reset --hard",
+            ".(('gi' + 't')) reset --hard",
+            "$x = & ('gi' + 't') reset --hard",
+            "Write-Output ok; & ('gi' + 't') reset --hard",
+        ] {
+            assert!(
+                powershell_invocation_reaches_pack_keyword(command, Some(&index)),
+                "a resolved call must pass both replay gates: {command}",
+            );
+            let view = powershell_call_operator_view(command)
+                .expect("bounded invocation")
+                .expect("resolved call view");
+            assert!(view.contains("& 'git' reset --hard"), "{command}: {view}");
+        }
+        for command in [
+            "git status",
+            "Write-Output \"& ('gi' + 't') reset --hard\"",
+            "# & ('gi' + 't') reset --hard\nWrite-Output ok",
+            "Write-Output ('gi' + 't')",
+            "& ('Write-' + 'Output') 'git reset --hard'",
+        ] {
+            assert!(
+                !powershell_invocation_reaches_pack_keyword(command, Some(&index)),
+                "data and unrelated callees cannot supply replay evidence: {command}",
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_literal_call_view_keeps_one_name_and_opaque_arguments() {
+        assert_eq!(
+            powershell_call_operator_view("& ('git reset --hard')").expect("bounded invocation"),
+            Some("& 'git reset --hard'".to_string()),
+        );
+        assert_eq!(
+            powershell_call_operator_view(". ('O''Brien/git.exe') -C 'two words' status")
+                .expect("bounded invocation"),
+            Some("& 'O''Brien/git.exe' -C 'two words' status".to_string()),
+        );
+        assert_eq!(
+            powershell_call_operator_view("& ('gi'+'t')[0] reset --hard")
+                .expect("bounded invocation"),
+            None,
+            "an attached index changes the invoked value",
+        );
+    }
+
+    #[test]
+    fn powershell_literal_call_view_reports_analysis_limits() {
+        let mut command = "'git'".to_string();
+        for _ in 0..64 {
+            command = format!("({command})");
+        }
+        assert!(powershell_call_operator_view(&format!("& {command} reset --hard")).is_err());
     }
 
     /// dcg#294: a replay is scoped to parses that expose a real extra command

@@ -45,6 +45,9 @@ use super::{
     classify_simple_command, judge_file_target,
 };
 use crate::normalize::ShellDialect;
+use crate::packs::core::git::{
+    PowerShellStaticExecutableError, decode_powershell_static_executable,
+};
 
 /// One lexed word plus the raw facts parameter binding needs.
 #[derive(Debug, Clone)]
@@ -59,6 +62,8 @@ struct Arg {
     comma_before: bool,
     /// Quoted command names execute only after the call/dot operator.
     invoked: bool,
+    /// Original source location of the operator that owns this command.
+    operator_span: Option<std::ops::Range<usize>>,
     /// A leading quote forms a standalone PowerShell string token. Quotes
     /// inside a bare word instead concatenate into that generic token.
     starts_quoted: bool,
@@ -83,6 +88,39 @@ const MAX_LEX_WORK_BYTES: usize = 1024 * 1024;
 pub(crate) enum WindowsShellParseIncomplete {
     Nesting,
     Work,
+}
+
+/// A single proven command-name value owned by a PowerShell call operator.
+/// Neither span refers to a normalized/reconstructed matching view.
+#[derive(Debug)]
+pub(crate) struct PowerShellInvokedCommand {
+    pub(crate) name: String,
+    pub(crate) span: std::ops::Range<usize>,
+    pub(crate) operator_span: std::ops::Range<usize>,
+}
+
+/// Actual call/dot-owned literal names, including bounded computed names.
+/// Argument data and uninvoked string expressions cannot contribute names.
+pub(crate) fn powershell_literal_invocations(
+    source: &str,
+) -> Result<Vec<PowerShellInvokedCommand>, WindowsShellParseIncomplete> {
+    Ok(lex(source, ShellDialect::PowerShell)?
+        .into_iter()
+        .filter_map(|command| {
+            let name = command.into_iter().find_map(|item| match item {
+                Lexed::Arg(arg) => Some(arg),
+                Lexed::Write { .. } => None,
+            })?;
+            if !name.invoked || !name.word.is_all_literal() {
+                return None;
+            }
+            Some(PowerShellInvokedCommand {
+                name: name.word.as_string(),
+                span: name.word.range,
+                operator_span: name.operator_span?,
+            })
+        })
+        .collect())
 }
 
 struct LexBudget {
@@ -1105,6 +1143,7 @@ fn lex_body(
     let mut nested: Vec<Vec<Lexed>> = Vec::new();
     let mut comma_before = false;
     let mut invoked = false;
+    let mut operator_span = None;
     let mut i = 0usize;
     while i < bytes.len() {
         let byte = bytes[i];
@@ -1145,6 +1184,51 @@ fn lex_body(
                 continue;
             }
         }
+        let invoked_group = match byte {
+            b'(' => Some(i),
+            b'$' | b'@' if bytes.get(i + 1) == Some(&b'(') => Some(i + 1),
+            _ => None,
+        };
+        if powershell
+            && current_is_empty
+            && invoked
+            && let Some(open) = invoked_group
+        {
+            let close = matching_paren(segment, open);
+            let end = (close + 1).min(bytes.len());
+            let mut inner_commands = lex_inner(&segment[open + 1..close], dialect, budget)?;
+            for command in &mut inner_commands {
+                shift(command, open + 1);
+            }
+            // An unresolved name does not make the expression's commands
+            // inert. Keep independently executing nested writers visible.
+            nested.extend(inner_commands);
+            let expression = &segment[open..end];
+            let has_postfix =
+                segment[end..].starts_with(['[', '.']) || segment[end..].starts_with("::");
+            let word = if close < bytes.len() && !has_postfix {
+                powershell_static_invocation_word(expression, i..end, budget)?
+            } else {
+                // A postfix may change the value. In particular, never
+                // prove ('Tee-Object')[0] by discarding its index.
+                unresolved(i..end)
+            };
+            if let Some(command) = commands.last_mut() {
+                command.push(Lexed::Arg(Arg {
+                    word,
+                    bare_first: None,
+                    comma_before: false,
+                    invoked: true,
+                    operator_span: operator_span.clone(),
+                    starts_quoted: false,
+                    verbatim: false,
+                    parameter_name: None,
+                }));
+            }
+            comma_before = false;
+            i = end;
+            continue;
+        }
         let separator = match byte {
             b'\n' | b'|' | b')' => true,
             // Grouping at a command's start; an argument expression after it.
@@ -1162,6 +1246,7 @@ fn lex_body(
             commands.push(Vec::new());
             comma_before = false;
             invoked = false;
+            operator_span = None;
             i += if matches!(byte, b'|' | b'&') && bytes.get(i + 1) == Some(&byte) {
                 2
             } else {
@@ -1171,6 +1256,7 @@ fn lex_body(
         }
         if byte == b'&' {
             invoked = true;
+            operator_span = Some(i..i + 1);
             i += 1;
             continue;
         }
@@ -1180,9 +1266,10 @@ fn lex_body(
             && segment[i + 1..]
                 .chars()
                 .next()
-                .is_some_and(char::is_whitespace)
+                .is_some_and(|next| next.is_whitespace() || next == '(')
         {
             invoked = true;
+            operator_span = Some(i..i + 1);
             i += 1;
             continue;
         }
@@ -1212,9 +1299,7 @@ fn lex_body(
             continue;
         }
         if powershell && byte == b'<' && bytes.get(i + 1) == Some(&b'#') {
-            i = segment[i..]
-                .find("#>")
-                .map_or(bytes.len(), |end| i + end + 2);
+            i = powershell_block_comment_end(segment, i);
             continue;
         }
         if powershell
@@ -1276,6 +1361,7 @@ fn lex_body(
                         bare_first: None,
                         comma_before: if position == 0 { comma_before } else { true },
                         invoked: false,
+                        operator_span: None,
                         starts_quoted: false,
                         verbatim: false,
                         parameter_name: None,
@@ -1323,6 +1409,28 @@ fn lex_body(
         }
         let (mut arg, end) = read_word(segment, i, dialect, &mut nested, budget)?;
         arg.invoked = invoked && current_is_empty;
+        arg.operator_span = if arg.invoked {
+            operator_span.clone()
+        } else {
+            None
+        };
+        if powershell && arg.invoked && arg.starts_quoted {
+            // A quoted operand can have the same value-changing postfix as
+            // a parenthesized one. Leave its remaining syntax to the normal
+            // scan so nested commands in an index still contribute effects.
+            arg.word = if segment[end..].starts_with(['[', '.']) || segment[end..].starts_with("::")
+            {
+                unresolved(arg.word.range.clone())
+            } else {
+                // Command names require exact string values, including
+                // control and Unicode escapes, rather than a path view.
+                powershell_static_invocation_word(
+                    &segment[arg.word.range.clone()],
+                    arg.word.range.clone(),
+                    budget,
+                )?
+            };
+        }
         i = end.max(i + 1);
         let raw = &segment[arg.word.range.clone()];
         if powershell
@@ -1353,6 +1461,29 @@ fn lex_body(
     commands.extend(nested);
     commands.retain(|command| !command.is_empty());
     Ok(commands)
+}
+
+/// Comments can nest and can contain apparent commands and parentheses.
+/// This scan is linear and is covered by the caller's byte-work budget.
+fn powershell_block_comment_end(segment: &str, start: usize) -> usize {
+    let bytes = segment.as_bytes();
+    let mut index = start + 2;
+    let mut depth = 1usize;
+    while index < bytes.len() {
+        if bytes.get(index..index + 2) == Some(b"<#") {
+            depth += 1;
+            index += 2;
+        } else if bytes.get(index..index + 2) == Some(b"#>") {
+            depth -= 1;
+            index += 2;
+            if depth == 0 {
+                return index;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    bytes.len()
 }
 
 /// PowerShell retains the marker and one verbatim argument in a cmdlet's
@@ -1486,6 +1617,7 @@ fn powershell_verbatim_argument(segment: &str, start: usize, end: usize) -> Arg 
         bare_first: None,
         comma_before: false,
         invoked: false,
+        operator_span: None,
         starts_quoted: false,
         verbatim: true,
         parameter_name: None,
@@ -1591,7 +1723,13 @@ fn matching_paren(segment: &str, open: usize) -> usize {
 fn shift(command: &mut [Lexed], by: usize) {
     for item in command {
         let word = match item {
-            Lexed::Arg(arg) => &mut arg.word,
+            Lexed::Arg(arg) => {
+                if let Some(operator_span) = arg.operator_span.as_mut() {
+                    operator_span.start += by;
+                    operator_span.end += by;
+                }
+                &mut arg.word
+            }
             Lexed::Write { target, .. } => target,
         };
         word.range = word.range.start + by..word.range.end + by;
@@ -1609,6 +1747,34 @@ fn unresolved(range: std::ops::Range<usize>) -> Word {
         literal,
         range,
         glued_paren: false,
+    }
+}
+
+/// Literal command names and computed literal operands share one decoder.
+/// Only their path separators are normalized for command identity; their
+/// quote/escape values and original source locations must stay exact.
+fn powershell_static_invocation_word(
+    expression: &str,
+    range: std::ops::Range<usize>,
+    budget: &mut LexBudget,
+) -> Result<Word, WindowsShellParseIncomplete> {
+    budget.charge(expression.len())?;
+    match decode_powershell_static_executable(expression) {
+        Ok(name) => {
+            let text: Vec<_> = name
+                .chars()
+                .map(|ch| if ch == '\\' { '/' } else { ch })
+                .collect();
+            Ok(Word {
+                literal: vec![true; text.len()],
+                text,
+                range,
+                glued_paren: false,
+            })
+        }
+        Err(PowerShellStaticExecutableError::NotStatic) => Ok(unresolved(range)),
+        Err(PowerShellStaticExecutableError::Work) => Err(WindowsShellParseIncomplete::Work),
+        Err(PowerShellStaticExecutableError::Nesting) => Err(WindowsShellParseIncomplete::Nesting),
     }
 }
 
@@ -1636,6 +1802,7 @@ fn here_string(segment: &str, start: usize) -> Option<(Arg, usize)> {
             bare_first: None,
             comma_before: false,
             invoked: false,
+            operator_span: None,
             starts_quoted: false,
             verbatim: false,
             parameter_name: None,
@@ -1845,6 +2012,7 @@ fn read_word(
             bare_first,
             comma_before: false,
             invoked: false,
+            operator_span: None,
             starts_quoted,
             verbatim: false,
             parameter_name,
@@ -2987,5 +3155,175 @@ mod tests {
             assert!(!targets.is_empty(), "{command}");
             assert!(targets.iter().any(|target| !target.literal), "{command}");
         }
+    }
+
+    #[test]
+    fn powershell_computed_tee_invocations_preserve_names_arguments_and_spans() {
+        for (operator, operand) in [
+            ("&", "('Tee-Object')"),
+            (".", "('Tee-'+'Object')"),
+            ("&", "((('Tee-Object')))"),
+            ("&", "(('Tee-')+('Object'))"),
+            ("&", "(\"Tee-\"+\"Object\")"),
+            ("&", "(\"Tee`u{2d}Object\")"),
+            ("&", "\"Tee`u{2d}Object\""),
+            ("&", "('Tee-' <# outer <# inner #> tail #> + 'Object')"),
+            ("&", "('Tee-' + # ) inside a comment\n 'Object')"),
+            ("&", "('Tee-' `\n + 'Object')"),
+            ("&", "(‘Tee-’+‘Object’)"),
+            ("&", "(“Tee-”+“Object”)"),
+            ("&", "('Microsoft.PowerShell.Utility\\Tee-'+'Object')"),
+            ("&", "'Microsoft.PowerShell.Utility\\Tee-Object'"),
+            ("&", "$('Tee-Object')"),
+            ("&", "@('Tee-Object')"),
+        ] {
+            let command = format!(
+                "Write-Output 'λ'; {operator} {operand} -InputObject NEW -FilePath /etc/hosts"
+            );
+            let targets = powershell_tee_truncation_targets(&command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}");
+            assert_eq!(targets[0].path, "/etc/hosts", "{command}");
+            assert_eq!(&command[targets[0].span.clone()], operand, "{command}");
+            let invocations = powershell_literal_invocations(&command).expect("bounded fixture");
+            assert_eq!(invocations.len(), 1, "{command}");
+            assert!(invocations[0].name.ends_with("Tee-Object"), "{command}");
+            assert!(!invocations[0].name.contains('\\'), "{command}");
+            assert_eq!(&command[invocations[0].span.clone()], operand, "{command}");
+            assert_eq!(
+                &command[invocations[0].operator_span.clone()],
+                operator,
+                "{command}"
+            );
+            assert!(powershell_tee_scan_required(&command), "{command}");
+        }
+        for command in [
+            "&('Tee-Object') /etc/hosts",
+            ".('Tee-'+'Object') /etc/hosts",
+        ] {
+            let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}");
+            assert_eq!(targets[0].path, "/etc/hosts", "{command}");
+        }
+    }
+
+    #[test]
+    fn powershell_computed_tee_invocations_preserve_binding_controls() {
+        for arguments in [
+            "-InputObject NEW -Append /etc/hosts",
+            "-InputObject NEW -Append:$true -FilePath /etc/hosts",
+            "-InputObject NEW -Variable captured",
+            "-InputObject NEW -WhatIf -FilePath /etc/hosts",
+            "-LiteralPath /etc/hosts -Append",
+            "-FilePath /etc/hosts /var/lib/other",
+        ] {
+            let command = format!("& ('Tee-'+'Object') {arguments}");
+            assert!(
+                powershell_tee_truncation_targets(&command)
+                    .expect("bounded fixture")
+                    .is_empty(),
+                "{command}"
+            );
+        }
+        for arguments in [
+            "-InputObject NEW -Append:$false -FilePath /etc/hosts",
+            "-InputObject NEW -Append:$flag -FilePath /etc/hosts",
+            "-InputObject '--%' -Append /etc/hosts",
+        ] {
+            let command = format!(". ('Tee-'+'Object') {arguments}");
+            let targets = powershell_tee_truncation_targets(&command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}");
+            assert_eq!(targets[0].path, "/etc/hosts", "{command}");
+        }
+        assert!(ps("& ('Tee-'+'Object') -Append ~/.ssh/authorized_keys").is_some());
+        assert!(ps("& ('Tee-'+'Object') -Append ~/.ssh/known_hosts").is_none());
+    }
+
+    #[test]
+    fn powershell_invoked_names_exclude_data_and_opaque_postfixes() {
+        for command in [
+            "Write-Output ('Tee-'+'Object') -FilePath /etc/hosts",
+            "('Tee-Object')",
+            "('Tee-'+'Object')",
+            "Write-Output \"& ('Tee-Object') -FilePath /etc/hosts\"",
+            "& ('Tee-Object')[0] -FilePath /etc/hosts",
+            "& ('Tee-Object').ToString() -FilePath /etc/hosts",
+            "& 'Tee-Object'[0] -FilePath /etc/hosts",
+            "& 'Tee-Object'.Length -FilePath /etc/hosts",
+            "& \"Tee-Object\"::Member -FilePath /etc/hosts",
+            "& ($program) -FilePath /etc/hosts",
+            "& ('Tee-'+$suffix) -FilePath /etc/hosts",
+            "& (\"Tee`u{}Object\") -FilePath /etc/hosts",
+            "& (\"Tee`u{D800}Object\") -FilePath /etc/hosts",
+            "Tee-Object /etc/hosts",
+        ] {
+            assert!(
+                powershell_literal_invocations(command)
+                    .expect("bounded fixture")
+                    .is_empty(),
+                "{command}"
+            );
+        }
+        for command in [
+            "& ('Other.Module\\Tee-Object') /etc/hosts",
+            "& ('Tee-Object -Append /etc/hosts') /etc/hosts",
+        ] {
+            assert!(
+                powershell_tee_truncation_targets(command)
+                    .expect("bounded fixture")
+                    .is_empty(),
+                "a string value stays one executable name: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_computed_invocations_keep_independent_nested_writes() {
+        for command in [
+            "& (Tee-Object -InputObject 'Tee-Object' /etc/hosts) -Append /tmp/log",
+            "& $(Write-Output 'unused'; Tee-Object /etc/hosts) -Variable captured",
+            "& ('Write-Output')[(Tee-Object /etc/hosts)]",
+            "& 'Write-Output'[(Tee-Object /etc/hosts)]",
+        ] {
+            let targets = powershell_tee_truncation_targets(command).expect("bounded fixture");
+            assert_eq!(targets.len(), 1, "{command}");
+            assert_eq!(targets[0].path, "/etc/hosts", "{command}");
+            assert_eq!(&command[targets[0].span.clone()], "Tee-Object", "{command}");
+        }
+        let command = "& ('Write-'+'Output') (& ('Tee-'+'Object') /etc/hosts)";
+        let invocations = powershell_literal_invocations(command).expect("bounded fixture");
+        assert_eq!(invocations.len(), 2);
+        for invocation in invocations {
+            assert_eq!(&command[invocation.operator_span], "&");
+            assert_eq!(
+                &command[invocation.span],
+                if invocation.name == "Write-Output" {
+                    "('Write-'+'Output')"
+                } else {
+                    "('Tee-'+'Object')"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_invocation_collection_surfaces_decoder_and_lexer_bounds() {
+        let oversized_name = format!("& ('{}') /etc/hosts", "x".repeat(100_000));
+        assert_eq!(
+            powershell_literal_invocations(&oversized_name).expect_err("decoder byte bound"),
+            WindowsShellParseIncomplete::Work
+        );
+        assert_eq!(
+            powershell_tee_truncation_targets(&oversized_name).expect_err("same bounded parse"),
+            WindowsShellParseIncomplete::Work
+        );
+        assert!(powershell_tee_scan_required(&oversized_name));
+        let mut nested = "& ('Tee-Object') /etc/hosts".to_string();
+        for _ in 0..MAX_LEX_DEPTH {
+            nested = format!("Write-Output ({nested})");
+        }
+        assert_eq!(
+            powershell_literal_invocations(&nested).expect_err("shared nesting bound"),
+            WindowsShellParseIncomplete::Nesting
+        );
     }
 }

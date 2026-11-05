@@ -2014,6 +2014,26 @@ enum PowerShellCallTarget {
     Dynamic,
 }
 
+/// A runtime-dependent expression is different from exhausting analysis.
+/// Shared callers must not turn a parser bound into proof of no invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PowerShellStaticExecutableError {
+    NotStatic,
+    Work,
+    Nesting,
+}
+
+const fn powershell_static_single_quote(character: char) -> bool {
+    matches!(
+        character,
+        '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}'
+    )
+}
+
+const fn powershell_static_double_quote(character: char) -> bool {
+    matches!(character, '"' | '\u{201C}' | '\u{201D}' | '\u{201E}')
+}
+
 struct PowerShellStaticExecutableParser<'a> {
     expression: &'a str,
     index: usize,
@@ -2029,104 +2049,173 @@ impl<'a> PowerShellStaticExecutableParser<'a> {
         }
     }
 
-    fn skip_whitespace(&mut self) {
+    fn skip_trivia(&mut self) -> Result<(), PowerShellStaticExecutableError> {
         while let Some(character) = self.expression[self.index..].chars().next() {
-            if !character.is_whitespace() {
+            let rest = &self.expression[self.index..];
+            if character.is_whitespace() {
+                self.index += character.len_utf8();
+            } else if rest.starts_with("`\r\n") {
+                self.index += 3;
+            } else if rest.starts_with("`\n") {
+                self.index += 2;
+            } else if rest.starts_with("<#") {
+                self.index += 2;
+                let mut depth = 1usize;
+                while depth > 0 {
+                    let rest = &self.expression[self.index..];
+                    if rest.starts_with("<#") {
+                        depth += 1;
+                        if depth > MAX_GIT_ALIAS_DEPTH {
+                            return Err(PowerShellStaticExecutableError::Nesting);
+                        }
+                        self.index += 2;
+                    } else if rest.starts_with("#>") {
+                        depth -= 1;
+                        self.index += 2;
+                    } else {
+                        self.index += rest
+                            .chars()
+                            .next()
+                            .ok_or(PowerShellStaticExecutableError::NotStatic)?
+                            .len_utf8();
+                    }
+                }
+            } else if character == '#' {
+                while let Some(character) = self.expression[self.index..].chars().next() {
+                    if matches!(character, '\r' | '\n') {
+                        break;
+                    }
+                    self.index += character.len_utf8();
+                }
+            } else {
                 break;
             }
-            self.index += character.len_utf8();
         }
+        Ok(())
     }
 
-    fn parse(mut self) -> Result<String, ()> {
+    fn parse(mut self) -> Result<String, PowerShellStaticExecutableError> {
         if self.expression.len() > MAX_GIT_SEMANTIC_BYTES {
-            return Err(());
+            return Err(PowerShellStaticExecutableError::Work);
         }
-        self.skip_whitespace();
+        self.skip_trivia()?;
         let value = self.parse_concatenation(0)?;
-        self.skip_whitespace();
+        self.skip_trivia()?;
         (self.index == self.expression.len())
             .then_some(value)
-            .ok_or(())
+            .ok_or(PowerShellStaticExecutableError::NotStatic)
     }
 
-    fn parse_concatenation(&mut self, depth: usize) -> Result<String, ()> {
+    fn parse_concatenation(
+        &mut self,
+        depth: usize,
+    ) -> Result<String, PowerShellStaticExecutableError> {
         if depth > MAX_GIT_ALIAS_DEPTH {
-            return Err(());
+            return Err(PowerShellStaticExecutableError::Nesting);
         }
         let mut value = self.parse_primary(depth)?;
         loop {
-            self.skip_whitespace();
+            self.skip_trivia()?;
             if self.expression.as_bytes().get(self.index) != Some(&b'+') {
                 return Ok(value);
             }
             self.index += 1;
-            self.skip_whitespace();
+            self.skip_trivia()?;
             let suffix = self.parse_primary(depth)?;
             if value.len().saturating_add(suffix.len()) > MAX_GIT_SEMANTIC_BYTES {
-                return Err(());
+                return Err(PowerShellStaticExecutableError::Work);
             }
             value.push_str(&suffix);
         }
     }
 
-    fn parse_primary(&mut self, depth: usize) -> Result<String, ()> {
-        self.skip_whitespace();
+    fn parse_primary(&mut self, depth: usize) -> Result<String, PowerShellStaticExecutableError> {
+        self.skip_trivia()?;
         self.terms = self.terms.saturating_add(1);
         if self.terms > MAX_GIT_SEMANTIC_TOKENS {
-            return Err(());
+            return Err(PowerShellStaticExecutableError::Work);
         }
-        match self.expression.as_bytes().get(self.index).copied() {
-            Some(b'\'') => self.parse_single_quoted(),
-            Some(b'"') => self.parse_double_quoted(),
-            Some(b'(') => {
+        match self.expression[self.index..].chars().next() {
+            Some(quote) if powershell_static_single_quote(quote) => self.parse_single_quoted(),
+            Some(quote) if powershell_static_double_quote(quote) => self.parse_double_quoted(),
+            Some('(') => {
                 self.index += 1;
                 let value = self.parse_concatenation(depth + 1)?;
-                self.skip_whitespace();
+                self.skip_trivia()?;
                 if self.expression.as_bytes().get(self.index) != Some(&b')') {
-                    return Err(());
+                    return Err(PowerShellStaticExecutableError::NotStatic);
                 }
                 self.index += 1;
                 Ok(value)
             }
-            _ => Err(()),
+            _ => Err(PowerShellStaticExecutableError::NotStatic),
         }
     }
 
-    fn parse_single_quoted(&mut self) -> Result<String, ()> {
-        self.index += 1;
+    fn parse_single_quoted(&mut self) -> Result<String, PowerShellStaticExecutableError> {
+        self.index += self.expression[self.index..]
+            .chars()
+            .next()
+            .ok_or(PowerShellStaticExecutableError::NotStatic)?
+            .len_utf8();
         let mut value = String::new();
         while self.index < self.expression.len() {
-            let character = self.expression[self.index..].chars().next().ok_or(())?;
-            if character == '\'' {
-                if self.expression.as_bytes().get(self.index + 1) == Some(&b'\'') {
-                    value.push('\'');
-                    self.index += 2;
+            let character = self.expression[self.index..]
+                .chars()
+                .next()
+                .ok_or(PowerShellStaticExecutableError::NotStatic)?;
+            if powershell_static_single_quote(character) {
+                self.index += character.len_utf8();
+                if let Some(next) = self.expression[self.index..]
+                    .chars()
+                    .next()
+                    .filter(|next| powershell_static_single_quote(*next))
+                {
+                    value.push(character);
+                    self.index += next.len_utf8();
                     continue;
                 }
-                self.index += 1;
                 return Ok(value);
             }
             value.push(character);
             self.index += character.len_utf8();
         }
-        Err(())
+        Err(PowerShellStaticExecutableError::NotStatic)
     }
 
-    fn parse_double_quoted(&mut self) -> Result<String, ()> {
-        self.index += 1;
+    fn parse_double_quoted(&mut self) -> Result<String, PowerShellStaticExecutableError> {
+        self.index += self.expression[self.index..]
+            .chars()
+            .next()
+            .ok_or(PowerShellStaticExecutableError::NotStatic)?
+            .len_utf8();
         let mut value = String::new();
         while self.index < self.expression.len() {
-            let character = self.expression[self.index..].chars().next().ok_or(())?;
+            let character = self.expression[self.index..]
+                .chars()
+                .next()
+                .ok_or(PowerShellStaticExecutableError::NotStatic)?;
             match character {
-                '"' => {
-                    self.index += 1;
+                quote if powershell_static_double_quote(quote) => {
+                    self.index += quote.len_utf8();
+                    if let Some(next) = self.expression[self.index..]
+                        .chars()
+                        .next()
+                        .filter(|next| powershell_static_double_quote(*next))
+                    {
+                        value.push(quote);
+                        self.index += next.len_utf8();
+                        continue;
+                    }
                     return Ok(value);
                 }
-                '$' => return Err(()),
+                '$' => return Err(PowerShellStaticExecutableError::NotStatic),
                 '`' => {
                     self.index += 1;
-                    let escaped = self.expression[self.index..].chars().next().ok_or(())?;
+                    let escaped = self.expression[self.index..]
+                        .chars()
+                        .next()
+                        .ok_or(PowerShellStaticExecutableError::NotStatic)?;
                     self.index += escaped.len_utf8();
                     match escaped {
                         '0' => value.push('\0'),
@@ -2138,6 +2227,39 @@ impl<'a> PowerShellStaticExecutableParser<'a> {
                         'r' => value.push('\r'),
                         't' => value.push('\t'),
                         'v' => value.push('\u{000b}'),
+                        'u' => {
+                            if self.expression.as_bytes().get(self.index) != Some(&b'{') {
+                                return Err(PowerShellStaticExecutableError::NotStatic);
+                            }
+                            self.index += 1;
+                            let mut scalar = 0_u32;
+                            let mut digits = 0_usize;
+                            loop {
+                                let digit = self.expression[self.index..]
+                                    .chars()
+                                    .next()
+                                    .ok_or(PowerShellStaticExecutableError::NotStatic)?;
+                                self.index += digit.len_utf8();
+                                if digit == '}' {
+                                    break;
+                                }
+                                if digits == 6 {
+                                    return Err(PowerShellStaticExecutableError::NotStatic);
+                                }
+                                scalar = scalar * 16
+                                    + digit
+                                        .to_digit(16)
+                                        .ok_or(PowerShellStaticExecutableError::NotStatic)?;
+                                digits += 1;
+                            }
+                            if digits == 0 {
+                                return Err(PowerShellStaticExecutableError::NotStatic);
+                            }
+                            value.push(
+                                char::from_u32(scalar)
+                                    .ok_or(PowerShellStaticExecutableError::NotStatic)?,
+                            );
+                        }
                         '\n' => {}
                         '\r' if self.expression.as_bytes().get(self.index) == Some(&b'\n') => {
                             self.index += 1;
@@ -2151,8 +2273,16 @@ impl<'a> PowerShellStaticExecutableParser<'a> {
                 }
             }
         }
-        Err(())
+        Err(PowerShellStaticExecutableError::NotStatic)
     }
+}
+
+/// Decode only the bounded literal/concatenation expression itself. Unlike
+/// the legacy call-tail helper, this never drops an index or member postfix.
+pub(crate) fn decode_powershell_static_executable(
+    expression: &str,
+) -> Result<String, PowerShellStaticExecutableError> {
+    PowerShellStaticExecutableParser::new(expression).parse()
 }
 
 fn powershell_call_expression_parts(command: &str) -> Option<(&str, &str)> {
@@ -2243,9 +2373,7 @@ pub(crate) fn powershell_static_call_executable(command: &str) -> Option<(Option
         .strip_prefix('$')
         .or_else(|| expression.strip_prefix('@'))
         .unwrap_or(expression);
-    let executable = PowerShellStaticExecutableParser::new(expression)
-        .parse()
-        .ok();
+    let executable = decode_powershell_static_executable(expression).ok();
     Some((executable, tail))
 }
 
@@ -6714,6 +6842,93 @@ mod tests {
     use crate::packs::test_helpers::*;
     use std::fmt::Write as _;
 
+    #[test]
+    fn powershell_static_executable_decoder_reuses_bounded_literal_grammar() {
+        for (expression, expected) in [
+            ("('gi'+'t')", "git"),
+            ("(('Tee-') + ('Object'))", "Tee-Object"),
+            (
+                "('Tee-' <# outer <# inner #> tail #> + 'Object')",
+                "Tee-Object",
+            ),
+            ("('Tee-' + # comment with )\n 'Object')", "Tee-Object"),
+            ("('Tee-' `\r\n + 'Object')", "Tee-Object"),
+            ("(‘Tee-’+‘Object’)", "Tee-Object"),
+            ("(“Tee-”+“Object”)", "Tee-Object"),
+            ("(\"Tee`-\"+\"Object\")", "Tee-Object"),
+            ("(\"gi`u{74}\")", "git"),
+            ("(\"Tee`u{2d}Object\")", "Tee-Object"),
+            ("(\"Tee`u{00002D}Object\")", "Tee-Object"),
+            ("(\"`u{1F600}\")", "😀"),
+            ("('a''b'+\"c\"\"d\")", "a'bc\"d"),
+            (
+                "('Microsoft.PowerShell.Utility\\Tee-'+'Object')",
+                "Microsoft.PowerShell.Utility\\Tee-Object",
+            ),
+        ] {
+            assert_eq!(
+                decode_powershell_static_executable(expression),
+                Ok(expected.to_string()),
+                "{expression}"
+            );
+        }
+        for expression in [
+            "('git')[0]",
+            "('git').ToString()",
+            "('gi'+$suffix)",
+            "(\"$program\")",
+            "('git'; Write-Output other)",
+            "('git' <# unfinished)",
+            "(\"git`u\")",
+            "(\"git`u{}\")",
+            "(\"git`u{74\")",
+            "(\"git`u{z}\")",
+            "(\"git`u{0000074}\")",
+            "(\"git`u{110000}\")",
+            "(\"git`u{D800}\")",
+            "(\"git`u{DFFF}\")",
+        ] {
+            assert_eq!(
+                decode_powershell_static_executable(expression),
+                Err(PowerShellStaticExecutableError::NotStatic),
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_static_executable_decoder_reports_its_existing_bounds() {
+        let oversized = format!("'{}'", "x".repeat(MAX_GIT_SEMANTIC_BYTES));
+        assert_eq!(
+            decode_powershell_static_executable(&oversized),
+            Err(PowerShellStaticExecutableError::Work)
+        );
+        let terms = std::iter::repeat_n("''", MAX_GIT_SEMANTIC_TOKENS + 1)
+            .collect::<Vec<_>>()
+            .join("+");
+        assert_eq!(
+            decode_powershell_static_executable(&terms),
+            Err(PowerShellStaticExecutableError::Work)
+        );
+        let nested = format!(
+            "{}'git'{}",
+            "(".repeat(MAX_GIT_ALIAS_DEPTH + 1),
+            ")".repeat(MAX_GIT_ALIAS_DEPTH + 1)
+        );
+        assert_eq!(
+            decode_powershell_static_executable(&nested),
+            Err(PowerShellStaticExecutableError::Nesting)
+        );
+        let comments = format!(
+            "{}{}'git'",
+            "<#".repeat(MAX_GIT_ALIAS_DEPTH + 1),
+            "#>".repeat(MAX_GIT_ALIAS_DEPTH + 1)
+        );
+        assert_eq!(
+            decode_powershell_static_executable(&comments),
+            Err(PowerShellStaticExecutableError::Nesting)
+        );
+    }
     // =========================================================================
     // Git LFS (Refs PR #383): `git lfs` is a known subcommand, and its three
     // destructive verbs carry their own rules.

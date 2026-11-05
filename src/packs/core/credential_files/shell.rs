@@ -32,7 +32,8 @@ pub(super) mod indirection;
 mod windows_shells;
 
 pub(crate) use windows_shells::{
-    PowerShellTruncationTarget, WindowsShellParseIncomplete, powershell_tee_scan_required,
+    PowerShellInvokedCommand, PowerShellTruncationTarget, WindowsShellParseIncomplete,
+    powershell_literal_invocations, powershell_tee_scan_required,
     powershell_tee_truncation_targets,
 };
 
