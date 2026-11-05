@@ -374,7 +374,8 @@ impl std::fmt::Debug for DestructivePattern {
 impl DestructivePattern {
     /// Match through the same executable-scope contract as the primary
     /// evaluator. Unscoped rules retain their historical raw-regex behavior.
-    fn matches_command(&self, command: &str) -> bool {
+    fn matches_command(&self, pack_id: &str, command: &str) -> bool {
+        self.regex.set_rule_identity(pack_id, self.name);
         match self.executables {
             None => self.regex.is_match(command),
             Some(executables) => crate::evaluator::executable_scoped_pattern_matches(
@@ -598,7 +599,7 @@ impl Pack {
     /// `safe_regex_set_is_complete`) to their default values. These are populated
     /// during pack registration by `PackEntry::get_pack()`.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         id: PackId,
         name: &'static str,
         description: &'static str,
@@ -606,6 +607,12 @@ impl Pack {
         safe_patterns: Vec<SafePattern>,
         destructive_patterns: Vec<DestructivePattern>,
     ) -> Self {
+        for pattern in &safe_patterns {
+            pattern.regex.set_rule_identity(&id, Some(pattern.name));
+        }
+        for pattern in &destructive_patterns {
+            pattern.regex.set_rule_identity(&id, pattern.name);
+        }
         Self {
             id,
             name,
@@ -675,7 +682,7 @@ impl Pack {
             && self
                 .destructive_patterns
                 .iter()
-                .any(|pattern| pattern.matches_command(cmd))
+                .any(|pattern| pattern.matches_command(&self.id, cmd))
     }
 
     fn destructive_match_vetoes_safe_with_deadline(
@@ -693,7 +700,7 @@ impl Pack {
                 // an indeterminate result rather than treating time as safety.
                 return true;
             }
-            if pattern.matches_command(cmd) {
+            if pattern.matches_command(&self.id, cmd) {
                 return true;
             }
         }
@@ -777,8 +784,10 @@ impl Pack {
         // With no set (including a RegexSet compilation failure), retain the
         // conservative fallback over every pattern.
         self.safe_patterns.iter().any(|p| {
-            (!linear_set_missed || regex_engine::needs_backtracking_engine(p.regex.as_str()))
-                && p.regex.is_match(cmd)
+            (!linear_set_missed || regex_engine::needs_backtracking_engine(p.regex.as_str())) && {
+                p.regex.set_rule_identity(&self.id, Some(p.name));
+                p.regex.is_match(cmd)
+            }
         })
     }
 
@@ -822,6 +831,7 @@ impl Pack {
             if deadline.is_some_and(crate::perf::Deadline::is_exceeded) {
                 return false;
             }
+            p.regex.set_rule_identity(&self.id, Some(p.name));
             if p.regex.is_match(cmd) {
                 return true;
             }
@@ -923,12 +933,13 @@ impl Pack {
             })
             .flatten();
         let found = self.destructive_patterns.iter().find(|pattern| {
+            pattern.regex.set_rule_identity(&self.id, pattern.name);
             if crate::packs::core::filesystem::is_unlink_rule(pattern.name)
                 && let Some(command) = &unlink_command
             {
                 return !command.safe && pattern.regex.is_match(&command.matching_view);
             }
-            pattern.matches_command(cmd)
+            pattern.matches_command(&self.id, cmd)
         });
         // The same add-only masked pass the evaluator gives core.filesystem
         // (#552 follow-up); the unlink proof above already read the operands.
@@ -937,7 +948,7 @@ impl Pack {
             self.destructive_patterns.iter().find(|pattern| {
                 !(crate::packs::core::filesystem::is_unlink_rule(pattern.name)
                     && unlink_command.is_some())
-                    && pattern.matches_command(&masked)
+                    && pattern.matches_command(&self.id, &masked)
             })
         });
         // #509: the `branch-force-delete` regex is the fallback for a branch
@@ -973,7 +984,7 @@ impl Pack {
             self.destructive_patterns
                 .iter()
                 .filter(|p| predicate(p.name))
-                .find(|p| p.matches_command(text))
+                .find(|p| p.matches_command(&self.id, text))
         };
         find(cmd)
             .or_else(|| {
@@ -1303,6 +1314,16 @@ impl PackEntry {
     pub fn get_pack(&self) -> &Pack {
         self.instance.get_or_init(|| {
             let mut pack = (self.builder)();
+            for pattern in &pack.safe_patterns {
+                pattern
+                    .regex
+                    .set_static_rule_identity(self.id, Some(pattern.name));
+            }
+            for pattern in &pack.destructive_patterns {
+                pattern
+                    .regex
+                    .set_static_rule_identity(self.id, pattern.name);
+            }
             // Build Aho-Corasick automaton for keyword matching
             //
             // These direct-transfer packs are selected through the global
@@ -8502,6 +8523,95 @@ destructive_patterns:
                 assert!(!pack.name.is_empty());
             }
         }
+    }
+
+    fn slow_diagnostic_pack() -> Pack {
+        Pack {
+            id: "test.provenance".to_string(),
+            name: "test",
+            description: "test",
+            keywords: &[],
+            safe_patterns: vec![safe_pattern!("slow-safe", r"^(a|aa)+\1$")],
+            destructive_patterns: vec![destructive_pattern!(
+                "slow-destructive",
+                r"^(a|aa)+\1$",
+                "test"
+            )],
+            keyword_matcher: None,
+            safe_regex_set: None,
+            safe_regex_set_is_complete: false,
+        }
+    }
+
+    #[test]
+    fn direct_pack_apis_attach_rule_provenance_issue_643() {
+        let command = format!("{}!", "a".repeat(80));
+        for operation in 0..3 {
+            let pack = slow_diagnostic_pack();
+            let scope = regex_engine::RegexEvaluationScope::enter();
+            let expected_name = match operation {
+                0 => {
+                    assert!(!pack.matches_safe(&command));
+                    "slow-safe"
+                }
+                1 => {
+                    assert!(!pack.matches_safe_with_deadline(&command, None));
+                    "slow-safe"
+                }
+                _ => {
+                    assert!(pack.matches_destructive(&command).is_none());
+                    "slow-destructive"
+                }
+            };
+            assert!(scope.has_failed());
+            let failure = scope.failure().unwrap();
+            assert_eq!(failure.pack_id.unwrap().as_str(), "test.provenance");
+            assert_eq!(failure.pattern_id.unwrap().as_str(), expected_name);
+            assert_eq!(
+                failure.cause,
+                crate::perf::RegexFailureCause::BacktrackLimit {
+                    steps: regex_engine::BACKTRACK_LIMIT
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn registered_patterns_retain_identity_when_evaluator_accesses_regex_directly_issue_643() {
+        let entry = PackEntry::new("test.provenance", &[], slow_diagnostic_pack);
+        let pack = entry.get_pack();
+        let command = format!("{}!", "a".repeat(80));
+        let scope = regex_engine::RegexEvaluationScope::enter();
+        assert!(
+            pack.destructive_patterns[0]
+                .regex
+                .find_from(&command, 0)
+                .is_none()
+        );
+        let failure = scope.failure().unwrap();
+        assert_eq!(failure.pack_id.unwrap().as_str(), "test.provenance");
+        assert_eq!(failure.pattern_id.unwrap().as_str(), "slow-destructive");
+        assert_eq!(failure.operation, crate::perf::RegexOperation::FindFrom);
+    }
+
+    #[test]
+    fn constructed_pack_provenance_survives_owned_pack_lifetime_issue_643() {
+        let failure = {
+            let pack = Pack::new(
+                String::from("test.owned"),
+                "test",
+                "test",
+                &[],
+                vec![safe_pattern!("slow-safe", r"^(a|aa)+\1$")],
+                Vec::new(),
+            );
+            let scope = regex_engine::RegexEvaluationScope::enter();
+            let command = format!("{}!", "a".repeat(80));
+            assert!(!pack.safe_patterns[0].regex.is_match(&command));
+            scope.failure().unwrap()
+        };
+        assert_eq!(failure.pack_id.unwrap().as_str(), "test.owned");
+        assert_eq!(failure.pattern_id.unwrap().as_str(), "slow-safe");
     }
 
     fn mixed_engine_safe_pack() -> Pack {

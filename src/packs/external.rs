@@ -803,6 +803,7 @@ impl ExternalPack {
     #[must_use]
     pub fn into_pack(self) -> Pack {
         // Leak the dynamic strings to get 'static lifetimes
+        let pack_id: &'static str = Box::leak(self.id.into_boxed_str());
         let name: &'static str = Box::leak(self.name.into_boxed_str());
         let description: &'static str = self
             .description
@@ -827,7 +828,8 @@ impl ExternalPack {
             .map(|p| {
                 let name: &'static str = Box::leak(p.name.into_boxed_str());
                 SafePattern {
-                    regex: LazyCompiledRegex::new(Box::leak(p.pattern.into_boxed_str())),
+                    regex: LazyCompiledRegex::new(Box::leak(p.pattern.into_boxed_str()))
+                        .with_rule_identity(pack_id, Some(name)),
                     name,
                 }
             })
@@ -877,7 +879,8 @@ impl ExternalPack {
                 });
 
                 DestructivePattern {
-                    regex: LazyCompiledRegex::new(Box::leak(p.pattern.into_boxed_str())),
+                    regex: LazyCompiledRegex::new(Box::leak(p.pattern.into_boxed_str()))
+                        .with_rule_identity(pack_id, Some(name)),
                     reason,
                     name: Some(name),
                     severity: p.severity.into(),
@@ -889,7 +892,7 @@ impl ExternalPack {
             .collect();
 
         Pack::new(
-            self.id,
+            pack_id.to_owned(),
             name,
             description,
             keywords,
@@ -1156,6 +1159,33 @@ mod tests {
         format!(
             "id: test.width\nname: Width\nversion: 1.0.0\n{section}:\n  - name: width\n    pattern: {quoted}\n"
         )
+    }
+
+    #[test]
+    fn loaded_rules_retain_failure_identity_before_pack_matching_issue_643() {
+        let command = format!("{}!", "a".repeat(80));
+        for safe in [false, true] {
+            let pack = parse_pack_string(&width_test_pack(r"^(a|aa)+\1$", safe))
+                .unwrap()
+                .into_pack();
+            let scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
+            let rule = if safe {
+                &pack.safe_patterns[0].regex
+            } else {
+                &pack.destructive_patterns[0].regex
+            };
+            assert!(rule.find_from(&command, 0).is_none());
+            let failure = scope.failure().unwrap();
+            assert_eq!(failure.pack_id.unwrap().as_str(), "test.width");
+            assert_eq!(failure.pattern_id.unwrap().as_str(), "width");
+            assert_eq!(failure.operation, crate::perf::RegexOperation::FindFrom);
+            assert_eq!(
+                failure.cause,
+                crate::perf::RegexFailureCause::BacktrackLimit {
+                    steps: crate::packs::regex_engine::BACKTRACK_LIMIT
+                }
+            );
+        }
     }
 
     #[test]

@@ -928,6 +928,10 @@ pub struct EvaluationResult {
     /// still deny, but a policy/confidence downgrade cannot authorize
     /// incomplete work.
     pub regex_evaluation_incomplete: bool,
+    /// The first regex failure belonging to this evaluation, including an
+    /// executed child. Contains bounded rule identifiers and engine limits,
+    /// never command text, pattern source, or execution context.
+    pub regex_failure: Option<crate::perf::RegexFailure>,
     /// Whether the evaluator proved that no enabled-pack keyword was present
     /// and returned through the bounded quick-reject fast path.
     pub quick_rejected: bool,
@@ -943,6 +947,19 @@ pub struct EvaluationResult {
 }
 
 impl EvaluationResult {
+    /// Add bounded failure provenance when a positive finding coexists with
+    /// incomplete analysis. Keep the matched rule and its reason unchanged in
+    /// the evaluator; only presentation should add this diagnostic context.
+    #[must_use]
+    pub fn reason_with_incomplete_analysis<'a>(&self, base: &'a str) -> Cow<'a, str> {
+        match self.regex_failure {
+            Some(failure) => Cow::Owned(format!(
+                "{base}\nSafety analysis also incomplete: {failure}"
+            )),
+            None => Cow::Borrowed(base),
+        }
+    }
+
     /// Create an "allowed" result.
     #[inline]
     #[must_use]
@@ -955,6 +972,7 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             quick_rejected: false,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -985,6 +1003,7 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             quick_rejected: true,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1008,6 +1027,7 @@ impl EvaluationResult {
             skipped_due_to_budget: true,
             quick_rejected: false,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1037,6 +1057,7 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             quick_rejected: false,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1066,6 +1087,7 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             quick_rejected: false,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1106,6 +1128,7 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             quick_rejected: false,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1166,6 +1189,7 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             quick_rejected: false,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1233,6 +1257,7 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             quick_rejected: false,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1263,6 +1288,7 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             quick_rejected: false,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1292,6 +1318,7 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             quick_rejected: false,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1328,6 +1355,7 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             quick_rejected: false,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1364,6 +1392,7 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             quick_rejected: false,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1403,6 +1432,7 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             quick_rejected: false,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1430,6 +1460,7 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             quick_rejected: false,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -17790,10 +17821,14 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         if result.decision != EvaluationDecision::Deny {
             result = EvaluationResult {
                 decision: EvaluationDecision::Indeterminate,
+                // A regex failure may precede a real hook expiration. Keep
+                // that deadline evidence when carrying the rule diagnostic.
+                skipped_due_to_budget: result.skipped_due_to_budget,
                 ..EvaluationResult::allowed()
             };
         }
         result.regex_evaluation_incomplete = true;
+        result.regex_failure = scope.failure();
     }
     // The early lookup predicate is a performance guard, not an authorization
     // boundary. A nested inspection it did not predict must not strand an
@@ -38454,6 +38489,7 @@ fn evaluate_heredoc(
                         skipped_due_to_budget: false,
                         quick_rejected: false,
                         regex_evaluation_incomplete: false,
+                        regex_failure: None,
                         branch_context: None,
                         session_occurrence: None,
                         graduated_response: None,
@@ -38733,13 +38769,11 @@ fn evaluate_heredoc(
                     (inner.start, inner.end)
                 };
 
-                // A nested evaluator may conservatively stop before the
-                // absolute deadline when the remaining budget is too
-                // small for its next stage. Propagate that result exactly;
-                // checking the clock again here can still be false and
-                // must never turn incomplete nested analysis into Allow.
+                // Preserve the nested failure cause: an incomplete regex
+                // operation need not exhaust the hook deadline. Checking the
+                // clock again must not turn incomplete analysis into Allow.
                 if nested_evaluation_incomplete(&result) {
-                    return Some(EvaluationResult::indeterminate_due_to_budget());
+                    return Some(result);
                 }
 
                 if result.is_denied() {
@@ -38794,6 +38828,7 @@ fn evaluate_heredoc(
                             skipped_due_to_budget: false,
                             quick_rejected: false,
                             regex_evaluation_incomplete: false,
+                            regex_failure: None,
                             branch_context: None,
                             session_occurrence: None,
                             graduated_response: None,
@@ -38914,6 +38949,7 @@ fn evaluate_heredoc(
                 skipped_due_to_budget: false,
                 quick_rejected: false,
                 regex_evaluation_incomplete: false,
+                regex_failure: None,
                 branch_context: None,
                 session_occurrence: None,
                 graduated_response: None,
@@ -39139,6 +39175,7 @@ fn exec_sink_backstop_verdict(
             skipped_due_to_budget: false,
             quick_rejected: false,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -39312,9 +39349,9 @@ fn reconstructed_interpreter_commands_verdict(
             context.inherited_automated_stdin,
         );
         // A nested evaluator can stop short of the deadline; propagate that
-        // exactly rather than reading incomplete analysis as Allow.
+        // exactly, including a regex failure that did not exhaust the deadline.
         if nested_evaluation_incomplete(&result) {
-            return Some(EvaluationResult::indeterminate_due_to_budget());
+            return Some(result);
         }
         if result.is_denied() {
             let mut result = result;
@@ -39629,6 +39666,7 @@ fn dynamic_source_finding_verdict(
         skipped_due_to_budget: false,
         quick_rejected: false,
         regex_evaluation_incomplete: false,
+        regex_failure: None,
         branch_context: None,
         session_occurrence: None,
         graduated_response: None,
@@ -40023,6 +40061,7 @@ fn check_credential_write_fallback(
                 skipped_due_to_budget: false,
                 quick_rejected: false,
                 regex_evaluation_incomplete: false,
+                regex_failure: None,
                 branch_context: None,
                 session_occurrence: None,
                 graduated_response: None,
@@ -61017,6 +61056,7 @@ mod tests {
                 skipped_due_to_budget: false,
                 quick_rejected: false,
                 regex_evaluation_incomplete: false,
+                regex_failure: None,
                 branch_context: None,
                 session_occurrence: None,
                 graduated_response: None,
@@ -61206,6 +61246,7 @@ mod tests {
                 skipped_due_to_budget: false,
                 quick_rejected: false,
                 regex_evaluation_incomplete: false,
+                regex_failure: None,
                 session_occurrence: None,
                 graduated_response: None,
                 bypass_method: None,

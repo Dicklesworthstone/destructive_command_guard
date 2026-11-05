@@ -1087,6 +1087,21 @@ const CLASSIFY_OUTPUT_SCHEMA_VERSION: u32 = 1;
 /// pattern has been proven, but execution is still blocked conservatively.
 const INDETERMINATE_REASON: &str = "Safety evaluation did not complete within the analysis budget";
 
+/// Describe the failure attached to this evaluation, never a stale thread-local
+/// observation. A regex work limit is independent of the hook's wall clock;
+/// retain the deadline wording when the evaluator actually exhausted it, with
+/// the known regex failure as additional context.
+fn indeterminate_reason(result: &EvaluationResult) -> std::borrow::Cow<'static, str> {
+    if !result.skipped_due_to_budget
+        && let Some(failure) = &result.regex_failure
+    {
+        return std::borrow::Cow::Owned(format!(
+            "Safety evaluation did not complete: {failure}; command was not verified"
+        ));
+    }
+    result.reason_with_incomplete_analysis(INDETERMINATE_REASON)
+}
+
 /// Maximum reason carried by dcg's private OMP bridge protocol.
 ///
 /// The general robot schema intentionally retains complete diagnostics, but
@@ -1161,6 +1176,24 @@ fn bounded_omp_bridge_reason(reason: &str) -> std::borrow::Cow<'_, str> {
         OMP_BRIDGE_REASON_MAX_BYTES,
         OMP_BRIDGE_REASON_TRUNCATION_SUFFIX,
     )
+}
+
+/// Preserve the bounded failure note even when an external rule's ordinary
+/// reason fills the bridge field. Successful evaluations keep identical bytes.
+fn bounded_omp_bridge_evaluation_reason<'a>(
+    result: &EvaluationResult,
+    reason: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    if result.regex_failure.is_none() {
+        return bounded_omp_bridge_reason(reason);
+    }
+    let suffix = result.reason_with_incomplete_analysis("");
+    let bounded = bounded_omp_bridge_field(
+        std::borrow::Cow::Borrowed(reason),
+        OMP_BRIDGE_REASON_MAX_BYTES - suffix.len(),
+        OMP_BRIDGE_REASON_TRUNCATION_SUFFIX,
+    );
+    std::borrow::Cow::Owned(format!("{bounded}{suffix}"))
 }
 
 fn bounded_omp_bridge_rule_id(rule_id: String) -> std::borrow::Cow<'static, str> {
@@ -1321,7 +1354,8 @@ fn omp_bridge_test_output(
             let pattern = result.pattern_info.as_ref();
             OmpBridgeTestOutput {
                 decision: resolved_mode.unwrap_or(DecisionMode::Deny).label(),
-                reason: pattern.map(|info| bounded_omp_bridge_reason(&info.reason)),
+                reason: pattern
+                    .map(|info| bounded_omp_bridge_evaluation_reason(result, &info.reason)),
                 rule_id: pattern.and_then(|info| {
                     info.pack_id.as_ref().and_then(|pack| {
                         info.pattern_name
@@ -1333,7 +1367,7 @@ fn omp_bridge_test_output(
         }
         EvaluationDecision::Indeterminate => OmpBridgeTestOutput {
             decision: "indeterminate",
-            reason: Some(std::borrow::Cow::Borrowed(INDETERMINATE_REASON)),
+            reason: Some(indeterminate_reason(result)),
             rule_id: None,
         },
     }
@@ -3635,7 +3669,7 @@ fn resolve_batch_entry(
             mode: None,
             rule_id: None,
             pack_id: None,
-            error: Some(INDETERMINATE_REASON.to_string()),
+            error: Some(indeterminate_reason(&eval_result).into_owned()),
             rank: 4,
         },
         EvaluationDecision::Deny => {
@@ -3667,6 +3701,7 @@ fn resolve_batch_entry(
                     .pattern_info
                     .as_ref()
                     .map_or("", |info| info.reason.as_str());
+                let reason = eval_result.reason_with_incomplete_analysis(reason);
                 eprintln!(
                     "[dcg] Warning: {} matched but policy mode is warn; allowing. {reason}",
                     rule_id.as_deref().unwrap_or("a destructive pattern")
@@ -3678,7 +3713,9 @@ fn resolve_batch_entry(
                 mode: Some(mode_label),
                 rule_id,
                 pack_id,
-                error: None,
+                error: eval_result
+                    .regex_failure
+                    .map(|failure| format!("Safety analysis also incomplete: {failure}")),
                 rank,
             }
         }
@@ -5532,7 +5569,11 @@ fn test_command(
                         (
                             info.pack_id.clone(),
                             info.pattern_name.clone(),
-                            Some(info.reason.clone()),
+                            Some(
+                                result
+                                    .reason_with_incomplete_analysis(&info.reason)
+                                    .into_owned(),
+                            ),
                             info.explanation.clone(),
                             Some(source_str.to_string()),
                             info.matched_span.as_ref().map(|s| (s.start, s.end)),
@@ -5579,7 +5620,7 @@ fn test_command(
                 rule_id: None,
                 pack_id: None,
                 pattern_name: None,
-                reason: Some(INDETERMINATE_REASON.to_string()),
+                reason: Some(indeterminate_reason(&result).into_owned()),
                 explanation: Some(
                     "Execution is blocked because DCG could not complete safety analysis."
                         .to_string(),
@@ -5668,7 +5709,10 @@ fn test_command(
                 if let Some(ref pattern_name) = info.pattern_name {
                     println!("Pattern: {pattern_name}");
                 }
-                println!("Reason: {}", info.reason);
+                println!(
+                    "Reason: {}",
+                    result.reason_with_incomplete_analysis(&info.reason)
+                );
                 if let Some(ref explanation) = info.explanation {
                     print_markdown_field("Explanation", explanation, "", use_color);
                 }
@@ -5706,7 +5750,7 @@ fn test_command(
                             // Security-aware prompt with verification code
                             if let Some(scope) = prompt_secure_bypass(
                                 command,
-                                &info.reason,
+                                &result.reason_with_incomplete_analysis(&info.reason),
                                 rule_id.as_deref(),
                                 &effective_config.interactive,
                             ) {
@@ -5906,7 +5950,7 @@ fn test_command(
         }
         EvaluationDecision::Indeterminate => {
             println!("Result: INDETERMINATE (BLOCKED)");
-            println!("Reason: {INDETERMINATE_REASON}");
+            println!("Reason: {}", indeterminate_reason(&result));
         }
     }
 
@@ -6056,10 +6100,11 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
                         .and_then(|p| info.pattern_name.as_ref().map(|n| format!("{p}:{n}")))
                         .unwrap_or_else(|| "unknown".to_string());
                     let severity_str = info.severity.map_or("high", |s| s.label()).to_string();
-                    let explanation = info
-                        .explanation
-                        .clone()
-                        .unwrap_or_else(|| info.reason.clone());
+                    let explanation = result
+                        .reason_with_incomplete_analysis(
+                            info.explanation.as_deref().unwrap_or(&info.reason),
+                        )
+                        .into_owned();
                     vec![ClassifyReason {
                         rule_id,
                         severity: severity_str,
@@ -6164,7 +6209,7 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
             vec![ClassifyReason {
                 rule_id: "dcg:analysis-budget".to_string(),
                 severity: "unknown".to_string(),
-                explanation: INDETERMINATE_REASON.to_string(),
+                explanation: indeterminate_reason(&result).into_owned(),
             }],
             vec![],
         ),
@@ -6977,10 +7022,17 @@ fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     }
     println!();
 
+    println!("Regex evaluation:");
+    println!(
+        "  Backtracking limit (steps per operation): {}",
+        crate::packs::regex_engine::BACKTRACK_LIMIT
+    );
+    println!();
+
     let heredoc = config.heredoc_settings();
     println!("Heredoc scanning:");
     println!("  Enabled: {}", heredoc.enabled);
-    println!("  Timeout (ms): {}", heredoc.limits.timeout_ms);
+    println!("  Extraction timeout (ms): {}", heredoc.limits.timeout_ms);
     println!("  Max body bytes: {}", heredoc.limits.max_body_bytes);
     println!("  Max body lines: {}", heredoc.limits.max_body_lines);
     println!("  Max heredocs: {}", heredoc.limits.max_heredocs);
@@ -7121,6 +7173,9 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
             "configured_but_not_loaded": unloaded_packs,
             "external_without_keywords": keywordless_packs,
             "load_warnings": pack_load_warnings,
+        },
+        "regex": {
+            "backtrack_limit_steps": crate::packs::regex_engine::BACKTRACK_LIMIT,
         },
         "heredoc": {
             "enabled": heredoc.enabled,
@@ -30123,6 +30178,121 @@ command = "dcg"
                 "private envelope unexpectedly contains {omitted}"
             );
         }
+    }
+
+    #[test]
+    fn incomplete_regex_reasons_keep_provenance_without_claiming_a_rule_match() {
+        use crate::perf::{DiagnosticId, RegexFailure, RegexFailureCause, RegexOperation};
+
+        let mut result = EvaluationResult::allowed();
+        result.decision = EvaluationDecision::Indeterminate;
+        result.regex_evaluation_incomplete = true;
+        result.regex_failure = Some(RegexFailure {
+            pack_id: Some(DiagnosticId::new("custom.regression")),
+            pattern_id: Some(DiagnosticId::new("slow-lookahead")),
+            operation: RegexOperation::FindFrom,
+            cause: RegexFailureCause::BacktrackLimit { steps: 123 },
+        });
+        let reason = indeterminate_reason(&result).into_owned();
+        assert!(reason.contains("custom.regression:slow-lookahead"));
+        assert!(reason.contains("backtracking limit of 123 steps"));
+        assert!(reason.contains("operation: find_from"));
+        assert!(!reason.contains("hook_timeout_ms"));
+
+        let bridge = omp_bridge_test_output(&result, None);
+        assert_eq!(bridge.decision, "indeterminate");
+        assert_eq!(bridge.reason.as_deref(), Some(reason.as_str()));
+        assert!(bridge.rule_id.is_none(), "a failed rule did not match");
+        let wire = serde_json::to_value(&bridge).expect("private incomplete envelope");
+        assert!(wire.get("rule_id").is_none());
+        assert!(wire.get("pack_id").is_none());
+
+        let batch = resolve_batch_entry(&Config::default(), "SOURCE_CANARY", result.clone());
+        assert_eq!(batch.decision, "indeterminate");
+        assert_eq!(batch.error.as_deref(), Some(reason.as_str()));
+        assert!(batch.rule_id.is_none());
+        assert!(batch.pack_id.is_none());
+        assert!(!batch.error.unwrap().contains("SOURCE_CANARY"));
+
+        // A real deadline stays the primary reason, while the earlier known
+        // regex failure remains useful additional context.
+        result.skipped_due_to_budget = true;
+        let deadline_reason = indeterminate_reason(&result).into_owned();
+        assert!(deadline_reason.starts_with(INDETERMINATE_REASON));
+        assert!(deadline_reason.contains("Safety analysis also incomplete:"));
+        assert!(deadline_reason.contains("custom.regression:slow-lookahead"));
+        assert!(deadline_reason.contains("123 steps (operation: find_from)"));
+        let bridge = omp_bridge_test_output(&result, None);
+        assert_eq!(bridge.reason.as_deref(), Some(deadline_reason.as_str()));
+        assert!(bridge.rule_id.is_none());
+        let batch = resolve_batch_entry(&Config::default(), "SOURCE_CANARY", result);
+        assert_eq!(batch.decision, "indeterminate");
+        assert_eq!(batch.error.as_deref(), Some(deadline_reason.as_str()));
+        assert!(batch.rule_id.is_none());
+        assert!(batch.pack_id.is_none());
+
+        let allowed = EvaluationResult::allowed();
+        let bridge = omp_bridge_test_output(&allowed, None);
+        assert_eq!(bridge.decision, "allow");
+        assert!(bridge.reason.is_none());
+        assert!(bridge.rule_id.is_none());
+    }
+
+    #[test]
+    fn positive_findings_retain_incomplete_regex_provenance_issue_643() {
+        use crate::perf::{DiagnosticId, RegexFailure, RegexFailureCause, RegexOperation};
+
+        let mut result = EvaluationResult::allowed();
+        result.decision = EvaluationDecision::Deny;
+        result.pattern_info = Some(crate::evaluator::PatternMatch {
+            pack_id: Some("external.proven".to_string()),
+            pattern_name: Some("danger".to_string()),
+            severity: Some(PackSeverity::High),
+            reason: "A destructive operation matched".to_string(),
+            source: MatchSource::Pack,
+            matched_span: None,
+            matched_text_preview: None,
+            explanation: None,
+            suggestions: &[],
+        });
+        result.regex_evaluation_incomplete = true;
+        result.regex_failure = Some(RegexFailure {
+            pack_id: Some(DiagnosticId::new("custom.regression")),
+            pattern_id: Some(DiagnosticId::new("slow-lookahead")),
+            operation: RegexOperation::FindFrom,
+            cause: RegexFailureCause::BacktrackLimit { steps: 123 },
+        });
+
+        let bridge = omp_bridge_test_output(&result, Some(DecisionMode::Deny));
+        assert_eq!(bridge.decision, "deny");
+        assert_eq!(bridge.rule_id.as_deref(), Some("external.proven:danger"));
+        let reason = bridge.reason.as_deref().unwrap();
+        assert!(reason.starts_with("A destructive operation matched"));
+        assert!(reason.contains("Safety analysis also incomplete:"));
+        assert!(reason.contains("custom.regression:slow-lookahead"));
+        assert!(reason.contains("123 steps (operation: find_from)"));
+
+        let batch = resolve_batch_entry(&Config::default(), "SOURCE_CANARY", result.clone());
+        assert_eq!(batch.decision, "deny");
+        assert_eq!(batch.rule_id.as_deref(), Some("external.proven:danger"));
+        assert_eq!(batch.pack_id.as_deref(), Some("external.proven"));
+        let note = batch.error.unwrap();
+        assert!(note.contains("custom.regression:slow-lookahead"));
+        assert!(note.contains("123 steps (operation: find_from)"));
+        assert!(!note.contains("SOURCE_CANARY"));
+
+        // External metadata can fill the bridge's field. Its ordinary reason
+        // may be truncated, but the bounded cause must survive intact.
+        result.pattern_info.as_mut().unwrap().reason = "雪".repeat(OMP_BRIDGE_REASON_MAX_BYTES);
+        let bridge = omp_bridge_test_output(&result, Some(DecisionMode::Deny));
+        let reason = bridge.reason.as_deref().unwrap();
+        assert!(reason.len() <= OMP_BRIDGE_REASON_MAX_BYTES);
+        assert!(reason.contains(OMP_BRIDGE_REASON_TRUNCATION_SUFFIX));
+        assert!(reason.contains("custom.regression:slow-lookahead"));
+        assert!(reason.ends_with("123 steps (operation: find_from)"));
+        assert_eq!(bridge.rule_id.as_deref(), Some("external.proven:danger"));
+        let encoded = serde_json::to_string(&bridge).expect("bounded combined reason");
+        assert!(encoded.len() < OMP_CHILD_STDOUT_MAX_BYTES);
     }
 
     #[test]

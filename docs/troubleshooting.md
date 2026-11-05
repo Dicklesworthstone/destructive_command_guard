@@ -42,13 +42,40 @@ Also verify environment overrides:
 
 ## Hook errors or timeouts
 
+First identify the budget or analysis step named in the diagnostic:
+
+- **Regex backtracking limit:** the reason names the responsible pack and
+  pattern, when known, and the operation such as `find_from`. The default is
+  100,000 backtracking steps per regex operation. Review that rule using
+  [Diagnosing incomplete rule evaluation](custom-packs.md#diagnosing-incomplete-rule-evaluation);
+  a larger hook deadline does not change this work limit.
+- **`interpreter_literal_recovery`:** a separate bounded analysis of literals
+  inside interpreter source did not finish. Possible causes include syntax or
+  structural limits, its own time budget, or an unavailable worker. This stage
+  does not identify a custom regex failure or establish hook-deadline
+  exhaustion. [Issue #643](https://github.com/Dicklesworthstone/destructive_command_guard/issues/643)
+  did not include the exact short Python inputs; the reported shape alone is
+  insufficient to identify or reproduce their specific failure. A minimal
+  sanitized example should preserve the interpreter options, quoting, escapes,
+  and heredoc delimiter.
+- **Hook deadline:** the reason reports that safety evaluation could not
+  complete within the configured hook time. The wall/CPU timing and phase help
+  distinguish expensive evaluation from a host that did not schedule dcg.
+
+`dcg config` separates `Regex evaluation` from `Heredoc scanning`. In
+particular, the default 50 ms extraction timeout belongs to heredoc extraction,
+not to regex matching. JSON exposes `regex.backtrack_limit_steps`,
+`heredoc.timeout_ms`, and `general.hook_timeout_ms` separately. Incomplete
+analysis retains the configured ask/deny behavior; it never proves a command
+safe.
+
 For heredoc or large script parsing:
 - Lower `max_body_bytes` or `max_body_lines`.
 - Increase `[heredoc].timeout_ms` if heredoc extraction itself is timing out.
 - Ensure `fallback_on_parse_error` is true for hook mode.
 
-For ordinary full evaluation on a slower workstation or modest VPS, tune the
-separate absolute hook budget. For example:
+When the diagnostic establishes genuine hook-deadline exhaustion on a slower
+workstation or modest VPS, tune the separate absolute hook budget. For example:
 
 ```toml
 [general]

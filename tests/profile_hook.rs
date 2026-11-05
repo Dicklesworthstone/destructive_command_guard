@@ -271,3 +271,36 @@ fn executable_heredoc_profiles_worker_analysis_and_history_without_command_text(
     );
     assert!(!report.to_string().contains("PROFILE_COMMAND_CANARY"));
 }
+
+/// #643's exact short Python failures were not supplied. An intentionally
+/// malformed program is a deterministic control for this independent recovery
+/// failure path, without depending on a scheduling timeout or changing policy.
+#[test]
+fn interpreter_literal_failure_is_unverified_without_blame_or_source_disclosure() {
+    let source = "python3 -I - <<'PY'\nimport re\npattern = r'\\d+'\n\
+                  secret = 'INTERPRETER_SOURCE_CANARY'\nif (\nPY";
+    for decision in ["ask", "deny"] {
+        let output = run_hook_with_env(
+            &payload(source),
+            Some("1"),
+            false,
+            false,
+            &[
+                ("DCG_UNVERIFIED_DECISION", decision),
+                ("DCG_AST_TIMEOUT_MS", "5000"),
+            ],
+        );
+        assert!(output.status.success(), "Claude JSON verdict exits zero");
+        let wire: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("unverified hook verdict");
+        let result = &wire["hookSpecificOutput"];
+        assert_eq!(result["permissionDecision"], decision);
+        let reason = result["permissionDecisionReason"].as_str().unwrap();
+        assert!(reason.contains("interpreter_literal_recovery"), "{reason}");
+        assert!(!reason.contains("increase hook_timeout_ms"), "{reason}");
+        assert!(!reason.contains("within 5000ms"), "{reason}");
+        assert!(!reason.contains("INTERPRETER_SOURCE_CANARY"), "{reason}");
+        let report = profile(&output);
+        assert!(!report.to_string().contains("INTERPRETER_SOURCE_CANARY"));
+    }
+}

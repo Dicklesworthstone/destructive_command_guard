@@ -89,9 +89,11 @@ impl TestResultBox {
                     pattern_id: pattern_info.and_then(|p| p.pattern_name.clone()),
                     pack_id: pattern_info.and_then(|p| p.pack_id.clone()),
                     severity: pattern_info.and_then(|p| p.severity),
-                    reason: pattern_info
-                        .map(|p| p.reason.clone())
-                        .unwrap_or_else(|| "Pattern matched".to_string()),
+                    reason: eval
+                        .reason_with_incomplete_analysis(
+                            pattern_info.map_or("Pattern matched", |p| p.reason.as_str()),
+                        )
+                        .into_owned(),
                     explanation: pattern_info.and_then(|p| p.explanation.clone()),
                     confidence: pattern_info.and_then(confidence_from_severity),
                 }
@@ -112,7 +114,14 @@ impl TestResultBox {
             }
             EvaluationDecision::Indeterminate => TestOutcome::Indeterminate {
                 reason: if eval.skipped_due_to_budget {
-                    "Evaluation budget exhausted before a safety decision".to_string()
+                    eval.reason_with_incomplete_analysis(
+                        "Evaluation budget exhausted before a safety decision",
+                    )
+                    .into_owned()
+                } else if let Some(failure) = eval.regex_failure {
+                    format!(
+                        "Safety evaluation did not complete: {failure}; command was not verified"
+                    )
                 } else {
                     "Safety evaluation could not reach a decision".to_string()
                 },
@@ -1045,6 +1054,7 @@ mod tests {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             regex_evaluation_incomplete: false,
+            regex_failure: None,
             quick_rejected: false,
             branch_context: None,
             session_occurrence: None,

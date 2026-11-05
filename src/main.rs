@@ -270,9 +270,9 @@ fn format_oversized_command_reason(command_len: usize, max_command_bytes: usize)
     )
 }
 
-/// What a deadline miss reports beyond its stage (#571): the phase the budget
-/// ran out in, the bounded analysis that stopped short (if one did before the
-/// deadline), the wall time spent, and the CPU time the process actually got.
+/// What incomplete evaluation reports beyond its stage (#571, #643): the
+/// exhausted budget and bounded rule provenance, the wall time spent, and the
+/// CPU time the process actually got.
 /// Wall time close to the budget with little CPU means the host did not
 /// schedule dcg; CPU close to the wall time means the input was slow.
 #[derive(Debug, Clone, Copy)]
@@ -290,6 +290,24 @@ impl IndeterminateDetail {
             cpu: perf::process_cpu_time(),
         }
     }
+}
+
+/// Use the selected evaluation's provenance, not a prior diagnostic or policy
+/// probe on this thread. Keep deadline evidence independently of regex failure.
+fn take_evaluation_exhaustion(failure: Option<perf::RegexFailure>) -> perf::BudgetExhaustion {
+    let mut exhaustion = perf::take_budget_exhaustion();
+    if let Some(failure) = failure {
+        let phase = match failure.operation {
+            perf::RegexOperation::Compile => ProfilePhase::RegexCompile,
+            _ => ProfilePhase::RegexMatch,
+        };
+        exhaustion.incomplete = Some((failure.operation.as_str(), Some(phase)));
+    } else if exhaustion.regex_failure.is_some() {
+        // An unrelated regex note cannot identify this result's failed step.
+        exhaustion.incomplete = None;
+    }
+    exhaustion.regex_failure = failure;
+    exhaustion
 }
 
 fn format_indeterminate_reason(
@@ -323,11 +341,28 @@ fn format_indeterminate_reason(
     // wording-jcpy). Some steps' clocks do grow with the remaining hook
     // budget (dynamic-source analysis) or follow `[heredoc] timeout_ms`, so
     // the message names no setting rather than one that may not help.
-    if incomplete.is_some() {
+    if (detail.elapsed < budget || exhaustion.deadline.is_none())
+        && let Some(failure) = exhaustion.regex_failure
+    {
+        return format!(
+            "DCG could not finish analyzing this command ({context}): {failure}; \
+             the command was not verified. Review the affected rule and review the \
+             command manually."
+        );
+    }
+    if incomplete.is_some() || (detail.elapsed < budget && exhaustion.deadline.is_none()) {
         return format!(
             "DCG could not finish analyzing this command ({context}): an analysis step \
              stopped before reaching a verdict, so the command was not verified. \
              Review manually."
+        );
+    }
+    if let Some(failure) = exhaustion.regex_failure {
+        return format!(
+            "DCG could not complete safety evaluation within {}ms ({context}); \
+             command was not verified. Regex analysis also stopped: {failure}. \
+             Review the affected rule and command manually.",
+            budget.as_millis()
         );
     }
     format!(
@@ -884,7 +919,7 @@ fn try_deny_unparseable_payload(
                 ResolvedCommandOutcome::DeadlineExhausted {
                     command: command.clone(),
                     stage: "oversized_payload_window_scan",
-                    exhaustion: perf::take_budget_exhaustion(),
+                    exhaustion: Box::new(perf::take_budget_exhaustion()),
                 },
                 &mut history_writer,
             );
@@ -1224,14 +1259,13 @@ enum ResolvedCommandOutcome {
     /// Command exceeds `max_command_bytes` and cannot be evaluated. Publishes
     /// the size-limit indeterminate message (no history row, as before).
     OversizedCommand { command_len: usize },
-    /// The shared wall-clock deadline was exhausted before or while
-    /// evaluating this entry. Publishes the conservative indeterminate
-    /// response — never a silent allow of unscanned entries.
+    /// Evaluation stopped at the shared wall-clock deadline or an incomplete
+    /// bounded analysis. Publishes the conservative indeterminate response.
     DeadlineExhausted {
         command: String,
         stage: &'static str,
         /// Where the budget ran out, taken right after the evaluation (#571).
-        exhaustion: perf::BudgetExhaustion,
+        exhaustion: Box<perf::BudgetExhaustion>,
     },
     /// Deny / Ask / Warn candidate awaiting decisive selection.
     DenyFamily(Box<ResolvedDenyFamily>),
@@ -1344,8 +1378,8 @@ enum RecoveryAttempt {
     /// The signal is active, but re-evaluating the rest of the line found
     /// another verdict that stands on its own. Nothing was consumed.
     Residual(Box<destructive_command_guard::evaluator::EvaluationResult>),
-    /// The deadline ran out during re-evaluation.
-    Indeterminate,
+    /// Re-evaluation could not complete, retaining its own diagnostic record.
+    Indeterminate(Box<perf::BudgetExhaustion>),
 }
 
 /// Decide whether the rebase-recovery window applies to a denied command.
@@ -1402,8 +1436,10 @@ fn attempt_rebase_recovery(
         return RecoveryAttempt::NotApplicable;
     };
 
+    // This independent evaluation must not inherit a confidence probe's notes.
+    let _ = perf::take_budget_exhaustion();
     if ctx.deadline.is_exceeded() {
-        return RecoveryAttempt::Indeterminate;
+        return RecoveryAttempt::Indeterminate(Box::new(take_evaluation_exhaustion(None)));
     }
     let relaxed = rebase_recovery::relaxed_allowlist(ctx.allowlists);
     let residual = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
@@ -1446,7 +1482,9 @@ fn attempt_rebase_recovery(
         },
     );
     if residual.decision == EvaluationDecision::Indeterminate || residual.skipped_due_to_budget {
-        return RecoveryAttempt::Indeterminate;
+        return RecoveryAttempt::Indeterminate(Box::new(take_evaluation_exhaustion(
+            residual.regex_failure,
+        )));
     }
     if residual.decision == EvaluationDecision::Deny {
         // A residual finding whose policy mode lets the line run (warn/log)
@@ -1507,7 +1545,7 @@ fn resolve_hook_command(
         return ResolvedCommandOutcome::DeadlineExhausted {
             command: command.to_string(),
             stage: "pre_evaluation",
-            exhaustion: perf::take_budget_exhaustion(),
+            exhaustion: Box::new(perf::take_budget_exhaustion()),
         };
     }
 
@@ -1580,7 +1618,7 @@ fn resolve_hook_command(
         return ResolvedCommandOutcome::DeadlineExhausted {
             command: command.to_string(),
             stage: "evaluation",
-            exhaustion: perf::take_budget_exhaustion(),
+            exhaustion: Box::new(take_evaluation_exhaustion(result.regex_failure)),
         };
     }
 
@@ -1678,11 +1716,11 @@ fn resolve_hook_command(
                 }
                 return ResolvedCommandOutcome::Allow(None);
             }
-            RecoveryAttempt::Indeterminate => {
+            RecoveryAttempt::Indeterminate(exhaustion) => {
                 return ResolvedCommandOutcome::DeadlineExhausted {
                     command: command.to_string(),
                     stage: "rebase_recovery_reevaluation",
-                    exhaustion: perf::take_budget_exhaustion(),
+                    exhaustion,
                 };
             }
             RecoveryAttempt::Residual(residual) => {
@@ -1795,7 +1833,7 @@ fn publish_decisive_response(
                 &command,
                 ctx.working_dir,
                 stage,
-                exhaustion,
+                *exhaustion,
                 ctx.deadline,
                 ctx.config.unverified_denies(),
             );
@@ -1818,6 +1856,7 @@ fn publish_decisive_response(
     let pack = info.pack_id.as_deref();
     let pattern = info.pattern_name.as_deref();
     let explanation = info.explanation.as_deref();
+    let diagnostic_reason = result.reason_with_incomplete_analysis(&info.reason);
 
     if let Some(writer) = history_writer.as_ref() {
         let outcome = match mode {
@@ -1842,9 +1881,9 @@ fn publish_decisive_response(
         DecisionMode::Deny | DecisionMode::Ask => {
             let reason = match (pack, pattern) {
                 (Some(pack_id), Some(pattern_name)) => {
-                    format!("{pack_id}:{pattern_name} - {}", info.reason)
+                    format!("{pack_id}:{pattern_name} - {diagnostic_reason}")
                 }
-                _ => info.reason.clone(),
+                _ => diagnostic_reason.to_string(),
             };
 
             // Allow-once code issuance is best-effort and must never delay the
@@ -1935,7 +1974,7 @@ fn publish_decisive_response(
                 hook::output_review_request_for_protocol(
                     ctx.hook_protocol,
                     &command,
-                    &info.reason,
+                    &diagnostic_reason,
                     pack,
                     pattern,
                     explanation,
@@ -1950,7 +1989,7 @@ fn publish_decisive_response(
                 hook::output_denial_for_protocol(
                     ctx.hook_protocol,
                     &command,
-                    &info.reason,
+                    &diagnostic_reason,
                     pack,
                     pattern,
                     explanation,
@@ -1968,7 +2007,7 @@ fn publish_decisive_response(
                 let _ = hook::log_blocked_command(
                     log_file,
                     &command,
-                    &info.reason,
+                    &diagnostic_reason,
                     pack,
                     &ctx.config.logging.redaction,
                 );
@@ -1986,7 +2025,7 @@ fn publish_decisive_response(
             let _ = hook::output_warning_for_protocol(
                 ctx.hook_protocol,
                 &command,
-                &info.reason,
+                &diagnostic_reason,
                 pack,
                 pattern,
                 explanation,
@@ -3187,6 +3226,7 @@ mod tests {
             exhaustion: perf::BudgetExhaustion {
                 deadline: Some(Some(ProfilePhase::RegexCompile)),
                 incomplete: None,
+                regex_failure: None,
             },
             elapsed: Duration::from_millis(1_152),
             cpu: Some(Duration::from_millis(91)),
@@ -3205,6 +3245,7 @@ mod tests {
             exhaustion: perf::BudgetExhaustion {
                 deadline: None,
                 incomplete: Some(("interpreter_literal_recovery", Some(ProfilePhase::AstMatch))),
+                regex_failure: None,
             },
             elapsed: Duration::from_millis(425),
             cpu: Some(Duration::from_millis(410)),
@@ -3235,6 +3276,7 @@ mod tests {
             exhaustion: perf::BudgetExhaustion {
                 deadline: None,
                 incomplete: Some(("unterminated_interpreter_stdin", None)),
+                regex_failure: None,
             },
             elapsed: Duration::from_millis(69),
             cpu: Some(Duration::from_millis(75)),
@@ -3253,6 +3295,7 @@ mod tests {
             exhaustion: perf::BudgetExhaustion {
                 deadline: Some(Some(ProfilePhase::PatternRules)),
                 incomplete: Some(("interpreter_literal_recovery", Some(ProfilePhase::AstMatch))),
+                regex_failure: None,
             },
             elapsed: Duration::from_millis(1_003),
             cpu: None,
@@ -3266,6 +3309,112 @@ mod tests {
             reason.contains("within 1000ms") && reason.contains("increase hook_timeout_ms"),
             "a real deadline keeps the deadline wording: {reason}"
         );
+    }
+
+    #[test]
+    fn regex_failure_reason_names_the_actual_work_limit_issue_643() {
+        let detail = IndeterminateDetail {
+            exhaustion: perf::BudgetExhaustion {
+                incomplete: Some(("find_from", Some(ProfilePhase::RegexMatch))),
+                regex_failure: Some(perf::RegexFailure {
+                    pack_id: Some(perf::DiagnosticId::new("test.slow_lookahead")),
+                    pattern_id: Some(perf::DiagnosticId::new("slow")),
+                    operation: perf::RegexOperation::FindFrom,
+                    cause: perf::RegexFailureCause::BacktrackLimit { steps: 100_000 },
+                }),
+                ..perf::BudgetExhaustion::default()
+            },
+            elapsed: Duration::from_millis(304),
+            cpu: Some(Duration::from_millis(260)),
+        };
+        let budget = Duration::from_millis(5_900);
+        let reason = format_indeterminate_reason("evaluation", budget, &detail);
+        assert!(
+            reason.contains("pattern test.slow_lookahead:slow"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("backtracking limit of 100000 steps"),
+            "{reason}"
+        );
+        assert!(reason.contains("operation: find_from"), "{reason}");
+        assert!(reason.contains("command was not verified"), "{reason}");
+        assert!(!reason.contains("within 5900ms"), "{reason}");
+        assert!(!reason.contains("hook_timeout_ms"), "{reason}");
+        assert!(
+            !reason.contains("50ms") && !reason.contains("50 ms"),
+            "{reason}"
+        );
+
+        // A later real deadline remains a separate, authoritative cause,
+        // without hiding the rule and work limit that also failed.
+        let mut deadline_detail = detail;
+        deadline_detail.elapsed = budget + Duration::from_millis(1);
+        deadline_detail.exhaustion.deadline = Some(Some(ProfilePhase::PatternRules));
+        let reason = format_indeterminate_reason("evaluation", budget, &deadline_detail);
+        assert!(reason.contains("within 5900ms"), "{reason}");
+        assert!(reason.contains("phase: pattern_rules"), "{reason}");
+        assert!(reason.contains("test.slow_lookahead:slow"), "{reason}");
+        assert!(
+            reason.contains("backtracking limit of 100000 steps"),
+            "{reason}"
+        );
+        assert!(reason.contains("operation: find_from"), "{reason}");
+        assert!(!reason.contains("increase hook_timeout_ms"), "{reason}");
+    }
+
+    #[test]
+    fn selected_evaluation_does_not_inherit_an_independent_regex_note_issue_643() {
+        let _ = perf::take_budget_exhaustion();
+        let prior = perf::RegexFailure {
+            pack_id: Some(perf::DiagnosticId::new("test.prior")),
+            pattern_id: Some(perf::DiagnosticId::new("prior-rule")),
+            operation: perf::RegexOperation::Compile,
+            cause: perf::RegexFailureCause::CompileError,
+        };
+        perf::note_regex_failure(prior);
+        perf::note_deadline_exhausted();
+        let deadline = take_evaluation_exhaustion(None);
+        assert!(deadline.deadline.is_some());
+        assert!(deadline.regex_failure.is_none());
+        assert!(deadline.incomplete.is_none());
+
+        perf::note_regex_failure(prior);
+        let selected = perf::RegexFailure {
+            pack_id: Some(perf::DiagnosticId::new("test.selected")),
+            pattern_id: Some(perf::DiagnosticId::new("selected-rule")),
+            operation: perf::RegexOperation::FindFrom,
+            cause: perf::RegexFailureCause::BacktrackLimit { steps: 100_000 },
+        };
+        let exhaustion = take_evaluation_exhaustion(Some(selected));
+        assert_eq!(exhaustion.regex_failure, Some(selected));
+        assert_eq!(
+            exhaustion.incomplete,
+            Some(("find_from", Some(ProfilePhase::RegexMatch)))
+        );
+        assert!(exhaustion.deadline.is_none());
+
+        perf::note_incomplete_analysis("interpreter_literal_recovery");
+        let generic = take_evaluation_exhaustion(None);
+        assert_eq!(
+            generic.incomplete.unwrap().0,
+            "interpreter_literal_recovery"
+        );
+        assert!(generic.regex_failure.is_none());
+    }
+
+    #[test]
+    fn unexplained_incomplete_analysis_does_not_invent_a_deadline_issue_643() {
+        let detail = IndeterminateDetail {
+            exhaustion: perf::BudgetExhaustion::default(),
+            elapsed: Duration::from_millis(20),
+            cpu: None,
+        };
+        let reason = format_indeterminate_reason("evaluation", Duration::from_secs(1), &detail);
+        assert!(reason.contains("an analysis step stopped"), "{reason}");
+        assert!(!reason.contains("within 1000ms"), "{reason}");
+        assert!(!reason.contains("hook_timeout_ms"), "{reason}");
+        assert!(!reason.contains("pattern "), "{reason}");
     }
 
     #[test]
@@ -3286,7 +3435,7 @@ mod tests {
         let exhausted = ResolvedCommandOutcome::DeadlineExhausted {
             command: "echo hi".to_string(),
             stage: "evaluation",
-            exhaustion: perf::BudgetExhaustion::default(),
+            exhaustion: Box::default(),
         };
         assert_eq!(outcome_rank(&oversized), RANK_INDETERMINATE);
         assert_eq!(outcome_rank(&exhausted), RANK_INDETERMINATE);

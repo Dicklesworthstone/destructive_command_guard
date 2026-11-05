@@ -374,6 +374,39 @@ dcg uses a dual regex engine:
 
 Simple patterns are faster. The validator reports which engine each pattern uses.
 
+### Diagnosing Incomplete Rule Evaluation
+
+A regex that cannot finish leaves safety evaluation **unverified**. Its failure
+is not a destructive-pattern match. When available, the diagnostic identifies
+the pack, pattern name, exhausted limit, and operation, for example:
+
+```text
+pattern test.slow_lookahead:slow exceeded its per-pattern regex backtracking limit of 100000 steps (operation: find_from)
+```
+
+The backtracking engine has a **100,000-step limit per regex operation**. This
+is a work limit, not a millisecond timeout. `dcg config` reports it under
+`Regex evaluation`; JSON reports `regex.backtrack_limit_steps`. The default
+50 ms shown under `Heredoc scanning` is the **extraction timeout**, reported as
+`heredoc.timeout_ms` in JSON. Increasing `hook_timeout_ms` does not change the
+regex work limit.
+
+If the hook deadline also expires, the diagnostic reports that deadline while
+retaining the known regex rule and work limit. The two limits are independent.
+
+Inspect the named rule for repeated whole-input lookaheads and broad searches.
+An unanchored expression can retry an expensive lookahead at many start
+positions. If the rule is intended to inspect the whole input from its start,
+an absolute `\A` anchor can avoid those retries. Narrow search ranges or pack
+keywords only when every intended destructive match remains covered. Verify
+both the original destructive cases and benign controls through `dcg test
+--stdin --dialect posix --format json` and the hook after changing a rule.
+
+Rule identifiers in failure diagnostics are bounded and sanitized; submitted
+commands, regex source, and match offsets are not included. See
+[Hook errors or timeouts](troubleshooting.md#hook-errors-or-timeouts) for other
+incomplete-analysis stages.
+
 ### Pattern Specificity
 
 Write patterns that match **exactly** what you want to block:

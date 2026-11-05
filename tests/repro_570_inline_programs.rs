@@ -793,6 +793,60 @@ fn decoded_inline_documentation_and_argv_data_stay_allowed() {
     }
 }
 
+/// #643 describes short json/re programs but does not supply the failing
+/// commands. These are representative controls, not a reproduction of those
+/// missing inputs. Backslashes deliberately enter interpreter-literal
+/// recovery. Generous test budgets isolate its verdict from host scheduling.
+#[test]
+fn issue_643_representative_short_python_json_and_regex_programs() {
+    let body = r#"import json
+import re
+document = '{"name": "demo", "values": [1, 2, 3]}'
+record = json.loads(document)
+name = record["name"]
+values = record["values"]
+label = re.sub(r"\s+", " ", "  sample   text  ").strip()
+words = re.findall(r"\w+", label)
+digits = re.findall(r"\d+", "a12 b34")
+parts = [word.upper() for word in words]
+total = sum(values)
+count = len(values)
+report = {"name": name, "label": label}
+report["words"] = parts
+report["digits"] = digits
+report["total"] = total
+report["count"] = count
+encoded = json.dumps(report, sort_keys=True)
+pretty = json.dumps(json.loads(encoded), indent=2)
+print(pretty)
+"#;
+    for padding in [String::new(), "# ordinary documentation text\n".repeat(30)] {
+        let safe = format!("{body}{padding}");
+        assert!((300..=1_700).contains(&safe.len()));
+        // An indirect shell sink must still recover the literal and deny;
+        // a benign prefix is not a reason to skip the remaining program.
+        let dangerous =
+            format!("{safe}import os\npayload = 'echo $(git reset --hard)'\nos.system(payload)\n");
+        for (program, expected, rule) in [
+            (safe.as_str(), "allow", ""),
+            (dangerous.as_str(), "deny", "core.git:reset-hard"),
+        ] {
+            for source in [
+                format!("python3 -c {}", quote(program, 2)),
+                format!("cd /tmp && python3 -I - <<'EOF'\n{program}EOF"),
+            ] {
+                for (surface, actual, actual_rule) in surface_verdicts(&source) {
+                    assert_eq!(
+                        (actual.as_str(), actual_rule.as_str()),
+                        (expected, rule),
+                        "{surface}: {source}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The decoded word gets the same Node option-ownership proof as the exact
 /// one (#544): a later `-e` replaces the first program, and an option stop
 /// keeps it active.

@@ -208,6 +208,149 @@ thread_local! {
     static EXHAUSTION: Cell<BudgetExhaustion> = const { Cell::new(BudgetExhaustion::NONE) };
 }
 
+/// Maximum bytes retained from a rule identifier in an incomplete-analysis report.
+///
+/// Identifiers are metadata, not submitted commands or regular expressions.
+/// Keeping them bounded also prevents an external pack from constructing an
+/// unbounded diagnostic while the evaluator is already short of resources.
+pub const DIAGNOSTIC_ID_MAX_BYTES: usize = 96;
+
+/// A bounded, single-line rule identifier safe for text and terminal diagnostics.
+///
+/// Only ASCII letters, digits, dots, underscores and hyphens are retained.
+/// Other bytes become underscores, and a truncated identifier ends in `...`.
+/// The source text is never stored alongside this diagnostic representation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DiagnosticId {
+    bytes: [u8; DIAGNOSTIC_ID_MAX_BYTES],
+    len: u8,
+}
+
+impl DiagnosticId {
+    /// Retain a bounded, printable representation of an identifier.
+    #[must_use]
+    pub fn new(identifier: &str) -> Self {
+        let mut bytes = [0; DIAGNOSTIC_ID_MAX_BYTES];
+        let len = identifier.len().min(DIAGNOSTIC_ID_MAX_BYTES);
+        for (to, from) in bytes.iter_mut().zip(identifier.bytes()).take(len) {
+            *to = if from.is_ascii_alphanumeric() || matches!(from, b'.' | b'_' | b'-') {
+                from
+            } else {
+                b'_'
+            };
+        }
+        if identifier.len() > DIAGNOSTIC_ID_MAX_BYTES {
+            bytes[DIAGNOSTIC_ID_MAX_BYTES - 3..].copy_from_slice(b"...");
+        }
+        Self {
+            bytes,
+            // The fixed bound is below u8::MAX.
+            len: u8::try_from(len).expect("diagnostic identifier bound fits u8"),
+        }
+    }
+
+    /// The sanitized identifier, at most [`DIAGNOSTIC_ID_MAX_BYTES`] bytes.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // Construction only writes ASCII, and the fields are private.
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)])
+            .expect("diagnostic identifiers contain only ASCII")
+    }
+}
+
+impl std::fmt::Display for DiagnosticId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Debug for DiagnosticId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DiagnosticId").field(&self.as_str()).finish()
+    }
+}
+
+/// The regex operation which could not complete, without any input or pattern text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegexOperation {
+    /// Lazy compilation of a rule.
+    Compile,
+    /// Boolean match evaluation.
+    Match,
+    /// Search for the first match.
+    Find,
+    /// Search beginning at an offset while retaining whole-input context.
+    FindFrom,
+    /// Replace one or more matches.
+    Replace,
+}
+
+impl RegexOperation {
+    /// Stable operation label used by incomplete-analysis diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compile => "compile",
+            Self::Match => "match",
+            Self::Find => "find",
+            Self::FindFrom => "find_from",
+            Self::Replace => "replace",
+        }
+    }
+}
+
+/// Why regex evaluation failed. A work limit is distinct from a wall-clock budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegexFailureCause {
+    /// The compiled engine's actual per-pattern backtracking work limit.
+    BacktrackLimit {
+        /// Maximum backtracking steps configured when this regex was compiled.
+        steps: usize,
+    },
+    /// A rule could not be compiled. No raw error or pattern text is retained.
+    CompileError,
+    /// Another engine error, for which no exhausted budget is known.
+    RuntimeError,
+}
+
+/// The first regex failure responsible for an incomplete evaluation (#643).
+///
+/// This value deliberately cannot contain command contents, raw patterns,
+/// engine error strings, paths, match offsets, or execution context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegexFailure {
+    /// Rule's pack, when the failing regex belongs to a known pack.
+    pub pack_id: Option<DiagnosticId>,
+    /// Rule identifier, when one is available.
+    pub pattern_id: Option<DiagnosticId>,
+    /// The operation which failed.
+    pub operation: RegexOperation,
+    /// The typed cause, including a known work limit.
+    pub cause: RegexFailureCause,
+}
+
+impl std::fmt::Display for RegexFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (&self.pack_id, &self.pattern_id) {
+            (Some(pack), Some(pattern)) => write!(f, "pattern {pack}:{pattern}"),
+            (Some(pack), None) => write!(f, "unnamed pattern in pack {pack}"),
+            (None, Some(pattern)) => write!(f, "pattern {pattern}"),
+            (None, None) => f.write_str("regex evaluation"),
+        }?;
+        match self.cause {
+            RegexFailureCause::BacktrackLimit { steps } => write!(
+                f,
+                " exceeded its per-pattern regex backtracking limit of {steps} steps"
+            ),
+            RegexFailureCause::CompileError => f.write_str(" could not compile"),
+            RegexFailureCause::RuntimeError => {
+                f.write_str(" stopped because of a regex engine error")
+            }
+        }?;
+        write!(f, " (operation: {})", self.operation.as_str())
+    }
+}
+
 /// Where this thread's evaluation ran out of budget, for the indeterminate
 /// reason (#571). Each field keeps its first observation since the last
 /// [`take_budget_exhaustion`].
@@ -220,12 +363,16 @@ pub struct BudgetExhaustion {
     /// The first bounded analysis that could not complete (a regex search
     /// limit or an optional proof's own budget), and the phase it ran in.
     pub incomplete: Option<(&'static str, Option<ProfilePhase>)>,
+    /// Provenance when the first incomplete step was a regex operation.
+    /// A later regex failure never takes credit for an earlier non-regex step.
+    pub regex_failure: Option<RegexFailure>,
 }
 
 impl BudgetExhaustion {
     const NONE: Self = Self {
         deadline: None,
         incomplete: None,
+        regex_failure: None,
     };
 }
 
@@ -246,6 +393,18 @@ pub fn note_incomplete_analysis(stage: &'static str) {
         let mut note = cell.get();
         if note.incomplete.is_none() {
             note.incomplete = Some((stage, CURRENT_PHASE.with(Cell::get)));
+            cell.set(note);
+        }
+    });
+}
+
+/// Record a typed regex failure only when it is the first incomplete step.
+pub fn note_regex_failure(failure: RegexFailure) {
+    EXHAUSTION.with(|cell| {
+        let mut note = cell.get();
+        if note.incomplete.is_none() {
+            note.incomplete = Some((failure.operation.as_str(), CURRENT_PHASE.with(Cell::get)));
+            note.regex_failure = Some(failure);
             cell.set(note);
         }
     });
@@ -894,6 +1053,7 @@ mod tests {
                     "interpreter_literal_recovery",
                     Some(ProfilePhase::Evaluation)
                 )),
+                regex_failure: None,
             }
         );
         // Taking clears; an expiry outside every phase is still recorded.
@@ -904,6 +1064,7 @@ mod tests {
             BudgetExhaustion {
                 deadline: Some(None),
                 incomplete: None,
+                regex_failure: None,
             }
         );
         // A deadline that has not passed records nothing.
@@ -916,6 +1077,97 @@ mod tests {
         assert_eq!(take_budget_exhaustion(), BudgetExhaustion::default());
         assert_eq!(phase_name(ProfilePhase::RegexCompile), "regex_compile");
         assert_eq!(phase_name(ProfilePhase::HistoryFlush), "history_flush");
+    }
+
+    #[test]
+    fn regex_provenance_only_describes_the_first_incomplete_step_issue_643() {
+        let _ = take_budget_exhaustion();
+        let first = RegexFailure {
+            pack_id: Some(DiagnosticId::new("test.first")),
+            pattern_id: Some(DiagnosticId::new("slow")),
+            operation: RegexOperation::FindFrom,
+            cause: RegexFailureCause::BacktrackLimit { steps: 123 },
+        };
+        let second = RegexFailure {
+            pack_id: Some(DiagnosticId::new("test.second")),
+            operation: RegexOperation::Match,
+            ..first
+        };
+        {
+            let _phase = phase(ProfilePhase::RegexMatch);
+            note_regex_failure(first);
+        }
+        note_regex_failure(second);
+        note_incomplete_analysis("interpreter_literal_recovery");
+        let record = take_budget_exhaustion();
+        assert_eq!(record.regex_failure, Some(first));
+        assert_eq!(
+            record.incomplete,
+            Some(("find_from", Some(ProfilePhase::RegexMatch)))
+        );
+
+        note_incomplete_analysis("interpreter_literal_recovery");
+        note_regex_failure(first);
+        let record = take_budget_exhaustion();
+        assert_eq!(
+            record.incomplete,
+            Some(("interpreter_literal_recovery", None))
+        );
+        assert_eq!(record.regex_failure, None);
+        assert_eq!(take_budget_exhaustion(), BudgetExhaustion::default());
+    }
+
+    #[test]
+    fn regex_diagnostic_identifiers_are_bounded_and_terminal_safe_issue_643() {
+        let normal = DiagnosticId::new("test.slow_lookahead-1");
+        assert_eq!(normal.as_str(), "test.slow_lookahead-1");
+        let hostile = DiagnosticId::new("rule\n\r\t\u{1b}[31m/雪");
+        assert!(
+            hostile
+                .as_str()
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') })
+        );
+        assert!(!hostile.to_string().contains('\n'));
+        let long = DiagnosticId::new(&"x".repeat(10_000));
+        assert_eq!(long.as_str().len(), DIAGNOSTIC_ID_MAX_BYTES);
+        assert!(long.as_str().ends_with("..."));
+        let failure = RegexFailure {
+            pack_id: Some(long),
+            pattern_id: Some(hostile),
+            operation: RegexOperation::FindFrom,
+            cause: RegexFailureCause::BacktrackLimit { steps: 100 },
+        };
+        let text = failure.to_string();
+        assert!(text.len() < DIAGNOSTIC_ID_MAX_BYTES * 2 + 160);
+        assert!(text.contains("100 steps (operation: find_from)"));
+        assert!(!text.contains("ms"));
+        assert!(!text.contains("hook"));
+    }
+
+    #[test]
+    fn regex_failure_descriptions_do_not_invent_unknown_limits_or_rule_ids_issue_643() {
+        let anonymous = RegexFailure {
+            pack_id: None,
+            pattern_id: None,
+            operation: RegexOperation::Compile,
+            cause: RegexFailureCause::CompileError,
+        };
+        assert_eq!(
+            anonymous.to_string(),
+            "regex evaluation could not compile (operation: compile)"
+        );
+        let runtime = RegexFailure {
+            pack_id: Some(DiagnosticId::new("test.pack")),
+            operation: RegexOperation::Match,
+            cause: RegexFailureCause::RuntimeError,
+            ..anonymous
+        };
+        let text = runtime.to_string();
+        assert!(text.contains("unnamed pattern in pack test.pack"));
+        assert!(text.contains("regex engine error (operation: match)"));
+        assert!(!text.contains("limit"));
+        assert!(!text.contains("timeout"));
     }
 
     #[test]

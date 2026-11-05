@@ -8240,7 +8240,7 @@ mod tests {
             "tee sub/.git/config",
         ] {
             assert!(
-                candidate.matches_command(cmd),
+                candidate.matches_command(&pack.id, cmd),
                 "the candidate regex must still match {cmd}; if it does not, the \
                  #460 reasoning needs re-measuring rather than trusting"
             );

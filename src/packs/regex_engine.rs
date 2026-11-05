@@ -17,11 +17,30 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
+use crate::perf::{DiagnosticId, RegexFailure, RegexFailureCause, RegexOperation};
+
+#[derive(Default)]
+struct EvaluationFailureState {
+    failed: bool,
+    // None after a non-regex proof fails first. A later regex failure must
+    // not be attributed as the cause of that earlier incomplete analysis.
+    first_regex_failure: Option<RegexFailure>,
+}
+
+/// Metadata attached to a rule, never to an ambient evaluation context.
+/// Built-in and externally loaded packs use static IDs; direct Pack callers
+/// can own their pack ID without leaking memory or borrowing command text.
+#[derive(Debug)]
+struct RegexRuleIdentity {
+    pack_id: Cow<'static, str>,
+    pattern_id: Option<&'static str>,
+}
+
 thread_local! {
     // Only active evaluator calls retain failures. A completed request cannot
     // poison the next request, and unrelated worker/diagnostic threads cannot
     // change a command's result.
-    static EVALUATION_FAILURES: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    static EVALUATION_FAILURES: RefCell<Vec<EvaluationFailureState>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Tracks incomplete regex work across nested evaluation and dialect views.
@@ -35,14 +54,26 @@ pub(crate) struct RegexEvaluationScope {
 
 impl RegexEvaluationScope {
     pub(crate) fn enter() -> Self {
-        EVALUATION_FAILURES.with(|stack| stack.borrow_mut().push(false));
+        EVALUATION_FAILURES
+            .with(|stack| stack.borrow_mut().push(EvaluationFailureState::default()));
         Self {
             _thread_bound: PhantomData,
         }
     }
 
     pub(crate) fn has_failed(&self) -> bool {
-        EVALUATION_FAILURES.with(|stack| stack.borrow().last().copied().unwrap_or(false))
+        EVALUATION_FAILURES.with(|stack| stack.borrow().last().is_some_and(|state| state.failed))
+    }
+
+    /// The first failure, only if it was a regex operation. The returned
+    /// record belongs to this request and survives after the scope ends.
+    pub(crate) fn failure(&self) -> Option<RegexFailure> {
+        EVALUATION_FAILURES.with(|stack| {
+            stack
+                .borrow()
+                .last()
+                .and_then(|state| state.first_regex_failure)
+        })
     }
 }
 
@@ -50,9 +81,11 @@ impl Drop for RegexEvaluationScope {
     fn drop(&mut self) {
         EVALUATION_FAILURES.with(|stack| {
             let mut stack = stack.borrow_mut();
-            let failed = stack.pop().unwrap_or(false);
-            if let Some(parent) = stack.last_mut() {
-                *parent |= failed;
+            let child = stack.pop().unwrap_or_default();
+            if let Some(parent) = stack.last_mut()
+                && !parent.failed
+            {
+                *parent = child;
             }
         });
     }
@@ -70,8 +103,8 @@ pub(crate) fn record_incomplete_analysis(
     error: &impl std::fmt::Display,
 ) -> bool {
     let recorded = EVALUATION_FAILURES.with(|stack| {
-        stack.borrow_mut().last_mut().is_some_and(|failed| {
-            *failed = true;
+        stack.borrow_mut().last_mut().is_some_and(|state| {
+            state.failed = true;
             true
         })
     });
@@ -83,30 +116,64 @@ pub(crate) fn record_incomplete_analysis(
     recorded
 }
 
-fn record_evaluation_failure(stage: &'static str, pattern: &str, error: &impl std::fmt::Display) {
+fn record_evaluation_failure(
+    operation: RegexOperation,
+    cause: RegexFailureCause,
+    identity: Option<&RegexRuleIdentity>,
+) {
+    // Copy only bounded identifier metadata, and only on the failure path.
+    // Raw patterns and error strings can contain secrets even without input.
+    let failure = RegexFailure {
+        pack_id: identity.map(|id| DiagnosticId::new(&id.pack_id)),
+        pattern_id: identity.and_then(|id| id.pattern_id.map(DiagnosticId::new)),
+        operation,
+        cause,
+    };
     EVALUATION_FAILURES.with(|stack| {
-        if let Some(failed) = stack.borrow_mut().last_mut() {
-            *failed = true;
-            crate::perf::note_incomplete_analysis(stage);
+        if let Some(state) = stack.borrow_mut().last_mut() {
+            if !state.failed {
+                state.first_regex_failure = Some(failure);
+            }
+            state.failed = true;
+            crate::perf::note_regex_failure(failure);
         }
     });
-    // Engine diagnostics contain no submitted command text. The pattern is a
-    // rule's own, and names which rule could not finish.
     tracing::debug!(
         target: "dcg_perf",
-        stage,
-        pattern,
-        error = %error,
+        operation = operation.as_str(),
+        pack_id = failure.pack_id.as_ref().map(DiagnosticId::as_str),
+        pattern_id = failure.pattern_id.as_ref().map(DiagnosticId::as_str),
+        cause = ?cause,
+        failure = %failure,
         "regex analysis incomplete"
     );
+}
+
+fn record_runtime_failure(
+    operation: RegexOperation,
+    error: &fancy_regex::Error,
+    backtrack_limit: usize,
+    identity: Option<&RegexRuleIdentity>,
+) {
+    let cause = if matches!(
+        error,
+        fancy_regex::Error::RuntimeError(fancy_regex::RuntimeError::BacktrackLimitExceeded)
+    ) {
+        RegexFailureCause::BacktrackLimit {
+            steps: backtrack_limit,
+        }
+    } else {
+        RegexFailureCause::RuntimeError
+    };
+    record_evaluation_failure(operation, cause, identity);
 }
 
 /// Maximum backtracking steps allowed per fancy_regex match.
 ///
 /// The default `fancy_regex` limit is 1,000,000. We lower it to 100,000 to
 /// bound worst-case evaluation time for pathological patterns (especially from
-/// external packs). At ~10ns per step on modern hardware, 100K steps ≈ 1ms
-/// which fits within the PATTERN_MATCH panic budget (1ms). When exceeded,
+/// external packs). This is a work limit, not a wall-clock timeout: the cost
+/// of a step depends on the expression, input, and host. When exceeded,
 /// `fancy_regex` returns `BacktrackLimitExceeded` and our match methods
 /// return `false`/`None`. Inside command evaluation an error also marks the
 /// analysis incomplete, so those fallback values can never prove an allow.
@@ -166,8 +233,14 @@ const fn canonical_static_pattern(pattern: &'static str) -> &'static str {
 pub enum CompiledRegex {
     /// Linear-time regex (O(n) guaranteed, no backtracking).
     Linear(regex::Regex),
-    /// Backtracking regex (supports lookahead/lookbehind).
-    Backtracking(fancy_regex::Regex),
+    /// Backtracking regex (supports lookahead/lookbehind), retaining its
+    /// configured work limit so failures report the actual exhausted budget.
+    Backtracking {
+        /// Compiled backtracking expression.
+        regex: fancy_regex::Regex,
+        /// Per-pattern maximum backtracking steps supplied to the builder.
+        backtrack_limit: usize,
+    },
 }
 
 impl CompiledRegex {
@@ -196,7 +269,10 @@ impl CompiledRegex {
             fancy_regex::RegexBuilder::new(pattern)
                 .backtrack_limit(limit)
                 .build()
-                .map(Self::Backtracking)
+                .map(|regex| Self::Backtracking {
+                    regex,
+                    backtrack_limit: limit,
+                })
                 .map_err(|e| format!("fancy_regex compile error: {e}"))
         } else {
             match regex::Regex::new(pattern) {
@@ -207,7 +283,10 @@ impl CompiledRegex {
                     fancy_regex::RegexBuilder::new(pattern)
                         .backtrack_limit(limit)
                         .build()
-                        .map(Self::Backtracking)
+                        .map(|regex| Self::Backtracking {
+                            regex,
+                            backtrack_limit: limit,
+                        })
                         .map_err(|fancy_err| {
                             format!(
                                 "regex compile error: {e}, fancy_regex compile error: {fancy_err}"
@@ -239,7 +318,10 @@ impl CompiledRegex {
         fancy_regex::RegexBuilder::new(pattern)
             .backtrack_limit(BACKTRACK_LIMIT)
             .build()
-            .map(Self::Backtracking)
+            .map(|regex| Self::Backtracking {
+                regex,
+                backtrack_limit: BACKTRACK_LIMIT,
+            })
             .map_err(|e| format!("fancy_regex compile error: {e}"))
     }
 
@@ -248,11 +330,18 @@ impl CompiledRegex {
     /// For backtracking engine, returns `false` on regex execution errors.
     #[must_use]
     pub fn is_match(&self, text: &str) -> bool {
+        self.is_match_with_identity(text, None)
+    }
+
+    fn is_match_with_identity(&self, text: &str, identity: Option<&RegexRuleIdentity>) -> bool {
         let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexMatch);
         match self {
             Self::Linear(re) => re.is_match(text),
-            Self::Backtracking(re) => re.is_match(text).unwrap_or_else(|error| {
-                record_evaluation_failure("match", re.as_str(), &error);
+            Self::Backtracking {
+                regex,
+                backtrack_limit,
+            } => regex.is_match(text).unwrap_or_else(|error| {
+                record_runtime_failure(RegexOperation::Match, &error, *backtrack_limit, identity);
                 false
             }),
         }
@@ -263,13 +352,29 @@ impl CompiledRegex {
     /// Returns the start and end byte offsets of the match.
     #[must_use]
     pub fn find(&self, text: &str) -> Option<(usize, usize)> {
+        self.find_with_identity(text, None)
+    }
+
+    fn find_with_identity(
+        &self,
+        text: &str,
+        identity: Option<&RegexRuleIdentity>,
+    ) -> Option<(usize, usize)> {
         let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexMatch);
         match self {
             Self::Linear(re) => re.find(text).map(|m| (m.start(), m.end())),
-            Self::Backtracking(re) => re
+            Self::Backtracking {
+                regex,
+                backtrack_limit,
+            } => regex
                 .find(text)
                 .unwrap_or_else(|error| {
-                    record_evaluation_failure("find", re.as_str(), &error);
+                    record_runtime_failure(
+                        RegexOperation::Find,
+                        &error,
+                        *backtrack_limit,
+                        identity,
+                    );
                     None
                 })
                 .map(|m| (m.start(), m.end())),
@@ -283,16 +388,33 @@ impl CompiledRegex {
     /// of `text`, or regex execution fails.
     #[must_use]
     pub fn find_from(&self, text: &str, start: usize) -> Option<(usize, usize)> {
+        self.find_from_with_identity(text, start, None)
+    }
+
+    fn find_from_with_identity(
+        &self,
+        text: &str,
+        start: usize,
+        identity: Option<&RegexRuleIdentity>,
+    ) -> Option<(usize, usize)> {
         if start > text.len() || !text.is_char_boundary(start) {
             return None;
         }
         let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexMatch);
         match self {
             Self::Linear(re) => re.find_at(text, start).map(|m| (m.start(), m.end())),
-            Self::Backtracking(re) => re
+            Self::Backtracking {
+                regex,
+                backtrack_limit,
+            } => regex
                 .find_from_pos(text, start)
                 .unwrap_or_else(|error| {
-                    record_evaluation_failure("find_from", re.as_str(), &error);
+                    record_runtime_failure(
+                        RegexOperation::FindFrom,
+                        &error,
+                        *backtrack_limit,
+                        identity,
+                    );
                     None
                 })
                 .map(|m| (m.start(), m.end())),
@@ -304,14 +426,14 @@ impl CompiledRegex {
     pub fn as_str(&self) -> &str {
         match self {
             Self::Linear(re) => re.as_str(),
-            Self::Backtracking(re) => re.as_str(),
+            Self::Backtracking { regex, .. } => regex.as_str(),
         }
     }
 
     /// Check if this regex uses the backtracking engine.
     #[must_use]
     pub const fn uses_backtracking(&self) -> bool {
-        matches!(self, Self::Backtracking(_))
+        matches!(self, Self::Backtracking { .. })
     }
 
     /// Replace up to `limit` matches with the replacement string.
@@ -324,10 +446,15 @@ impl CompiledRegex {
         match self {
             Self::Linear(re) => re.replacen(text, limit, rep),
             // Use try_replacen to handle errors gracefully (returns Result)
-            Self::Backtracking(re) => re.try_replacen(text, limit, rep).unwrap_or_else(|error| {
-                record_evaluation_failure("replace", re.as_str(), &error);
-                Cow::Borrowed(text)
-            }),
+            Self::Backtracking {
+                regex,
+                backtrack_limit,
+            } => regex
+                .try_replacen(text, limit, rep)
+                .unwrap_or_else(|error| {
+                    record_runtime_failure(RegexOperation::Replace, &error, *backtrack_limit, None);
+                    Cow::Borrowed(text)
+                }),
         }
     }
 }
@@ -424,6 +551,9 @@ pub fn needs_backtracking_engine(pattern: &str) -> bool {
 pub struct LazyCompiledRegex {
     pattern: PatternText,
     compiled: OnceLock<Result<CompiledRegex, String>>,
+    // Bind identity to this expression, not the surrounding evaluation. A
+    // nested or auxiliary regex must never inherit another rule's metadata.
+    rule_identity: OnceLock<RegexRuleIdentity>,
     // Opted-in static safe patterns can prove a miss before paying for their
     // backtracking VM. An unknown proof always retains the ordinary engine.
     anchored_prefix: Option<OnceLock<Option<Box<str>>>>,
@@ -583,6 +713,7 @@ impl LazyCompiledRegex {
         Self {
             pattern: PatternText::Static(canonical_static_pattern(pattern)),
             compiled: OnceLock::new(),
+            rule_identity: OnceLock::new(),
             anchored_prefix: None,
             exclusion: None,
             superset: None,
@@ -601,10 +732,44 @@ impl LazyCompiledRegex {
         Self {
             pattern,
             compiled: OnceLock::new(),
+            rule_identity: OnceLock::new(),
             anchored_prefix: None,
             exclusion: None,
             superset: None,
         }
+    }
+
+    /// Attach static rule metadata when constructing a built-in or external pack.
+    /// This does not compile the regex or allocate on its matching path.
+    #[must_use]
+    pub(crate) fn with_rule_identity(
+        self,
+        pack_id: &'static str,
+        pattern_id: Option<&'static str>,
+    ) -> Self {
+        self.set_static_rule_identity(pack_id, pattern_id);
+        self
+    }
+
+    /// Bind an unbound rule while initializing a lazily built registry pack.
+    pub(crate) fn set_static_rule_identity(
+        &self,
+        pack_id: &'static str,
+        pattern_id: Option<&'static str>,
+    ) {
+        self.rule_identity.get_or_init(|| RegexRuleIdentity {
+            pack_id: Cow::Borrowed(pack_id),
+            pattern_id,
+        });
+    }
+
+    /// Bind direct `Pack` callers without leaking their dynamically owned IDs.
+    /// Registry and external rules are already bound, so they do not clone.
+    pub(crate) fn set_rule_identity(&self, pack_id: &str, pattern_id: Option<&'static str>) {
+        self.rule_identity.get_or_init(|| RegexRuleIdentity {
+            pack_id: Cow::Owned(DiagnosticId::new(pack_id).to_string()),
+            pattern_id,
+        });
     }
 
     /// Opt a statically authored safe pattern into a necessary-prefix proof.
@@ -701,8 +866,13 @@ impl LazyCompiledRegex {
             .as_ref()
         {
             Ok(compiled) => Some(compiled),
-            Err(error) => {
-                record_evaluation_failure("compile", self.pattern.as_str(), error);
+            Err(_) => {
+                let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexCompile);
+                record_evaluation_failure(
+                    RegexOperation::Compile,
+                    RegexFailureCause::CompileError,
+                    self.rule_identity.get(),
+                );
                 None
             }
         }
@@ -718,9 +888,9 @@ impl LazyCompiledRegex {
     #[must_use]
     pub fn is_match(&self, haystack: &str) -> bool {
         self.may_match(haystack)
-            && self
-                .get_compiled()
-                .is_some_and(|compiled| compiled.is_match(haystack))
+            && self.get_compiled().is_some_and(|compiled| {
+                compiled.is_match_with_identity(haystack, self.rule_identity.get())
+            })
             && !self.is_excluded(haystack)
     }
 
@@ -732,7 +902,9 @@ impl LazyCompiledRegex {
         if !self.may_match(haystack) {
             return None;
         }
-        let span = self.get_compiled()?.find(haystack)?;
+        let span = self
+            .get_compiled()?
+            .find_with_identity(haystack, self.rule_identity.get())?;
         (!self.is_excluded(haystack)).then_some(span)
     }
 
@@ -745,7 +917,11 @@ impl LazyCompiledRegex {
         if !self.may_match(haystack) {
             return None;
         }
-        let span = self.get_compiled()?.find_from(haystack, start)?;
+        let span = self.get_compiled()?.find_from_with_identity(
+            haystack,
+            start,
+            self.rule_identity.get(),
+        )?;
         (!self.is_excluded(haystack)).then_some(span)
     }
 
@@ -779,16 +955,24 @@ mod tests {
         let pattern = r"^(a|aa)+\1$";
         let input = format!("{}!", "a".repeat(80));
         let compiled = CompiledRegex::new_with_backtrack_limit(pattern, 100).unwrap();
-        let CompiledRegex::Backtracking(raw) = &compiled else {
+        let CompiledRegex::Backtracking { regex: raw, .. } = &compiled else {
             panic!("regression must exercise the bounded VM");
         };
         assert!(
             raw.is_match(&input).is_err(),
             "fixture must exhaust real engine work"
         );
-        for operation in 0..4 {
+        for (case, operation) in [
+            RegexOperation::Match,
+            RegexOperation::Find,
+            RegexOperation::FindFrom,
+            RegexOperation::Replace,
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let scope = RegexEvaluationScope::enter();
-            match operation {
+            match case {
                 0 => {
                     assert!(!compiled.is_match(&input));
                 }
@@ -804,7 +988,17 @@ mod tests {
             }
             assert!(
                 scope.has_failed(),
-                "operation {operation} must retain the failure"
+                "operation {operation:?} must retain the failure"
+            );
+            assert_eq!(
+                scope.failure(),
+                Some(RegexFailure {
+                    pack_id: None,
+                    pattern_id: None,
+                    operation,
+                    cause: RegexFailureCause::BacktrackLimit { steps: 100 },
+                }),
+                "anonymous regexes report their actual limit without an invented rule ID"
             );
         }
         let scope = RegexEvaluationScope::enter();
@@ -813,6 +1007,7 @@ mod tests {
             !scope.has_failed(),
             "a real miss must not become indeterminate"
         );
+        assert!(scope.failure().is_none());
     }
 
     #[test]
@@ -825,10 +1020,15 @@ mod tests {
                 let child = RegexEvaluationScope::enter();
                 assert!(re.find_from(&input, 0).is_none());
                 assert!(child.has_failed());
+                assert_eq!(child.failure().unwrap().operation, RegexOperation::FindFrom);
             }
             assert!(
                 parent.has_failed(),
                 "nested incomplete analysis reaches its parent"
+            );
+            assert_eq!(
+                parent.failure().unwrap().operation,
+                RegexOperation::FindFrom
             );
         }
         let next = RegexEvaluationScope::enter();
@@ -836,10 +1036,12 @@ mod tests {
             !next.has_failed(),
             "completed request must not poison the next one"
         );
+        assert!(next.failure().is_none());
         std::thread::spawn(move || {
             let worker = RegexEvaluationScope::enter();
             assert!(!re.is_match(&input));
             assert!(worker.has_failed());
+            assert_eq!(worker.failure().unwrap().operation, RegexOperation::Match);
         })
         .join()
         .unwrap();
@@ -847,6 +1049,7 @@ mod tests {
             !next.has_failed(),
             "independent threads must not share failure state"
         );
+        assert!(next.failure().is_none());
     }
 
     #[test]
@@ -855,7 +1058,204 @@ mod tests {
         let scope = RegexEvaluationScope::enter();
         assert!(invalid.find("ordinary").is_none());
         assert!(scope.has_failed());
+        assert_eq!(
+            scope.failure(),
+            Some(RegexFailure {
+                pack_id: None,
+                pattern_id: None,
+                operation: RegexOperation::Compile,
+                cause: RegexFailureCause::CompileError,
+            })
+        );
         assert!(!invalid.is_compiled());
+    }
+
+    #[test]
+    fn first_rule_failure_survives_nesting_without_poisoning_other_rules_issue_643() {
+        let first = LazyCompiledRegex::new(r"^(a|aa)+\1$")
+            .with_rule_identity("test.first", Some("first-rule"));
+        let second = LazyCompiledRegex::new(r"^(a|aa)+\1$")
+            .with_rule_identity("test.second", Some("second-rule"));
+        let input = format!("{}!", "a".repeat(80));
+        {
+            let outer = RegexEvaluationScope::enter();
+            assert!(!first.is_match(&input));
+            let original = outer.failure().unwrap();
+            assert_eq!(original.pack_id.unwrap().as_str(), "test.first");
+            assert_eq!(original.pattern_id.unwrap().as_str(), "first-rule");
+            {
+                let inner = RegexEvaluationScope::enter();
+                assert!(second.find_from(&input, 0).is_none());
+                let failure = inner.failure().unwrap();
+                assert_eq!(failure.pack_id.unwrap().as_str(), "test.second");
+                assert_eq!(failure.pattern_id.unwrap().as_str(), "second-rule");
+                assert_eq!(failure.operation, RegexOperation::FindFrom);
+            }
+            assert_eq!(outer.failure(), Some(original));
+            {
+                let inner = RegexEvaluationScope::enter();
+                assert!(second.is_match("aaaa"));
+                assert!(!second.is_match("b"));
+                assert!(!inner.has_failed());
+                assert!(inner.failure().is_none());
+            }
+            assert_eq!(outer.failure(), Some(original));
+        }
+        let independent = RegexEvaluationScope::enter();
+        assert!(independent.failure().is_none());
+        assert!(second.find(&input).is_none());
+        let failure = independent.failure().unwrap();
+        assert_eq!(failure.pack_id.unwrap().as_str(), "test.second");
+        assert_eq!(failure.operation, RegexOperation::Find);
+    }
+
+    #[test]
+    fn contributor_lookahead_reports_its_controlled_work_limit_issue_643() {
+        // This is the exact expression supplied in #643, with a synthetic
+        // command of the documented shape. fancy-regex 0.20 delegates the
+        // lookahead bodies, including the word boundary, to regex-automata.
+        // This controlled 100-step limit exercises repeated start-position
+        // searches; it does not claim to reproduce the reporter's missing
+        // exact command at the production 100,000-step limit.
+        const PATTERN: &str = r"(?=[\s\S]*(?:^|[\n;&|]\s*)[A-Z]=/data/tmp/x/)(?=[\s\S]*(?:^|[\s;|&])\s*\bIFS\+?=)[\s\S]*";
+        let unanchored = CompiledRegex::new_with_backtrack_limit(PATTERN, 100).unwrap();
+        let anchored =
+            CompiledRegex::new_with_backtrack_limit(&format!(r"\A{PATTERN}"), 100).unwrap();
+        let identity = RegexRuleIdentity {
+            pack_id: Cow::Borrowed("test.slow_lookahead"),
+            pattern_id: Some("slow"),
+        };
+        let command = format!("scratch {};A=/data/tmp/x/repro", "q".repeat(4_096));
+        {
+            let scope = RegexEvaluationScope::enter();
+            assert!(
+                unanchored
+                    .find_from_with_identity(&command, 0, Some(&identity))
+                    .is_none()
+            );
+            assert!(
+                scope.has_failed(),
+                "retries must exhaust the explicit work limit"
+            );
+            assert_eq!(
+                scope.failure(),
+                Some(RegexFailure {
+                    pack_id: Some(DiagnosticId::new("test.slow_lookahead")),
+                    pattern_id: Some(DiagnosticId::new("slow")),
+                    operation: RegexOperation::FindFrom,
+                    cause: RegexFailureCause::BacktrackLimit { steps: 100 },
+                })
+            );
+        }
+
+        // A fresh scope does not inherit the exhausted rule. Anchoring
+        // avoids retrying every position, so the same miss is now complete.
+        let scope = RegexEvaluationScope::enter();
+        assert!(!scope.has_failed());
+        assert!(scope.failure().is_none());
+        assert!(
+            anchored
+                .find_from_with_identity(&command, 0, Some(&identity))
+                .is_none()
+        );
+        assert!(!scope.has_failed());
+        assert!(scope.failure().is_none());
+
+        // The same budget still permits ordinary matches for either rule.
+        let matching = "A=/data/tmp/x/repro;IFS=,;scratch";
+        for compiled in [&unanchored, &anchored] {
+            assert_eq!(
+                compiled.find_from_with_identity(matching, 0, Some(&identity)),
+                Some((0, matching.len()))
+            );
+            assert!(!scope.has_failed());
+            assert!(scope.failure().is_none());
+        }
+    }
+
+    #[test]
+    fn non_regex_first_failure_is_not_attributed_to_a_later_rule_issue_643() {
+        let _ = crate::perf::take_budget_exhaustion();
+        let pattern = LazyCompiledRegex::new(r"^(a|aa)+\1$")
+            .with_rule_identity("test.later", Some("later-rule"));
+        let input = format!("{}!", "a".repeat(80));
+        let outer = RegexEvaluationScope::enter();
+        assert!(record_incomplete_analysis(
+            "interpreter_literal_recovery",
+            &"bounded proof stopped"
+        ));
+        {
+            let inner = RegexEvaluationScope::enter();
+            assert!(!pattern.is_match(&input));
+            assert!(inner.failure().is_some());
+        }
+        assert!(outer.has_failed());
+        assert!(outer.failure().is_none());
+        let note = crate::perf::take_budget_exhaustion();
+        assert_eq!(note.incomplete.unwrap().0, "interpreter_literal_recovery");
+        assert!(note.regex_failure.is_none());
+    }
+
+    #[test]
+    fn unscoped_or_unattributed_regex_does_not_inherit_a_previous_rule_issue_643() {
+        let _ = crate::perf::take_budget_exhaustion();
+        let bound = LazyCompiledRegex::new(r"^(a|aa)+\1$")
+            .with_rule_identity("test.bound", Some("bound-rule"));
+        let input = format!("{}!", "a".repeat(80));
+        // No evaluator owns this call, so it cannot contaminate a later request.
+        assert!(!bound.is_match(&input));
+        assert_eq!(
+            crate::perf::take_budget_exhaustion(),
+            crate::perf::BudgetExhaustion::default()
+        );
+        let scope = RegexEvaluationScope::enter();
+        assert!(scope.failure().is_none());
+        let anonymous = CompiledRegex::new_with_backtrack_limit(r"^(a|aa)+\1$", 17).unwrap();
+        assert!(!anonymous.is_match(&input));
+        let failure = scope.failure().unwrap();
+        assert!(failure.pack_id.is_none());
+        assert!(failure.pattern_id.is_none());
+        assert_eq!(
+            failure.cause,
+            RegexFailureCause::BacktrackLimit { steps: 17 }
+        );
+    }
+
+    #[test]
+    fn regex_failure_logging_does_not_expose_pattern_or_command_text_issue_643() {
+        #[derive(Clone)]
+        struct Writer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || Writer(sink.clone()))
+            .finish();
+        let _tracing = tracing::subscriber::set_default(subscriber);
+        let invalid = LazyCompiledRegex::new("SECRET_PATTERN[")
+            .with_rule_identity("test.private", Some("broken-rule"));
+        let scope = RegexEvaluationScope::enter();
+        assert!(invalid.find("SECRET_SUBMITTED_COMMAND").is_none());
+        let failure = scope.failure().unwrap();
+        assert_eq!(failure.operation, RegexOperation::Compile);
+        assert_eq!(failure.cause, RegexFailureCause::CompileError);
+        let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("test.private:broken-rule"), "{text}");
+        assert!(text.contains("operation: compile"), "{text}");
+        assert!(!text.contains("SECRET_PATTERN"), "{text}");
+        assert!(!text.contains("SECRET_SUBMITTED_COMMAND"), "{text}");
     }
 
     fn assert_same_regex_results(
