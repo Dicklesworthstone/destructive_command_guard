@@ -37389,6 +37389,10 @@ fn evaluate_heredoc(
                 Some(_) => (!content.quoted).then_some(content.content.as_str()),
             };
             let target = content.target_command.as_deref();
+            // Source on stdin was always read command by command, so a pack
+            // that names one of its commands keeps the denial and its rule id
+            // (`bash <<EOF` holding `$F zap`); this one applies after them.
+            let mut deferred_unverified = None;
             if outer_filled_script.is_some_and(|script| {
                 target.is_some_and(inline_script_target_parses_posix_shell)
                     && (crate::heredoc::shell_script_runs_an_expansion_as_a_command(script)
@@ -37403,7 +37407,10 @@ fn evaluate_heredoc(
                     context.project_path,
                     first_allowlist_hit,
                 ) {
-                    return Some(denial);
+                    if content.heredoc_type.is_none() {
+                        return Some(denial);
+                    }
+                    deferred_unverified = Some(denial);
                 }
             }
             let inline_automated_stdin = content.heredoc_type.is_none()
@@ -37649,6 +37656,9 @@ fn evaluate_heredoc(
                 // A grant for the complete script's destination remains an
                 // audit result, not permission for another extracted command.
                 record_nested_allowlist_hit(first_allowlist_hit, &mut result);
+            }
+            if deferred_unverified.is_some() {
+                return deferred_unverified;
             }
         }
 
