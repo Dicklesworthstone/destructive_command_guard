@@ -9,6 +9,7 @@
 //! Unix fixture checks native PowerShell 7, Python, and Bash against
 //! disposable credential-shaped files.
 
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -170,12 +171,14 @@ impl PipelineFixture {
             "[history]\nenabled = false\n",
         )
         .expect("isolated configuration");
-        let allowlist = grants
-            .iter()
-            .map(|rule| {
-                format!("[[allow]]\nrule = \"{rule}\"\nreason = \"one reviewed pipeline rule\"\n")
-            })
-            .collect::<String>();
+        let mut allowlist = String::new();
+        for rule in grants {
+            writeln!(
+                allowlist,
+                "[[allow]]\nrule = \"{rule}\"\nreason = \"one reviewed pipeline rule\""
+            )
+            .expect("write pipeline rule grant to String");
+        }
         std::fs::write(config.join("allowlist.toml"), allowlist).expect("isolated allowlist");
         Self { dir }
     }

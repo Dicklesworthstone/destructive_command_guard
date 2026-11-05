@@ -7221,6 +7221,13 @@ fn powershell_substitution_body_for_evaluation(body: &str) -> String {
 }
 
 fn collect_powershell_substitution_bodies(command: &str) -> Result<Vec<String>, ()> {
+    // A quote or comment error cannot conceal a substitution when the
+    // source contains no dollar sign at all. In an Unknown view,
+    // treating unrelated quoting as substitution failure would prevent the
+    // concrete Cmd view from reporting its actual executable command.
+    if !command.contains('$') {
+        return Ok(Vec::new());
+    }
     let bytes = command.as_bytes();
     let mut bodies = Vec::new();
     let mut index = 0usize;
@@ -13644,6 +13651,78 @@ fn powershell_call_operator_view(
     Ok(powershell_resolved_call_operator_view(command, invocations))
 }
 
+/// A literal operand owned by a leading PowerShell call operator, or a
+/// parenthesized operand owned by a leading dot operator. A leading `&`
+/// cannot start a POSIX command; direct dot operands and calls after a
+/// PowerShell assignment can still contain executable POSIX backticks.
+fn leading_literal_powershell_call(
+    command: &str,
+) -> Option<crate::packs::core::credential_files::PowerShellInvokedCommand> {
+    let start = command.len() - command.trim_start().len();
+    if !matches!(command.as_bytes().get(start), Some(b'&' | b'.')) {
+        return None;
+    }
+    crate::packs::core::credential_files::powershell_literal_invocations(command)
+        .ok()?
+        .into_iter()
+        .find(|invocation| {
+            invocation.operator_span.start == start
+                && command.get(invocation.span.clone()).is_some_and(|operand| {
+                    command.as_bytes()[start] == b'&' || operand.starts_with('(')
+                })
+        })
+}
+
+/// Preserve a proven callee as one opaque word in a secondary matching view.
+/// No argument or sibling command is removed, and the source keeps its byte
+/// coordinates. The caller chooses whether this view is appropriate for the
+/// particular dialect and policy being inspected.
+fn mask_literal_powershell_callee<'a>(
+    command: &'a str,
+    invocation: &crate::packs::core::credential_files::PowerShellInvokedCommand,
+) -> Cow<'a, str> {
+    let Some(operand) = command.get(invocation.span.clone()) else {
+        return Cow::Borrowed(command);
+    };
+    if operand.bytes().all(|byte| byte.is_ascii_whitespace()) {
+        return Cow::Borrowed(command);
+    }
+    let mut masked = command.as_bytes().to_vec();
+    masked[invocation.span.clone()].fill(b'_');
+    Cow::Owned(String::from_utf8(masked).expect("complete callee spans preserve UTF-8"))
+}
+
+fn mask_leading_powershell_callee_for_posix_substitutions(command: &str) -> Cow<'_, str> {
+    let Some(invocation) = leading_literal_powershell_call(command) else {
+        return Cow::Borrowed(command);
+    };
+    mask_literal_powershell_callee(command, &invocation)
+}
+
+fn mask_leading_non_git_powershell_callee<'a>(
+    command_for_match: &'a str,
+    original_command: &str,
+) -> Cow<'a, str> {
+    if command_for_match.len() != original_command.len() {
+        return Cow::Borrowed(command_for_match);
+    }
+    let Some(invocation) = leading_literal_powershell_call(original_command) else {
+        return Cow::Borrowed(command_for_match);
+    };
+    let basename = invocation
+        .name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&invocation.name)
+        .to_ascii_lowercase();
+    // Keep Git's dashed builtins and external helpers in the ordinary Git
+    // analysis. A single name such as "git reset --hard" is not Git argv.
+    if matches!(basename.as_str(), "git" | "git.exe") || basename.starts_with("git-") {
+        return Cow::Borrowed(command_for_match);
+    }
+    mask_literal_powershell_callee(command_for_match, &invocation)
+}
+
 fn powershell_resolved_call_operator_view(
     command: &str,
     mut invocations: Vec<crate::packs::core::credential_files::PowerShellInvokedCommand>,
@@ -15392,7 +15471,9 @@ fn evaluate_command_substitutions(
             let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
             let substitution_source =
                 crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
-            let posix_view = mask_powershell_block_comments(substitution_source.as_ref());
+            let posix_comments = mask_powershell_block_comments(substitution_source.as_ref());
+            let posix_view =
+                mask_leading_powershell_callee_for_posix_substitutions(posix_comments.as_ref());
             let posix_substitutions = match crate::heredoc::extract_posix_command_substitutions(
                 posix_view.as_ref(),
             ) {
@@ -28106,14 +28187,28 @@ fn evaluate_packs_with_allowlists_at_depth(
     // the length-preserving, sanitized raw command for core.git whenever the
     // hook envelope proves a dialect; other packs continue to consume the
     // established normalized view.
-    let core_git_command = if shell_dialect == crate::normalize::ShellDialect::Unknown {
+    // Unknown's normalized view can turn a single computed executable name
+    // into command-line tokens. Keep only a proven non-Git leading callee
+    // opaque; the argument tail and every sibling retain their usual view.
+    let core_git_atomic_source = if shell_dialect == ShellDialect::Unknown {
+        mask_leading_non_git_powershell_callee(dialect_semantic_masked.as_ref(), original_command)
+    } else {
+        Cow::Borrowed(dialect_semantic_masked.as_ref())
+    };
+    let core_git_atomic_view = matches!(core_git_atomic_source, Cow::Owned(_))
+        .then(|| crate::normalize::normalize_command(core_git_atomic_source.as_ref()).into_owned());
+    let core_git_command = if let Some(view) = core_git_atomic_view.as_deref() {
+        view
+    } else if shell_dialect == crate::normalize::ShellDialect::Unknown {
         command_for_packs
     } else {
         dialect_semantic_masked.as_ref()
     };
     let core_git_segment_ranges =
         command_segment_ranges_in_dialect(core_git_command, shell_dialect);
-    let core_git_offset = if shell_dialect == crate::normalize::ShellDialect::Unknown {
+    let core_git_offset = if core_git_atomic_view.is_some() {
+        compute_normalized_offset(core_git_atomic_source.as_ref(), core_git_command)
+    } else if shell_dialect == crate::normalize::ShellDialect::Unknown {
         normalized_offset
     } else {
         Some(0)
@@ -65093,6 +65188,103 @@ mod tests {
             command = format!("({command})");
         }
         assert!(powershell_call_operator_view(&format!("& {command} reset --hard")).is_err());
+    }
+
+    #[test]
+    fn powershell_substitution_scan_requires_a_dollar_sign() {
+        for command in [
+            "echo 'ok & docker system prune -af",
+            "Write-Output \"unfinished text",
+            "Write-Output value#ambiguous",
+        ] {
+            assert_eq!(
+                collect_powershell_substitution_bodies(command),
+                Ok(Vec::new()),
+                "unrelated syntax cannot invent a substitution: {command}"
+            );
+        }
+        assert!(collect_powershell_substitution_bodies("Write-Output $(git reset --hard").is_err());
+        assert_eq!(
+            collect_powershell_substitution_bodies("Write-Output $(git reset --hard)"),
+            Ok(vec!["git reset --hard".to_string()])
+        );
+    }
+
+    #[test]
+    fn unknown_posix_substitutions_keep_literal_callee_ownership() {
+        for command in [
+            "& (\"gi`u{74}\") reset --hard",
+            "& (\"Tee`u{2d}Object\") -FilePath /etc/hosts",
+            "& \"gi`u{74}\" reset --hard",
+            "& \"Tee`u{2d}Object\" -FilePath /etc/hosts",
+        ] {
+            let masked = mask_leading_powershell_callee_for_posix_substitutions(command);
+            assert!(matches!(masked, Cow::Owned(_)), "{command}");
+            assert_eq!(masked.len(), command.len());
+            assert!(
+                crate::heredoc::extract_posix_command_substitutions(masked.as_ref())
+                    .expect("literal callee has no POSIX substitution")
+                    .is_empty(),
+                "{command}"
+            );
+        }
+        let command = "& (\"gi`u{74}\") status $(git reset --hard)";
+        let masked = mask_leading_powershell_callee_for_posix_substitutions(command);
+        let substitutions =
+            crate::heredoc::extract_posix_command_substitutions(masked.as_ref()).unwrap();
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(substitutions[0].body, "git reset --hard");
+        assert_eq!(substitutions[0].start, command.find("$(").unwrap());
+        for command in [
+            ". \"file`git reset --hard`name\"",
+            ". \"gi`u{74}\" reset --hard",
+            "$x = & (\"file`git reset --hard`name\")",
+            "Write-Output '& (\"gi`u{74}\")'",
+            "& ('git')[0] reset --hard",
+            "& ($runtime) reset --hard",
+        ] {
+            assert_eq!(
+                mask_leading_powershell_callee_for_posix_substitutions(command),
+                command,
+                "unproved or cross-dialect executable syntax stays visible: {command}"
+            );
+        }
+        let command = "& (\"gi`u{74}\") status `unfinished";
+        let masked = mask_leading_powershell_callee_for_posix_substitutions(command);
+        assert!(crate::heredoc::extract_posix_command_substitutions(masked.as_ref()).is_err());
+    }
+
+    #[test]
+    fn unknown_git_matching_keeps_non_git_callees_atomic_and_siblings_visible() {
+        for command in [
+            "& ('git reset --hard')",
+            "& ('git ' + 'reset --hard')",
+            "& 'git reset --hard'",
+            ". ('git reset --hard')",
+        ] {
+            let masked = mask_leading_non_git_powershell_callee(command, command);
+            assert!(matches!(masked, Cow::Owned(_)), "{command}");
+            assert_eq!(masked.len(), command.len());
+            assert!(
+                !masked.contains("git"),
+                "callee is one non-Git name: {masked}"
+            );
+        }
+        let command = "& ('git reset --hard'); git reset --hard";
+        let masked = mask_leading_non_git_powershell_callee(command, command);
+        assert!(masked.ends_with("; git reset --hard"));
+        for command in [
+            "& ('gi' + 't') reset --hard",
+            "& ('C:/Program Files/Git/git.exe') reset --hard",
+            "& ('git-reset') --hard",
+            "Write-Output '& (git reset --hard)'",
+        ] {
+            assert_eq!(
+                mask_leading_non_git_powershell_callee(command, command),
+                command,
+                "Git executables and inert text keep their ordinary analysis: {command}"
+            );
+        }
     }
 
     /// dcg#294: a replay is scoped to parses that expose a real extra command
