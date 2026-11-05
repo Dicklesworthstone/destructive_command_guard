@@ -2822,7 +2822,7 @@ fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
     let mut literal_mode = false;
 
     while i < len {
-        i = skip_shell_horizontal_whitespace(bytes, i, len);
+        i = skip_powershell_header_whitespace(bytes, i, len);
         if i >= len {
             break;
         }
@@ -3061,7 +3061,10 @@ fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize) -> usize {
         let byte = bytes[i];
         match quote {
             PowerShellQuote::Unquoted => {
-                if byte.is_ascii_whitespace() || powershell_separator_end(bytes, i, len).is_some() {
+                if byte.is_ascii_whitespace()
+                    || (!byte.is_ascii() && skip_powershell_header_whitespace(bytes, i, len) > i)
+                    || powershell_separator_end(bytes, i, len).is_some()
+                {
                     break;
                 }
                 match byte {
@@ -4864,6 +4867,25 @@ fn strip_leading_backslash(command: &str) -> Option<(String, StrippedWrapper)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn powershell_unicode_word_separators_preserve_quoted_data() {
+        for separator in ['\u{00a0}', '\u{2003}'] {
+            let source = format!("python3{separator}-{separator}'a{separator}b'");
+            let tokens = tokenize_for_shell_dialect(&source, ShellDialect::PowerShell);
+            let words: Vec<_> = tokens
+                .iter()
+                .filter(|token| token.kind == NormalizeTokenKind::Word)
+                .filter_map(|token| token.text(&source))
+                .collect();
+            let quoted = format!("'a{separator}b'");
+            assert_eq!(words, ["python3", "-", quoted.as_str()]);
+            for dialect in [ShellDialect::Posix, ShellDialect::Cmd] {
+                let other = tokenize_for_shell_dialect(&source, dialect);
+                assert_eq!(other.len(), 1, "{dialect:?}: {source:?}");
+            }
+        }
+    }
 
     fn raw_token_snapshot(
         command: &str,

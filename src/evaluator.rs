@@ -2091,6 +2091,10 @@ fn split_top_level_powershell_statements(command: &str) -> Result<Vec<&str>, ()>
     let mut index = 0usize;
 
     while index < bytes.len() {
+        if powershell_quote_at(bytes, index).is_some() {
+            index = powershell_quoted_region_end(command, index, 0)?;
+            continue;
+        }
         match bytes[index] {
             b'`' => {
                 if index + 1 >= bytes.len() {
@@ -2101,51 +2105,8 @@ fn split_top_level_powershell_statements(command: &str) -> Result<Vec<&str>, ()>
                 {
                     3
                 } else {
-                    2
+                    escape_sequence_end(command, index) - index
                 };
-            }
-            b'\'' => {
-                let mut cursor = index + 1;
-                let mut closed = false;
-                while cursor < bytes.len() {
-                    if bytes[cursor] == b'\'' {
-                        if bytes.get(cursor + 1) == Some(&b'\'') {
-                            cursor += 2;
-                        } else {
-                            cursor += 1;
-                            closed = true;
-                            break;
-                        }
-                    } else {
-                        cursor += 1;
-                    }
-                }
-                if !closed {
-                    return Err(());
-                }
-                index = cursor;
-            }
-            b'"' => {
-                let mut cursor = index + 1;
-                let mut closed = false;
-                while cursor < bytes.len() {
-                    if bytes[cursor] == b'`' {
-                        if cursor + 1 >= bytes.len() {
-                            return Err(());
-                        }
-                        cursor += 2;
-                    } else if bytes[cursor] == b'"' {
-                        cursor += 1;
-                        closed = true;
-                        break;
-                    } else {
-                        cursor += 1;
-                    }
-                }
-                if !closed {
-                    return Err(());
-                }
-                index = cursor;
             }
             b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
                 if let Some((_, _, end)) = powershell_here_string_end(command, index) {
@@ -4766,6 +4727,10 @@ fn find_powershell_script_block_close(command: &str, start: usize) -> Option<usi
     let mut index = start;
     let mut depth = 1usize;
     while index < bytes.len() {
+        if powershell_quote_at(bytes, index).is_some() {
+            index = powershell_quoted_region_end(command, index, 0).ok()?;
+            continue;
+        }
         match bytes[index] {
             b'`' => index = escape_sequence_end(command, index),
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
@@ -4775,22 +4740,6 @@ fn find_powershell_script_block_close(command: &str, start: usize) -> Option<usi
             }
             b'<' if bytes.get(index + 1) == Some(&b'#') => {
                 index = skip_powershell_block_comment(command, index);
-            }
-            b'\'' => index = skip_powershell_single_quote(command, index),
-            b'"' => {
-                index += 1;
-                while index < bytes.len() {
-                    if bytes[index] == b'`' {
-                        index = escape_sequence_end(command, index);
-                    } else if bytes[index] == b'"' {
-                        index += 1;
-                        break;
-                    } else if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'(') {
-                        index = find_powershell_subexpression_close(command, index + 2).ok()? + 1;
-                    } else {
-                        index += 1;
-                    }
-                }
             }
             b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
                 index =
@@ -7102,28 +7051,89 @@ fn skip_powershell_block_comment(command: &str, start: usize) -> usize {
     bytes.len()
 }
 
-fn skip_powershell_single_quote(command: &str, start: usize) -> usize {
+/// PowerShell treats these Unicode characters as ordinary single/double
+/// quote delimiters. Retain their byte widths so structural scans preserve
+/// the original source map and never enter the middle of a UTF-8 character.
+fn powershell_quote_at(bytes: &[u8], index: usize) -> Option<(u8, usize)> {
+    match bytes.get(index).copied()? {
+        quote @ (b'\'' | b'"') => Some((quote, 1)),
+        0xe2 => match bytes.get(index..index + 3)? {
+            [0xe2, 0x80, 0x98..=0x9b] => Some((b'\'', 3)),
+            [0xe2, 0x80, 0x9c..=0x9e] => Some((b'"', 3)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Skip a quoted region only for syntax ownership. This does not prove its
+/// value literal: expandable `$()` bodies remain in the original source for
+/// the independent substitution collector to inspect.
+fn powershell_quoted_region_end(
+    command: &str,
+    start: usize,
+    recursion_depth: usize,
+) -> Result<usize, ()> {
+    if recursion_depth >= MAX_POWERSHELL_VISIBLE_NESTING {
+        return Err(());
+    }
     let bytes = command.as_bytes();
-    let mut index = start + 1;
+    let (quote, width) = powershell_quote_at(bytes, start).ok_or(())?;
+    let mut index = start + width;
     while index < bytes.len() {
-        if bytes[index] == b'\'' {
-            if bytes.get(index + 1) == Some(&b'\'') {
-                index += 2;
+        if quote == b'"' && bytes[index] == b'`' {
+            if index + 1 >= bytes.len() {
+                return Err(());
+            }
+            index = escape_sequence_end(command, index);
+        } else if quote == b'"' && bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'(') {
+            index = find_powershell_subexpression_close_at_depth(
+                command,
+                index + 2,
+                recursion_depth + 1,
+            )? + 1;
+        } else if let Some((closing, width)) = powershell_quote_at(bytes, index)
+            && closing == quote
+        {
+            index += width;
+            if let Some((next, width)) = powershell_quote_at(bytes, index)
+                && next == quote
+            {
+                index += width;
             } else {
-                return index + 1;
+                return Ok(index);
             }
         } else {
             index += 1;
         }
     }
-    bytes.len()
+    Err(())
+}
+
+fn skip_powershell_single_quote(command: &str, start: usize) -> usize {
+    powershell_quoted_region_end(command, start, 0).unwrap_or(command.len())
 }
 
 fn find_powershell_subexpression_close(command: &str, body_start: usize) -> Result<usize, ()> {
+    find_powershell_subexpression_close_at_depth(command, body_start, 0)
+}
+
+fn find_powershell_subexpression_close_at_depth(
+    command: &str,
+    body_start: usize,
+    recursion_depth: usize,
+) -> Result<usize, ()> {
+    if recursion_depth >= MAX_POWERSHELL_VISIBLE_NESTING {
+        return Err(());
+    }
     let bytes = command.as_bytes();
     let mut index = body_start;
     let mut depth = 1usize;
     while index < bytes.len() {
+        if powershell_quote_at(bytes, index).is_some() {
+            index = powershell_quoted_region_end(command, index, recursion_depth)?;
+            continue;
+        }
         match bytes[index] {
             b'`' => index = escape_sequence_end(command, index),
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
@@ -7137,23 +7147,6 @@ fn find_powershell_subexpression_close(command: &str, body_start: usize) -> Resu
             b'<' if bytes.get(index + 1) == Some(&b'#') => {
                 index = skip_powershell_block_comment(command, index);
             }
-            b'\'' => index = skip_powershell_single_quote(command, index),
-            b'"' => {
-                index += 1;
-                while index < bytes.len() {
-                    if bytes[index] == b'`' {
-                        index = escape_sequence_end(command, index);
-                    } else if bytes[index] == b'"' {
-                        index += 1;
-                        break;
-                    } else if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'(') {
-                        let close = find_powershell_subexpression_close(command, index + 2)?;
-                        index = close + 1;
-                    } else {
-                        index += 1;
-                    }
-                }
-            }
             b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
                 if let Some((_, _, end)) = powershell_here_string_end(command, index) {
                     index = end;
@@ -7162,7 +7155,11 @@ fn find_powershell_subexpression_close(command: &str, body_start: usize) -> Resu
                 }
             }
             b'$' if bytes.get(index + 1) == Some(&b'(') => {
-                let close = find_powershell_subexpression_close(command, index + 2)?;
+                let close = find_powershell_subexpression_close_at_depth(
+                    command,
+                    index + 2,
+                    recursion_depth + 1,
+                )?;
                 index = close + 1;
             }
             b'(' => {
@@ -7228,6 +7225,14 @@ fn collect_powershell_substitution_bodies(command: &str) -> Result<Vec<String>, 
     let mut bodies = Vec::new();
     let mut index = 0usize;
     while index < bytes.len() {
+        if let Some((quote, width)) = powershell_quote_at(bytes, index) {
+            let end = powershell_quoted_region_end(command, index, 0)?;
+            if quote == b'"' {
+                collect_powershell_expandable_region(command, index + width, end, &mut bodies)?;
+            }
+            index = end;
+            continue;
+        }
         match bytes[index] {
             b'`' => index = escape_sequence_end(command, index),
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
@@ -7240,26 +7245,6 @@ fn collect_powershell_substitution_bodies(command: &str) -> Result<Vec<String>, 
             }
             b'<' if bytes.get(index + 1) == Some(&b'#') => {
                 index = skip_powershell_block_comment(command, index);
-            }
-            b'\'' => index = skip_powershell_single_quote(command, index),
-            b'"' => {
-                index += 1;
-                while index < bytes.len() {
-                    if bytes[index] == b'`' {
-                        index = escape_sequence_end(command, index);
-                    } else if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'(') {
-                        let close = find_powershell_subexpression_close(command, index + 2)?;
-                        bodies.push(powershell_substitution_body_for_evaluation(
-                            &command[index + 2..close],
-                        ));
-                        index = close + 1;
-                    } else if bytes[index] == b'"' {
-                        index += 1;
-                        break;
-                    } else {
-                        index += 1;
-                    }
-                }
             }
             b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
                 if let Some((quote, content_start, end)) =
@@ -7372,6 +7357,10 @@ fn mask_powershell_comments_in(command: &str, line_comments: bool) -> Cow<'_, st
     let mut index = 0usize;
     let mut masked: Option<Vec<u8>> = None;
     while index < bytes.len() {
+        if powershell_quote_at(bytes, index).is_some() {
+            index = powershell_quoted_region_end(command, index, 0).unwrap_or(bytes.len());
+            continue;
+        }
         match bytes[index] {
             b'`' => index = escape_sequence_end(command, index),
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
@@ -7382,20 +7371,6 @@ fn mask_powershell_comments_in(command: &str, line_comments: bool) -> Cow<'_, st
                     masked.get_or_insert_with(|| bytes.to_vec())[index..end].fill(b' ');
                 }
                 index = end;
-            }
-            b'\'' => index = skip_powershell_single_quote(command, index),
-            b'"' => {
-                index += 1;
-                while index < bytes.len() {
-                    if bytes[index] == b'`' {
-                        index = escape_sequence_end(command, index);
-                    } else if bytes[index] == b'"' {
-                        index += 1;
-                        break;
-                    } else {
-                        index += 1;
-                    }
-                }
             }
             b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
                 index =
@@ -7588,6 +7563,7 @@ impl<'a> PowerShellStaticStringParser<'a> {
         match self.expression.as_bytes().get(self.index).copied() {
             Some(b'\'') => self.parse_single_quoted(),
             Some(b'"') => self.parse_double_quoted(),
+            Some(b'@') => self.parse_here_string(),
             Some(b'(') => {
                 self.index += 1;
                 let value = self.parse_concatenation(depth + 1)?;
@@ -7607,6 +7583,11 @@ impl<'a> PowerShellStaticStringParser<'a> {
         let mut value = String::new();
         while self.index < self.expression.len() {
             let ch = self.expression[self.index..].chars().next().ok_or(())?;
+            if matches!(ch, '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}') {
+                // These are quote delimiters in PowerShell too; this bounded
+                // reader must not certify them as ordinary string contents.
+                return Err(());
+            }
             if ch == '\'' {
                 if self.expression.as_bytes().get(self.index + 1) == Some(&b'\'') {
                     value.push('\'');
@@ -7624,44 +7605,102 @@ impl<'a> PowerShellStaticStringParser<'a> {
 
     fn parse_double_quoted(&mut self) -> Result<String, ()> {
         self.index += 1;
-        let mut value = String::new();
+        let start = self.index;
         while self.index < self.expression.len() {
             let ch = self.expression[self.index..].chars().next().ok_or(())?;
             match ch {
+                '\u{201c}' | '\u{201d}' | '\u{201e}' => return Err(()),
                 '"' => {
+                    let value = decode_static_powershell_expandable_text(
+                        &self.expression[start..self.index],
+                    )?;
                     self.index += 1;
                     return Ok(value);
                 }
-                '$' => return Err(()),
                 '`' => {
                     self.index += 1;
                     let escaped = self.expression[self.index..].chars().next().ok_or(())?;
                     self.index += escaped.len_utf8();
-                    match escaped {
-                        '0' => value.push('\0'),
-                        'a' => value.push('\u{0007}'),
-                        'b' => value.push('\u{0008}'),
-                        'e' => value.push('\u{001b}'),
-                        'f' => value.push('\u{000c}'),
-                        'n' => value.push('\n'),
-                        'r' => value.push('\r'),
-                        't' => value.push('\t'),
-                        'v' => value.push('\u{000b}'),
-                        '\n' => {}
-                        '\r' if self.expression.as_bytes().get(self.index) == Some(&b'\n') => {
-                            self.index += 1;
-                        }
-                        other => value.push(other),
-                    }
                 }
                 other => {
-                    value.push(other);
                     self.index += other.len_utf8();
                 }
             }
         }
         Err(())
     }
+
+    fn parse_here_string(&mut self) -> Result<String, ()> {
+        let (quote, body_start, end) =
+            powershell_here_string_end(self.expression, self.index).ok_or(())?;
+        // The physical newline immediately before the closing marker belongs
+        // to the delimiter, not to the value of the here-string.
+        let body = &self.expression[body_start..end - 2];
+        let body = body
+            .strip_suffix("\r\n")
+            .or_else(|| body.strip_suffix(['\r', '\n']))
+            .unwrap_or(body);
+        let value = if quote == b'\'' {
+            body.to_string()
+        } else {
+            decode_static_powershell_expandable_text(body)?
+        };
+        self.index = end;
+        Ok(value)
+    }
+}
+
+/// Decode the literal subset shared by expandable strings and here-strings.
+/// Interpolation remains unverified; its executable subexpressions are also
+/// inspected independently by the PowerShell substitution pass.
+fn decode_static_powershell_expandable_text(text: &str) -> Result<String, ()> {
+    let mut value = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '$' => return Err(()),
+            '`' => match characters.next().ok_or(())? {
+                '0' => value.push('\0'),
+                'a' => value.push('\u{0007}'),
+                'b' => value.push('\u{0008}'),
+                'e' => value.push('\u{001b}'),
+                'f' => value.push('\u{000c}'),
+                'n' => value.push('\n'),
+                'r' => value.push('\r'),
+                't' => value.push('\t'),
+                'v' => value.push('\u{000b}'),
+                'u' => {
+                    if characters.next() != Some('{') {
+                        return Err(());
+                    }
+                    let mut scalar = 0_u32;
+                    let mut digits = 0_usize;
+                    loop {
+                        let digit = characters.next().ok_or(())?;
+                        if digit == '}' {
+                            break;
+                        }
+                        if digits == 6 {
+                            return Err(());
+                        }
+                        scalar = scalar * 16 + digit.to_digit(16).ok_or(())?;
+                        digits += 1;
+                    }
+                    if digits == 0 {
+                        return Err(());
+                    }
+                    value.push(char::from_u32(scalar).ok_or(())?);
+                }
+                '\n' => {}
+                '\r' if characters.peek() == Some(&'\n') => {
+                    characters.next();
+                }
+                other => value.push(other),
+            },
+            other => value.push(other),
+        }
+    }
+    Ok(value)
 }
 
 fn parse_static_powershell_source(expression: &str) -> Result<String, ()> {
@@ -10765,14 +10804,32 @@ fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineSh
         return script_interpreter_pipeline_input_mode(command, &executable, &args, language);
     }
 
+    posix_shell_argv_input_mode(&args, depth, &mut false)
+}
+
+/// Classify already-decoded shell arguments without applying the outer shell's
+/// quoting rules again. Native PowerShell pipelines share this option grammar
+/// with the POSIX pipeline reader.
+fn posix_shell_argv_input_mode(
+    args: &[String],
+    depth: usize,
+    terminal_arguments: &mut bool,
+) -> PipelineShellInputMode {
+    *terminal_arguments = false;
     let mut force_stdin = false;
     let mut index = 0usize;
     while index < args.len() {
         let argument = &args[index];
         if argument == "--" {
-            return if force_stdin || index + 1 == args.len() {
+            return if force_stdin
+                || index + 1 == args.len()
+                || args.get(index + 1).is_some_and(|script| {
+                    script == "-"
+                        || classify_shell_positional(script) == ShellPositional::StdinDevice
+                }) {
                 PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell)
             } else {
+                *terminal_arguments = true;
                 PipelineShellInputMode::DoesNotReadStdin
             };
         }
@@ -10780,6 +10837,7 @@ fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineSh
             return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell);
         }
         if matches!(argument.as_str(), "--help" | "--version") {
+            *terminal_arguments = true;
             return PipelineShellInputMode::DoesNotReadStdin;
         }
         if matches!(
@@ -10799,11 +10857,15 @@ fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineSh
         if matches!(argument.as_str(), "--command" | "--command=")
             || argument.starts_with("--command=")
         {
+            let source = argument
+                .strip_prefix("--command=")
+                .or_else(|| args.get(index + 1).map(String::as_str));
+            *terminal_arguments = source.is_some();
             if depth > 0 {
-                let source = argument
-                    .strip_prefix("--command=")
-                    .or_else(|| args.get(index + 1).map(String::as_str));
                 return source.map_or(PipelineShellInputMode::Unverified, |source| {
+                    if source.trim().is_empty() {
+                        return PipelineShellInputMode::DoesNotReadStdin;
+                    }
                     match remote_shell_payload_input_mode(source, depth) {
                         PipelineShellInputMode::NotShell => {
                             PipelineShellInputMode::DoesNotReadStdin
@@ -10820,11 +10882,15 @@ fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineSh
         {
             if flags.contains('c') {
                 if let Some(source) = args.get(index + 1) {
+                    *terminal_arguments = true;
                     // A remote fixed script may hand stdin to another shell
                     // with flags (e.g. `bash -s`) or to an interpreter. Follow
                     // that command with the same recursion bound; compound
                     // or dynamic dispatch stays unverified.
                     if depth > 0 {
+                        if source.trim().is_empty() {
+                            return PipelineShellInputMode::DoesNotReadStdin;
+                        }
                         return match remote_shell_payload_input_mode(source, depth) {
                             PipelineShellInputMode::NotShell => {
                                 PipelineShellInputMode::DoesNotReadStdin
@@ -10888,6 +10954,7 @@ fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineSh
         return if force_stdin {
             PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell)
         } else {
+            *terminal_arguments = true;
             PipelineShellInputMode::DoesNotReadStdin
         };
     }
@@ -12294,6 +12361,553 @@ fn dialect_stdin_reading_shell(argv: &[String]) -> Option<PipelineShellInputMode
     }
 }
 
+/// Decode a literal argument without treating its backslashes as path syntax
+/// or applying a second, POSIX quote-removal pass.
+fn powershell_pipeline_literal_word(raw: &str) -> Result<String, ()> {
+    if raw.len() > MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES {
+        return Err(());
+    }
+    if raw.starts_with(['\'', '"', '(']) || raw.starts_with("@'") || raw.starts_with("@\"") {
+        return parse_static_powershell_source(raw);
+    }
+    if powershell_alias_word_is_dynamic(raw) || raw == "--%" {
+        return Err(());
+    }
+    let mut parser = PowerShellStaticStringParser::new(raw);
+    let mut value = String::with_capacity(raw.len());
+    while parser.index < raw.len() {
+        let character = raw[parser.index..].chars().next().ok_or(())?;
+        match character {
+            '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' | '\u{201c}' | '\u{201d}'
+            | '\u{201e}' => return Err(()),
+            '\'' | '"' => value.push_str(&parser.parse_primary(0)?),
+            '\u{0060}' => {
+                let start = parser.index;
+                parser.index += 1;
+                let escaped = raw[parser.index..].chars().next().ok_or(())?;
+                parser.index += escaped.len_utf8();
+                if escaped == 'u' {
+                    if raw.as_bytes().get(parser.index) != Some(&b'{') {
+                        return Err(());
+                    }
+                    let close = raw[parser.index..].find('}').ok_or(())?;
+                    parser.index += close + 1;
+                } else if escaped == '\r' && raw.as_bytes().get(parser.index) == Some(&b'\n') {
+                    parser.index += 1;
+                }
+                value.push_str(&decode_static_powershell_expandable_text(
+                    &raw[start..parser.index],
+                )?);
+            }
+            '(' | ')' | '{' | '}' | ',' | ';' | '|' | '&' => return Err(()),
+            other => {
+                value.push(other);
+                parser.index += other.len_utf8();
+            }
+        }
+    }
+    Ok(value)
+}
+
+struct PowerShellPipelineWord<'a> {
+    raw: &'a str,
+    value: Option<String>,
+}
+
+/// Keep native quote provenance until binding is complete. A quoted string
+/// beginning with a dash is data to Write-Output, not one of its parameters.
+fn powershell_pipeline_words(
+    arguments: &str,
+    output_array: bool,
+) -> Result<(Vec<PowerShellPipelineWord<'_>>, bool), ()> {
+    let tokens = tokenize_for_shell_dialect(arguments, ShellDialect::PowerShell);
+    let mut words = Vec::new();
+    let mut stdin_redirect = false;
+    let mut index = 0usize;
+    while let Some(token) = tokens.get(index) {
+        if words.len() >= MAX_STATIC_SHELL_SOURCE_TERMS {
+            return Err(());
+        }
+        let raw = token.text(arguments).ok_or(())?;
+        let (raw, end) = if token.kind == NormalizeTokenKind::Separator && raw == "(" {
+            let close = find_powershell_subexpression_close(arguments, token.byte_range.end)?;
+            (&arguments[token.byte_range.start..=close], close + 1)
+        } else if token.kind == NormalizeTokenKind::Word {
+            (raw, token.byte_range.end)
+        } else {
+            return Err(());
+        };
+        while tokens
+            .get(index)
+            .is_some_and(|next| next.byte_range.start < end)
+        {
+            index += 1;
+        }
+        let positional = classify_shell_positional(raw);
+        if matches!(positional, ShellPositional::StdinReassignRedirect { .. }) {
+            stdin_redirect = true;
+        }
+        if let Some(bare) = positional.redirect_is_bare() {
+            if bare {
+                if tokens.get(index).is_none() {
+                    return Err(());
+                }
+                index += 1;
+            }
+            continue;
+        }
+        let value = powershell_pipeline_literal_word(raw).ok();
+        // Commas construct arrays for the cmdlet. Native receivers retain
+        // their original argument words and are never given this flattening.
+        if output_array && value.is_none() && raw.starts_with(['\'', '"', '(']) {
+            let mut parser = PowerShellStaticStringParser::new(raw);
+            let mut records = Vec::new();
+            loop {
+                let start = parser.index;
+                let value = parser.parse_concatenation(0)?;
+                records.push(PowerShellPipelineWord {
+                    raw: &raw[start..parser.index],
+                    value: Some(value),
+                });
+                parser.skip_whitespace();
+                if parser.index == raw.len() {
+                    break;
+                }
+                if raw.as_bytes().get(parser.index) != Some(&b',') {
+                    return Err(());
+                }
+                parser.index += 1;
+            }
+            if words.len().saturating_add(records.len()) > MAX_STATIC_SHELL_SOURCE_TERMS {
+                return Err(());
+            }
+            words.extend(records);
+        } else {
+            words.push(PowerShellPipelineWord { raw, value });
+        }
+    }
+    Ok((words, stdin_redirect))
+}
+
+/// The callee and untouched argument tail of one native stage. Only the
+/// shared invocation collector may promote a quoted or computed command name
+/// into executable syntax.
+fn powershell_pipeline_callee(stage: &str) -> Result<Option<(String, Range<usize>)>, ()> {
+    let stage_start = stage.len() - stage.trim_start().len();
+    let trimmed = &stage[stage_start..];
+    let called = trimmed.starts_with('&')
+        || trimmed.strip_prefix('.').is_some_and(|rest| {
+            rest.starts_with('(') || rest.chars().next().is_some_and(char::is_whitespace)
+        });
+    if called {
+        let invocations =
+            crate::packs::core::credential_files::powershell_literal_invocations(stage)
+                .map_err(|_| ())?;
+        return invocations
+            .into_iter()
+            .find(|invocation| invocation.operator_span.start == stage_start)
+            .map(|invocation| Some((invocation.name, invocation.span)))
+            .ok_or(());
+    }
+    let tokens = tokenize_for_shell_dialect(stage, ShellDialect::PowerShell);
+    let Some(first) = tokens.first() else {
+        return Ok(None);
+    };
+    if first.kind != NormalizeTokenKind::Word {
+        return Ok(None);
+    }
+    let raw = first.text(stage).ok_or(())?;
+    if raw.starts_with(['\'', '"', '$', '@', '{']) {
+        return Ok(None);
+    }
+    Ok(Some((
+        powershell_pipeline_literal_word(raw)?,
+        first.byte_range.clone(),
+    )))
+}
+
+/// Reuse each interpreter's existing option grammar after native arguments
+/// have been proved literal. The empty context deliberately prevents the
+/// helpers from interpreting PowerShell escapes as POSIX substitutions.
+fn powershell_pipeline_consumer_mode(
+    executable: &str,
+    args: &[String],
+) -> Option<(PipelineShellInputMode, bool)> {
+    let executable = cmd_executable_basename(executable);
+    match executable.as_str() {
+        "cmd" => return Some((cmd_pipeline_input_mode(args), false)),
+        "powershell" | "pwsh" => return Some((powershell_pipeline_input_mode(args), false)),
+        "sh" | "bash" | "zsh" | "fish" | "ksh" | "dash" => {
+            let mut terminal = false;
+            // A fixed -c body can forward inherited stdin to another shell or
+            // interpreter. Reuse the bounded carrier-body analysis for it.
+            let mode = posix_shell_argv_input_mode(args, 1, &mut terminal);
+            return Some((mode, terminal));
+        }
+        _ => {}
+    }
+    let language = crate::heredoc::ScriptLanguage::from_command(&executable);
+    match language {
+        crate::heredoc::ScriptLanguage::Python => {
+            let mode = python_pipeline_input_mode("", args, language);
+            let terminal = mode == PipelineShellInputMode::DoesNotReadStdin;
+            Some((mode, terminal))
+        }
+        crate::heredoc::ScriptLanguage::JavaScript
+        | crate::heredoc::ScriptLanguage::Ruby
+        | crate::heredoc::ScriptLanguage::Perl
+        | crate::heredoc::ScriptLanguage::Php => Some((
+            script_interpreter_pipeline_input_mode("", &executable, args, language),
+            false,
+        )),
+        _ => None,
+    }
+}
+
+fn powershell_pipeline_literal_source(mut source: String) -> IndirectInputSource {
+    // PowerShell sends each string object to a native process with a final
+    // newline, including an empty string object.
+    if source.len() >= MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES {
+        return IndirectInputSource::Unverified(
+            "PowerShell producer exceeds the bounded source size".to_string(),
+        );
+    }
+    source.push('\n');
+    IndirectInputSource::StaticProducer(source)
+}
+
+fn powershell_pipeline_source(stage: &str) -> IndirectInputSource {
+    let unverified = || {
+        IndirectInputSource::Unverified(
+            "PowerShell producer is not a completely literal source".to_string(),
+        )
+    };
+    let mut stage = crate::normalize::powershell_assignment_rhs(stage.trim())
+        .unwrap_or(stage)
+        .trim();
+    let prefix_tokens = tokenize_for_shell_dialect(stage, ShellDialect::PowerShell);
+    if let Some(prefix) = prefix_tokens.first()
+        && prefix.kind == NormalizeTokenKind::Word
+        && prefix.text(stage).is_some_and(|raw| {
+            ["return", "throw", "exit"]
+                .iter()
+                .any(|keyword| raw.eq_ignore_ascii_case(keyword))
+        })
+    {
+        stage = stage[prefix.byte_range.end..].trim_start();
+    }
+    if let Ok(value) = parse_static_powershell_source(stage) {
+        return powershell_pipeline_literal_source(value);
+    }
+    let Ok(Some((name, span))) = powershell_pipeline_callee(stage) else {
+        return unverified();
+    };
+    let name = cmd_executable_basename(&name);
+    if matches!(name.as_str(), "get-content" | "gc" | "cat" | "type") {
+        // File contents are intentionally not opened: the executable source
+        // could change between inspection and execution.
+        return IndirectInputSource::File(PathBuf::new());
+    }
+    if !matches!(name.as_str(), "write-output" | "echo" | "write") {
+        return unverified();
+    }
+    let Ok((words, redirected)) = powershell_pipeline_words(&stage[span.end..], true) else {
+        return unverified();
+    };
+    if redirected {
+        return unverified();
+    }
+    let mut records = Vec::new();
+    for word in words {
+        let dash_width = word
+            .raw
+            .chars()
+            .next()
+            .filter(|first| matches!(*first, '-' | '\u{2013}' | '\u{2014}' | '\u{2015}'))
+            .map(char::len_utf8);
+        if let Some(width) = dash_width {
+            let (raw_name, attached) = word.raw[width..]
+                .split_once(':')
+                .map_or((&word.raw[width..], None), |(name, value)| {
+                    (name, Some(value))
+                });
+            // Quotes in an attached value do not turn the parameter into
+            // positional data. A quote fragment in its name does.
+            if !raw_name.contains(['\'', '"']) {
+                let Ok(parameter) = powershell_pipeline_literal_word(raw_name) else {
+                    return unverified();
+                };
+                let parameter = parameter.to_ascii_lowercase();
+                if parameter.len() >= 3 && "inputobject".starts_with(&parameter) {
+                    if let Some(value) = attached.filter(|value| !value.is_empty()) {
+                        let Ok(value) = powershell_pipeline_literal_word(value) else {
+                            return unverified();
+                        };
+                        records.push(value);
+                    }
+                    continue;
+                }
+                if !parameter.is_empty() && "noenumerate".starts_with(&parameter) {
+                    if attached.is_some_and(|value| {
+                        !value.eq_ignore_ascii_case("$true")
+                            && !value.eq_ignore_ascii_case("$false")
+                    }) {
+                        return unverified();
+                    }
+                    continue;
+                }
+                return unverified();
+            }
+        }
+        let Some(value) = word.value else {
+            return unverified();
+        };
+        records.push(value);
+    }
+    if records.is_empty() {
+        // InputObject can be pipeline-bound. An argument-free output cmdlet
+        // is not proof that the downstream interpreter receives no source.
+        return unverified();
+    }
+    powershell_pipeline_literal_source(records.join("\n"))
+}
+
+fn powershell_pipeline_is_passthrough(stage: &str) -> bool {
+    powershell_pipeline_callee(stage)
+        .ok()
+        .flatten()
+        .is_some_and(|(name, span)| {
+            matches!(
+                cmd_executable_basename(&name).as_str(),
+                "write-output" | "echo" | "write"
+            ) && stage[span.end..].trim().is_empty()
+        })
+}
+
+fn powershell_pipeline_sets_interpreter_environment(stage: &str) -> bool {
+    let Some((name, end)) = powershell_variable_prefix(stage) else {
+        return false;
+    };
+    let Some(name) = name.strip_prefix("env:") else {
+        return false;
+    };
+    let Some(value) = stage[end..].trim_start().strip_prefix('=') else {
+        return false;
+    };
+    let setting = format!("{}=", name.to_ascii_uppercase());
+    !value.starts_with('=')
+        && INTERPRETER_CODE_SETTING
+            .find(&setting)
+            .is_some_and(|matched| matched.start() == 0)
+        && !value.trim().eq_ignore_ascii_case("$null")
+        && !parse_static_powershell_source(value).is_ok_and(|value| value.is_empty())
+}
+
+/// Candidate proof for Unknown-dialect replay. Only native executable input
+/// sinks require replay; a quoted pipe, an ordinary data consumer, or a fixed
+/// program that does not execute stdin cannot supply this proof. Parse/budget
+/// uncertainty remains a candidate so it reaches the normal incomplete rule.
+fn powershell_pipeline_scan_required(command: &str) -> bool {
+    if !command.as_bytes().contains(&b'|') {
+        return false;
+    }
+    let mut sinks = Vec::new();
+    collect_powershell_pipeline_stdin_sinks(command, &mut sinks, 0, 0, &mut (1024 * 1024), true);
+    !sinks.is_empty()
+}
+
+fn collect_powershell_pipeline_stdin_sinks(
+    command: &str,
+    sinks: &mut Vec<ExecutableTextSink>,
+    depth: usize,
+    source_offset: usize,
+    remaining_work: &mut usize,
+    pipeline_only: bool,
+) {
+    let bounds = |sinks: &mut Vec<ExecutableTextSink>| {
+        sinks.push(ExecutableTextSink::Unverified {
+            rule: SINK_ANALYSIS_BOUNDS_RULE,
+            reason: "PowerShell pipeline source exceeds bounded native analysis",
+        });
+    };
+    if depth >= MAX_EMBEDDED_SHELL_DEPTH || command.len() > *remaining_work {
+        bounds(sinks);
+        return;
+    }
+    *remaining_work -= command.len();
+    let uncommented = mask_powershell_comments(command);
+    let redirected = windows_redirection_free_view(&uncommented, ShellDialect::PowerShell);
+    let syntax = redirected.as_deref().unwrap_or(&uncommented);
+    let Ok(stages) = split_top_level_powershell_statements(syntax) else {
+        bounds(sinks);
+        return;
+    };
+    if stages.len() > 128 {
+        bounds(sinks);
+        return;
+    }
+    let mut previous_end = None;
+    let mut interpreter_environment = false;
+    for (stage_index, stage) in stages.iter().copied().enumerate() {
+        if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
+            bounds(sinks);
+            return;
+        }
+        let start = stage.as_ptr() as usize - syntax.as_ptr() as usize;
+        let from_pipe = previous_end.is_some_and(|end| syntax[end..start].trim() == "|");
+        previous_end = Some(start + stage.len());
+        interpreter_environment |= powershell_pipeline_sets_interpreter_environment(stage);
+        if !from_pipe && (pipeline_only || !stage.contains('<')) {
+            continue;
+        }
+        let (name, span) = match powershell_pipeline_callee(stage) {
+            Ok(Some(callee)) => callee,
+            Ok(None) => continue,
+            Err(()) => {
+                sinks.push(ExecutableTextSink::Unverified {
+                    rule: PIPELINE_CONSUMER_RULE,
+                    reason: "PowerShell pipeline receiver cannot be statically resolved",
+                });
+                continue;
+            }
+        };
+        if powershell_pipeline_consumer_mode(&name, &[]).is_none() {
+            continue;
+        }
+        let (words, stdin_redirect) = match powershell_pipeline_words(&stage[span.end..], false) {
+            Ok(arguments) => arguments,
+            Err(()) => {
+                sinks.push(ExecutableTextSink::Unverified {
+                    rule: PIPELINE_CONSUMER_RULE,
+                    reason: "PowerShell pipeline receiver arguments cannot be statically resolved",
+                });
+                continue;
+            }
+        };
+        let mut args = Vec::new();
+        let mut unresolved = false;
+        for word in words {
+            let Some(value) = word.value else {
+                unresolved = true;
+                break;
+            };
+            args.push(value);
+        }
+        let (mut mode, terminal_arguments) = powershell_pipeline_consumer_mode(&name, &args)
+            .unwrap_or((PipelineShellInputMode::Unverified, false));
+        if matches!(mode, PipelineShellInputMode::DoesNotReadStdin)
+            && interpreter_environment
+            && matches!(
+                crate::heredoc::ScriptLanguage::from_command(&cmd_executable_basename(&name)),
+                crate::heredoc::ScriptLanguage::Python
+                    | crate::heredoc::ScriptLanguage::JavaScript
+                    | crate::heredoc::ScriptLanguage::Ruby
+                    | crate::heredoc::ScriptLanguage::Perl
+                    | crate::heredoc::ScriptLanguage::Php
+            )
+        {
+            mode = PipelineShellInputMode::Unverified;
+        }
+        // Python and POSIX shells stop option processing after a fixed
+        // program/script operand; later dynamic words are program data.
+        if unresolved && (!terminal_arguments || mode != PipelineShellInputMode::DoesNotReadStdin) {
+            mode = PipelineShellInputMode::Unverified;
+        }
+        if stdin_redirect && matches!(mode, PipelineShellInputMode::ReadsStdin(_)) {
+            sinks.push(ExecutableTextSink::Unverified {
+                rule: PIPELINE_FILE_SOURCE_RULE,
+                reason: "an executable pipeline reads source from an unverified stdin file",
+            });
+            continue;
+        }
+        if !from_pipe {
+            continue;
+        }
+        match mode {
+            PipelineShellInputMode::ReadsStdin(kind) => {
+                let mut producer_index = stage_index - 1;
+                while producer_index > 0
+                    && powershell_pipeline_is_passthrough(stages[producer_index])
+                {
+                    let prior = stages[producer_index - 1];
+                    let prior_start = prior.as_ptr() as usize - syntax.as_ptr() as usize;
+                    let current_start =
+                        stages[producer_index].as_ptr() as usize - syntax.as_ptr() as usize;
+                    if syntax[prior_start + prior.len()..current_start].trim() != "|" {
+                        break;
+                    }
+                    producer_index -= 1;
+                }
+                push_executable_input_source_at(
+                    powershell_pipeline_source(stages[producer_index]),
+                    kind,
+                    Some(MatchSpan {
+                        start: source_offset + start + span.start,
+                        end: source_offset + start + span.end,
+                    }),
+                    false,
+                    sinks,
+                );
+            }
+            PipelineShellInputMode::Unverified => sinks.push(ExecutableTextSink::Unverified {
+                rule: PIPELINE_CONSUMER_RULE,
+                reason: "PowerShell pipeline receiver options cannot be statically verified",
+            }),
+            PipelineShellInputMode::NotShell
+            | PipelineShellInputMode::DoesNotReadStdin
+            | PipelineShellInputMode::FixedTemplate(_) => {}
+        }
+    }
+
+    // Parenthesized pipelines execute even without a dollar-sign substitution.
+    // Script blocks have their own execution/ownership pass, so do not scan an
+    // uninvoked block merely because its text contains a pipeline.
+    let mut cursor = 0usize;
+    while cursor < syntax.len() {
+        let work = syntax.len() - cursor;
+        if work > *remaining_work {
+            bounds(sinks);
+            return;
+        }
+        *remaining_work -= work;
+        let paren = find_powershell_code_marker(syntax, "(", cursor);
+        let brace = find_powershell_code_marker(syntax, "{", cursor);
+        if let Some(open) = brace
+            && paren.is_none_or(|paren| open < paren)
+        {
+            if syntax.as_bytes().get(open.wrapping_sub(1)) == Some(&b'@') {
+                cursor = open + 1;
+                continue;
+            }
+            let Some(close) = find_powershell_script_block_close(syntax, open + 1) else {
+                bounds(sinks);
+                return;
+            };
+            cursor = close + 1;
+            continue;
+        }
+        let Some(open) = paren else {
+            break;
+        };
+        let Ok(close) = find_powershell_subexpression_close(syntax, open + 1) else {
+            bounds(sinks);
+            return;
+        };
+        let body = &syntax[open + 1..close];
+        if body.contains('|') {
+            collect_powershell_pipeline_stdin_sinks(
+                body,
+                sinks,
+                depth + 1,
+                source_offset + open + 1,
+                remaining_work,
+                pipeline_only,
+            );
+        }
+        cursor = close + 1;
+    }
+}
+
 /// Executing-sink coverage for the cmd and PowerShell dialects that mirrors the
 /// POSIX `collect_posix_pipeline_executable_sinks`: a statically-known producer
 /// piped into a bare stdin-reading shell (`echo del /s /q C:\x | cmd`,
@@ -12310,6 +12924,19 @@ fn collect_dialect_pipeline_stdin_sinks(
     sinks: &mut Vec<ExecutableTextSink>,
 ) {
     if !matches!(dialect, ShellDialect::Cmd | ShellDialect::PowerShell) {
+        return;
+    }
+    if dialect == ShellDialect::PowerShell {
+        if command.contains(['|', '<']) {
+            collect_powershell_pipeline_stdin_sinks(
+                command,
+                sinks,
+                0,
+                0,
+                &mut (1024 * 1024),
+                false,
+            );
+        }
         return;
     }
     let tokens = tokenize_for_shell_dialect(command, dialect);
@@ -12507,6 +13134,10 @@ fn find_powershell_code_marker(command: &str, marker: &str, start: usize) -> Opt
     let marker_bytes = marker.as_bytes();
     let mut index = start;
     while index < bytes.len() {
+        if powershell_quote_at(bytes, index).is_some() {
+            index = powershell_quoted_region_end(command, index, 0).ok()?;
+            continue;
+        }
         match bytes[index] {
             b'`' => index = escape_sequence_end(command, index),
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
@@ -12516,20 +13147,6 @@ fn find_powershell_code_marker(command: &str, marker: &str, start: usize) -> Opt
             }
             b'<' if bytes.get(index + 1) == Some(&b'#') => {
                 index = skip_powershell_block_comment(command, index);
-            }
-            b'\'' => index = skip_powershell_single_quote(command, index),
-            b'"' => {
-                index += 1;
-                while index < bytes.len() {
-                    if bytes[index] == b'`' {
-                        index = escape_sequence_end(command, index);
-                    } else if bytes[index] == b'"' {
-                        index += 1;
-                        break;
-                    } else {
-                        index += 1;
-                    }
-                }
             }
             b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
                 index =
@@ -16860,9 +17477,10 @@ fn dialect_view_may_expose_hidden_execution(
 /// [`unknown_dialect_fanout_candidate`] requires a dialect-divergent byte plus a
 /// live enabled-pack keyword, and each replay additionally requires
 /// [`dialect_view_may_expose_hidden_execution`]. A bounded, parser-proven
-/// PowerShell invocation naming an enabled keyword can satisfy both guards;
-/// that proof is computed lazily once and cannot come from quoted argument
-/// data. A replay must expose execution the POSIX reading could not see.
+/// PowerShell invocation naming an enabled keyword, or a native pipeline
+/// delivering executable input, can satisfy both guards. Their shared proof
+/// is computed lazily once and cannot come from quoted argument data. A
+/// replay must expose execution the POSIX reading could not see.
 ///
 /// Recursion is impossible: the replays pass a concrete dialect, and the
 /// fan-out is confined to top-level evaluation (`nested_command_depth == 0`).
@@ -17129,20 +17747,24 @@ fn evaluate_command_in_dialect_union(
         return primary;
     }
 
-    let literal_call_proof = std::cell::OnceCell::new();
-    let has_protected_powershell_call = || {
-        *literal_call_proof
-            .get_or_init(|| powershell_invocation_reaches_pack_keyword(command, keyword_index))
+    let powershell_execution_proof = std::cell::OnceCell::new();
+    let may_expose_powershell_execution = || {
+        *powershell_execution_proof.get_or_init(|| {
+            powershell_invocation_reaches_pack_keyword(command, keyword_index)
+                || powershell_pipeline_scan_required(command)
+        })
     };
-    if !unknown_dialect_fanout_candidate(command, keyword_index) && !has_protected_powershell_call()
+    if !unknown_dialect_fanout_candidate(command, keyword_index)
+        && !may_expose_powershell_execution()
     {
         return primary;
     }
 
     for view in [ShellDialect::Cmd, ShellDialect::PowerShell] {
-        if !dialect_view_may_expose_hidden_execution(command, view, keyword_index, ordered_packs)
-            && !(view == ShellDialect::PowerShell && has_protected_powershell_call())
-        {
+        let reveals_execution =
+            dialect_view_may_expose_hidden_execution(command, view, keyword_index, ordered_packs)
+                || (view == ShellDialect::PowerShell && may_expose_powershell_execution());
+        if !reveals_execution {
             continue;
         }
         // An exhausted budget is never proof that the un-run views are clean.
@@ -40328,6 +40950,253 @@ pub fn apply_branch_strictness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_powershell_pipeline_preserves_literal_records_and_escapes() {
+        for (stage, expected) in [
+            ("@'\nfirst\nsecond\n'@", "first\nsecond\n"),
+            ("(@'\nfirst\nsecond\n'@)", "first\nsecond\n"),
+            ("Write-Output 'first' 'second'", "first\nsecond\n"),
+            ("Write-Output 'first','second'", "first\nsecond\n"),
+            ("Write-Output -InputObject 'first'", "first\n"),
+            ("Write-Output -InputObject:'first'", "first\n"),
+            ("Write-Output -InputObject:\"first\"", "first\n"),
+            ("Write-Output \u{2013}InputObject:'first'", "first\n"),
+            ("Write-Output -NoEnumerate 'first'", "first\n"),
+            ("Write-Output -NoEnumerate:$false 'first'", "first\n"),
+            ("Write-Output ('fir'+'st')", "first\n"),
+            ("\"first\x60nsecond\"", "first\nsecond\n"),
+            ("\"\x60u{66}irst\"", "first\n"),
+            ("@'\nprint(\"it’s data\")\n'@", "print(\"it’s data\")\n"),
+            ("'C:\\work\\file'", "C:\\work\\file\n"),
+            ("''", "\n"),
+        ] {
+            let IndirectInputSource::StaticProducer(source) = powershell_pipeline_source(stage)
+            else {
+                panic!("{stage:?} must produce known literal records");
+            };
+            assert_eq!(source, expected, "{stage:?}");
+        }
+        for stage in [
+            "Write-Output",
+            "Write-Output $source",
+            "@\"\n$source\n\"@",
+            "\"\x60u{00000041}\"",
+            "\"\x60u{D800}\"",
+            "Write-Output \u{2018}print(1)\u{2019}",
+        ] {
+            assert!(
+                matches!(
+                    powershell_pipeline_source(stage),
+                    IndirectInputSource::Unverified(_)
+                ),
+                "{stage:?} must not certify literal source"
+            );
+        }
+    }
+
+    #[test]
+    fn native_powershell_pipeline_requires_a_bound_fixed_shell_program() {
+        for command in [
+            "'printf unsafe' | bash -c $program",
+            "'printf unsafe' | bash --command $program",
+            "'print(1)' | python3 -c $program",
+            "'print(1)' | python3 -m $module",
+        ] {
+            let mut sinks = Vec::new();
+            collect_dialect_pipeline_stdin_sinks(command, ShellDialect::PowerShell, &mut sinks);
+            assert!(
+                sinks.iter().any(|sink| matches!(
+                    sink,
+                    ExecutableTextSink::Unverified {
+                        rule: PIPELINE_CONSUMER_RULE,
+                        ..
+                    }
+                )),
+                "{command:?}: {sinks:?}"
+            );
+        }
+        for command in [
+            "$source | bash -c 'printf fixed' $arguments",
+            "$source | bash -c '' $arguments",
+            "$source | python3 -c 'print(1)' $arguments",
+            "'print(1)' || python3 -",
+            "'print(1)'; python3 -",
+        ] {
+            let mut sinks = Vec::new();
+            collect_dialect_pipeline_stdin_sinks(command, ShellDialect::PowerShell, &mut sinks);
+            assert!(sinks.is_empty(), "{command:?}: {sinks:?}");
+        }
+        for command in [
+            "'printf unsafe' | bash -c 'bash -s'",
+            "'printf unsafe' | Write-Output | bash",
+        ] {
+            let mut sinks = Vec::new();
+            collect_dialect_pipeline_stdin_sinks(command, ShellDialect::PowerShell, &mut sinks);
+            assert!(
+                sinks.iter().any(|sink| matches!(
+                    sink,
+                    ExecutableTextSink::Payload { source, dialect: ShellDialect::Posix, .. }
+                        if source == "printf unsafe\n"
+                )),
+                "{command:?}: {sinks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_powershell_pipeline_unverified_source_keeps_original_receiver_span() {
+        for receiver in ["& ('py'+'thon3') -", ".('py'+'thon3') -"] {
+            let command = format!("Get-UnknownSource | {receiver}");
+            let mut sinks = Vec::new();
+            collect_dialect_pipeline_stdin_sinks(&command, ShellDialect::PowerShell, &mut sinks);
+            assert!(
+                sinks.iter().any(|sink| matches!(
+                    sink,
+                    ExecutableTextSink::UnverifiedSource { matched_span: Some(span), .. }
+                        if command.get(span.start..span.end) == Some("('py'+'thon3')")
+                )),
+                "{command:?}: {sinks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_powershell_pipeline_replay_requires_owned_executable_input() {
+        for command in [
+            "'print(1)' | python3 -",
+            "@'\nprint(1)\n'@ | python3 -",
+            "'print(1)' | Write-Output | python3 -",
+            "'print(1)' | & ('py'+'thon3') -",
+            "'print(1)' | & $receiver",
+            "('print(1)' | python3 -)",
+        ] {
+            assert!(powershell_pipeline_scan_required(command), "{command:?}");
+        }
+        for command in [
+            "python3 --help",
+            "Write-Output \"'print(1)' | python3 -\"",
+            "'text' | Out-String",
+            "$data | python3 -c 'print(1)'",
+            "$data | python3 -m json.tool",
+            "$data | bash -c 'printf harmless'",
+            "Write-Output '|'; python3 < payload.py",
+        ] {
+            assert!(!powershell_pipeline_scan_required(command), "{command:?}");
+        }
+        let mut oversized = "Write-Output harmless; ".repeat(129);
+        oversized.push_str("'print(1)' | python3 -");
+        assert!(powershell_pipeline_scan_required(&oversized));
+    }
+
+    #[test]
+    fn native_powershell_pipeline_keeps_quoted_syntax_as_data() {
+        for (open, close) in [("'", "'"), ("\"", "\""), ("‘", "’"), ("“", "”")] {
+            for data in [
+                "text | python3",
+                "text ( marker | python3 - )",
+                "text { marker | python3 - }",
+                "text # marker | python3 -",
+                "text <# marker | python3 - #> ( ) { }",
+            ] {
+                let command = format!("Write-Output {open}{data}{close}");
+                assert_eq!(mask_powershell_comments(&command), command, "{command}");
+                assert_eq!(
+                    split_top_level_powershell_statements(&command),
+                    Ok(vec![command.as_str()]),
+                    "{command}"
+                );
+                for marker in ["(", "{"] {
+                    assert_eq!(
+                        find_powershell_code_marker(&command, marker, 0),
+                        None,
+                        "{command}"
+                    );
+                }
+                assert!(!powershell_pipeline_scan_required(&command), "{command}");
+                let mut sinks = Vec::new();
+                collect_dialect_pipeline_stdin_sinks(
+                    &command,
+                    ShellDialect::PowerShell,
+                    &mut sinks,
+                );
+                assert!(sinks.is_empty(), "{command}: {sinks:?}");
+            }
+        }
+        for command in [
+            "Write-Output “text `” ( marker | python3 - )”",
+            "Write-Output ‘text ’’ { marker | python3 - }’",
+        ] {
+            assert!(!powershell_pipeline_scan_required(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn native_powershell_smart_quoted_executable_source_stays_unverified() {
+        for command in [
+            "‘open(\".ssh/authorized_keys\",\"w\")’ | python3 -",
+            "“open('.ssh/authorized_keys','w')” | python3 -",
+        ] {
+            assert!(powershell_pipeline_scan_required(command), "{command}");
+            let mut sinks = Vec::new();
+            collect_dialect_pipeline_stdin_sinks(command, ShellDialect::PowerShell, &mut sinks);
+            assert!(
+                sinks.iter().any(|sink| matches!(
+                    sink,
+                    ExecutableTextSink::UnverifiedSource {
+                        rule: PIPELINE_CONSUMER_RULE,
+                        ..
+                    }
+                )),
+                "{command}: {sinks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_structural_quotes_preserve_substitutions_and_byte_offsets() {
+        let body = "Write-Output ‘)’; 'print(1)' | python3 -";
+        let command = format!("Write-Output “before $({body}) after”");
+        assert_eq!(
+            collect_powershell_substitution_bodies(&command),
+            Ok(vec![body.to_string()])
+        );
+        let open = command.find('“').expect("smart quote");
+        assert_eq!(
+            powershell_quoted_region_end(&command, open, 0),
+            Ok(command.len())
+        );
+        assert_eq!(find_powershell_code_marker(&command, "(", 0), None);
+
+        // Single-quote characters inside an expandable string are data and
+        // cannot suppress a real substitution. Smart single quotes do.
+        let command = "Write-Output “'$('print(1)' | python3 -)'”";
+        assert_eq!(
+            collect_powershell_substitution_bodies(command),
+            Ok(vec!["'print(1)' | python3 -".to_string()])
+        );
+        assert_eq!(
+            collect_powershell_substitution_bodies("Write-Output ‘$(python3 -)’"),
+            Ok(Vec::new())
+        );
+
+        let command = "(Write-Output ‘)’; Write-Output “}”)";
+        assert_eq!(
+            find_powershell_subexpression_close(command, 1),
+            Ok(command.len() - 1)
+        );
+        let command = "{Write-Output ‘}’; Write-Output “)”}";
+        assert_eq!(
+            find_powershell_script_block_close(command, 1),
+            Some(command.len() - 1)
+        );
+
+        let mut nested = "Write-Output ok".to_string();
+        for _ in 0..MAX_POWERSHELL_VISIBLE_NESTING {
+            nested = format!("\"$({nested})\"");
+        }
+        assert!(powershell_quoted_region_end(&nested, 0, 0).is_err());
+    }
 
     #[test]
     fn a_dynamic_source_wait_outlasts_a_scheduling_delay_inside_the_deadline() {
