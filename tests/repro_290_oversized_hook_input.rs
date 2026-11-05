@@ -702,6 +702,16 @@ fn run_native_recovery(
 ) -> Output {
     let config =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/fixtures/configs/minimal.toml");
+    run_recovery_with_config(input, home, agent, fail_closed, &config)
+}
+
+fn run_recovery_with_config(
+    input: &[u8],
+    home: &Path,
+    agent: NativeRecoveryAgent,
+    fail_closed: bool,
+    config: &Path,
+) -> Output {
     let mut command = Command::new(dcg_binary());
     command.env_clear();
     // Preserve executable/platform lookup only; no caller agent markers,
@@ -756,6 +766,141 @@ fn run_native_recovery(
         .write_all(input)
         .expect("write native fixture bytes");
     child.wait_with_output().expect("wait for native recovery")
+}
+
+fn limited_recovery_config(home: &Path, max_command_bytes: usize) -> PathBuf {
+    let path = home.join("scan-limits.toml");
+    fs::write(
+        &path,
+        format!(
+            "[general]\nmax_hook_input_bytes = 128\nmax_command_bytes = {max_command_bytes}\n\
+             self_heal_hook = false\ncheck_updates = false\n[history]\nenabled = false\n"
+        ),
+    )
+    .expect("write scan-limit configuration");
+    path
+}
+
+fn limited_recovery_payload(command: &str, tool: &str) -> String {
+    serde_json::json!({
+        "tool_name": tool,
+        "tool_input": {"command": command},
+        "padding": "p".repeat(256)
+    })
+    .to_string()
+}
+
+/// Bounds must leave an explicit unverified result, including when there is
+/// no evaluable window at all. These are command strings sent to the guard;
+/// none of the fixture commands are executed.
+#[test]
+fn uncovered_oversized_commands_publish_indeterminate_in_every_protocol() {
+    for (limit, command) in [
+        (0, "git reset --hard".to_string()),
+        (1, "🛡x".to_string()),
+        // A 1 KiB window advances one byte under the fixed 4 KiB overlap.
+        // All 128 permitted windows end before the destructive tail.
+        (1024, format!("{}; git reset --hard", "a".repeat(6000))),
+    ] {
+        for agent in [
+            "claude-code",
+            "codex",
+            "copilot",
+            "gemini",
+            "hermes",
+            "grok",
+            "agy",
+            "crush",
+            "reasonix",
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let config = limited_recovery_config(temp.path(), limit);
+            let input = limited_recovery_payload(&command, "Bash");
+            let output = run_recovery_with_config(
+                input.as_bytes(),
+                temp.path(),
+                NativeRecoveryAgent::Forced(agent),
+                false,
+                &config,
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(if agent == "reasonix" { 2 } else { 0 }),
+                "{agent}, limit={limit}: {output:?}"
+            );
+            assert!(
+                stderr.contains("exceeds limit"),
+                "{agent}, limit={limit}: {stderr}"
+            );
+            assert!(
+                !stderr.contains("fail-open"),
+                "{agent}, limit={limit}: {stderr}"
+            );
+            if agent == "reasonix" {
+                assert!(
+                    output.stdout.is_empty(),
+                    "Reasonix uses its blocking exit status"
+                );
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .unwrap_or_else(|error| panic!("{agent}, limit={limit}: {error}: {output:?}"));
+            let (decision, expected) = match agent {
+                "claude-code" => (&value["hookSpecificOutput"]["permissionDecision"], "ask"),
+                "codex" => (&value["hookSpecificOutput"]["permissionDecision"], "deny"),
+                "copilot" => (&value["permissionDecision"], "ask"),
+                "hermes" => (&value["decision"], "block"),
+                _ => (&value["decision"], "deny"),
+            };
+            assert_eq!(decision, expected, "{agent}, limit={limit}: {value}");
+        }
+    }
+}
+
+#[test]
+fn incomplete_window_coverage_keeps_concrete_denials_and_non_shell_controls() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = limited_recovery_config(temp.path(), 1024);
+    let input =
+        limited_recovery_payload(&format!("git reset --hard; {}", "a".repeat(6000)), "Bash");
+    let output = run_recovery_with_config(
+        input.as_bytes(),
+        temp.path(),
+        NativeRecoveryAgent::Forced("claude-code"),
+        false,
+        &config,
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("deny JSON");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(value["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("core.git:reset-hard"),
+        "a proven denial must outrank the unscanned tail: {output:?}"
+    );
+
+    for (limit, tool, command) in [(32, "Bash", "echo hello"), (0, "Write", "git reset --hard")] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = limited_recovery_config(temp.path(), limit);
+        let input = limited_recovery_payload(command, tool);
+        let output = run_recovery_with_config(
+            input.as_bytes(),
+            temp.path(),
+            NativeRecoveryAgent::Forced("claude-code"),
+            false,
+            &config,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{tool}, limit={limit}: {output:?}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{tool}, limit={limit}: {output:?}"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("fail-open"));
+    }
 }
 
 fn native_recovery_payload(command: &str) -> String {

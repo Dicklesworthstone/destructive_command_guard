@@ -614,9 +614,9 @@ fn handle_unparseable_hook_input(
 }
 
 /// Overlap between consecutive scan windows of an over-limit command, so a
-/// destructive command that straddles a window boundary is still wholly
-/// contained in the next window. 4 KiB comfortably exceeds any realistic
-/// single shell command.
+/// short destructive command that straddles a window boundary can still be
+/// contained in the next window. This does not establish shell context for a
+/// command longer than the overlap.
 const OVERSIZED_SCAN_WINDOW_OVERLAP: usize = 4 * 1024;
 
 /// Hard cap on the number of scan windows produced from one extracted
@@ -629,20 +629,31 @@ const OVERSIZED_SCAN_MAX_WINDOWS: usize = 128;
 /// `out`.
 ///
 /// A command within the limit contributes itself unchanged. Empty windows are
-/// dropped. Windows always start and end on char boundaries.
-fn push_oversized_scan_windows(out: &mut Vec<String>, command: &str, max_command_bytes: usize) {
-    if command.is_empty() || max_command_bytes == 0 {
-        return;
+/// dropped. Windows always start and end on char boundaries. Returns whether
+/// the windows cover every byte of the command: a zero limit, exhausted window
+/// cap, or a code point wider than a window must not look like a completed scan.
+fn push_oversized_scan_windows(
+    out: &mut Vec<String>,
+    command: &str,
+    max_command_bytes: usize,
+) -> bool {
+    if command.is_empty() {
+        return true;
+    }
+    if max_command_bytes == 0 {
+        return false;
     }
     if command.len() <= max_command_bytes {
         out.push(command.to_string());
-        return;
+        return true;
     }
 
     let stride = max_command_bytes
         .saturating_sub(OVERSIZED_SCAN_WINDOW_OVERLAP)
         .max(1);
     let mut start = 0usize;
+    let mut covered_end = 0usize;
+    let mut contiguous = true;
     for _ in 0..OVERSIZED_SCAN_MAX_WINDOWS {
         if start >= command.len() {
             break;
@@ -656,13 +667,16 @@ fn push_oversized_scan_windows(out: &mut Vec<String>, command: &str, max_command
             end -= 1;
         }
         if begin < end {
+            contiguous &= begin <= covered_end;
+            covered_end = covered_end.max(end);
             out.push(command[begin..end].to_string());
         }
         if end >= command.len() {
-            break;
+            return contiguous && covered_end == command.len();
         }
         start += stride;
     }
+    false
 }
 
 /// Best-effort evaluation of an oversized hook payload's truncated prefix
@@ -730,7 +744,10 @@ fn try_deny_unparseable_payload(
     // once the whole input also passed `max_hook_input_bytes`. A data
     // receiver (`cat > file <<'EOF'`) and padding outside any heredoc keep
     // the documented fail-open default.
-    let mut oversized_code_command: Option<usize> = None;
+    // Also retain a command whose recovered bytes do not fit in the bounded
+    // scan. Limits restrict work; they do not establish that omitted bytes are
+    // safe. A later window's concrete denial still takes precedence.
+    let mut oversized_unverified_command: Option<usize> = None;
     // A PowerShell/cmd payload needs the `windows.*` packs, which are off by
     // default on a non-Windows host and only enabled for a Windows payload.
     // The normal parsed path computes this (see the `windows_payload` block in
@@ -743,13 +760,13 @@ fn try_deny_unparseable_payload(
     let mut windows_payload = false;
     for command in hook::extract_commands_from_truncated_json(prefix) {
         if command.len() > max_command_bytes
-            && oversized_code_command.is_none()
+            && oversized_unverified_command.is_none()
             && destructive_command_guard::heredoc::any_heredoc_runs_as_code(&command)
         {
             // The whole command is scanned, not just its first window: padding
             // or an earlier data heredoc before the interpreter heredoc must
             // not hide it (bd-oversized-code-heredoc-receivers-azu4).
-            oversized_code_command = Some(command.len());
+            oversized_unverified_command = Some(command.len());
         }
         if !windows_payload {
             windows_payload = match hook::refine_shell_dialect(&command, shell_dialect) {
@@ -758,9 +775,11 @@ fn try_deny_unparseable_payload(
                 ShellDialect::Posix => false,
             };
         }
-        push_oversized_scan_windows(&mut commands, &command, max_command_bytes);
+        if !push_oversized_scan_windows(&mut commands, &command, max_command_bytes) {
+            oversized_unverified_command.get_or_insert(command.len());
+        }
     }
-    if commands.is_empty() {
+    if commands.is_empty() && oversized_unverified_command.is_none() {
         return None;
     }
 
@@ -837,10 +856,10 @@ fn try_deny_unparseable_payload(
     // `issue_290_padding_inside_command_before_destructive_part_is_denied`
     // flaked: it was green only while the host was fast enough to finish.
     //
-    // Completing the scan with no hit still returns None. That is a real
-    // "nothing found", not an unknown, so a benign oversized payload keeps
-    // failing open exactly as `issue_290_padded_benign_command_still_fails_open`
-    // requires.
+    // Completing every recovered byte's window scan with no hit still returns
+    // None, so a benign oversized payload keeps failing open exactly as
+    // `issue_290_padded_benign_command_still_fails_open` requires. Reaching the
+    // window cap or having no usable window is incomplete analysis instead.
     //
     // A window whose own evaluation could not finish is the same unknown as an
     // exhausted deadline: the evaluator answered Indeterminate (an incomplete
@@ -917,7 +936,7 @@ fn try_deny_unparseable_payload(
         }
     }
     let indeterminate = pending_indeterminate.or_else(|| {
-        oversized_code_command
+        oversized_unverified_command
             .map(|command_len| ResolvedCommandOutcome::OversizedCommand { command_len })
     })?;
     let mut history_writer = if config.history.enabled {
@@ -2917,6 +2936,57 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_scan_preserves_complete_commands_and_utf8_boundary_coverage() {
+        let mut windows = Vec::new();
+        assert!(push_oversized_scan_windows(&mut windows, "echo hello", 64));
+        assert_eq!(windows, ["echo hello"]);
+
+        let command = format!("{}🛡tail", "a".repeat(65_535));
+        windows.clear();
+        assert!(push_oversized_scan_windows(&mut windows, &command, 65_536));
+        assert!(windows.iter().all(|window| window.len() <= 65_536));
+        assert!(
+            windows
+                .last()
+                .is_some_and(|window| window.ends_with("🛡tail"))
+        );
+    }
+
+    #[test]
+    fn oversized_scan_cannot_claim_coverage_with_no_usable_window() {
+        let mut windows = Vec::new();
+        assert!(push_oversized_scan_windows(&mut windows, "", 0));
+        assert!(!push_oversized_scan_windows(
+            &mut windows,
+            "git reset --hard",
+            0
+        ));
+        assert!(windows.is_empty());
+
+        // Reaching the end after skipping a multibyte character still leaves
+        // unexamined source. Merely checking the last window's end is unsound.
+        assert!(!push_oversized_scan_windows(&mut windows, "🛡x", 1));
+        assert_eq!(windows, ["x"]);
+    }
+
+    #[test]
+    fn oversized_scan_distinguishes_exact_cap_coverage_from_omitted_tail() {
+        let limit = 2 * OVERSIZED_SCAN_WINDOW_OVERLAP;
+        let covered =
+            limit + (OVERSIZED_SCAN_MAX_WINDOWS - 1) * (limit - OVERSIZED_SCAN_WINDOW_OVERLAP);
+        let mut command = "a".repeat(covered);
+        let mut windows = Vec::new();
+        assert!(push_oversized_scan_windows(&mut windows, &command, limit));
+        assert_eq!(windows.len(), OVERSIZED_SCAN_MAX_WINDOWS);
+
+        command.push('x');
+        windows.clear();
+        assert!(!push_oversized_scan_windows(&mut windows, &command, limit));
+        assert_eq!(windows.len(), OVERSIZED_SCAN_MAX_WINDOWS);
+        assert!(windows.iter().all(|window| !window.contains('x')));
+    }
 
     /// #358: Reasonix reads only the exit status, so every delivered blocking
     /// verdict must exit 2 there, while stdout-JSON protocols keep exit 0. A
