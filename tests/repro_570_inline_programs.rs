@@ -869,3 +869,65 @@ fn decoded_node_programs_keep_option_ownership() {
         }
     }
 }
+
+/// #645: an interpreter that prints a command can feed an executing shell.
+/// Extracting the producer must not discard its enclosing consumer.
+#[test]
+fn issue_645_nested_shell_consumers_are_not_isolated_python_programs() {
+    let producer = format!(
+        "python3 -c {}",
+        quote(r#"print("rm -rf /Users/example/scratch")"#, 0)
+    );
+    for source in [
+        format!("bash -c {} | sh", quote(&producer, 0)),
+        format!("bash -c {}", quote(&format!("{producer} | sh"), 0)),
+    ] {
+        decision(&source, "deny", false);
+    }
+}
+
+/// Literal payloads become executable when passed to an execution API. Native
+/// filesystem calls must also stay protected even without a shell command.
+#[test]
+fn issue_645_real_interpreter_operations_remain_denied() {
+    for body in [
+        r#"import os; os.system("rm -rf /Users/example/scratch")"#,
+        r#"import subprocess; subprocess.run("rm -rf /Users/example/scratch", shell=True)"#,
+        r#"import subprocess; subprocess.run(["rm", "-rf", "/Users/example/scratch"])"#,
+        r#"import shutil; shutil.rmtree("/Users/example/scratch")"#,
+        r#"import os; command = "rm -rf /Users/example/scratch"; os.system(command)"#,
+        r#"print("rm -rf /Users/example/scratch" == "x"); import os; os.system("rm -rf /Users/example/scratch")"#,
+        r#"import os; f = getattr(os, "sys" + "tem"); f("rm -rf /Users/example/scratch")"#,
+    ] {
+        for style in 0..3 {
+            decision(&format!("python3 -c {}", quote(body, style)), "deny", false);
+        }
+        decision(&format!("python3 - <<'PY'\n{body}\nPY"), "deny", false);
+    }
+}
+
+/// Unknown calls, rebinding, and write-capable opens are not proof of inert
+/// data. The source-word uncertainty policy from #570 remains unchanged.
+#[test]
+fn issue_645_ambiguous_programs_do_not_gain_a_data_exemption() {
+    for body in [
+        r#"opaque("rm -rf /Users/example/scratch")"#,
+        r#"run("rm -rf /Users/example/scratch")"#,
+        r#"from helper import run; run("rm -rf /Users/example/scratch")"#,
+        r#"print = run; print("rm -rf /Users/example/scratch")"#,
+        r#"open = run; print("rm -rf /Users/example/scratch" in open("pending-exceptions.jsonl").read())"#,
+        r#"print("rm -rf /Users/example/scratch" in open("pending-exceptions.jsonl", "w").read())"#,
+        r#"print("rm -rf /Users/example/scratch" in open("pending-exceptions.jsonl", "r+").read())"#,
+        r#"print("rm -rf /Users/example/scratch" in open("pending-exceptions.jsonl", mode).read())"#,
+        r#"print(f"{run('rm -rf /Users/example/scratch')}")"#,
+    ] {
+        for style in 0..3 {
+            decision(&format!("python3 -c {}", quote(body, style)), "deny", false);
+        }
+        decision(&format!("python3 - <<'PY'\n{body}\nPY"), "deny", false);
+    }
+    let unresolved = r#"python3 -c 'print('"$VALUE"')'"#;
+    decision(unresolved, "allow", false);
+    decision(unresolved, "deny", true);
+    decision("python3 -c 'print(unterminated", "deny", true);
+}
