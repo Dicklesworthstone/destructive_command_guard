@@ -1120,3 +1120,60 @@ fn issue_645_ambiguous_programs_do_not_gain_a_data_exemption() {
     decision(unresolved, "deny", true);
     decision("python3 -c 'print(unterminated", "deny", true);
 }
+
+/// Bound text keeps its data role even when its identifier resembles an
+/// execution API. Exercise comparisons and supported record inspection with
+/// the same values and consumers under each identifier.
+#[test]
+fn issue_645_data_bindings_do_not_imply_execution() {
+    for name in ["note", "run", "system"] {
+        for body in [
+            format!(r#"{name} = "$(git reset --hard)"; print({name} == "x")"#),
+            format!(
+                r#"{name} = "$(git reset --hard)"; print({name} in open("pending-exceptions.jsonl").read())"#
+            ),
+        ] {
+            for source in [
+                format!("python3 -c {}", quote(&body, 0)),
+                format!("python3 - <<'PY'\n{body}\nPY"),
+            ] {
+                for (surface, actual, rule) in surface_verdicts(&source) {
+                    assert_eq!(actual, "allow", "{surface}: {source}: {rule}");
+                }
+            }
+        }
+    }
+}
+
+/// A data binding cannot hide execution calls or the program's shell
+/// consumer. The producer includes a comparison so these controls also reach
+/// the expanded data proof rather than only the established print proof.
+#[test]
+fn issue_645_data_binding_proofs_preserve_execution_context() {
+    for body in [
+        r#"import os; run = "$(git reset --hard)"; os.system(run)"#,
+        r#"import os; run = "$(git reset --hard)"; invoke = os.system; invoke(run)"#,
+    ] {
+        for source in [
+            format!("python3 -c {}", quote(body, 0)),
+            format!("python3 - <<'PY'\n{body}\nPY"),
+        ] {
+            for (surface, actual, rule) in surface_verdicts(&source) {
+                assert_eq!(actual, "deny", "{surface}: {source}: {rule}");
+            }
+        }
+    }
+
+    let comparison_body = r#"run = "$(git reset --hard)"; print(run == "x")"#;
+    let producer_body = r#"run = "$(git reset --hard)"; print(run); print(run == "x")"#;
+    let producer = format!("python3 -c {}", quote(producer_body, 0));
+    for source in [
+        format!("python3 - <<PY\n{comparison_body}\nPY"),
+        format!("{producer} | sh"),
+        format!("bash -c {}", quote(&format!("{producer} | sh"), 0)),
+    ] {
+        for (surface, actual, rule) in surface_verdicts(&source) {
+            assert_eq!(actual, "deny", "{surface}: {source}: {rule}");
+        }
+    }
+}

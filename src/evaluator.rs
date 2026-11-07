@@ -39368,10 +39368,13 @@ fn exec_sink_pack_verdict(
             budget,
         )
     } else {
+        // Capture #645's complete-request permission before entering the
+        // worker; its independent consumer proof must also permit data.
         crate::ast_matcher::interpreter_literal_shell_commands(
             &content.content,
             content.language,
             proof,
+            interpreter_data_has_complete_context(command),
             budget,
         )
     };

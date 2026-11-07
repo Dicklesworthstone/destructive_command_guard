@@ -305,6 +305,13 @@ established conservative behavior. The existing source ancestry tracks this
 boundary without an extra recursive evaluation, and completed proof caches
 include that context. Established heredoc documentation proofs remain available.
 
+The same permission also governs the existing literal-recovery worker. A data
+binding named `run` or `system` can conservatively trigger its execution-evidence
+screen, but that name alone must not turn a proved comparison into a shell
+operation. Recovery uses its already parsed tree and existing deadline to apply
+the expanded proof only when both complete-request and consumer ownership hold.
+Nested source and unquoted heredoc expansion retain the established recovery.
+
 The original source still reaches the AST, execution-sink, dynamic-source, and
 protected-write checks. Only proven literal bytes are masked from subsequent
 shell matching, with source offsets and shell quote boundaries preserved.

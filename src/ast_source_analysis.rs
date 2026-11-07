@@ -1160,6 +1160,7 @@ pub(crate) fn interpreter_literal_shell_commands(
         allow_documentation_literals,
         budget,
         false,
+        false,
     )
 }
 
@@ -1171,6 +1172,7 @@ pub(super) fn interpreter_literal_shell_commands_with_execution_evidence(
     allow_documentation_literals: impl FnOnce() -> Option<bool> + Send + 'static,
     budget: Duration,
     screen_execution_evidence: bool,
+    allow_data_inspection: bool,
 ) -> Result<Vec<ReconstructedCommand>, MatchError> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1236,6 +1238,7 @@ pub(super) fn interpreter_literal_shell_commands_with_execution_evidence(
                             language,
                             allow_documentation_literals,
                             screen_execution_evidence,
+                            allow_data_inspection,
                         )
                     }
                     None => Ok(Vec::new()),
@@ -1289,6 +1292,7 @@ pub(super) fn interpreter_literal_shell_commands_inner(
         language,
         allow_documentation_literals,
         false,
+        false,
     )
 }
 
@@ -1297,6 +1301,7 @@ pub(super) fn interpreter_literal_shell_commands_inner_with_execution_evidence(
     language: ScriptLanguage,
     allow_documentation_literals: bool,
     screen_execution_evidence: bool,
+    allow_data_inspection: bool,
 ) -> Result<Vec<ReconstructedCommand>, MatchError> {
     use ast_grep_core::{AstGrep, Node};
     use ast_grep_language::SupportLang;
@@ -1348,6 +1353,9 @@ pub(super) fn interpreter_literal_shell_commands_inner_with_execution_evidence(
         // An edit script of a thousand lines binds hundreds of names; the
         // step budget, which every binding spends, bounds the work (#555).
         let mut proof = DocumentationProof::new(language, node_limit / 16, node_limit);
+        // New data operations require the caller's complete source context.
+        // Unquoted heredocs retain live shell expansion even for pure data.
+        proof.allow_data_inspection = allow_data_inspection && screen_execution_evidence;
         if proof.expression(&root, 0).is_some() {
             return Ok(Vec::new());
         }
@@ -3084,6 +3092,41 @@ mod tests {
                 .any(|command| command.command.contains("git reset --hard")),
             "recovery's established proof must not acquire the new boolean exemption"
         );
+    }
+
+    #[test]
+    fn interpreter_literal_recovery_requires_data_inspection_context_645() {
+        for source in [
+            "run = '$(git reset --hard)'; print(run == 'x')",
+            "system = '$(git reset --hard)'; print(system == 'x')",
+            "run = open('pending-exceptions.jsonl').read(); print('$(git reset --hard)' in run)",
+            "system = open('pending-exceptions.jsonl').read(); print('$(git reset --hard)' in system)",
+        ] {
+            for (owner, screen, data_inspection, inert) in [
+                (true, true, true, true),
+                (true, true, false, false),
+                (false, true, true, false),
+                (true, false, true, false),
+            ] {
+                let commands = interpreter_literal_shell_commands_inner_with_execution_evidence(
+                    source,
+                    ScriptLanguage::Python,
+                    owner,
+                    screen,
+                    data_inspection,
+                )
+                .expect("bounded, complete Python source");
+                assert_eq!(
+                    commands.is_empty(),
+                    inert,
+                    "owner={owner}, screen={screen}, data_inspection={data_inspection}: {source}"
+                );
+                if !inert {
+                    assert_eq!(commands.len(), 1);
+                    assert_eq!(commands[0].command, "$(git reset --hard)");
+                }
+            }
+        }
     }
 
     #[test]

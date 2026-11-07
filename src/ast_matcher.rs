@@ -217,6 +217,7 @@ pub(crate) fn interpreter_literal_shell_commands(
     code: &str,
     language: ScriptLanguage,
     allow_documentation_literals: impl FnOnce() -> Option<bool> + Send + 'static,
+    allow_data_inspection: bool,
     budget: Duration,
 ) -> Result<Vec<ReconstructedCommand>, MatchError> {
     // The source analyzer owns the only source copy, parse, worker permit and
@@ -228,6 +229,7 @@ pub(crate) fn interpreter_literal_shell_commands(
         allow_documentation_literals,
         budget,
         true,
+        allow_data_inspection,
     )
 }
 
@@ -247,6 +249,7 @@ pub(crate) fn expanded_interpreter_literal_shell_commands(
         language,
         allow_documentation_literals,
         budget,
+        false,
         false,
     )
 }
@@ -700,7 +703,7 @@ mod shared_literal_ast_tests {
     fn shared(code: &str, language: ScriptLanguage, isolated: bool) -> Snapshot {
         snapshot(
             source_analysis::interpreter_literal_shell_commands_inner_with_execution_evidence(
-                code, language, isolated, true,
+                code, language, isolated, true, false,
             ),
         )
     }
@@ -840,6 +843,7 @@ mod shared_literal_ast_tests {
                     source,
                     ScriptLanguage::Python,
                     || panic!("zero budget must stop before the callback or parser"),
+                    true,
                     Duration::ZERO,
                 ),
                 Err(MatchError::Timeout { .. })
@@ -850,11 +854,50 @@ mod shared_literal_ast_tests {
                 "print('ordinary text')",
                 ScriptLanguage::Python,
                 || panic!("the no-candidate fast path must not run the callback"),
+                true,
                 Duration::ZERO,
             )
             .expect("no candidates need no recovery budget")
             .is_empty()
         );
+    }
+
+    #[test]
+    fn shared_literal_worker_preserves_data_inspection_permission_645() {
+        let source = "run = '$(git reset --hard)'; print(run == 'x')";
+        for (isolated, data_inspection, inert) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let commands = interpreter_literal_shell_commands(
+                source,
+                ScriptLanguage::Python,
+                move || Some(isolated),
+                data_inspection,
+                Duration::from_secs(5),
+            )
+            .expect("bounded complete interpreter source");
+            assert_eq!(
+                commands.is_empty(),
+                inert,
+                "isolated={isolated}, data_inspection={data_inspection}"
+            );
+            if !inert {
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0].command, "$(git reset --hard)");
+            }
+        }
+
+        let expanded = expanded_interpreter_literal_shell_commands(
+            source,
+            ScriptLanguage::Python,
+            || Some(true),
+            Duration::from_secs(5),
+        )
+        .expect("unquoted expansion keeps the established recovery");
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].command, "$(git reset --hard)");
     }
 
     #[test]
@@ -878,6 +921,7 @@ mod shared_literal_ast_tests {
                     observed.fetch_add(1, Ordering::Relaxed);
                     None
                 },
+                true,
                 Duration::from_secs(5),
             )
             .expect("unsupported extraction stays with its original analysis path");
@@ -900,6 +944,7 @@ mod shared_literal_ast_tests {
                         observed.fetch_add(1, Ordering::Relaxed);
                         Some(isolated)
                     },
+                    true,
                     Duration::from_secs(5),
                 ));
                 let expected = incumbent(&source, language, isolated);
