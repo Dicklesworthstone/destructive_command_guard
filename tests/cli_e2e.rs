@@ -1140,6 +1140,25 @@ mod explain_tests {
     use super::*;
 
     #[test]
+    fn issue_645_explain_distinguishes_python_comparison_from_shell_execution() {
+        for (source, expected) in [
+            (
+                r#"python3 -c 'print("rm -rf /Users/example/scratch" == "x")'"#,
+                "allow",
+            ),
+            ("rm -rf /Users/example/scratch", "deny"),
+        ] {
+            let output = run_dcg(&["explain", "--format", "json", source]);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let verdict: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|error| panic!("{source}: {error}: {stdout}"));
+            assert!(output.status.success(), "{source}: {output:?}");
+            assert_eq!(verdict["decision"], expected, "{source}: {verdict}");
+            assert_eq!(verdict["outcome"], expected, "{source}: {verdict}");
+        }
+    }
+
+    #[test]
     fn explain_safe_command_returns_allow_pretty() {
         let output = run_dcg(&["explain", "echo hello"]);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3651,6 +3670,41 @@ mod scan_tests {
 
 mod test_command_tests {
     use super::*;
+
+    /// POSIX backslashes can keep a separator inside a Python string while
+    /// PowerShell executes it. A POSIX data proof cannot cross that boundary.
+    #[test]
+    fn issue_645_inline_data_mask_preserves_other_dialects_execution() {
+        for (source, rule) in [
+            (
+                r#"python3 -c "print(\"; rm -rf /Users/example/scratch; #\")""#,
+                "core.filesystem:rm-rf-root-home",
+            ),
+            (
+                r#"python3 -c "print(\"; git reset --hard; #\")""#,
+                "core.git:reset-hard",
+            ),
+            (
+                r#"python3 -c "print(\"; git reset --hard; # \$(echo marker)\")""#,
+                "core.git:reset-hard",
+            ),
+        ] {
+            for dialect in ["posix", "ps", "unknown"] {
+                let output = run_dcg(&["test", "--format", "json", "--dialect", dialect, source]);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let verdict: serde_json::Value = serde_json::from_str(&stdout)
+                    .unwrap_or_else(|error| panic!("{dialect}: {source}: {error}: {stdout}"));
+                let expected = if dialect == "posix" { "allow" } else { "deny" };
+                assert_eq!(
+                    verdict["decision"], expected,
+                    "{dialect}: {source}: {verdict}"
+                );
+                if expected == "deny" {
+                    assert_eq!(verdict["rule_id"], rule, "{dialect}: {source}: {verdict}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_safe_command_returns_allowed() {

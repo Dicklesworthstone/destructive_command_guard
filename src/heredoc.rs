@@ -2576,7 +2576,9 @@ fn shell_word_around(text: &str, position: usize) -> Option<Range<usize>> {
 /// bytes with backslash escapes. An expansion, substitution, ANSI-C or locale
 /// quote, pattern, brace, tilde, redirection or unterminated quote returns
 /// `None`. `offsets[i]` is the byte of `word` that produced decoded byte `i`.
-fn literal_word_with_offsets(word: &str) -> Option<(String, Vec<usize>)> {
+/// This supplies coordinates, never a proof of source ownership or safety.
+/// Callers must establish those independently before using it to mask data.
+pub(crate) fn literal_word_with_offsets(word: &str) -> Option<(String, Vec<usize>)> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Quote {
         None,

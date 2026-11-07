@@ -259,6 +259,15 @@ fn denied_by(source: &str, rule: &str) {
 
 /// One DCG verdict, and a description of the run for assertion messages.
 fn run_dcg(source: &str, hook: bool, strict: bool) -> (serde_json::Value, String) {
+    run_dcg_with_packs(source, hook, strict, &[])
+}
+
+fn run_dcg_with_packs(
+    source: &str,
+    hook: bool,
+    strict: bool,
+    packs: &[&str],
+) -> (serde_json::Value, String) {
     let temp = tempfile::tempdir().expect("isolated working directory");
     let home = temp.path().join("home");
     std::fs::create_dir(&home).expect("isolated home");
@@ -266,8 +275,10 @@ fn run_dcg(source: &str, hook: bool, strict: bool) -> (serde_json::Value, String
     std::fs::write(
         &config,
         format!(
-            "[heredoc]\ntimeout_ms = 5000\nfallback_on_parse_error = {}\n",
-            !strict
+            "[heredoc]\ntimeout_ms = 5000\nfallback_on_parse_error = {}\n\
+             [packs]\nenabled = {}\n",
+            !strict,
+            serde_json::to_string(packs).expect("pack IDs serialize")
         ),
     )
     .expect("explicit test configuration");
@@ -870,20 +881,183 @@ fn decoded_node_programs_keep_option_ownership() {
     }
 }
 
-/// #645: an interpreter that prints a command can feed an executing shell.
-/// Extracting the producer must not discard its enclosing consumer.
+/// #645 is a classification regression after extraction: the complete Python
+/// program is code, but command-like text it only compares or displays is data.
+/// Exercise the same real-binary surfaces as the extraction regressions above.
+#[test]
+fn issue_645_exact_python_comparison_is_data_on_every_surface() {
+    let source = r#"python3 -c 'print("rm -rf /Users/example/scratch" == "x")'"#;
+    for (surface, actual, rule) in surface_verdicts(source) {
+        assert_eq!(actual, "allow", "{surface}: {source}: {rule}");
+    }
+    // A fully proved data program is allowed in strict extraction mode too.
+    decision(source, "allow", true);
+}
+
+#[test]
+fn issue_645_python_literals_stay_data_across_shell_quoting() {
+    for body in [
+        r#"print("rm -rf /Users/example/scratch")"#,
+        r#"print("rm -rf /Users/example/scratch" == "x")"#,
+        r#"command = "rm -rf /Users/example/scratch"; print(command == "x")"#,
+        r#"print("shutdown")"#,
+        r#"print("git reset --hard; rm -rf /Users/example/scratch; shutdown")"#,
+        r#"print("example: \\\"rm -rf /Users/example/scratch\\\"")"#,
+        r#"print('''quoted "rm -rf /Users/example/scratch" and 'shutdown' ''')"#,
+        r#"print(r"rm -rf /Users/example/scratch\nshutdown")"#,
+        r#"print(b"rm -rf /Users/example/scratch")"#,
+        r#"print("use $(rm -rf /Users/example/scratch) with care")"#,
+    ] {
+        for style in 0..3 {
+            let source = format!("python3 -c {}", quote(body, style));
+            for (surface, actual, rule) in surface_verdicts(&source) {
+                assert_eq!(actual, "allow", "{surface}: {source}: {rule}");
+            }
+        }
+    }
+}
+
+#[test]
+fn issue_645_read_only_record_inspection_and_heredoc_literals_allow() {
+    for body in [
+        r#"print("rm -rf /Users/example/scratch" in open("pending-exceptions.jsonl").read())"#,
+        r#"print(open("pending-exceptions.jsonl", "r").read() == "rm -rf /Users/example/scratch")"#,
+        r#"print("shutdown")"#,
+        r#"print("rm -rf /Users/example/scratch" == "x")"#,
+        r#"print("rm -rf $HOME")"#,
+    ] {
+        for source in [
+            format!("python3 -c {}", quote(body, 0)),
+            format!("python3 - <<'PY'\n{body}\nPY"),
+        ] {
+            for (surface, actual, rule) in surface_verdicts(&source) {
+                assert_eq!(actual, "allow", "{surface}: {source}: {rule}");
+            }
+        }
+    }
+    for source in [
+        "cat <<'JSON'\n{\"command\": \"rm -rf /Users/example/scratch\", \"note\": \"shutdown\"}\nJSON",
+        "python3 - <<'PY'\n# Recorded commands are data.\nrecord = '''rm -rf /Users/example/scratch\nshutdown'''\nprint(record)\nPY",
+    ] {
+        for (surface, actual, rule) in surface_verdicts(source) {
+            assert_eq!(actual, "allow", "{surface}: {source}: {rule}");
+        }
+    }
+}
+
+#[test]
+fn issue_645_shutdown_literal_with_enabled_services_pack_is_data() {
+    for (source, expected) in [
+        ("python3 -c 'print(\"shutdown\")'", "allow"),
+        ("python3 - <<'PY'\nprint('shutdown')\nPY", "allow"),
+        ("shutdown -h now", "deny"),
+        (
+            "python3 -c 'import os; os.system(\"shutdown -h now\")'",
+            "deny",
+        ),
+    ] {
+        for hook in [false, true] {
+            let (verdict, context) = run_dcg_with_packs(source, hook, false, &["system.services"]);
+            assert_eq!(verdict["decision"], expected, "{context}: {verdict}");
+            if source == "shutdown -h now" {
+                assert_eq!(
+                    verdict["rule_id"], "system.services:shutdown",
+                    "services rule must actually be enabled: {context}: {verdict}"
+                );
+            }
+        }
+    }
+}
+
+/// A proof about one interpreter's data must not hide surrounding shell code,
+/// shell expansion of an unquoted heredoc, or stdout consumed as shell source.
+#[test]
+fn issue_645_outer_shell_execution_remains_denied() {
+    const RULE: &str = "core.filesystem:rm-rf-root-home";
+    let data = r#"python3 -c 'print("rm -rf /Users/example/scratch" == "x")'"#;
+    for source in [
+        "rm -rf /Users/example/scratch".to_string(),
+        "rm -rf /home/example/scratch".to_string(),
+        "rm -rf /".to_string(),
+        format!("{data}; rm -rf /Users/example/scratch"),
+        format!("rm -rf /Users/example/scratch && {data}"),
+        "python3 - <<'PY'\nprint('shutdown')\nPY\nrm -rf /Users/example/scratch".to_string(),
+    ] {
+        for (surface, actual, rule) in surface_verdicts(&source) {
+            assert_eq!(
+                (actual.as_str(), rule.as_str()),
+                ("deny", RULE),
+                "{surface}: {source}"
+            );
+        }
+    }
+    for source in [
+        "python3 -c 'print(\"rm -rf /Users/example/scratch\")' | sh",
+        "python3 - <<'PY' | sh\nprint('rm -rf /Users/example/scratch')\nPY",
+        "python3 - <<PY\nprint('$(rm -rf /Users/example/scratch)')\nPY",
+        "python3 -c \"print('$(rm -rf /Users/example/scratch)')\"",
+    ] {
+        decision(source, "deny", false);
+    }
+}
+
+/// Evaluating a simple command extracted from a shell program must retain the
+/// enclosing consumer. The producer alone is inert; its stdout handed to sh is
+/// executable source, whether the pipe is inside or outside the shell wrapper.
 #[test]
 fn issue_645_nested_shell_consumers_are_not_isolated_python_programs() {
     let producer = format!(
         "python3 -c {}",
         quote(r#"print("rm -rf /Users/example/scratch")"#, 0)
     );
+    let nested_pipe = format!("bash -c {}", quote(&format!("{producer} | sh"), 0));
     for source in [
         format!("bash -c {} | sh", quote(&producer, 0)),
-        format!("bash -c {}", quote(&format!("{producer} | sh"), 0)),
+        nested_pipe.clone(),
+        format!("bash -c {}", quote(&nested_pipe, 0)),
     ] {
         decision(&source, "deny", false);
     }
+}
+
+/// Extracted leaves cannot prove the interpreter's identity or environment.
+/// The rebound function executes the producer's stdout; an exported search
+/// path may load startup code. Both facts disappear from an isolated leaf.
+#[test]
+fn issue_645_nested_bindings_and_generated_files_do_not_gain_data_proof() {
+    let inline = format!(
+        "python3 -c {}",
+        quote(r#"print("rm -rf /Users/example/scratch")"#, 0)
+    );
+    let heredoc = "python3 - <<'PY'\nprint(\"rm -rf /Users/example/scratch\")\nPY";
+    for producer in [inline.as_str(), heredoc] {
+        for body in [
+            format!("python3() {{ command python3 \"$@\" | sh; }}; {producer}"),
+            format!("export PYTHONPATH=/tmp/modules; {producer}"),
+        ] {
+            decision(&format!("bash -c {}", quote(&body, 0)), "deny", false);
+        }
+    }
+    for body in [
+        format!("{inline} > run.sh; sh run.sh"),
+        format!("f=run.sh; {inline} > \"$f\"; sh \"$f\""),
+    ] {
+        decision(&format!("bash -c {}", quote(&body, 0)), "deny", false);
+    }
+    // The new read-only-file proof must retain its owner for non-filesystem
+    // packs too; this function hands the printed git command to a shell.
+    let body = "python3() { command python3 \"$@\" | sh; }; python3 - <<'PY'\n\
+                open(\"notes.txt\").read(); print(\"git reset --hard\")\nPY";
+    denied_by(
+        &format!("bash -c {}", quote(body, 0)),
+        "core.git:reset-hard",
+    );
+}
+
+#[test]
+fn issue_645_nested_heredoc_documentation_preserves_existing_data_proof() {
+    let body = "python3 - <<'PY'\nprint(\"use `git reset --hard` with care\")\nPY";
+    decision(&format!("bash -c {}", quote(body, 0)), "allow", false);
 }
 
 /// Literal payloads become executable when passed to an execution API. Native
@@ -903,6 +1077,21 @@ fn issue_645_real_interpreter_operations_remain_denied() {
             decision(&format!("python3 -c {}", quote(body, style)), "deny", false);
         }
         decision(&format!("python3 - <<'PY'\n{body}\nPY"), "deny", false);
+    }
+}
+
+#[test]
+fn issue_645_javascript_literal_and_execution_keep_distinct_roles() {
+    for style in 0..3 {
+        for (body, expected) in [
+            (r#"console.log("rm -rf /Users/example/scratch")"#, "allow"),
+            (
+                r#"require("child_process").execSync("rm -rf /Users/example/scratch")"#,
+                "deny",
+            ),
+        ] {
+            decision(&format!("node -e {}", quote(body, style)), expected, false);
+        }
     }
 }
 

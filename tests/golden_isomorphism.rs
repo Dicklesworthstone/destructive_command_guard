@@ -235,6 +235,17 @@ fn golden_rule_id_verification() {
     println!("All rule_id verifications passed!");
 }
 
+/// #645: inspecting a destructive command as interpreter data must not change
+/// the rule that protects execution of those exact bytes by the outer shell.
+#[test]
+fn golden_issue_645_interpreter_data_and_shell_execution_are_distinct() {
+    assert_allows_command(r#"python3 -c 'print("rm -rf /Users/example/scratch" == "x")'"#);
+    assert_denies_with_rule(
+        "rm -rf /Users/example/scratch",
+        "core.filesystem:rm-rf-root-home",
+    );
+}
+
 /// Verify rm parser parity across flag/quoting/path variants.
 #[test]
 fn golden_rm_variant_parity() {

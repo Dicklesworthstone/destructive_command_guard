@@ -5,10 +5,9 @@
 //!
 //! A heredoc whose target only *stores* its stdin (`cat`, `tee`, …) is data in
 //! every spelling — redirect before or after the operator, quoted or unquoted
-//! delimiter. Executing sinks (`bash <<EOF`, `… | sh`) must keep blocking, and
-//! inline interpreter bodies (`python3 -c "print(\"rm -rf\")"`) deliberately
-//! stay on the conservative raw-shell scan (#136 / #278): a string literal can
-//! reach an exec sink through indirection no static scan can rule out.
+//! delimiter. Executing sinks (`bash <<EOF`, `… | sh`) must keep blocking.
+//! Issue #645 additionally permits interpreter programs proved to only consume
+//! inert data; unknown calls retain the conservative raw-shell scan.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -136,10 +135,9 @@ fn destructive_command_outside_the_heredoc_still_blocks() {
 }
 
 #[test]
-fn inline_interpreter_string_literal_stays_conservative() {
-    // Repro 2 from the report. Intentionally NOT relaxed: interpreter bodies
-    // are re-scanned as raw shell because a literal can reach an exec sink
-    // through indirection (#136 revert, #278). Pinned so the posture is a
-    // decision, not an accident.
-    assert_denied("python3 -c \"print(\\\"rm -rf\\\")\"");
+fn inline_interpreter_literal_is_data_only_when_its_consumer_is_proved() {
+    // #645: printing a literal is harmless, while an opaque consumer can run
+    // it. Pin both sides of the new, deliberately narrower data proof.
+    assert_allowed("python3 -c \"print(\\\"rm -rf\\\")\"");
+    assert_denied("python3 -c \"run(\\\"rm -rf /Users/example/scratch\\\")\"");
 }

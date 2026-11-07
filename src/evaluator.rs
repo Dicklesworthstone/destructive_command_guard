@@ -19165,9 +19165,10 @@ fn redirection_free_pack_views(
 /// Carry the original command's data-body proof into the byte-aligned regex
 /// view before normalization changes its offsets. Sanitization can remove a
 /// prior sed/awk reader's program, so proving the same body from that rewritten
-/// command loses the ordering evidence (#525). Only bytes the source proof
-/// masks are changed here; existing sanitized data and live expansions retain
-/// their current representation. Explicit Windows dialects use their own syntax.
+/// command loses the ordering evidence (#525). The same applies to literals
+/// inside a complete inline interpreter program (#645). Only bytes the source
+/// proof masks are changed here; existing sanitized data and live expansions
+/// retain their current representation. Explicit Windows dialects use their own syntax.
 fn preserve_source_heredoc_data_mask<'a>(
     command_for_match: &'a str,
     source: &str,
@@ -19176,7 +19177,6 @@ fn preserve_source_heredoc_data_mask<'a>(
     if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
         || command_for_match.len() != source.len()
         || source.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
-        || !source.contains("<<")
     {
         return Cow::Borrowed(command_for_match);
     }
@@ -19210,12 +19210,27 @@ thread_local! {
     static DOCUMENTATION_MASK_ANALYSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// A derived command can lose its enclosing pipeline, bindings, or generated
+/// file consumer. New interpreter-data proofs therefore require the complete
+/// original request, including during depth-zero policy replays (#645).
+fn interpreter_data_has_complete_context(command: &str) -> bool {
+    SAFE_PATTERN_SOURCE.with(|source| {
+        source
+            .borrow()
+            .as_ref()
+            .is_none_or(|source| source.parent.is_none() && source.command == command)
+    })
+}
+
 /// Withdraw shell syntax invented from proven Python/JavaScript documentation
-/// literals (#544), and from every literal of a proven program that only
-/// prints (#586). Only the final shell matching view uses this mask. The
-/// complete original body remains input to interpreter, execution, pipeline,
-/// and protected-write checks; an opaque program never receives a mask.
+/// literals (#544), and from every literal of a proven data-only program
+/// (#586/#645), whether supplied by a quoted heredoc or a literal inline word.
+/// Only the final shell matching view uses this mask. The complete original
+/// source remains input to interpreter, execution, pipeline, and protected-write
+/// checks; an opaque program never receives a mask.
 fn mask_proven_interpreter_documentation(command: &str) -> Cow<'_, str> {
+    // Capture provenance on the evaluating thread before entering the worker.
+    let complete_context = interpreter_data_has_complete_context(command);
     // Only a Python or Node receiver can earn a mask, and both names are
     // spelled out in the command (`ScriptLanguage::from_command`). Missing an
     // unusual spelling here only keeps the unmasked, conservative view.
@@ -19225,9 +19240,10 @@ fn mask_proven_interpreter_documentation(command: &str) -> Cow<'_, str> {
             .windows(name.len())
             .any(|window| window.eq_ignore_ascii_case(name))
     };
-    if !command.contains("<<")
-        || command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
+    if command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
+        || (!complete_context && !command.contains("<<"))
         || !(names_interpreter(b"python") || names_interpreter(b"node"))
+        || check_triggers(command) == TriggerResult::NoTrigger
     {
         return Cow::Borrowed(command);
     }
@@ -19242,13 +19258,13 @@ fn mask_proven_interpreter_documentation(command: &str) -> Cow<'_, str> {
         static ACTIVE: std::sync::Arc<std::sync::atomic::AtomicBool> =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Completed analyses of recent sources. The mask is a pure function
-        // of the command text, and the per-segment pack passes ask for the
-        // same complete command once per segment: a 300-line documentation
-        // heredoc used to re-extract and re-parse the whole command about
-        // fifty times per hook (#555). Only finished analyses are kept; a
+        // of the command text and its complete-source status. Per-segment
+        // pack passes ask for the same complete command once per segment.
+        // A 300-line documentation heredoc used to re-extract and re-parse
+        // the whole command about fifty times per hook (#555). Only finished analyses are kept; a
         // timeout or busy slot is asked again, exactly as before.
         static COMPLETED: std::cell::RefCell<
-            std::collections::VecDeque<(String, Option<String>)>,
+            std::collections::VecDeque<(String, bool, Option<String>)>,
         > = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     }
     const COMPLETED_CAPACITY: usize = 4;
@@ -19256,8 +19272,8 @@ fn mask_proven_interpreter_documentation(command: &str) -> Cow<'_, str> {
         completed
             .borrow()
             .iter()
-            .find(|(source, _)| source == command)
-            .map(|(_, mask)| mask.clone())
+            .find(|(source, complete, _)| source == command && *complete == complete_context)
+            .map(|(_, _, mask)| mask.clone())
     });
     let completed = cached.or_else(|| {
         #[cfg(test)]
@@ -19267,10 +19283,12 @@ fn mask_proven_interpreter_documentation(command: &str) -> Cow<'_, str> {
             ACTIVE.with(std::sync::Arc::clone),
             crate::ast_matcher::protected_scan_budget(),
             move || {
-                Some(match mask_proven_interpreter_documentation_inner(&source) {
-                    Cow::Owned(masked) => Some(masked),
-                    Cow::Borrowed(_) => None,
-                })
+                Some(
+                    match mask_proven_interpreter_documentation_inner(&source, complete_context) {
+                        Cow::Owned(masked) => Some(masked),
+                        Cow::Borrowed(_) => None,
+                    },
+                )
             },
         )?;
         COMPLETED.with(|completed| {
@@ -19278,7 +19296,7 @@ fn mask_proven_interpreter_documentation(command: &str) -> Cow<'_, str> {
             if completed.len() == COMPLETED_CAPACITY {
                 completed.pop_front();
             }
-            completed.push_back((command.to_string(), mask.clone()));
+            completed.push_back((command.to_string(), complete_context, mask.clone()));
         });
         Some(mask)
     });
@@ -19333,7 +19351,10 @@ fn run_documentation_mask_worker<T: Send + 'static>(
     (started.elapsed() < budget).then_some(result).flatten()
 }
 
-fn mask_proven_interpreter_documentation_inner(command: &str) -> Cow<'_, str> {
+fn mask_proven_interpreter_documentation_inner(
+    command: &str,
+    complete_context: bool,
+) -> Cow<'_, str> {
     let ExtractionResult::Extracted(contents) = extract_content(
         command,
         &crate::heredoc::ExtractionLimits::structural_scan(),
@@ -19346,6 +19367,57 @@ fn mask_proven_interpreter_documentation_inner(command: &str) -> Cow<'_, str> {
             content.language,
             crate::heredoc::ScriptLanguage::Python | crate::heredoc::ScriptLanguage::JavaScript
         ) {
+            continue;
+        }
+        if content.heredoc_type.is_none() {
+            if !complete_context {
+                continue;
+            }
+            // #570 already recovered the complete argv word. Require that
+            // resolved identity and the existing isolated-consumer proof;
+            // neither a benign prefix nor an unresolved suffix is data.
+            let Some(word) = content.word_range.as_ref() else {
+                continue;
+            };
+            if crate::heredoc::decoded_inline_interpreter_source_proof(
+                command,
+                word,
+                &content.content,
+                content.language,
+            ) != Some(true)
+            {
+                continue;
+            }
+            let Some((decoded, offsets)) = command
+                .get(word.clone())
+                .and_then(crate::heredoc::literal_word_with_offsets)
+            else {
+                continue;
+            };
+            if decoded != content.content {
+                continue;
+            }
+            for literal in crate::ast_matcher::inert_documentation_literal_ranges(
+                &content.content,
+                content.language,
+            ) {
+                if content.content.get(literal.clone()).is_none() {
+                    return Cow::Borrowed(command);
+                }
+                let Some(mapped) = offsets.get(literal) else {
+                    return Cow::Borrowed(command);
+                };
+                let bytes = output.get_or_insert_with(|| command.as_bytes().to_vec());
+                for &offset in mapped {
+                    let byte = &mut bytes[word.start + offset];
+                    if !matches!(*byte, b'\r' | b'\n') {
+                        *byte = b' ';
+                    }
+                }
+            }
+            // Mask only bytes emitted by quote removal. Retaining the shell's
+            // quote/escape syntax keeps outer statement boundaries intact,
+            // including concatenated words such as 'print('\''text'\'')'.
             continue;
         }
         let Some(body_range) = content.content_range.as_ref() else {
@@ -19361,9 +19433,11 @@ fn mask_proven_interpreter_documentation_inner(command: &str) -> Cow<'_, str> {
         let Some(body) = command.get(body_range.clone()) else {
             continue;
         };
-        for literal in
-            crate::ast_matcher::inert_documentation_literal_ranges(body, content.language)
-        {
+        for literal in crate::ast_matcher::inert_documentation_literal_ranges_with_data_inspection(
+            body,
+            content.language,
+            complete_context,
+        ) {
             if body.get(literal.clone()).is_none() {
                 return Cow::Borrowed(command);
             }
@@ -34846,9 +34920,16 @@ fn evaluate_core_filesystem_pack(
     // the caller already proved inert (#525). The expansion-aware view keeps
     // every byte the outer shell executes, and every executable stdin/file
     // body, while preserving the offsets used by segments and findings.
+    // Keep the interpreter-literal proof too (#645): restoring those bytes
+    // here would make an explicitly POSIX evaluation deny data that the
+    // identical Unknown-dialect evaluation already recognizes as inert.
     let dialect_source = if shell_dialect != ShellDialect::Unknown && normalized_offset == Some(0) {
         if shell_dialect == ShellDialect::Posix {
-            crate::heredoc::mask_non_expanding_data_heredocs(original_command)
+            if interpreter_data_has_complete_context(original_command) {
+                preserve_source_heredoc_data_mask(original_command, original_command, shell_dialect)
+            } else {
+                crate::heredoc::mask_non_expanding_data_heredocs(original_command)
+            }
         } else {
             // The heredoc proof uses Bash grammar. Preserve caller-proven
             // Cmd and PowerShell syntax without applying that grammar.
@@ -37214,6 +37295,7 @@ fn evaluate_pack_destructive_patterns(
     // sanitizer erased, but must not restore documentation literals whose
     // interpreter/data-flow proof deliberately removed shell syntax (#544).
     let documentation_source = if pack_id == "core.git"
+        && matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
         && normalized_offset == Some(0)
         && original_command
             .get(slice_offset..slice_offset.saturating_add(command_slice.len()))
@@ -41856,7 +41938,7 @@ mod tests {
         completion.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
-    /// The documentation mask is a pure function of the command, and the
+    /// The documentation mask is a pure function of command and provenance. The
     /// per-segment pack passes ask for it once per segment. It used to extract
     /// and re-parse the whole command every time: about fifty analyses for one
     /// 300-line documentation heredoc (#555). A completed analysis is reused.
@@ -41882,6 +41964,84 @@ mod tests {
             2,
             "a different source is analysed on its own"
         );
+    }
+
+    #[test]
+    fn issue_645_inline_literal_mask_preserves_complete_shell_word_boundaries() {
+        for source in [
+            r#"python3 -c 'print("élève rm -rf /Users/example/scratch" == "x")'"#,
+            r#"python3 -c "print('rm -rf /Users/example/scratch' == 'x')""#,
+            r"python3 -c 'print('\''rm -rf /Users/example/scratch'\'' == '\''x'\'')'",
+            r#"python3 -c 'print('"'"'rm -rf /Users/example/scratch'"'"' == '"'"'x'"'"')'"#,
+        ] {
+            let masked = mask_proven_interpreter_documentation_inner(source, true);
+            assert_eq!(masked.len(), source.len(), "{source}");
+            assert!(!masked.contains("rm -rf"), "{source}: {masked}");
+            let ExtractionResult::Extracted(contents) =
+                extract_content(source, &crate::heredoc::ExtractionLimits::structural_scan())
+            else {
+                panic!("the complete literal word must be extracted: {source}");
+            };
+            let word = contents[0].word_range.clone().unwrap();
+            assert_eq!(&masked[..word.start], &source[..word.start]);
+            assert_eq!(&masked[word.end..], &source[word.end..]);
+            assert!(
+                crate::normalize::decode_posix_literal_word(&masked[word]).is_some(),
+                "blanking interpreter data must preserve the shell's quoting: {source} => {masked}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_645_inline_literal_mask_requires_complete_source_and_consumer_proofs() {
+        for source in [
+            r#"python3 -c 'import os; os.system("rm -rf /")'"#,
+            r#"python3 -c 'print("rm -rf /")' | sh"#,
+            r#"python3 -c 'print("rm -rf /")' > run.sh; sh run.sh"#,
+            r#"python3 -c 'print("rm -rf /")'"$UNKNOWN""#,
+            r#"python3 -c 'print("rm -rf /")"#,
+            r#"python3() { sh -c "$2"; }; python3 -c 'print("rm -rf /")'"#,
+        ] {
+            assert_eq!(
+                mask_proven_interpreter_documentation_inner(source, true),
+                source,
+                "unproved source or a consumer must retain the conservative view: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_645_cached_data_proofs_keep_their_containing_source_context() {
+        for source in [
+            r#"python3 -c 'print("rm -rf /Users/example/scratch")'"#,
+            "python3 - <<'PY'\nopen('notes.txt').read(); print('rm -rf /Users/example/scratch')\nPY",
+        ] {
+            let root = SafePatternScope::enter(source, ShellDialect::Posix, 0);
+            let masked = mask_proven_interpreter_documentation(source).into_owned();
+            assert_ne!(
+                masked, source,
+                "a complete isolated program earns its proof"
+            );
+            {
+                let _child = SafePatternScope::enter(source, ShellDialect::Posix, 1);
+                assert_eq!(mask_proven_interpreter_documentation(source), source);
+                let _descendant = SafePatternScope::enter(source, ShellDialect::Posix, 2);
+                assert_eq!(mask_proven_interpreter_documentation(source), source);
+            }
+            assert_eq!(mask_proven_interpreter_documentation(source), masked);
+            drop(root);
+
+            // Policy replays can enter at depth zero with changed source. The
+            // original request, not apparent depth, decides proof ownership.
+            let outer = format!("{source} | sh");
+            {
+                let _replay = CommandReplayScope::enter(&outer);
+                let _scope = SafePatternScope::enter(source, ShellDialect::Posix, 0);
+                assert_eq!(mask_proven_interpreter_documentation(source), source);
+            }
+            let _root = SafePatternScope::enter(source, ShellDialect::Posix, 0);
+            assert_eq!(mask_proven_interpreter_documentation(source), masked);
+        }
     }
 
     #[test]
@@ -66109,7 +66269,7 @@ mod tests {
                 ("python3 - <<'PY'\ngit reset --hard\nPY", "reset-hard"),
                 ("python3 - <<'PY'\nrm -rf /etc\nPY", "rm-rf-root-home"),
                 (
-                    "python3 - <<'PY'\nprint(\"rm -rf $HOME\")\nPY",
+                    "python3 - <<'PY'\nopaque(\"rm -rf $HOME\")\nPY",
                     "rm-rf-root-home",
                 ),
             ] {
@@ -66117,6 +66277,20 @@ mod tests {
                     denying_rule(command).as_deref(),
                     Some(rule),
                     "literal destructive evidence must survive: {command:?}"
+                );
+            }
+            // #645: the quoted heredoc reaches Python verbatim, and the
+            // proved builtin print has no executing consumer. The opaque()
+            // call above keeps the old conservative evidence instead.
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result = evaluate_with_pack_ids_in_dialect(
+                    "python3 - <<'PY'\nprint(\"rm -rf $HOME\")\nPY",
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "literal print data: {dialect:?}: {result:?}"
                 );
             }
         }
