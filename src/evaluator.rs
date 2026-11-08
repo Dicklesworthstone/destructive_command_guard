@@ -2088,6 +2088,17 @@ fn evaluate_with_completion_deadline(
     result
 }
 
+/// Selection can itself perform semantic analysis or normalization. Its result
+/// is usable only if the budget remains after the complete predicate finishes.
+#[inline]
+fn budget_checked_quick_reject(
+    select: impl FnOnce() -> bool,
+    is_expired: impl FnOnce() -> bool,
+) -> Option<bool> {
+    let quick_reject = select();
+    (!is_expired()).then_some(quick_reject)
+}
+
 /// The text keyword gating reads: the command without its inert POSIX
 /// redirections ([`crate::packs::blank_inert_redirections`], #571). Cmd and
 /// PowerShell give `>` and `/dev/null` other meanings (`2>/dev/null` writes a
@@ -18671,86 +18682,86 @@ fn evaluate_command_in_single_dialect_view(
     // AC scan (O(n)) replaces the N×memmem per-keyword scan. If the AC says no
     // keyword appears in the raw command, we can skip the more expensive
     // normalize+span-classify path in pack_aware_quick_reject entirely.
-    if let Some(index) = keyword_index {
-        // An enabled external pack with no keywords must be evaluated on every
-        // command (`Pack::might_match`), and the AC index cannot represent
-        // "always" — an external pack has no registry entry to set a bit for.
-        // The hook path already disables the index when external packs exist;
-        // this keeps every other entry point honest too (issue #402).
-        if sed_shell_sources.is_empty()
-            && tar_helper_sources.is_empty()
-            && !crate::packs::get_external_packs()
-                .is_some_and(crate::packs::ExternalPackStore::has_keywordless_pack)
-            && !index.has_any_keyword(gating_command.as_ref())
-            && !contains_shell_word_obfuscation(command, shell_dialect)
-            && !force_core_git
-            && !force_core_filesystem
-            && !force_cmd_recovery
-            && !force_cloudflare_workers
-            && !force_snowflake
-            && force_literal_database_packs.is_empty()
-            && !force_windows_filesystem
-            && !force_scp_semantics
-            && !external_pack_needs_identity_selection(
-                gating_command.as_ref(),
-                shell_dialect,
-                ordered_packs,
-            )
-        {
-            if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
-                return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
-            }
-            return EvaluationResult::allowed_by_quick_reject();
-        }
-    } else if sed_shell_sources.is_empty()
-        && tar_helper_sources.is_empty()
-        && !force_core_git
-        && !force_core_filesystem
-        && !force_cmd_recovery
-        && !force_cloudflare_workers
-        && !force_snowflake
-        && force_literal_database_packs.is_empty()
-        && !force_windows_filesystem
-        && !force_scp_semantics
-        && {
-            let _phase = phase(ProfilePhase::Normalization);
-            let dialect_normalized =
-                crate::normalize::normalize_command_in_dialect(command, shell_dialect);
-            let gating = inert_redirection_gating_view(dialect_normalized.as_ref(), shell_dialect);
-            // The span gate in `pack_aware_quick_reject` reads POSIX quoting.
-            // cmd.exe passes single quotes through as argv bytes, so that gate
-            // took `echo 'x & git reset --hard & y'` for one quoted argument
-            // and skipped every pack. PowerShell does not escape with a
-            // backslash, so `Write-Output "a\" ; git push --force ; \"b"`
-            // runs git there while POSIX reads one string. This branch runs
-            // whenever the keyword index is absent, as it is for the hook and
-            // `dcg test` with an external pack loaded, including the unknown
-            // dialect's PowerShell and cmd replays. Gate both without quote
-            // roles, as the keyword index does; Step 5 masks their data in
-            // their own syntax.
-            if matches!(shell_dialect, ShellDialect::Cmd | ShellDialect::PowerShell) {
-                pack_aware_quick_reject_pre_normalized(gating.as_ref(), enabled_keywords)
+    let Some(quick_reject) = budget_checked_quick_reject(
+        || {
+            if let Some(index) = keyword_index {
+                // An enabled external pack with no keywords must be evaluated on every
+                // command (`Pack::might_match`), and the AC index cannot represent
+                // "always" — an external pack has no registry entry to set a bit for.
+                // The hook path already disables the index when external packs exist;
+                // this keeps every other entry point honest too (issue #402).
+                sed_shell_sources.is_empty()
+                    && tar_helper_sources.is_empty()
+                    && !crate::packs::get_external_packs()
+                        .is_some_and(crate::packs::ExternalPackStore::has_keywordless_pack)
+                    && !index.has_any_keyword(gating_command.as_ref())
+                    && !contains_shell_word_obfuscation(command, shell_dialect)
+                    && !force_core_git
+                    && !force_core_filesystem
+                    && !force_cmd_recovery
+                    && !force_cloudflare_workers
+                    && !force_snowflake
+                    && force_literal_database_packs.is_empty()
+                    && !force_windows_filesystem
+                    && !force_scp_semantics
+                    && !external_pack_needs_identity_selection(
+                        gating_command.as_ref(),
+                        shell_dialect,
+                        ordered_packs,
+                    )
             } else {
-                pack_aware_quick_reject(gating.as_ref(), enabled_keywords)
+                sed_shell_sources.is_empty()
+                    && tar_helper_sources.is_empty()
+                    && !force_core_git
+                    && !force_core_filesystem
+                    && !force_cmd_recovery
+                    && !force_cloudflare_workers
+                    && !force_snowflake
+                    && force_literal_database_packs.is_empty()
+                    && !force_windows_filesystem
+                    && !force_scp_semantics
+                    && {
+                        let _phase = phase(ProfilePhase::Normalization);
+                        let dialect_normalized =
+                            crate::normalize::normalize_command_in_dialect(command, shell_dialect);
+                        let gating =
+                            inert_redirection_gating_view(dialect_normalized.as_ref(), shell_dialect);
+                        // The span gate in `pack_aware_quick_reject` reads POSIX quoting.
+                        // cmd.exe passes single quotes through as argv bytes, so that gate
+                        // took `echo 'x & git reset --hard & y'` for one quoted argument
+                        // and skipped every pack. PowerShell does not escape with a
+                        // backslash, so `Write-Output "a\" ; git push --force ; \"b"`
+                        // runs git there while POSIX reads one string. This branch runs
+                        // whenever the keyword index is absent, as it is for the hook and
+                        // `dcg test` with an external pack loaded, including the unknown
+                        // dialect's PowerShell and cmd replays. Gate both without quote
+                        // roles, as the keyword index does; Step 5 masks their data in
+                        // their own syntax.
+                        if matches!(shell_dialect, ShellDialect::Cmd | ShellDialect::PowerShell) {
+                            pack_aware_quick_reject_pre_normalized(gating.as_ref(), enabled_keywords)
+                        } else {
+                            pack_aware_quick_reject(gating.as_ref(), enabled_keywords)
+                        }
+                    }
+                    // The keyword gate reads text. An external pack whose program the
+                    // text does not spell (a variable, a substitution, a glob, quotes
+                    // inside a launcher's operand) is still owed its rules (#592).
+                    && !external_pack_needs_identity_selection(
+                        gating_command.as_ref(),
+                        shell_dialect,
+                        ordered_packs,
+                    )
             }
-        }
-        // The keyword gate reads text. An external pack whose program the
-        // text does not spell (a variable, a substitution, a glob, quotes
-        // inside a launcher's operand) is still owed its rules (#592).
-        && !external_pack_needs_identity_selection(
-            gating_command.as_ref(),
-            shell_dialect,
-            ordered_packs,
-        )
-    {
+        },
+        || deadline_exceeded(deadline),
+    ) else {
+        return EvaluationResult::indeterminate_due_to_budget();
+    };
+    if quick_reject {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
         return EvaluationResult::allowed_by_quick_reject();
-    }
-
-    if deadline_exceeded(deadline) {
-        return EvaluationResult::indeterminate_due_to_budget();
     }
 
     // Step 5: False-positive immunity - strip known-safe string arguments (commit messages, search
@@ -18873,36 +18884,39 @@ fn evaluate_command_in_single_dialect_view(
             )
         );
     drop(normalization_phase);
-    if sed_shell_sources.is_empty()
-        && tar_helper_sources.is_empty()
-        && quick_reject
-        && !force_core_git
-        && !force_core_filesystem
-        && !force_cmd_recovery
-        && !force_cloudflare_workers
-        && !force_snowflake
-        && force_literal_database_packs.is_empty()
-        && !force_windows_filesystem
-        && !force_scp_semantics
-        && !should_check_original_control_plane_payload_for_any_pack(
-            command_for_match,
-            command,
-            ordered_packs,
-        )
-        && !external_pack_needs_identity_selection(
-            inert_redirection_gating_view(custom_command_for_match, shell_dialect).as_ref(),
-            shell_dialect,
-            ordered_packs,
-        )
-    {
+    let Some(quick_reject) = budget_checked_quick_reject(
+        || {
+            sed_shell_sources.is_empty()
+                && tar_helper_sources.is_empty()
+                && quick_reject
+                && !force_core_git
+                && !force_core_filesystem
+                && !force_cmd_recovery
+                && !force_cloudflare_workers
+                && !force_snowflake
+                && force_literal_database_packs.is_empty()
+                && !force_windows_filesystem
+                && !force_scp_semantics
+                && !should_check_original_control_plane_payload_for_any_pack(
+                    command_for_match,
+                    command,
+                    ordered_packs,
+                )
+                && !external_pack_needs_identity_selection(
+                    inert_redirection_gating_view(custom_command_for_match, shell_dialect).as_ref(),
+                    shell_dialect,
+                    ordered_packs,
+                )
+        },
+        || deadline_exceeded(deadline),
+    ) else {
+        return EvaluationResult::indeterminate_due_to_budget();
+    };
+    if quick_reject {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
         return EvaluationResult::allowed_by_quick_reject();
-    }
-
-    if deadline_exceeded(deadline) {
-        return EvaluationResult::indeterminate_due_to_budget();
     }
 
     // Deferred allow-once check for commands without nested executable syntax.
@@ -50836,6 +50850,33 @@ mod tests {
         }
 
         #[test]
+        fn quick_reject_discards_selection_that_exhausts_budget() {
+            use std::cell::Cell;
+
+            // Model a live budget becoming exhausted inside semantic selection.
+            // An already-expired Deadline would only exercise the entry check;
+            // this transition also catches a clock read moved before selection.
+            for selected in [false, true] {
+                let expired = Cell::new(false);
+                let selection_finished = Cell::new(false);
+                let result = budget_checked_quick_reject(
+                    || {
+                        assert!(!expired.get());
+                        selection_finished.set(true);
+                        expired.set(true);
+                        selected
+                    },
+                    || {
+                        assert!(selection_finished.get());
+                        expired.get()
+                    },
+                );
+
+                assert_eq!(result, None, "selected={selected}");
+            }
+        }
+
+        #[test]
         fn completion_deadline_preserves_denials_and_incomplete_diagnostics() {
             let denial = EvaluationResult::denied_by_pack_pattern(
                 "test.pack",
@@ -50865,6 +50906,16 @@ mod tests {
                 assert_eq!(result.skipped_due_to_budget, before.skipped_due_to_budget);
                 assert!(result.regex_evaluation_incomplete);
                 assert_eq!(result.regex_failure, before.regex_failure);
+            }
+        }
+
+        #[test]
+        fn quick_reject_preserves_selection_with_live_budget() {
+            for selected in [false, true] {
+                assert_eq!(
+                    budget_checked_quick_reject(|| selected, || false),
+                    Some(selected),
+                );
             }
         }
 
@@ -50902,6 +50953,82 @@ mod tests {
                 assert!(result.is_allowed(), "{result:?}");
                 assert!(result.quick_rejected);
                 assert!(!result.skipped_due_to_budget);
+            }
+        }
+
+        #[test]
+        fn live_budget_keeps_quick_reject_paths_and_windows_denials() {
+            let compiled = default_compiled_overrides();
+            let allowlists = default_allowlists();
+            let heredoc_settings = test_heredoc_settings();
+            let enabled_keywords = ["rm", "Remove-Item"];
+            let ordered_packs = ["windows.filesystem".to_string()];
+            let keyword_index = crate::packs::REGISTRY
+                .build_enabled_keyword_index(&ordered_packs)
+                .expect("Windows filesystem keywords should be indexed");
+
+            for (command, raw_has_keyword, expected_rule) in [
+                ("pwd", false, None),
+                ("Write-Output 'rm x'", true, None),
+                (
+                    r"Remove-Item C:\example -Recurse -Force",
+                    true,
+                    Some("remove-item-recurse-force"),
+                ),
+            ] {
+                // pwd can use the initial indexed/unindexed gate. The quoted
+                // keyword must survive both initial gates, so its quick reject
+                // below requires the later normalized predicate to succeed.
+                assert_eq!(keyword_index.has_any_keyword(command), raw_has_keyword);
+                assert_eq!(
+                    pack_aware_quick_reject_pre_normalized(command, &enabled_keywords),
+                    !raw_has_keyword,
+                );
+
+                for index in [None, Some(&keyword_index)] {
+                    let live = Deadline::new(Duration::from_secs(30));
+                    for deadline in [None, Some(&live)] {
+                        let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                            command,
+                            &enabled_keywords,
+                            &ordered_packs,
+                            index,
+                            &compiled,
+                            &allowlists,
+                            &heredoc_settings,
+                            None,
+                            None,
+                            deadline,
+                            ShellDialect::PowerShell,
+                        );
+                        assert!(
+                            !result.skipped_due_to_budget,
+                            "{command:?}; index={}; deadline={}: {result:?}",
+                            index.is_some(),
+                            deadline.is_some(),
+                        );
+                        assert_eq!(
+                            result.quick_rejected,
+                            expected_rule.is_none(),
+                            "{command:?}; index={}; deadline={}: {result:?}",
+                            index.is_some(),
+                            deadline.is_some(),
+                        );
+                        if let Some(rule) = expected_rule {
+                            assert!(result.is_denied(), "{command:?}: {result:?}");
+                            assert_eq!(
+                                result
+                                    .pattern_info
+                                    .as_ref()
+                                    .and_then(|info| info.pattern_name.as_deref()),
+                                Some(rule),
+                            );
+                        } else {
+                            assert!(result.is_allowed(), "{command:?}: {result:?}");
+                            assert!(result.pattern_info.is_none(), "{command:?}: {result:?}");
+                        }
+                    }
+                }
             }
         }
 

@@ -609,6 +609,7 @@ fn hook_protocol_keeps_guardrails_active_with_global_options() {
 /// These commands are classifier input on stdin; no PowerShell is executed.
 mod issue_647 {
     use super::dcg_binary;
+    use destructive_command_guard::config::DEFAULT_MAX_COMMAND_BYTES;
     use std::io::Write;
     use std::path::PathBuf;
     use std::process::{Command, Output, Stdio};
@@ -692,6 +693,7 @@ mod issue_647 {
             let payload = serde_json::json!({
                 "hook_event_name": "PreToolUse",
                 "tool_name": "PowerShell",
+                "tool_use_id": "toolu_dcg_issue_647",
                 "tool_input": {"command": command},
                 "cwd": self.dir.path(),
             });
@@ -722,6 +724,24 @@ mod issue_647 {
                 );
                 let expected_exit = i32::from(surface != "hook" && expected != "allow");
                 assert_eq!(output.status.code(), Some(expected_exit), "{diagnostics}");
+                // CLI stdin admission rejects oversized input before producing
+                // evaluator JSON. The hook surfaces report incomplete analysis
+                // below; assert each transport's blocking contract separately.
+                if surface == "CLI"
+                    && expected == "indeterminate"
+                    && command.len() > DEFAULT_MAX_COMMAND_BYTES
+                {
+                    assert!(rule.is_none(), "{diagnostics}");
+                    assert!(output.stdout.is_empty(), "{diagnostics}");
+                    assert_eq!(
+                        String::from_utf8_lossy(&output.stderr),
+                        format!(
+                            "Error: stdin command exceeds general.max_command_bytes ({DEFAULT_MAX_COMMAND_BYTES} bytes)\n"
+                        ),
+                        "{diagnostics}"
+                    );
+                    continue;
+                }
                 if surface == "hook" && expected == "allow" {
                     assert!(output.stdout.is_empty(), "{diagnostics}");
                     continue;
@@ -794,7 +814,7 @@ mod issue_647 {
         for count in [400, 511] {
             for last in [
                 r"Clear-Content C:\important.conf",
-                r"Cl`ear-Con`tent C:\important.conf",
+                r"Clear`-Content C:\important.conf",
             ] {
                 lab.assert_surfaces(
                     &with_late_statement(count, last),
@@ -827,7 +847,7 @@ mod issue_647 {
         // destructive executable that view has already found.
         for last in [
             r"Clear-Content C:\important.conf",
-            r"Cl`ear-Con`tent C:\important.conf",
+            r"Clear`-Content C:\important.conf",
             "Clear-Content $target",
             "Clear-Content 'C:\\important.conf",
         ] {
