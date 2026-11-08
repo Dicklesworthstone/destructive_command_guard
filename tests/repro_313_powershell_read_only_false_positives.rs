@@ -604,3 +604,277 @@ fn hook_protocol_keeps_guardrails_active_with_global_options() {
         }
     }
 }
+
+/// #647: a bounded semantic scan must inspect the whole supported program.
+/// These commands are classifier input on stdin; no PowerShell is executed.
+mod issue_647 {
+    use super::dcg_binary;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::process::{Command, Output, Stdio};
+
+    const PACKS: &str = "core.git,core.filesystem,windows.filesystem";
+    const SAFE_STATEMENT: &str = "Write-Output 'rm x'";
+    const CLEAR_RULE: &str = "windows.filesystem:clear-content";
+
+    struct Lab {
+        dir: tempfile::TempDir,
+        config: PathBuf,
+    }
+
+    impl Lab {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("isolated #647 test");
+            std::fs::create_dir_all(dir.path().join("home")).expect("isolated home");
+            let config = dir.path().join("config.toml");
+            std::fs::write(&config, "[history]\nenabled = false\n").expect("test config");
+            Self { dir, config }
+        }
+
+        fn run(&self, args: &[&str], input: &str, budget_ms: Option<u64>) -> Output {
+            let home = self.dir.path().join("home");
+            let mut process = Command::new(dcg_binary());
+            process
+                .args(["--agent", "claude-code"])
+                .args(args)
+                .env_clear()
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("XDG_CONFIG_HOME", home.join("config"))
+                .env("XDG_DATA_HOME", home.join("data"))
+                .env("XDG_CACHE_HOME", home.join("cache"))
+                .env("APPDATA", home.join("appdata"))
+                .env("LOCALAPPDATA", home.join("localappdata"))
+                .env("TEMP", self.dir.path())
+                .env("TMP", self.dir.path())
+                .env("TMPDIR", self.dir.path())
+                .env("DCG_CONFIG", &self.config)
+                .env("DCG_PACKS", PACKS)
+                .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                .env(
+                    "DCG_PENDING_EXCEPTIONS_PATH",
+                    self.dir.path().join("pending.jsonl"),
+                )
+                .env("DCG_SELF_HEAL_HOOK", "0")
+                .current_dir(self.dir.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(ms) = budget_ms {
+                process.env("DCG_HOOK_TIMEOUT_MS", ms.to_string());
+            }
+            let mut child = process.spawn().expect("start dcg classifier");
+            child
+                .stdin
+                .take()
+                .expect("classifier stdin")
+                .write_all(input.as_bytes())
+                .expect("write classifier input");
+            child.wait_with_output().expect("classifier result")
+        }
+
+        fn assert_budget(&self, budget_ms: Option<u64>, expected_ms: u64, source: &str) {
+            let output = self.run(&["config", "--format", "json"], "", budget_ms);
+            assert!(output.status.success(), "{output:?}");
+            let report: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("config JSON");
+            assert_eq!(report["general"]["hook_timeout_ms"], expected_ms);
+            assert_eq!(report["general"]["hook_timeout_source"], source);
+        }
+
+        fn assert_surfaces(
+            &self,
+            command: &str,
+            expected: &str,
+            rule: Option<&str>,
+            budget_ms: Option<u64>,
+        ) {
+            let payload = serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "PowerShell",
+                "tool_input": {"command": command},
+                "cwd": self.dir.path(),
+            });
+            let hook_input = format!("{payload}\n");
+            for (surface, args, input) in [
+                (
+                    "CLI",
+                    &[
+                        "test",
+                        "--stdin",
+                        "--dialect",
+                        "powershell",
+                        "--format",
+                        "json",
+                        "--enforce-budget",
+                    ][..],
+                    command,
+                ),
+                ("batch", &["hook", "--batch"][..], hook_input.as_str()),
+                ("hook", &[][..], hook_input.as_str()),
+            ] {
+                let output = self.run(args, input, budget_ms);
+                let diagnostics = format!(
+                    "{surface}, {} bytes, expected {expected}: stdout={} stderr={}",
+                    command.len(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let expected_exit = i32::from(surface != "hook" && expected != "allow");
+                assert_eq!(output.status.code(), Some(expected_exit), "{diagnostics}");
+                if surface == "hook" && expected == "allow" {
+                    assert!(output.stdout.is_empty(), "{diagnostics}");
+                    continue;
+                }
+                let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+                    .unwrap_or_else(|error| panic!("{error}: {diagnostics}"));
+                let reported_rule = if surface == "hook" {
+                    let decision = &json["hookSpecificOutput"];
+                    assert_eq!(decision["hookEventName"], "PreToolUse", "{diagnostics}");
+                    let hook_decision = if expected == "indeterminate" {
+                        "ask"
+                    } else {
+                        expected
+                    };
+                    assert_eq!(
+                        decision["permissionDecision"], hook_decision,
+                        "{diagnostics}"
+                    );
+                    decision["ruleId"].as_str().or_else(|| {
+                        decision["permissionDecisionReason"]
+                            .as_str()?
+                            .lines()
+                            .find_map(|line| line.strip_prefix("Rule: "))
+                    })
+                } else {
+                    assert_eq!(json["decision"], expected, "{diagnostics}");
+                    json["rule_id"].as_str()
+                };
+                if let Some(rule) = rule {
+                    assert_eq!(reported_rule, Some(rule), "{diagnostics}");
+                } else if expected == "deny" {
+                    assert!(
+                        reported_rule.is_some(),
+                        "a denial needs a finding: {diagnostics}"
+                    );
+                } else {
+                    assert!(reported_rule.is_none(), "no rule was found: {diagnostics}");
+                }
+            }
+        }
+    }
+
+    fn statements(count: usize) -> String {
+        vec![SAFE_STATEMENT; count].join("; ")
+    }
+
+    fn with_late_statement(safe_count: usize, last: &str) -> String {
+        format!("{}; {last}", statements(safe_count))
+    }
+
+    #[test]
+    fn supported_safe_statements_allow_with_the_shipped_deadline() {
+        let lab = Lab::new();
+        lab.assert_budget(
+            None,
+            destructive_command_guard::perf::HOOK_EVALUATION_BUDGET_MS,
+            "default",
+        );
+        for count in [300, 512] {
+            lab.assert_surfaces(&statements(count), "allow", None, None);
+        }
+    }
+
+    #[test]
+    fn later_destructive_statements_are_inspected_at_the_supported_bound() {
+        let lab = Lab::new();
+        // These are classification tests. Their explicit test-only budget
+        // isolates semantic results from contention; the test above and the
+        // constrained-budget test below retain the production deadline path.
+        for count in [400, 511] {
+            for last in [
+                r"Clear-Content C:\important.conf",
+                r"Cl`ear-Con`tent C:\important.conf",
+            ] {
+                lab.assert_surfaces(
+                    &with_late_statement(count, last),
+                    "deny",
+                    Some(CLEAR_RULE),
+                    Some(5000),
+                );
+            }
+            lab.assert_surfaces(
+                &with_late_statement(count, r"Remove-Item C:\example -Recurse -Force"),
+                "deny",
+                Some("core.filesystem:powershell-remove-item-recursive"),
+                Some(5000),
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_analysis_never_certifies_a_safe_prefix() {
+        let lab = Lab::new();
+        for command in [
+            statements(513),
+            format!("Write-Output 'rm {}'", "x".repeat(64 * 1024)),
+        ] {
+            lab.assert_surfaces(&command, "indeterminate", None, Some(5000));
+        }
+        // A visible destructive spelling still wins after the semantic pass
+        // reaches its bound. Executable-position backticks are decoded in the
+        // regex view; unresolved or malformed operands do not erase the
+        // destructive executable that view has already found.
+        for last in [
+            r"Clear-Content C:\important.conf",
+            r"Cl`ear-Con`tent C:\important.conf",
+            "Clear-Content $target",
+            "Clear-Content 'C:\\important.conf",
+        ] {
+            lab.assert_surfaces(
+                &with_late_statement(512, last),
+                "deny",
+                Some(CLEAR_RULE),
+                Some(5000),
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_data_and_unverified_execution_keep_distinct_outcomes() {
+        let lab = Lab::new();
+        let quoted = vec![
+            r"Write-Output 'Remove-Item C:\example -Recurse -Force; .Delete($true) read-only'";
+            512
+        ]
+        .join("; ");
+        lab.assert_surfaces(&quoted, "allow", None, Some(5000));
+        for last in [
+            r"& $command -Recurse -Force C:\example",
+            r"Remove-Item C:\example -Recurse:$flag",
+            "Cl`ear-Content`",
+        ] {
+            lab.assert_surfaces(&with_late_statement(400, last), "deny", None, Some(5000));
+        }
+        let too_many_tokens = format!("Clear-Content {}", vec!["'x'"; 512].join(" "));
+        lab.assert_surfaces(
+            &too_many_tokens,
+            "deny",
+            Some("windows.filesystem:windows-filesystem-semantic-unverified"),
+            Some(5000),
+        );
+    }
+
+    #[test]
+    fn a_small_configured_deadline_cannot_allow_an_unread_remainder() {
+        let lab = Lab::new();
+        // Configuration clamps 1 ms to the existing production minimum.
+        // Neither this check nor the implementation raises that minimum.
+        lab.assert_budget(
+            Some(1),
+            destructive_command_guard::perf::MIN_HOOK_TIMEOUT_MS,
+            "configured",
+        );
+        lab.assert_surfaces(&statements(513), "indeterminate", None, Some(1));
+    }
+}

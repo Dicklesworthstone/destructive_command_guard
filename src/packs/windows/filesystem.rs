@@ -3692,6 +3692,33 @@ mod tests {
     }
 
     #[test]
+    fn issue_647_unverified_final_statement_is_incomplete_above_the_bound() {
+        let prefix = "Write-Output 'rm x'; ".repeat(511);
+        for tail in [
+            "Remove`-Item @parameters C:\\important",
+            "Remove`-Item -Re`curse C:\\important -Fo`rce`",
+            "& $command -Recurse C:\\important",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(
+                    &format!("{prefix}{tail}"),
+                    ShellDialect::PowerShell,
+                ),
+                WindowsFilesystemSemanticDecision::Unverified,
+                "an inspected unresolved final statement remains unverified: {tail}",
+            );
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(
+                    &format!("{prefix}Write-Output 'rm x'; {tail}"),
+                    ShellDialect::PowerShell,
+                ),
+                WindowsFilesystemSemanticDecision::Incomplete,
+                "an unread unresolved tail must not become safe: {tail}",
+            );
+        }
+    }
+
+    #[test]
     fn issue_647_safe_powershell_statements_up_to_512_are_fully_analyzed() {
         // The issue's quoted keyword must select the semantic pass without
         // becoming an executable. Exercise the old and new boundaries as

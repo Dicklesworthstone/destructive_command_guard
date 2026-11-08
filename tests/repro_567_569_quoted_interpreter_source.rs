@@ -262,6 +262,73 @@ fn issue_569_complete_python_programs_allow_at_every_size() {
 }
 
 #[test]
+fn issue_647_long_python_heredocs_keep_powershell_like_text_as_data() {
+    // The body is Python source, even when a docstring starts with a
+    // PowerShell-shaped word or a quoted print argument contains a separator.
+    // Its own extraction bounds permit all three sizes; the Windows statement
+    // limit must not be applied to this proven interpreter body off Windows.
+    for count in [300, 512, 513] {
+        let source = format!(
+            "python3 - <<'PY'\n\"\"\"\nread-only\nWrite-Output examples are documentation\n\"\"\"\n{}PY",
+            "print(\"read-only; Write-Output 'rm x'\")\n".repeat(count)
+        );
+        for (route, verdict) in verdicts(&source, false) {
+            assert_eq!(
+                verdict.decision, "allow",
+                "{route:?}, {count} Python statements: {verdict:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn issue_647_long_python_prefix_does_not_hide_execution() {
+    let prefix = format!(
+        "\"\"\"\nread-only\nWrite-Output examples are documentation\n\"\"\"\n{}",
+        "print(0)\n".repeat(400)
+    );
+    // Quoting the heredoc delimiter makes the substitution-shaped literal
+    // Python data. Removing those quotes below makes the outer shell execute
+    // it before Python receives stdin, despite the Python string quotes.
+    let quoted =
+        format!("python3 - <<'PY'\n{prefix}print('$(rm -rf /Users/example/important)')\nPY");
+    for (route, verdict) in verdicts(&quoted, false) {
+        assert_eq!(
+            verdict.decision, "allow",
+            "{route:?}, quoted substitution data: {verdict:?}"
+        );
+    }
+
+    for source in [
+        format!(
+            "python3 - <<'PY'\n{prefix}import os\nos.system('rm -rf /Users/example/important')\nPY"
+        ),
+        format!("python3 - <<'PY'\n{prefix}PY\nrm -rf /Users/example/important"),
+        format!("python3 - <<PY\n{prefix}print('$(rm -rf /Users/example/important)')\nPY"),
+    ] {
+        for (route, verdict) in verdicts(&source, false) {
+            assert_eq!(
+                verdict.decision, "deny",
+                "{route:?} {source:?}: {verdict:?}"
+            );
+        }
+    }
+
+    // A Windows statement after the body still activates its pack through the
+    // Bash-labeled hook. The explicit POSIX CLI intentionally uses its proven
+    // dialect instead of this payload-based activation.
+    let windows_tail = format!("python3 - <<'PY'\n{prefix}PY\nClear-Content C:\\app\\db");
+    for route in [Route::Hook, Route::Batch] {
+        let verdict = classify(&windows_tail, false, route);
+        assert_eq!(
+            (verdict.decision.as_str(), verdict.rule.as_deref()),
+            ("deny", Some("windows.filesystem:clear-content")),
+            "{route:?} {windows_tail:?}: {verdict:?}"
+        );
+    }
+}
+
+#[test]
 fn issue_569_unparseable_python_is_never_attributed_to_a_windows_rule() {
     // These bodies are not valid Python (each leaves a `'''` string open), so
     // the interpreter literal recovery cannot finish. Whatever that yields,

@@ -179,6 +179,94 @@ fn bench_issue_555(c: &mut Criterion) {
     group.finish();
 }
 
+/// Warm evaluator work for #647, including the independent byte/statement
+/// limits and quoted .NET-looking data. Cold hook deadlines are measured by
+/// the real-binary latency harness; this group deliberately has no deadline so
+/// a timeout cannot make an expensive input look fast by skipping its work.
+fn bench_issue_647(c: &mut Criterion) {
+    use destructive_command_guard::normalize::ShellDialect;
+
+    let mut config = Config::default();
+    config.packs.enabled = vec!["core".to_string(), "windows.filesystem".to_string()];
+    let enabled = config.enabled_pack_ids();
+    let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+    let keywords = REGISTRY.collect_enabled_keywords(&enabled);
+    let index = REGISTRY.build_enabled_keyword_index(&ordered);
+    let overrides = config.overrides.compile();
+    let allowlists = LayeredAllowlist::default();
+    let heredoc = config.heredoc_settings();
+    let evaluate = |command: &str| {
+        destructive_command_guard::evaluator::evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            command,
+            &keywords,
+            &ordered,
+            index.as_ref(),
+            &overrides,
+            &allowlists,
+            &heredoc,
+            None,
+            None,
+            None,
+            ShellDialect::PowerShell,
+        )
+    };
+
+    let mut cases = Vec::new();
+    for count in [300, 512, 513] {
+        cases.push((
+            format!("quoted_rm_{count}"),
+            vec!["Write-Output 'rm x'"; count].join("; "),
+            if count <= 512 {
+                EvaluationDecision::Allow
+            } else {
+                EvaluationDecision::Indeterminate
+            },
+        ));
+    }
+    cases.push((
+        "destructive_statement_512".to_string(),
+        format!(
+            "{}Remove-Item C:\\important -Recurse -Force",
+            "Write-Output 'rm x'; ".repeat(511),
+        ),
+        EvaluationDecision::Deny,
+    ));
+    cases.push((
+        "quoted_dotnet_512".to_string(),
+        vec!["Write-Output '$directory.Delete($true); rm x'"; 512].join("; "),
+        EvaluationDecision::Allow,
+    ));
+    // Many words force the intact-command prepasses to inspect the full
+    // 64 KiB input; a single quoted padding word would not exercise that cost.
+    let dense = format!("Write-Output {}rm", "x ".repeat((64 * 1024 - 15) / 2));
+    assert_eq!(dense.len(), 64 * 1024 - 1);
+    cases.push((
+        "dense_words_near_byte_bound".to_string(),
+        dense.clone(),
+        EvaluationDecision::Allow,
+    ));
+    cases.push((
+        "over_byte_bound".to_string(),
+        format!("{dense} xx"),
+        EvaluationDecision::Indeterminate,
+    ));
+
+    let mut group = c.benchmark_group("issue_647");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    for (name, command, expected) in cases {
+        assert_eq!(evaluate(&command).decision, expected, "pre-check: {name}");
+        group.bench_function(&name, |b| {
+            b.iter(|| {
+                let result = evaluate(black_box(&command));
+                assert_eq!(result.decision, expected, "timed verdict: {name}");
+                black_box(result)
+            });
+        });
+    }
+    group.finish();
+}
+
 fn bench_keyword_rejection(c: &mut Criterion) {
     let ctx = EvalContext::new();
 
@@ -239,6 +327,7 @@ criterion_group!(
     bench_evaluate_command,
     bench_long_command,
     bench_issue_555,
+    bench_issue_647,
     bench_keyword_rejection,
     bench_throughput
 );
