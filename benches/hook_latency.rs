@@ -250,6 +250,29 @@ fn bench_issue_647(c: &mut Criterion) {
         format!("{dense} xx"),
         EvaluationDecision::Indeterminate,
     ));
+    // The .NET necessary-literal guard rejects the dense case above cheaply.
+    // Retain a guard-positive worst case: a quoted member call at the end
+    // still exercises the suffix scans. Its active counterpart must deny.
+    let prefix = "Write-Output ";
+    for (name, tail, expected) in [
+        (
+            "dense_words_with_quoted_dotnet",
+            "'$directory.Delete($true)'",
+            EvaluationDecision::Allow,
+        ),
+        (
+            "dense_words_with_active_dotnet",
+            "; $directory.Delete($true)",
+            EvaluationDecision::Deny,
+        ),
+    ] {
+        let command = format!(
+            "{prefix}{}{tail}",
+            "x ".repeat((64 * 1024 - prefix.len() - tail.len()) / 2),
+        );
+        assert!((64 * 1024 - 1..=64 * 1024).contains(&command.len()));
+        cases.push((name.to_string(), command, expected));
+    }
 
     let mut group = c.benchmark_group("issue_647");
     group.sample_size(10);

@@ -1222,6 +1222,20 @@ fn powershell_dotnet_directory_delete_rule(
     segment: &str,
     tokens: &[NormalizeToken],
 ) -> Option<&'static str> {
+    // All three expressions require an ASCII dot and a contiguous Delete
+    // spelling. Prove only that this .NET surface cannot match before paying
+    // for context classification and suffix searches on ordinary cmdlets.
+    // Keep the checks separate: the member syntax permits `. Delete(...)`.
+    // Callers must still inspect statements and enforce their semantic bounds.
+    if !segment.as_bytes().contains(&b'.')
+        || !segment
+            .as_bytes()
+            .windows(b"delete".len())
+            .any(|window| window.eq_ignore_ascii_case(b"delete"))
+    {
+        return None;
+    }
+
     // The intact-command caller uses this detector before PowerShell's
     // structural parentheses are split. Preserve that benefit without
     // reinterpreting examples inside comments, quoted arguments, or
@@ -2700,6 +2714,11 @@ mod tests {
                 "dotnet-directory-delete",
             ),
             (r"$dir.Delete($true)", "directoryinfo-delete-recursive"),
+            (r"$dir. DeLeTe($true)", "directoryinfo-delete-recursive"),
+            (
+                r"[ſystem.IO.Directory]::DeLeTe($path, $true)",
+                "dotnet-directory-delete-recursive",
+            ),
             (
                 r"(Get-Item 'C:\tmp\scratch').Delete($true)",
                 "directoryinfo-delete-recursive",
@@ -3689,6 +3708,34 @@ mod tests {
             WindowsFilesystemSemanticDecision::Destructive("clear-content"),
             "an inert call target must not hide a later destructive statement",
         );
+    }
+
+    #[test]
+    fn issue_647_dotnet_scan_preserves_late_execution_and_quoted_data() {
+        for count in [400, 511] {
+            let prefix = "Write-Output 'rm x'; ".repeat(count);
+            for (tail, expected) in [
+                (
+                    "$directory. DeLeTe($true)",
+                    WindowsFilesystemSemanticDecision::Destructive(
+                        "directoryinfo-delete-recursive",
+                    ),
+                ),
+                (
+                    "Write-Output '$directory. DeLeTe($true)'",
+                    WindowsFilesystemSemanticDecision::NoMatch,
+                ),
+            ] {
+                assert_eq!(
+                    windows_filesystem_semantic_decision_in_dialect(
+                        &format!("{prefix}{tail}"),
+                        ShellDialect::PowerShell,
+                    ),
+                    expected,
+                    ".NET spelling after {count} safe statements: {tail}",
+                );
+            }
+        }
     }
 
     #[test]
