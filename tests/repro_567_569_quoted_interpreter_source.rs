@@ -91,9 +91,11 @@ fn classify(source: &str, external_pack: bool, route: Route) -> Verdict {
         .env("DCG_SELF_HEAL_HOOK", "0")
         .env("DCG_HISTORY_DISABLED", "1")
         // Semantic tests use the existing #412/#438 test envelopes so a slow
-        // worker cannot turn a decision into a budget verdict.
+        // worker cannot turn a decision into a budget verdict. Extraction has
+        // an independent clock (bd-e1xl), so give it the same test envelope.
         .env("DCG_HOOK_TIMEOUT_MS", "5000")
         .env("DCG_AST_TIMEOUT_MS", "5000")
+        .env("DCG_HEREDOC_TIMEOUT_MS", "5000")
         .current_dir(temp.path());
     if external_pack {
         let pack = temp.path().join("fp-pack.yaml");
