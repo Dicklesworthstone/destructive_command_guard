@@ -15617,8 +15617,16 @@ fn evaluate_command_substitutions(
                     ));
                 }
             };
+            // #649: the secondary PowerShell `$()` view of a POSIX `$((...))`
+            // loses one pair of parentheses and hence its arithmetic context.
+            // Blank only parser-proven shift operators in this view so their
+            // `<<` cannot become a heredoc during nested evaluation. The POSIX
+            // pass above still sees the shifts, and every nested command's
+            // source remains available to both substitution scanners.
+            let powershell_view =
+                crate::heredoc::mask_arithmetic_shift_operators(substitution_source.as_ref());
             let powershell_bodies = match collect_powershell_substitution_bodies(
-                substitution_source.as_ref(),
+                powershell_view.as_ref(),
             ) {
                 Ok(bodies) => bodies,
                 Err(()) => {

@@ -1590,12 +1590,15 @@ impl SkipReason {
     /// `UnterminatedHeredoc` deliberately does not. It reports a shape — a
     /// `<<` with no terminator line — and nothing was dropped on account of
     /// it; the text is still in the command every pattern is matched against.
-    /// It is also routinely a *misread* of ordinary data, because the operator
-    /// appears in arithmetic (`$((1<<3))`), in prose that a rule is documented
-    /// with (`git commit -m "explain <<EOF"`), and historically in the tail of
-    /// a here-string. Treating it as an incomplete reading would put all of
-    /// those on the bounded-fallback path and deny them outright under
-    /// `fallback_on_parse_error=false`.
+    /// It can also be a *misread* of ordinary data, such as quoted prose.
+    /// Treating every such observation as an early stop would turn otherwise
+    /// complete extractions into partial readings.
+    ///
+    /// This distinction governs mixed successes and skips, not an extraction
+    /// containing only skips: that still yields `Skipped`, whose configured
+    /// fallback/strict handling must protect genuinely malformed source.
+    /// Arithmetic shifts therefore have to be rejected as heredoc candidates
+    /// in `heredoc_operator_captures`, before they create a failure (#649).
     #[must_use]
     pub fn stopped_early(&self) -> bool {
         match self {
@@ -1687,15 +1690,96 @@ static HEREDOC_EXTRACTOR: LazyLock<Regex> = LazyLock::new(|| {
 /// operator into its delimiter: `echo '<<'; python3 - <<'EOF'` matched once,
 /// as `<<'; python3 - <<'EOF…`, and the Python heredoc was never extracted.
 /// Each search here resumes two bytes into the previous match, so every
-/// operator is a candidate of its own; the callers' checks reject false ones.
+/// operator is a candidate of its own. Only proven arithmetic shift tokens
+/// are excluded here; the callers' other checks reject remaining false ones.
 fn heredoc_operator_captures(command: &str) -> impl Iterator<Item = regex::Captures<'_>> {
     let mut next = 0usize;
+    let mut arithmetic_shifts = None;
     std::iter::from_fn(move || {
         let capture = HEREDOC_EXTRACTOR.captures_at(command, next)?;
         // A match starts with the ASCII `<<`, so two bytes on is a boundary.
         next = capture.get(0)?.start() + 2;
         Some(capture)
     })
+    .filter(move |capture| {
+        let shifts = arithmetic_shifts.get_or_insert_with(|| arithmetic_shift_operators(command));
+        shifts
+            .binary_search(&capture.get(0).expect("complete heredoc candidate").start())
+            .is_err()
+    })
+}
+
+/// Exact `<<`/`<<=` tokens in portable `$((…))` arithmetic, not the enclosing
+/// expansion's whole span. Command substitutions inside arithmetic can still
+/// contain real heredocs; even a `$((` prefix can open a command substitution
+/// containing a subshell. Only a complete parse can prove the distinction.
+///
+/// Bare `((…))` and `$[…]` are intentionally not exempt: Dash can read their
+/// `<<` as a real redirection (see `context::HeredocRules`). Failure to prove
+/// arithmetic leaves the existing extraction and incomplete-analysis paths
+/// intact. This is computed at most once per candidate walk, within the same
+/// input and pipeline bounds used for command-substitution analysis.
+fn arithmetic_shift_operators(command: &str) -> Vec<usize> {
+    if !command.contains("<<")
+        || !command.contains("$((")
+        || command.len() > MAX_SUBSTITUTION_SOURCE_BYTES
+        || longest_pipeline_stages(command) > MAX_PARSED_PIPELINE_STAGES
+    {
+        return Vec::new();
+    }
+    let Ok(ast) = try_parse_shell_ast(command) else {
+        return Vec::new();
+    };
+    let root = ast.root();
+    if root.get_inner_node().has_error() {
+        return Vec::new();
+    }
+    let mut shifts = Vec::new();
+    let mut pending = vec![(root, false)];
+    while let Some((node, inherited_arithmetic)) = pending.pop() {
+        let arithmetic = match node.kind().as_ref() {
+            "arithmetic_expansion" => command
+                .get(node.range())
+                .is_some_and(|source| source.starts_with("$((") && source.ends_with("))")),
+            "binary_expression"
+            | "unary_expression"
+            | "ternary_expression"
+            | "postfix_expression"
+            | "parenthesized_expression"
+            | "subscript" => inherited_arithmetic,
+            // A substitution, command, quoted word, heredoc body or any
+            // other context is not part of this arithmetic proof.
+            _ => false,
+        };
+        if arithmetic
+            && node.kind().as_ref() == "binary_expression"
+            && let Some(operator) = node.field("operator")
+            && matches!(command.get(operator.range()), Some("<<" | "<<="))
+        {
+            shifts.push(operator.range().start);
+        }
+        // Carry the context in one walk: checking every shift's ancestors
+        // would make a long left-associated arithmetic expression quadratic.
+        pending.extend(node.children().map(|child| (child, arithmetic)));
+    }
+    shifts.sort_unstable();
+    shifts
+}
+
+/// Preserve the original command and all nested executable text, blanking only
+/// the two angle bytes of proven POSIX arithmetic shifts. The Unknown dialect
+/// uses this for its secondary PowerShell substitution reading, which otherwise
+/// removes `$(` and reinterprets `(1<<2)` as an unterminated shell heredoc.
+pub(crate) fn mask_arithmetic_shift_operators(command: &str) -> Cow<'_, str> {
+    let shifts = arithmetic_shift_operators(command);
+    if shifts.is_empty() {
+        return Cow::Borrowed(command);
+    }
+    let mut bytes = command.as_bytes().to_vec();
+    for offset in shifts {
+        bytes[offset..offset + 2].fill(b' ');
+    }
+    Cow::Owned(String::from_utf8(bytes).expect("only ASCII arithmetic operators were blanked"))
 }
 
 /// Regex for here-string extraction with single quotes (<<<).
@@ -8469,6 +8553,12 @@ fn extract_heredocs(
                 }
             }
         }
+    }
+
+    // The candidate walk may have parsed and excluded only arithmetic
+    // operators, without yielding a body to the checks inside the loop.
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+        return;
     }
 
     if hit_limit {
@@ -15938,14 +16028,173 @@ pub(crate) fn try_parse_shell_ast(command: &str) -> Result<ShellAst, String> {
     let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstParse);
     // Heredoc terminators joined across line continuations are read as the
     // shell reads them; the offsets of every node are the command's own.
-    AstGrep::try_new(
+    let original = AstGrep::try_new(
         crate::context::shell_parse_source(command).as_ref(),
         SupportLang::Bash,
-    )
+    )?;
+    let recovered = recover_nested_arithmetic(&original, NestedArithmeticLimits::DEFAULT);
+    Ok(recovered.unwrap_or(original))
 }
 
 pub(crate) fn parse_shell_ast(command: &str) -> ShellAst {
     try_parse_shell_ast(command).expect("should parse")
+}
+
+/// Limits for an optional correction of tree-sitter-bash's nested arithmetic
+/// grammar. Exhaustion retains the original tree and its diagnostics.
+#[derive(Clone, Copy)]
+struct NestedArithmeticLimits {
+    passes: usize,
+    parse_bytes: usize,
+    nodes: usize,
+}
+
+impl NestedArithmeticLimits {
+    const DEFAULT: Self = Self {
+        passes: 8,
+        parse_bytes: 1024 * 1024,
+        nodes: 65_536,
+    };
+}
+
+/// The grammar accepts `$((...))` as an argv word but not as an arithmetic
+/// operand. In `$((1 << $((1<<1))))` it calls the inner expansion a command
+/// substitution containing a broken redirection. This both invents a heredoc
+/// and sends numeric arithmetic to the command-substitution evaluator (#649).
+///
+/// In a temporary parse view, replace only the dollar of such a nested
+/// candidate, so its contents are parsed as parenthesized arithmetic. Accept
+/// the correction only when the entire parse is complete and every changed
+/// span is exactly parenthesized arithmetic within portable `$((...))`.
+/// Command substitutions and heredocs inside those parentheses remain nodes
+/// of their own. An ambiguous subshell, malformed source, or exhausted proof
+/// retains the original tree; no generic parse error is waived.
+///
+/// Restore the original source after validating the tree. Only ASCII dollars
+/// changed and no offsets moved, so all node text, reconstructed commands,
+/// diagnostics and executable substitution bodies retain their original bytes.
+fn recover_nested_arithmetic(
+    original: &ShellAst,
+    limits: NestedArithmeticLimits,
+) -> Option<ShellAst> {
+    let source = original.source();
+    if !source.contains("<<")
+        || source.match_indices("$((").take(2).count() < 2
+        || source.len() > MAX_SUBSTITUTION_SOURCE_BYTES
+        || longest_pipeline_stages(source) > MAX_PARSED_PIPELINE_STAGES
+    {
+        return None;
+    }
+
+    let mut parse_bytes = limits.parse_bytes;
+    let mut nodes = limits.nodes;
+    let mut view = source.to_string();
+    let mut repaired: Option<ShellAst> = None;
+    let mut replacements = Vec::new();
+    for pass in 0..=limits.passes {
+        let current = repaired.as_ref().unwrap_or(original);
+        let candidates = nested_arithmetic_candidates(current, &mut nodes)?;
+        if candidates.is_empty() {
+            if replacements.is_empty() || current.root().get_inner_node().has_error() {
+                return None;
+            }
+            replacements.sort_unstable_by_key(|range: &Range<usize>| (range.start, range.end));
+            if !nested_arithmetic_replacements_proven(current, &replacements, &mut nodes)? {
+                return None;
+            }
+            let mut doc = current.root().get_doc().clone();
+            doc.src = source.to_string();
+            return Some(AstGrep::doc(doc));
+        }
+        if pass == limits.passes {
+            return None;
+        }
+        parse_bytes = parse_bytes.checked_sub(view.len())?;
+        for range in candidates {
+            // The candidate's exact ASCII `$((` prefix was checked against
+            // this view, so replacing one byte preserves UTF-8 and offsets.
+            view.replace_range(range.start..=range.start, " ");
+            replacements.push(range);
+        }
+        repaired = Some(AstGrep::try_new(&view, SupportLang::Bash).ok()?);
+    }
+    None
+}
+
+/// Visit once per node, carrying arithmetic context instead of walking each
+/// operator's ancestors. Count nodes when queued, bounding the pending stack
+/// as well as the total work across every recovery pass and final proof.
+fn walk_arithmetic_context<'ast>(
+    ast: &'ast ShellAst,
+    remaining_nodes: &mut usize,
+    mut visit: impl FnMut(
+        &ast_grep_core::Node<'ast, ast_grep_core::tree_sitter::StrDoc<SupportLang>>,
+        bool,
+        bool,
+    ),
+) -> Option<()> {
+    *remaining_nodes = remaining_nodes.checked_sub(1)?;
+    let mut pending = vec![(ast.root(), false)];
+    while let Some((node, inherited)) = pending.pop() {
+        let arithmetic = match node.kind().as_ref() {
+            "arithmetic_expansion" => ast
+                .source()
+                .get(node.range())
+                .is_some_and(|text| text.starts_with("$((") && text.ends_with("))")),
+            "binary_expression"
+            | "unary_expression"
+            | "ternary_expression"
+            | "postfix_expression"
+            | "parenthesized_expression"
+            | "subscript" => inherited,
+            _ => false,
+        };
+        visit(&node, inherited, arithmetic);
+        for child in node.children() {
+            *remaining_nodes = remaining_nodes.checked_sub(1)?;
+            pending.push((child, arithmetic));
+        }
+    }
+    Some(())
+}
+
+fn nested_arithmetic_candidates(
+    ast: &ShellAst,
+    remaining_nodes: &mut usize,
+) -> Option<Vec<Range<usize>>> {
+    let mut candidates = Vec::new();
+    walk_arithmetic_context(ast, remaining_nodes, |node, inherited, _| {
+        if inherited
+            && node.kind().as_ref() == "command_substitution"
+            && ast
+                .source()
+                .get(node.range())
+                .is_some_and(|text| text.starts_with("$((") && text.ends_with("))"))
+        {
+            candidates.push(node.range());
+        }
+    })?;
+    Some(candidates)
+}
+
+fn nested_arithmetic_replacements_proven(
+    ast: &ShellAst,
+    replacements: &[Range<usize>],
+    remaining_nodes: &mut usize,
+) -> Option<bool> {
+    let mut proven = vec![false; replacements.len()];
+    walk_arithmetic_context(ast, remaining_nodes, |node, _, arithmetic| {
+        if arithmetic && node.kind().as_ref() == "parenthesized_expression" {
+            let range = node.range();
+            if let Some(start) = range.start.checked_sub(1)
+                && let Ok(index) = replacements
+                    .binary_search_by_key(&(start, range.end), |range| (range.start, range.end))
+            {
+                proven[index] = true;
+            }
+        }
+    })?;
+    Some(proven.into_iter().all(|found| found))
 }
 
 /// Extracted shell command with position info for evaluator integration.
@@ -18822,6 +19071,198 @@ mod tests {
         }
     }
 
+    mod nested_arithmetic_recovery {
+        use super::*;
+
+        #[test]
+        fn nested_shifts_preserve_source_and_are_not_commands_649() {
+            for command in [
+                "echo $((1 << $((1<<1)))) && rm -rf build",
+                "echo $((1 << $((1 << $((1<<1)))))) && rm -rf build",
+                "echo $((1 << $((1 << $((1 << $((1<<1))))))))",
+                "echo $((1 << $((value <<= 1))))",
+                "echo π \"$((1 << $((1<<1))))\" && rm -rf build",
+            ] {
+                let ast = try_parse_shell_ast(command).expect("shell parse");
+                assert!(!ast.root().get_inner_node().has_error(), "{command:?}");
+                assert_eq!(ast.source(), command);
+                assert_eq!(ast.root().text().as_ref(), command);
+                assert!(
+                    extract_posix_command_substitutions(command)
+                        .expect("numeric arithmetic is not an incomplete substitution")
+                        .is_empty(),
+                    "no numeric expression may become a shell command: {command:?}"
+                );
+                assert_eq!(
+                    arithmetic_shift_operators(command),
+                    command
+                        .match_indices("<<")
+                        .map(|(at, _)| at)
+                        .collect::<Vec<_>>(),
+                    "every shift retains its original byte offset: {command:?}"
+                );
+                for extracted in extract_shell_commands(command) {
+                    assert_eq!(
+                        extracted.text,
+                        command[extracted.start..extracted.end],
+                        "reconstructed commands must retain their original dollars"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn nested_arithmetic_keeps_executable_substitution_bytes_649() {
+            for (command, body) in [
+                ("echo $((1 << $((1<<$(rm -rf /)))))", "rm -rf /"),
+                (
+                    "echo \"$(printf '%s' \"$((1<<$((1<<1))))\")\"",
+                    "printf '%s' \"$((1<<$((1<<1))))\"",
+                ),
+                (
+                    "echo $((1 << $((1<<$(python3 <<'PY'\nimport os; os.unlink('/etc/passwd')\nPY\n)))))",
+                    "python3 <<'PY'\nimport os; os.unlink('/etc/passwd')\nPY\n",
+                ),
+                (
+                    "echo $((1 << $((1<<`python3 <<'PY'\nimport os; os.unlink('/etc/passwd')\nPY\n`))))",
+                    "python3 <<'PY'\nimport os; os.unlink('/etc/passwd')\nPY\n",
+                ),
+            ] {
+                let ast = try_parse_shell_ast(command).expect("shell parse");
+                assert!(!ast.root().get_inner_node().has_error(), "{command:?}");
+                assert_eq!(ast.source(), command);
+                let found = extract_posix_command_substitutions(command)
+                    .expect("real substitutions remain readable");
+                assert_eq!(found.len(), 1, "{command:?}: {found:?}");
+                assert_eq!(found[0].body, body, "{command:?}");
+                let source = &command[found[0].start..found[0].end];
+                assert!(
+                    source == format!("$({body})") || source == format!("`{body}`"),
+                    "substitution source offsets must stay exact: {command:?}"
+                );
+                if body.contains("<<'PY'") {
+                    assert!(
+                        ast.root()
+                            .dfs()
+                            .any(|node| node.kind() == "heredoc_redirect"),
+                        "a nested interpreter heredoc must stay executable source"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn nested_arithmetic_retains_malformed_and_literal_trees_649() {
+            for command in [
+                "echo $((1 << $((1<<1))) && rm -rf build",
+                "echo $((1 << $((1<<)))) && rm -rf build",
+                "echo \"$((1<<$((2<<1)))) && rm -rf build",
+                "echo $((1 << $((1<<1)))) && cat <<EOF\nunterminated",
+                "echo $((1 << $((python3 <<'PY')\nprint(2)\nPY\n)))",
+                "echo $((1 << $(((python3 <<'PY')\nprint(2)\nPY\n))))",
+                "echo '$((1<<$((2<<1))))' && rm -rf build",
+                "echo ok # $((1<<$((2<<1))))\nrm -rf build",
+                "python3 -c 'print(\"$((1<<$((2<<1))))\")'",
+                "python3 <<'PY'\nprint(\"$((1<<$((2<<1))))\")\nPY",
+                "bash <<'$((1<<$((2<<1))))'\nrm -rf /\n$((1<<$((2<<1))))",
+            ] {
+                let original = AstGrep::new(command, SupportLang::Bash);
+                assert!(
+                    recover_nested_arithmetic(&original, NestedArithmeticLimits::DEFAULT).is_none(),
+                    "unproven or literal source must retain the original reading: {command:?}"
+                );
+                let parsed = try_parse_shell_ast(command).expect("shell parse");
+                assert_eq!(parsed.source(), command);
+                assert_eq!(
+                    parsed.root().get_inner_node().to_sexp(),
+                    original.root().get_inner_node().to_sexp(),
+                    "the original parse diagnostics must be retained: {command:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn nested_arithmetic_requires_every_replaced_span_to_be_proven_649() {
+            let proof = "echo $((1 <<  ((1<<1))))";
+            let ast = AstGrep::new(proof, SupportLang::Bash);
+            assert!(!ast.root().get_inner_node().has_error());
+            let start = proof
+                .find(" ((1<<1))")
+                .expect("normalized nested expansion");
+            let replacement = start..start + " ((1<<1))".len();
+            assert_eq!(
+                nested_arithmetic_replacements_proven(
+                    &ast,
+                    std::slice::from_ref(&replacement),
+                    &mut 1024
+                ),
+                Some(true)
+            );
+            // A partial range, or a second unproved edit, invalidates the
+            // entire proof rather than silently keeping the successful part.
+            for replacements in [
+                vec![replacement.start..replacement.end - 1],
+                vec![0..proof.len(), replacement],
+            ] {
+                assert_eq!(
+                    nested_arithmetic_replacements_proven(&ast, &replacements, &mut 1024),
+                    Some(false)
+                );
+            }
+            let bare = AstGrep::new("((1<<1))", SupportLang::Bash);
+            assert_eq!(
+                nested_arithmetic_replacements_proven(&bare, &[0..8], &mut 1024),
+                Some(false),
+                "a bare arithmetic/subshell ambiguity cannot prove an edit"
+            );
+        }
+
+        #[test]
+        fn nested_arithmetic_recovery_has_deterministic_work_limits_649() {
+            let source = "echo $((1 << $((1 << $((1<<1))))))";
+            let original = AstGrep::new(source, SupportLang::Bash);
+            assert!(
+                recover_nested_arithmetic(&original, NestedArithmeticLimits::DEFAULT).is_some()
+            );
+            for limits in [
+                NestedArithmeticLimits {
+                    passes: 0,
+                    ..NestedArithmeticLimits::DEFAULT
+                },
+                NestedArithmeticLimits {
+                    passes: 1,
+                    ..NestedArithmeticLimits::DEFAULT
+                },
+                NestedArithmeticLimits {
+                    parse_bytes: source.len(),
+                    ..NestedArithmeticLimits::DEFAULT
+                },
+                NestedArithmeticLimits {
+                    nodes: 1,
+                    ..NestedArithmeticLimits::DEFAULT
+                },
+            ] {
+                assert!(recover_nested_arithmetic(&original, limits).is_none());
+            }
+            let mut nested = "$((1<<1))".to_string();
+            for _ in 0..32 {
+                nested = format!("$((1 << {nested}))");
+            }
+            let deep = AstGrep::new(format!("echo {nested}"), SupportLang::Bash);
+            assert!(
+                recover_nested_arithmetic(&deep, NestedArithmeticLimits::DEFAULT).is_none(),
+                "deep grammar recovery must stop at its pass/work bound"
+            );
+            let oversized = AstGrep::new(
+                format!("{source}{}", " ".repeat(MAX_SUBSTITUTION_SOURCE_BYTES)),
+                SupportLang::Bash,
+            );
+            assert!(
+                recover_nested_arithmetic(&oversized, NestedArithmeticLimits::DEFAULT).is_none()
+            );
+        }
+    }
+
     // ========================================================================
     // POSIX command-substitution extraction (grammar-recovery scoping)
     // ========================================================================
@@ -19436,6 +19877,149 @@ mod tests {
                 test_limits.timeout_ms = 5_000;
             }
             super::super::extract_content(command, &test_limits)
+        }
+
+        #[test]
+        fn arithmetic_shifts_are_not_heredocs_649() {
+            for command in [
+                "echo $((1<<2))",
+                "echo $((1<<2)) && rm -rf build",
+                "echo $((8>>1)) && rm -rf build",
+                "echo $((value <<= 2)) && rm -rf build",
+                "echo \"$(( (1 << 2) + (4 >> 1) ))\" && rm -rf build",
+                "echo \"$((1 << $(printf '%s' 2)))\" && rm -rf build",
+                "echo \"$(printf '%s' $((1 << 2)))\" && rm -rf build",
+                "echo $((1 << `printf '%s' 2`)) && rm -rf build",
+                "echo \"$(printf '%s' \"$((1<<2))\")\" && rm -rf build",
+                "echo $((1 << $((1<<1)))) && rm -rf build",
+                "echo $((1 << $((1 << $((1<<1)))))) && rm -rf build",
+                // A later line matching the apparent delimiter must not turn
+                // unrelated commands into a fictitious heredoc body either.
+                "echo $((1<<2))\nrm -rf build\n2",
+            ] {
+                let result = extract_content(command, &ExtractionLimits::default());
+                assert!(
+                    matches!(result, ExtractionResult::NoContent),
+                    "an arithmetic operator is not embedded source: {command:?}: {result:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn arithmetic_shifts_preserve_real_heredocs_and_quoted_delimiters_649() {
+            for delimiter in ["PY", "'PY'", "\"PY\"", "P'Y'", "\\PY"] {
+                let command = format!("echo $((1<<2)) && python3 <<{delimiter}\nprint(2)\nPY");
+                let limits = ExtractionLimits {
+                    max_heredocs: 1,
+                    ..ExtractionLimits::default()
+                };
+                let result = extract_content(&command, &limits);
+                let ExtractionResult::Extracted(contents) = result else {
+                    panic!("the shift must not consume the heredoc quota: {command:?}: {result:?}");
+                };
+                assert_eq!(contents.len(), 1, "{command:?}");
+                assert_eq!(contents[0].delimiter.as_deref(), Some("PY"));
+                assert_eq!(contents[0].content, "print(2)");
+                assert_eq!(contents[0].quoted, delimiter != "PY");
+            }
+
+            let command = "echo $((1<<2)) && python3 <<'2'\nprint(2)\n2";
+            let result = extract_content(command, &ExtractionLimits::default());
+            let ExtractionResult::Extracted(contents) = result else {
+                panic!("a numeric delimiter belongs only to the real heredoc: {result:?}");
+            };
+            assert_eq!(contents.len(), 1);
+            assert_eq!(contents[0].delimiter.as_deref(), Some("2"));
+            assert_eq!(contents[0].content, "print(2)");
+        }
+
+        #[test]
+        fn arithmetic_shift_secondary_view_preserves_executable_source_649() {
+            let command = "echo $((1<<2 + $(sh <<'SH'\nrm -rf /\nSH\n)))";
+            let view = mask_arithmetic_shift_operators(command);
+            assert_eq!(view.len(), command.len());
+            assert_eq!(view, "echo $((1  2 + $(sh <<'SH'\nrm -rf /\nSH\n)))");
+            for command in [
+                "Write-Output $((git reset --hard))",
+                "echo $((1<<2",
+                "echo '$((1<<2))'",
+                "sh <<'SH'\necho $((1<<2))\nrm -rf /\nSH",
+            ] {
+                assert_eq!(mask_arithmetic_shift_operators(command), command);
+            }
+        }
+
+        #[test]
+        fn arithmetic_shifts_do_not_hide_nested_shell_sources_649() {
+            for command in [
+                "echo $((1 << 2 + $(python3 <<'PY'\nprint(2)\nPY\n)))",
+                "echo $((1 << 2 + `python3 <<'PY'\nprint(2)\nPY\n`))",
+                // This starts with `$((`, but Bash reads a command
+                // substitution containing a subshell, not arithmetic.
+                "echo $((python3 <<'PY')\nprint(2)\nPY\n)",
+            ] {
+                assert_eq!(check_triggers(command), TriggerResult::Triggered);
+                let result = extract_content(command, &ExtractionLimits::default());
+                let ExtractionResult::Extracted(contents) = result else {
+                    panic!("nested heredoc must remain visible: {command:?}: {result:?}");
+                };
+                assert_eq!(contents.len(), 1, "{command:?}");
+                assert_eq!(contents[0].delimiter.as_deref(), Some("PY"));
+                assert_eq!(contents[0].content, "print(2)");
+            }
+
+            let command = "echo $((1<<2)) && perl -e 'unlink \"/etc/passwd\"'";
+            let result = extract_content(command, &ExtractionLimits::default());
+            let ExtractionResult::Extracted(contents) = result else {
+                panic!("arithmetic must not disable inline interpreter scanning: {result:?}");
+            };
+            assert_eq!(contents.len(), 1);
+            assert_eq!(contents[0].language, ScriptLanguage::Perl);
+            assert_eq!(contents[0].content, "unlink \"/etc/passwd\"");
+        }
+
+        #[test]
+        fn arithmetic_shifts_preserve_malformed_input_diagnostics_649() {
+            for (command, delimiter) in [
+                ("echo $((1<<2", "2"),
+                ("echo $((1<<2)) && cat <<'PY'\nunterminated", "PY"),
+                // These are not portable arithmetic: Dash reads real
+                // heredoc redirections where Bash reads ((...)) or $[...].
+                ("((sh<<EOF))", "EOF"),
+                ("sh $[1<<EOF]", "EOF]"),
+            ] {
+                let result = extract_content(command, &ExtractionLimits::default());
+                let ExtractionResult::Skipped(reasons) = result else {
+                    panic!("unproven arithmetic must retain diagnostics: {command:?}: {result:?}");
+                };
+                assert!(
+                    reasons.iter().any(|reason| matches!(reason,
+                        SkipReason::UnterminatedHeredoc { delimiter: found } if found == delimiter
+                    )),
+                    "{command:?}: {reasons:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn arithmetic_shifts_do_not_suppress_actual_extraction_limits_649() {
+            let command = "echo $((1<<2)) && python3 <<'PY'\nprint(2)\nPY";
+            for limits in [
+                ExtractionLimits {
+                    max_body_bytes: 8,
+                    ..ExtractionLimits::default()
+                },
+                ExtractionLimits {
+                    timeout_ms: 0,
+                    ..ExtractionLimits::default()
+                },
+            ] {
+                let result = extract_content(command, &limits);
+                let ExtractionResult::Skipped(reasons) = result else {
+                    panic!("a real extraction limit must remain visible: {result:?}");
+                };
+                assert!(reasons.iter().any(SkipReason::stopped_early), "{reasons:?}");
+            }
         }
 
         #[test]
