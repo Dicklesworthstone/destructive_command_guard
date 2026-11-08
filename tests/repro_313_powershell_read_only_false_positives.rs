@@ -833,6 +833,59 @@ mod issue_647 {
     }
 
     #[test]
+    fn late_quoted_dotnet_delete_members_are_inspected() {
+        let lab = Lab::new();
+        // Quotes around a method name retain its executable role. Inspect
+        // these calls after a safe prefix through every public transport.
+        for (last, rule) in [
+            (
+                r"[IO.Directory]::'Delete'('C:\example', $true)",
+                "windows.filesystem:dotnet-directory-delete-recursive",
+            ),
+            (
+                r#"[IO.Directory]::"Delete"('C:\example', $true)"#,
+                "windows.filesystem:dotnet-directory-delete-recursive",
+            ),
+            (
+                r"[IO.Directory]::'Delete'('C:\example')",
+                "windows.filesystem:dotnet-directory-delete",
+            ),
+            (
+                r#"[IO.Directory]::"Delete"('C:\example')"#,
+                "windows.filesystem:dotnet-directory-delete",
+            ),
+            (
+                r"([IO.DirectoryInfo]'C:\example').'Delete'($true)",
+                "windows.filesystem:directoryinfo-delete-recursive",
+            ),
+            (
+                r#"([IO.DirectoryInfo]'C:\example')."Delete"($true)"#,
+                "windows.filesystem:directoryinfo-delete-recursive",
+            ),
+        ] {
+            lab.assert_surfaces(
+                &with_late_statement(400, last),
+                "deny",
+                Some(rule),
+                Some(5000),
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_dotnet_member_examples_remain_inert_data() {
+        let lab = Lab::new();
+        // A quoted member name in a call executes, but an ordinary quoted
+        // argument containing that entire call remains data.
+        for last in [
+            r#"Write-Output '[IO.Directory]::"Delete"($path, $true); $dir."Delete"($true)'"#,
+            r#"Write-Output "[IO.Directory]::'Delete'('C:\example', $true); $dir.'Delete'($true)""#,
+        ] {
+            lab.assert_surfaces(&with_late_statement(400, last), "allow", None, Some(5000));
+        }
+    }
+
+    #[test]
     fn incomplete_analysis_never_certifies_a_safe_prefix() {
         let lab = Lab::new();
         for command in [

@@ -240,8 +240,9 @@ const POWERSHELL_PROTECTED_EXECUTABLES: &[&str] = &[
 /// accelerator spelling) with a literally-true second argument, anchored to the
 /// start of a word token by the semantic caller. PowerShell type literals are
 /// case-insensitive and tolerate whitespace around `[`, `]`, and `::`.
+/// Literal single- or double-quoted method names invoke the same member.
 static DOTNET_DIRECTORY_DELETE_RECURSIVE_EXPRESSION: LazyCompiledRegex = LazyCompiledRegex::new(
-    r#"(?i)^\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\((?=[^|&\r\n]*?,\s*(?:\$true|1|"true"|'true')\s*\))"#,
+    r#"(?i)^\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*(?:delete|'delete'|"delete")\s*\((?=[^|&\r\n]*?,\s*(?:\$true|1|"true"|'true')\s*\))"#,
 );
 
 /// Any `[System.IO.Directory]::Delete(...)` call, anchored to a word start.
@@ -249,15 +250,16 @@ static DOTNET_DIRECTORY_DELETE_RECURSIVE_EXPRESSION: LazyCompiledRegex = LazyCom
 /// whose second argument is dynamic — PowerShell coerces any truthy value
 /// (including every non-empty string) to `$true`, so an unresolved flag must
 /// still be reviewed.
-static DOTNET_DIRECTORY_DELETE_EXPRESSION: LazyCompiledRegex =
-    LazyCompiledRegex::new(r"(?i)^\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\(");
+static DOTNET_DIRECTORY_DELETE_EXPRESSION: LazyCompiledRegex = LazyCompiledRegex::new(
+    r#"(?i)^\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*(?:delete|'delete'|"delete")\s*\("#,
+);
 
 /// `<DirectoryInfo>.Delete($true)` instance-method spelling, for example
 /// `(Get-Item $path).Delete($true)` or a `[System.IO.DirectoryInfo]` variable.
 /// `$true` is required so that unrelated `.delete(...)` member calls in inline
 /// scripts of other languages do not match.
 static DIRECTORYINFO_DELETE_RECURSIVE_MEMBER: LazyCompiledRegex =
-    LazyCompiledRegex::new(r"(?i)\.\s*delete\s*\(\s*\$true\s*\)");
+    LazyCompiledRegex::new(r#"(?i)\.\s*(?:delete|'delete'|"delete")\s*\(\s*\$true\s*\)"#);
 
 fn syntax_is_incomplete(raw: &str, dialect: ShellDialect) -> bool {
     let mut chars = raw.chars().peekable();
@@ -1222,6 +1224,16 @@ fn powershell_dotnet_directory_delete_rule(
     segment: &str,
     tokens: &[NormalizeToken],
 ) -> Option<&'static str> {
+    powershell_dotnet_directory_delete_rule_with_member_search(segment, tokens, |start| {
+        DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find_from(segment, start)
+    })
+}
+
+fn powershell_dotnet_directory_delete_rule_with_member_search(
+    segment: &str,
+    tokens: &[NormalizeToken],
+    mut find_member: impl FnMut(usize) -> Option<(usize, usize)>,
+) -> Option<&'static str> {
     // All three expressions require an ASCII dot and a contiguous Delete
     // spelling. Prove only that this .NET surface cannot match before paying
     // for context classification and suffix searches on ordinary cmdlets.
@@ -1261,6 +1273,13 @@ fn powershell_dotnet_directory_delete_rule(
         })
         .map(|token| token.byte_range.clone())
         .collect();
+    // Word starts advance monotonically. The first member match in a suffix
+    // remains the first match until a later word starts beyond it. Cache its
+    // data-context verdict as well as its position, and remember a miss so
+    // dense prefixes do not repeatedly search or classify the same suffix.
+    // Search lazily below the static checks to retain their per-token priority.
+    let mut next_member = None;
+    let mut member_search_exhausted = false;
     for token in tokens
         .iter()
         .filter(|token| token.kind == NormalizeTokenKind::Word)
@@ -1286,15 +1305,20 @@ fn powershell_dotnet_directory_delete_rule(
                 return Some("dotnet-directory-delete");
             }
         }
-        if let Some((match_start, _)) = DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find(tail) {
-            let absolute = token.byte_range.start.saturating_add(match_start);
-            if !quoted_word_ranges
-                .iter()
-                .any(|range| range.contains(&absolute))
-                && !inert_ranges.iter().any(|range| range.contains(&absolute))
-            {
-                return Some("directoryinfo-delete-recursive");
-            }
+        if !member_search_exhausted
+            && next_member.is_none_or(|(start, _)| start < token.byte_range.start)
+        {
+            next_member = find_member(token.byte_range.start).map(|(start, _)| {
+                let executable = !quoted_word_ranges
+                    .iter()
+                    .any(|range| range.contains(&start))
+                    && !inert_ranges.iter().any(|range| range.contains(&start));
+                (start, executable)
+            });
+            member_search_exhausted = next_member.is_none();
+        }
+        if next_member.is_some_and(|(_, executable)| executable) {
+            return Some("directoryinfo-delete-recursive");
         }
     }
     None
@@ -2511,7 +2535,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // recursive call reports the more specific id and severity.
         destructive_pattern!(
             "dotnet-directory-delete-recursive",
-            r#"(?i)\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\((?=[^|&\r\n]*?,\s*(?:\$true|1|"true"|'true')\s*\))"#,
+            r#"(?i)\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*(?:delete|'delete'|"delete")\s*\((?=[^|&\r\n]*?,\s*(?:\$true|1|"true"|'true')\s*\))"#,
             "[System.IO.Directory]::Delete with a true recursive flag deletes an entire directory tree.",
             Critical,
             "`[System.IO.Directory]::Delete($path, $true)` (or the `[IO.Directory]` accelerator \
@@ -2527,7 +2551,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // === .NET: [System.IO.Directory]::Delete(...) — any other call ===
         destructive_pattern!(
             "dotnet-directory-delete",
-            r"(?i)\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\(",
+            r#"(?i)\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*(?:delete|'delete'|"delete")\s*\("#,
             "[System.IO.Directory]::Delete removes a directory outside the Recycle Bin.",
             High,
             "`[System.IO.Directory]::Delete` permanently removes the target directory. With a \
@@ -2542,7 +2566,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // === .NET: <DirectoryInfo>.Delete($true) instance-method spelling ===
         destructive_pattern!(
             "directoryinfo-delete-recursive",
-            r"(?i)\.\s*delete\s*\(\s*\$true\s*\)",
+            r#"(?i)\.\s*(?:delete|'delete'|"delete")\s*\(\s*\$true\s*\)"#,
             ".Delete($true) on a DirectoryInfo object recursively deletes the directory tree.",
             Critical,
             "`<DirectoryInfo>.Delete($true)` — for example `(Get-Item $path).Delete($true)` or a \
@@ -2648,6 +2672,9 @@ mod tests {
             r#"[System.IO.Directory]::Delete($root, "true")"#,
             r"[ System.IO.Directory ] :: Delete ($repo, $true)",
             r"[System.IO.Directory]::Delete((Join-Path $root 'sub'), $true)",
+            r"[IO.Directory]::'Delete'('C:\src', $true)",
+            r#"[IO.Directory]::"Delete"('C:\src', $true)"#,
+            r#"[ System.IO.Directory ] :: "dElEtE" ($repo, 1)"#,
         ];
         for command in checks {
             assert_blocks_with_pattern(&pack, command, "dotnet-directory-delete-recursive");
@@ -2663,6 +2690,10 @@ mod tests {
         for command in [
             r"[System.IO.Directory]::Delete($path, $flag)",
             r"[IO.Directory]::Delete('C:\obsolete-empty')",
+            r"[IO.Directory]::'Delete'('C:\obsolete-empty')",
+            r#"[IO.Directory]::"Delete"('C:\obsolete-empty')"#,
+            r"[System.IO.Directory]::'Delete'($path, $flag)",
+            r#"[System.IO.Directory]::"Delete"($path, $flag)"#,
         ] {
             assert_blocks_with_pattern(&pack, command, "dotnet-directory-delete");
             assert_blocks_with_severity(&pack, command, Severity::High);
@@ -2677,6 +2708,9 @@ mod tests {
             r"(Get-Item 'C:\tmp\scratch').Delete($true)",
             r"([System.IO.DirectoryInfo]'C:\src').Delete($true)",
             r"(New-Object System.IO.DirectoryInfo 'C:\src').Delete( $true )",
+            r"$dir.'Delete'($true)",
+            r#"$dir."Delete"($true)"#,
+            r#"(Get-Item 'C:\src'). "dElEtE" ( $true )"#,
         ];
         for command in checks {
             assert_blocks_with_pattern(&pack, command, "directoryinfo-delete-recursive");
@@ -2696,6 +2730,105 @@ mod tests {
         // rule's target (a $false flag is the non-recursive one-arg form).
         assert_no_match(&pack, r"$dir.Delete($false)");
         assert_no_match(&pack, r"$queue.Delete($item)");
+        assert_no_match(&pack, r"$dir.'Delete'($false)");
+        assert_no_match(&pack, r#"$dir."Delete"($false)"#);
+        assert_no_match(&pack, r#"$dir.'Delete"($true)"#);
+        assert_no_match(&pack, r#"$dir."Delete'($true)"#);
+        assert_no_match(&pack, r#"[IO.Directory]::'Delete"($path, $true)"#);
+        assert_no_match(&pack, r#"[IO.Directory]::"Delete'($path, $true)"#);
+    }
+
+    #[test]
+    fn powershell_semantic_detects_literal_quoted_dotnet_method_names() {
+        for count in [0, 400] {
+            let prefix = "Write-Output 'rm x'; ".repeat(count);
+            for (tail, expected) in [
+                (
+                    r"[IO.Directory]::'Delete'('C:\src', $true)",
+                    "dotnet-directory-delete-recursive",
+                ),
+                (
+                    r#"[IO.Directory]::"Delete"('C:\src', $true)"#,
+                    "dotnet-directory-delete-recursive",
+                ),
+                (
+                    r"[IO.Directory]::'Delete'('C:\src')",
+                    "dotnet-directory-delete",
+                ),
+                (
+                    r#"[IO.Directory]::"Delete"($path, $flag)"#,
+                    "dotnet-directory-delete",
+                ),
+                (r"$dir.'Delete'($true)", "directoryinfo-delete-recursive"),
+                (
+                    r#"$dir. "dElEtE" ($true)"#,
+                    "directoryinfo-delete-recursive",
+                ),
+            ] {
+                let command = format!("{prefix}{tail}");
+                for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+                    assert_eq!(
+                        windows_filesystem_semantic_decision_in_dialect(&command, dialect),
+                        WindowsFilesystemSemanticDecision::Destructive(expected),
+                        "{dialect:?}, {count} safe statements before {tail}",
+                    );
+                }
+            }
+            for inert in [
+                r#"Write-Output '[IO.Directory]::"Delete"($path, $true)'"#,
+                r#"Write-Output "[IO.Directory]::'Delete'($path, $true)""#,
+                r#"Write-Output '$dir."Delete"($true)'"#,
+                r#"Write-Output "$dir.'Delete'($true)""#,
+                r#"Write-Output ok # [IO.Directory]::"Delete"($path, $true)"#,
+                r"<# $dir.'Delete'($true) #> Write-Output ok",
+                "$text = @'\n$dir.\"Delete\"($true)\n'@\nWrite-Output $text",
+            ] {
+                assert_eq!(
+                    windows_filesystem_semantic_decision_in_dialect(
+                        &format!("{prefix}{inert}"),
+                        ShellDialect::PowerShell,
+                    ),
+                    WindowsFilesystemSemanticDecision::NoMatch,
+                    "{count} safe statements before inert example {inert}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_dotnet_method_patterns_cover_semantically_incomplete_input() {
+        let pack = create_pack();
+        let prefix = "x ".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES / 2);
+        for (tail, expected) in [
+            (
+                r"[IO.Directory]::'Delete'($path, $true)",
+                "dotnet-directory-delete-recursive",
+            ),
+            (
+                r#"[IO.Directory]::"Delete"($path, $true)"#,
+                "dotnet-directory-delete-recursive",
+            ),
+            (
+                r"[IO.Directory]::'Delete'($path)",
+                "dotnet-directory-delete",
+            ),
+            (
+                r#"[IO.Directory]::"Delete"($path)"#,
+                "dotnet-directory-delete",
+            ),
+            (r"$dir.'Delete'($true)", "directoryinfo-delete-recursive"),
+            (r#"$dir."Delete"($true)"#, "directoryinfo-delete-recursive"),
+        ] {
+            let command = format!("{prefix}; {tail}");
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(&command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::Incomplete,
+                "the byte bound must remain enforced",
+            );
+            // Incomplete semantic analysis falls back to the pack patterns.
+            // Those patterns must cover every newly recognized literal name.
+            assert_blocks_with_pattern(&pack, &command, expected);
+        }
     }
 
     #[test]
@@ -2777,6 +2910,246 @@ mod tests {
                     WindowsFilesystemSemanticDecision::Destructive(_)
                 ),
                 "an inert example must not hide a later executable delete: {active_after_inert:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dotnet_member_cache_preserves_legacy_traversal_and_attribution() {
+        // Keep the uncached traversal as an oracle for search order and data
+        // context. It deliberately shares the current patterns: support for
+        // literal quoted method names is a separate semantic improvement.
+        fn uncached_rule(segment: &str, tokens: &[NormalizeToken]) -> Option<&'static str> {
+            let inert_ranges: Vec<_> = crate::context::classify_command(segment)
+                .spans()
+                .iter()
+                .filter(|span| {
+                    matches!(
+                        span.kind,
+                        crate::context::SpanKind::Argument
+                            | crate::context::SpanKind::Data
+                            | crate::context::SpanKind::Comment
+                    )
+                })
+                .map(|span| span.byte_range.clone())
+                .collect();
+            let quoted_ranges: Vec<_> = tokens
+                .iter()
+                .filter(|token| {
+                    token.kind == NormalizeTokenKind::Word
+                        && token.text(segment).is_some_and(powershell_wholly_quoted)
+                })
+                .map(|token| token.byte_range.clone())
+                .collect();
+            for token in tokens
+                .iter()
+                .filter(|token| token.kind == NormalizeTokenKind::Word)
+            {
+                let Some(raw) = token.text(segment) else {
+                    continue;
+                };
+                if powershell_wholly_quoted(raw) {
+                    continue;
+                }
+                let Some(tail) = segment.get(token.byte_range.start..) else {
+                    continue;
+                };
+                for (expression, rule) in [
+                    (
+                        &DOTNET_DIRECTORY_DELETE_RECURSIVE_EXPRESSION,
+                        "dotnet-directory-delete-recursive",
+                    ),
+                    (
+                        &DOTNET_DIRECTORY_DELETE_EXPRESSION,
+                        "dotnet-directory-delete",
+                    ),
+                ] {
+                    if let Some((start, _)) = expression.find(tail) {
+                        let absolute = token.byte_range.start.saturating_add(start);
+                        if !inert_ranges.iter().any(|range| range.contains(&absolute)) {
+                            return Some(rule);
+                        }
+                    }
+                }
+                if let Some((start, _)) = DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find(tail) {
+                    let absolute = token.byte_range.start.saturating_add(start);
+                    if !quoted_ranges.iter().any(|range| range.contains(&absolute))
+                        && !inert_ranges.iter().any(|range| range.contains(&absolute))
+                    {
+                        return Some("directoryinfo-delete-recursive");
+                    }
+                }
+            }
+            None
+        }
+
+        for (command, expected) in [
+            (
+                "[IO.Directory]::Delete($p, $true); $dir.Delete($true)",
+                "dotnet-directory-delete-recursive",
+            ),
+            (
+                "Write-Output ok; [IO.Directory]::Delete($p, $true); $dir.Delete($true)",
+                "directoryinfo-delete-recursive",
+            ),
+        ] {
+            let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
+            assert_eq!(
+                powershell_dotnet_directory_delete_rule(command, &tokens),
+                Some(expected),
+                "the existing per-token priority must remain stable",
+            );
+        }
+
+        for prefix in [
+            "",
+            "Write-Output ok; ",
+            "'quoted prefix'; ",
+            "# $dir.Delete($true)\n",
+            "<# $dir.'Delete'($true) #> ",
+            "Write-Output '$dir.Delete($true)'; ",
+            "$text = @'\n$dir.Delete($true)\n'@\n",
+            "Write-Output α; ",
+        ] {
+            for tail in [
+                "[IO.Directory]::Delete($p, $true); $dir.Delete($true)",
+                "[IO.Directory]::Delete($p); $dir.Delete($true)",
+                r#"[IO.Directory]::"Delete"($p, $true); $dir.'Delete'($true)"#,
+                "$dir.Delete($true); [IO.Directory]::Delete($p, $true)",
+                "Write-Output '$dir.Delete($true)'; [IO.Directory]::Delete($p)",
+                "Write-Output '$dir.Delete($true)'; $dir.Delete($true)",
+                r#"Write-Output "$dir.'Delete'($true)"; $dir."Delete"($true)"#,
+                "$dir.\u{2003}'Delete'(\t$true\t)",
+                "$dir.Delete($false)",
+                r#"$dir.'Delete"($true)"#,
+                "Write-Output 'delete-marker.'",
+                "",
+            ] {
+                let command = format!("{prefix}{tail}");
+                let tokens = tokenize_for_shell_dialect(&command, ShellDialect::PowerShell);
+                assert_eq!(
+                    powershell_dotnet_directory_delete_rule(&command, &tokens),
+                    uncached_rule(&command, &tokens),
+                    "cached traversal diverged for {command:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dotnet_member_cache_bounds_searches_across_dense_prefixes() {
+        let prefix = format!("Write-Output {}", "word ".repeat(4096));
+        for (label, tail, expected, expected_searches) in [
+            ("quoted member", "'$dir.Delete($true)'", None, 1),
+            ("no member match", "$dir.Delete($false)", None, 1),
+            ("no dot", "delete-marker", None, 0),
+            ("no delete", "harmless.", None, 0),
+            (
+                "active member",
+                "; $dir.Delete($true)",
+                Some("directoryinfo-delete-recursive"),
+                1,
+            ),
+            (
+                "active quoted name after inert example",
+                "'$dir.Delete($true)'; $dir.'Delete'($true)",
+                Some("directoryinfo-delete-recursive"),
+                2,
+            ),
+        ] {
+            let command = format!("{prefix}{tail}");
+            let tokens = tokenize_for_shell_dialect(&command, ShellDialect::PowerShell);
+            let mut searches = 0;
+            assert_eq!(
+                powershell_dotnet_directory_delete_rule_with_member_search(
+                    &command,
+                    &tokens,
+                    |start| {
+                        searches += 1;
+                        DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find_from(&command, start)
+                    },
+                ),
+                expected,
+                "{label}",
+            );
+            assert_eq!(searches, expected_searches, "{label}");
+        }
+
+        // A failed search after a quoted candidate is cached too, even when
+        // thousands of eligible word starts remain after that candidate.
+        let command = format!("Write-Output '$dir.Delete($true)'; {prefix}");
+        let tokens = tokenize_for_shell_dialect(&command, ShellDialect::PowerShell);
+        let mut searches = 0;
+        assert_eq!(
+            powershell_dotnet_directory_delete_rule_with_member_search(
+                &command,
+                &tokens,
+                |start| {
+                    searches += 1;
+                    DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find_from(&command, start)
+                },
+            ),
+            None,
+        );
+        assert_eq!(searches, 2);
+    }
+
+    #[test]
+    fn dotnet_member_cache_advances_once_per_candidate_and_stays_lazy() {
+        for (tail, expected) in [
+            ("Write-Output ok", None),
+            (
+                r#"$dir."Delete"($true)"#,
+                Some("directoryinfo-delete-recursive"),
+            ),
+        ] {
+            let command = format!(
+                "{}{tail}",
+                "Write-Output '$dir.Delete($true)'; ".repeat(256)
+            );
+            let tokens = tokenize_for_shell_dialect(&command, ShellDialect::PowerShell);
+            let mut searches = 0;
+            assert_eq!(
+                powershell_dotnet_directory_delete_rule_with_member_search(
+                    &command,
+                    &tokens,
+                    |start| {
+                        searches += 1;
+                        DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find_from(&command, start)
+                    },
+                ),
+                expected,
+            );
+            assert_eq!(searches, 257, "each candidate is searched once");
+        }
+
+        for (head, expected) in [
+            (
+                "[IO.Directory]::'Delete'($path, $true)",
+                "dotnet-directory-delete-recursive",
+            ),
+            (
+                r#"[IO.Directory]::"Delete"($path)"#,
+                "dotnet-directory-delete",
+            ),
+        ] {
+            let command = format!("{head}; {}$dir.Delete($true)", "word ".repeat(4096));
+            let tokens = tokenize_for_shell_dialect(&command, ShellDialect::PowerShell);
+            let mut searches = 0;
+            assert_eq!(
+                powershell_dotnet_directory_delete_rule_with_member_search(
+                    &command,
+                    &tokens,
+                    |start| {
+                        searches += 1;
+                        DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find_from(&command, start)
+                    },
+                ),
+                Some(expected),
+            );
+            assert_eq!(
+                searches, 0,
+                "an immediate static denial needs no member scan"
             );
         }
     }
