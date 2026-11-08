@@ -2066,6 +2066,28 @@ fn deadline_exceeded(deadline: Option<&Deadline>) -> bool {
     deadline.is_some_and(Deadline::is_exceeded)
 }
 
+/// Check the shared deadline after every evaluation exit, including quick
+/// rejection and safe-data proofs that can finish between internal checks.
+/// A Deny finding or an existing incomplete result keeps its evidence; callers
+/// still resolve policy and replay nonblocking findings separately. An
+/// already-consumed exact-command grant remains an authorization for the whole
+/// request (GH#537), not an analysis-derived allow; do not spend it and then ask
+/// again. Other allows require the evaluation to finish within its deadline.
+/// This completion guard does not interrupt synchronous work between checks.
+fn evaluate_with_completion_deadline(
+    deadline: Option<&Deadline>,
+    evaluate: impl FnOnce() -> EvaluationResult,
+) -> EvaluationResult {
+    let result = evaluate();
+    if result.decision == EvaluationDecision::Allow
+        && result.bypass_method != Some(BypassMethod::AllowOnce)
+        && deadline_exceeded(deadline)
+    {
+        return EvaluationResult::indeterminate_due_to_budget();
+    }
+    result
+}
+
 /// The text keyword gating reads: the command without its inert POSIX
 /// redirections ([`crate::packs::blank_inert_redirections`], #571). Cmd and
 /// PowerShell give `>` and `/dev/null` other meanings (`2>/dev/null` writes a
@@ -17216,21 +17238,23 @@ pub fn evaluate_command_with_pack_order_deadline_at_path_in_dialect(
     deadline: Option<&Deadline>,
     shell_dialect: crate::normalize::ShellDialect,
 ) -> EvaluationResult {
-    evaluate_command_with_pack_order_deadline_at_path_inner(
-        command,
-        enabled_keywords,
-        ordered_packs,
-        keyword_index,
-        compiled_overrides,
-        allowlists,
-        heredoc_settings,
-        allow_once_audit,
-        project_path,
-        deadline,
-        shell_dialect,
-        0,
-        false,
-    )
+    evaluate_with_completion_deadline(deadline, || {
+        evaluate_command_with_pack_order_deadline_at_path_inner(
+            command,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            shell_dialect,
+            0,
+            false,
+        )
+    })
 }
 
 /// Bytes whose shell meaning differs between the dialects dcg models, and which
@@ -50673,6 +50697,212 @@ mod tests {
 
         fn test_heredoc_settings() -> crate::config::HeredocSettings {
             crate::config::Config::default().heredoc_settings()
+        }
+
+        fn completion_regex_failure() -> crate::perf::RegexFailure {
+            crate::perf::RegexFailure {
+                pack_id: Some(crate::perf::DiagnosticId::new("test.pack")),
+                pattern_id: Some(crate::perf::DiagnosticId::new("work-limited")),
+                operation: crate::perf::RegexOperation::Find,
+                cause: crate::perf::RegexFailureCause::BacktrackLimit { steps: 123 },
+            }
+        }
+
+        #[test]
+        fn completion_deadline_expiring_during_evaluation_is_indeterminate() {
+            // The operation returns only after its deadline. An entry-only
+            // check either misses that expiry or skips the operation if a
+            // scheduling pause used the budget first; neither satisfies this
+            // completion boundary. No assertion bounds scheduling latency.
+            let deadline = Deadline::new(Duration::from_millis(1));
+            let mut completed = false;
+            let result = evaluate_with_completion_deadline(Some(&deadline), || {
+                if let Some(remaining) = deadline.remaining() {
+                    std::thread::sleep(remaining + Duration::from_millis(1));
+                }
+                assert!(deadline.is_exceeded());
+                completed = true;
+                EvaluationResult::allowed_by_quick_reject()
+            });
+
+            assert!(completed);
+            assert!(result.is_indeterminate(), "{result:?}");
+            assert!(result.skipped_due_to_budget);
+            assert!(!result.quick_rejected);
+            assert!(result.pattern_info.is_none());
+        }
+
+        #[test]
+        fn completion_deadline_rejects_expired_analysis_allows_without_attribution() {
+            let finding = EvaluationResult::denied_by_pack_pattern(
+                "test.pack",
+                "reviewed-rule",
+                "matched a reviewed rule",
+                None,
+                crate::packs::Severity::High,
+                &[],
+            )
+            .pattern_info
+            .expect("named finding");
+            let allowed_by_rule = EvaluationResult::allowed_by_allowlist(
+                finding.clone(),
+                AllowlistLayer::User,
+                "allow this rule, not unverified work".to_string(),
+            );
+            let warning = EvaluationResult {
+                pattern_info: Some(finding.clone()),
+                effective_mode: Some(crate::packs::DecisionMode::Warn),
+                ..EvaluationResult::allowed()
+            };
+            let logged = EvaluationResult {
+                pattern_info: Some(finding),
+                effective_mode: Some(crate::packs::DecisionMode::Log),
+                ..EvaluationResult::allowed()
+            };
+            let expired = Deadline::new(Duration::ZERO);
+            for (label, before) in [
+                ("plain", EvaluationResult::allowed()),
+                (
+                    "quick rejection",
+                    EvaluationResult::allowed_by_quick_reject(),
+                ),
+                ("rule allowlist", allowed_by_rule),
+                ("warning", warning),
+                ("log", logged),
+            ] {
+                let result = evaluate_with_completion_deadline(Some(&expired), || before);
+                assert!(result.is_indeterminate(), "{label}: {result:?}");
+                assert!(result.skipped_due_to_budget, "{label}");
+                assert!(!result.quick_rejected, "{label}");
+                assert!(result.pattern_info.is_none(), "{label}");
+                assert!(result.allowlist_override.is_none(), "{label}");
+                assert!(result.effective_mode.is_none(), "{label}");
+                assert!(result.bypass_method.is_none(), "{label}");
+            }
+        }
+
+        #[test]
+        fn completion_deadline_propagates_through_warning_and_log_replays() {
+            for (label, mode) in [
+                ("warn", crate::config::PolicyMode::Warn),
+                ("log", crate::config::PolicyMode::Log),
+            ] {
+                let mut config = default_config();
+                config
+                    .policy
+                    .rules
+                    .insert("test.pack:reviewed-rule".to_string(), mode);
+                // Real nonblocking findings still carry decision Deny. The
+                // policy replay must not return that original Warn/Log once
+                // its residual evaluation has exhausted the shared deadline.
+                let finding = EvaluationResult::denied_by_pack_pattern(
+                    "test.pack",
+                    "reviewed-rule",
+                    "a finding configured to permit execution",
+                    None,
+                    crate::packs::Severity::High,
+                    &[],
+                );
+                let matched = finding.pattern_info.clone().expect("named finding");
+                let deadline = Deadline::new(Duration::from_millis(1));
+                let mut replays = 0;
+                let result = escalate_masked_findings(
+                    &config,
+                    "test-command",
+                    &default_allowlists(),
+                    finding,
+                    |_, _| {
+                        replays += 1;
+                        evaluate_with_completion_deadline(Some(&deadline), || {
+                            if let Some(remaining) = deadline.remaining() {
+                                std::thread::sleep(remaining + Duration::from_millis(1));
+                            }
+                            EvaluationResult::allowed_by_allowlist(
+                                matched.clone(),
+                                AllowlistLayer::User,
+                                "re-evaluation past the nonblocking rule".to_string(),
+                            )
+                        })
+                    },
+                );
+
+                assert_eq!(replays, 1, "{label}");
+                assert!(result.is_indeterminate(), "{label}: {result:?}");
+                assert!(result.skipped_due_to_budget, "{label}");
+                assert!(result.pattern_info.is_none(), "{label}");
+                assert!(result.allowlist_override.is_none(), "{label}");
+                assert!(result.effective_mode.is_none(), "{label}");
+            }
+        }
+
+        #[test]
+        fn completion_deadline_preserves_denials_and_incomplete_diagnostics() {
+            let denial = EvaluationResult::denied_by_pack_pattern(
+                "test.pack",
+                "known-destructive",
+                "positive destructive finding",
+                Some("retain the finding even if other analysis is incomplete"),
+                crate::packs::Severity::High,
+                &[],
+            );
+            let incomplete = EvaluationResult {
+                decision: EvaluationDecision::Indeterminate,
+                ..EvaluationResult::allowed()
+            };
+            let expired = Deadline::new(Duration::ZERO);
+            for mut before in [
+                denial,
+                incomplete,
+                EvaluationResult::indeterminate_due_to_budget(),
+            ] {
+                before.regex_evaluation_incomplete = true;
+                before.regex_failure = Some(completion_regex_failure());
+                let result = evaluate_with_completion_deadline(Some(&expired), || before.clone());
+
+                assert_eq!(result.decision, before.decision);
+                assert_eq!(result.pattern_info, before.pattern_info);
+                assert_eq!(result.effective_mode, before.effective_mode);
+                assert_eq!(result.skipped_due_to_budget, before.skipped_due_to_budget);
+                assert!(result.regex_evaluation_incomplete);
+                assert_eq!(result.regex_failure, before.regex_failure);
+            }
+        }
+
+        #[test]
+        fn completion_deadline_preserves_consumed_exact_allow_once_grant() {
+            let expired = Deadline::new(Duration::ZERO);
+            let mut consumed = false;
+            let result = evaluate_with_completion_deadline(Some(&expired), || {
+                // The completion boundary receives a grant already consumed
+                // by the evaluator. It must not strand that authorization.
+                consumed = true;
+                EvaluationResult {
+                    regex_evaluation_incomplete: true,
+                    regex_failure: Some(completion_regex_failure()),
+                    ..EvaluationResult::allowed_by_allow_once()
+                }
+            });
+
+            assert!(consumed);
+            assert!(result.is_allowed(), "{result:?}");
+            assert_eq!(result.bypass_method, Some(BypassMethod::AllowOnce));
+            assert!(!result.skipped_due_to_budget);
+            assert!(result.regex_evaluation_incomplete);
+            assert_eq!(result.regex_failure, Some(completion_regex_failure()));
+        }
+
+        #[test]
+        fn completion_deadline_keeps_allows_when_budget_remains_or_is_unset() {
+            let deadline = Deadline::new(Duration::from_secs(10));
+            for budget in [None, Some(&deadline)] {
+                let result = evaluate_with_completion_deadline(
+                    budget,
+                    EvaluationResult::allowed_by_quick_reject,
+                );
+                assert!(result.is_allowed(), "{result:?}");
+                assert!(result.quick_rejected);
+                assert!(!result.skipped_due_to_budget);
+            }
         }
 
         /// An already-expired deadline must never be interpreted as an allow.
