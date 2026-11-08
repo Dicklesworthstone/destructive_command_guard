@@ -33,7 +33,10 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 const MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES: usize = 64 * 1024;
-const MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS: usize = 128;
+// #647: long scripts with quoted filesystem words still need their segments
+// analyzed. Admit up to 512 without changing the byte/word limits or the
+// existing incomplete-analysis fallback above the segment bound.
+const MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS: usize = 512;
 const MAX_WINDOWS_FILESYSTEM_SEMANTIC_TOKENS: usize = 512;
 
 pub(crate) const WINDOWS_FILESYSTEM_UNVERIFIED_RULE: &str =
@@ -3686,6 +3689,143 @@ mod tests {
             WindowsFilesystemSemanticDecision::Destructive("clear-content"),
             "an inert call target must not hide a later destructive statement",
         );
+    }
+
+    #[test]
+    fn issue_647_safe_powershell_statements_up_to_512_are_fully_analyzed() {
+        // The issue's quoted keyword must select the semantic pass without
+        // becoming an executable. Exercise the old and new boundaries as
+        // well as the reported 300-statement input.
+        for separator in ["; ", "\n", "\r\n"] {
+            for count in [128, 129, 300, 512] {
+                let command = vec!["Write-Output 'rm x'"; count].join(separator);
+                assert_eq!(
+                    windows_filesystem_semantic_decision_in_dialect(
+                        &command,
+                        ShellDialect::PowerShell,
+                    ),
+                    WindowsFilesystemSemanticDecision::NoMatch,
+                    "{count} statements separated by {separator:?}",
+                );
+            }
+            let command = vec!["Write-Output 'rm x'"; 513].join(separator);
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(&command, ShellDialect::PowerShell),
+                WindowsFilesystemSemanticDecision::Incomplete,
+                "513 statements separated by {separator:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn issue_647_late_powershell_destruction_is_not_hidden_by_safe_statements() {
+        for (safe_statement, safe_count) in [
+            ("Get-Location", 400),
+            ("Write-Output 'rm x'", 400),
+            ("Write-Output 'rm x'", 511),
+        ] {
+            for destructive in [
+                r"Remove-Item C:\example -Recurse -Force",
+                // Requires shell decoding; a raw Remove-Item regex cannot
+                // stand in for inspecting this statement.
+                r"Re`move-Item C:\example -Recurse -Force",
+            ] {
+                let command = format!(
+                    "{}{destructive}",
+                    format!("{safe_statement}; ").repeat(safe_count),
+                );
+                assert_eq!(
+                    windows_filesystem_semantic_decision_in_dialect(
+                        &command,
+                        ShellDialect::PowerShell,
+                    ),
+                    WindowsFilesystemSemanticDecision::Destructive("remove-item-recurse-force"),
+                    "destructive statement {}: {destructive}",
+                    safe_count + 1,
+                );
+            }
+        }
+
+        let command = format!(
+            "{}Remove-Item C:\\example -Recurse -Force",
+            "Remove-Item C:\\preview -Recurse -Force -WhatIf; ".repeat(511),
+        );
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(&command, ShellDialect::PowerShell),
+            WindowsFilesystemSemanticDecision::Destructive("remove-item-recurse-force"),
+            "an earlier Safe decision must not exempt the final statement",
+        );
+    }
+
+    #[test]
+    fn issue_647_cmd_statements_share_the_bounded_scan() {
+        let safe = vec!["echo rd"; 512].join(" & ");
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(&safe, ShellDialect::Cmd),
+            WindowsFilesystemSemanticDecision::NoMatch,
+        );
+        let destructive = format!("{}r^d /s /q C:\\example", "echo rd & ".repeat(511));
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(&destructive, ShellDialect::Cmd),
+            WindowsFilesystemSemanticDecision::Destructive("rd-recursive"),
+        );
+        let over_bound = format!("{safe} & echo rd");
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(&over_bound, ShellDialect::Cmd),
+            WindowsFilesystemSemanticDecision::Incomplete,
+        );
+    }
+
+    #[test]
+    fn issue_647_statement_extension_preserves_byte_and_word_bounds() {
+        // One inert statement at exactly 64 KiB, then one byte over. This
+        // isolates the byte bound from both the statement and word bounds.
+        let prefix = "Write-Output 'rm ";
+        let at_byte_bound = format!(
+            "{prefix}{}'",
+            "x".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES - prefix.len() - 1),
+        );
+        assert_eq!(at_byte_bound.len(), MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES);
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                &at_byte_bound,
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::NoMatch,
+        );
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                &format!("{at_byte_bound} "),
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::Incomplete,
+        );
+
+        // The 512-word limit is per protected statement, not a shared token
+        // budget for all 512 statements. Exceeding it must remain unverified,
+        // even when a preview/help flag would otherwise establish safety.
+        for (prefix, dialect) in [
+            ("Remove-Item -WhatIf", ShellDialect::PowerShell),
+            ("rd /?", ShellDialect::Cmd),
+        ] {
+            let at_word_bound = format!(
+                "{prefix}{}",
+                " C:\\example".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_TOKENS - 2),
+            );
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(&at_word_bound, dialect),
+                WindowsFilesystemSemanticDecision::Safe,
+                "{dialect:?} at the word bound",
+            );
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(
+                    &format!("{at_word_bound} C:\\example"),
+                    dialect,
+                ),
+                WindowsFilesystemSemanticDecision::Unverified,
+                "{dialect:?} over the word bound",
+            );
+        }
     }
 
     /// #569: the whole-command bounds stop the pass before it reads any

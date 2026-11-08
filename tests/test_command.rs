@@ -171,6 +171,120 @@ fn test_stdin_preserves_multiline_commands_and_rejects_empty_input() {
     assert!(stderr_text(&empty).contains("stdin did not contain a command"));
 }
 
+/// #647: quoted filesystem keywords in long, simple PowerShell statements
+/// must remain data all the way through the CLI evaluator.
+#[test]
+fn test_long_powershell_stdin_within_statement_bound_is_allowed() {
+    for count in [300, 512] {
+        let command = vec!["Write-Output 'rm x'"; count].join("; ");
+        let output = run_dcg_isolated_with_stdin(
+            &[
+                "test",
+                "--stdin",
+                "--dialect",
+                "powershell",
+                "--format",
+                "json",
+                "--with-packs",
+                "windows.filesystem",
+            ],
+            &command,
+        );
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{count} safe PowerShell statements should be allowed\nstdout: {}\nstderr: {}",
+            stdout_text(&output),
+            stderr_text(&output)
+        );
+        let json = parse_json(&output);
+        assert_eq!(json["decision"], "allow", "{count} statements: {json}");
+        assert!(json["rule_id"].is_null(), "{count} statements: {json}");
+    }
+}
+
+#[test]
+fn test_long_powershell_stdin_above_statement_bound_is_indeterminate() {
+    let command = vec!["Write-Output 'rm x'"; 513].join("; ");
+    let output = run_dcg_isolated_with_stdin(
+        &[
+            "test",
+            "--stdin",
+            "--dialect",
+            "powershell",
+            "--format",
+            "json",
+            "--with-packs",
+            "windows.filesystem",
+        ],
+        &command,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an uninspected suffix must keep execution blocked\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
+        stderr_text(&output)
+    );
+    let json = parse_json(&output);
+    assert_eq!(json["decision"], "indeterminate", "{json}");
+    assert_eq!(json["source"], "analysis_budget", "{json}");
+    assert!(json["rule_id"].is_null(), "{json}");
+    assert!(json["pattern_name"].is_null(), "{json}");
+}
+
+#[test]
+fn test_long_powershell_stdin_keeps_late_destructive_statements_visible() {
+    let plain = r"Remove-Item C:\example -Recurse -Force";
+    // This spelling requires semantic decoding; the raw executable text
+    // alone does not match Remove-Item.
+    let escaped = r"Remove`-Item C:\example -Recurse -Force";
+    for (count, destructive) in [
+        (400, plain),
+        (511, plain),
+        (512, plain), // Existing protection also applies beyond the new bound.
+        (400, escaped),
+        (511, escaped),
+    ] {
+        let command = format!("{}{destructive}", "Write-Output 'rm x'; ".repeat(count));
+        let output = run_dcg_isolated_with_stdin(
+            &[
+                "test",
+                "--stdin",
+                "--dialect",
+                "powershell",
+                "--format",
+                "json",
+            ],
+            &command,
+        );
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{destructive:?} after {count} safe statements should be denied\nstdout: {}\nstderr: {}",
+            stdout_text(&output),
+            stderr_text(&output)
+        );
+        let json = parse_json(&output);
+        assert_eq!(json["decision"], "deny", "{count}, {destructive:?}: {json}");
+        // The default core pack already protects these commands and runs
+        // before windows.filesystem. Preserve its existing rule attribution;
+        // pack unit tests exercise the Windows semantic pass directly.
+        assert_eq!(json["pack_id"], "core.filesystem", "{json}");
+        assert_eq!(
+            json["pattern_name"], "powershell-remove-item-recursive",
+            "{json}"
+        );
+        assert_eq!(
+            json["rule_id"], "core.filesystem:powershell-remove-item-recursive",
+            "{json}"
+        );
+    }
+}
+
 #[test]
 fn test_stdin_and_positional_command_are_mutually_exclusive() {
     let output = run_dcg_isolated(&["test", "--stdin", "git status"], None);

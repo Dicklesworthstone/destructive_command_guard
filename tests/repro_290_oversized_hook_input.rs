@@ -491,7 +491,7 @@ fn issue_569_incomplete_window_analysis_on_an_oversized_payload_is_not_allowed()
     let temp = tempfile::tempdir().expect("tempdir");
     let command = format!(
         "echo rm & r^d /s /q C:\\src & {}{}",
-        "echo a & ".repeat(140),
+        "echo a & ".repeat(513),
         "A".repeat(PADDING_BYTES)
     );
     let input = serde_json::json!({

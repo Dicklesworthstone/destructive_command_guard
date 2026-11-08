@@ -57432,6 +57432,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn issue_647_long_powershell_input_respects_expired_deadline() {
+        use std::time::Duration;
+
+        let command = vec!["Write-Output 'rm x'"; 512].join("; ");
+        let enabled_keywords = ["rm"];
+        let ordered_packs = ["windows.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+
+        for index in [None, keyword_index.as_ref()] {
+            let evaluate = |deadline: Option<&Deadline>| {
+                evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    &command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    deadline,
+                    ShellDialect::PowerShell,
+                )
+            };
+
+            let completed = evaluate(None);
+            assert!(
+                completed.is_allowed(),
+                "512 safe statements; index={}: {completed:?}",
+                index.is_some(),
+            );
+
+            let expired = Deadline::new(Duration::ZERO);
+            let result = evaluate(Some(&expired));
+            assert!(
+                result.is_indeterminate() && result.skipped_due_to_budget,
+                "expired deadline; index={}: {result:?}",
+                index.is_some(),
+            );
+            assert!(result.pattern_info.is_none(), "{result:?}");
+        }
+    }
+
     /// #569: a Windows filesystem pass that stops at its size or statement
     /// bound reports the configured incomplete-analysis outcome
     /// (`Indeterminate`) instead of a `windows-filesystem-semantic-unverified`
@@ -57477,13 +57524,19 @@ mod tests {
             )
         };
 
-        let statements = "Write-Output 'rm x'; ".repeat(140);
-        // The generator from the issue at the first failing size. Its `^`
-        // after `(x|y)` and the `ri` inside `print` are what select the pass.
-        let tuples = " ('a', 'b'), ('c', 'd'),\n".repeat(29);
+        let statements = "Write-Output 'rm x'; ".repeat(513);
+        // Keep the issue's generator above the expanded statement bound.
+        // Its `^` after `(x|y)` and the `ri` inside `print` select the pass.
+        let tuples = " ('a', 'b'), ('c', 'd'),\n".repeat(128);
         let python = format!(
             "python3 - <<'EOF'\nimport re\ns = 'text'\nR = [\n{tuples}]\nfor m in re.finditer(r'[^\\n]{{0,40}}(x|y)[^\\n]{{0,40}}', s):\n    print(m.group(0))\nEOF"
         );
+        assert!(
+            crate::packs::split_command_segments_in_dialect(&python, ShellDialect::PowerShell)
+                .len()
+                > 512,
+        );
+        assert!(python.len() < 64 * 1024);
 
         for index in [None, keyword_index.as_ref()] {
             for (command, dialect) in [
