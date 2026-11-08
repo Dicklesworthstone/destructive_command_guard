@@ -745,7 +745,7 @@ Environment variables override config files (highest priority):
 - `DCG_BRIDGE_CRASH_DECISION=allow`: let a command through when the OpenCode plugin or the Oh My Pi bridge started dcg but got no verdict from it (dcg crashed or was killed); the default blocks (see [Bounded Failure Policy](#bounded-failure-policy))
 - `DCG_BYPASS=1`: bypass dcg entirely (escape hatch; use sparingly)
 - `DCG_CONFIG=/path/to/config.toml`: use explicit config file
-- `DCG_HEREDOC_ENABLED=true|false`: enable/disable heredoc scanning
+- `DCG_HEREDOC_ENABLED=true|false`: enable/disable the combined heredoc and inline-interpreter scanning tier (see [heredoc configuration](docs/configuration.md#heredoc-and-inline-script-scanning))
 - `DCG_HEREDOC_TIMEOUT=50`: heredoc extraction timeout (milliseconds)
 - `DCG_HEREDOC_TIMEOUT_MS=50`: heredoc extraction timeout (milliseconds)
 - `DCG_HEREDOC_LANGUAGES=python,bash`: filter heredoc languages
@@ -1007,14 +1007,20 @@ payload is not allowed blind: dcg scans the raw text for a shell tool's
 `"command"` value and evaluates it. A command that this scan finds denied (or
 asked about) gets that answer; only a payload with no evaluable shell command,
 or one whose command the scan allows, falls through to the fail-open allow. The
-scan is a best effort and can allow what the full evaluation would not: hook
-input larger than `max_hook_input_bytes` (256 KiB by default) that holds a
-quoted Python, JavaScript or Ruby heredoc calling `eval` or `exec` on a string
-dcg cannot read is allowed, although the same command asks when the limit is
-raised. To deny oversized input instead, set `general.fail_closed = true` (or
-`DCG_FAIL_CLOSED=1`). Unpaired UTF-16 surrogate escapes (`\ud800`), which
-JavaScript hosts can emit, are replaced with U+FFFD before parsing rather than
-failing it.
+scan is a best effort. For an over-length command containing a heredoc, its
+windows cannot preserve the relationship between the body and its consumer.
+DCG therefore retains the size-limit review/block response unless a bounded
+parse proves the body is inert data. Piped interpreters, wrappers, descriptor
+handoffs, unknown receivers, malformed source and exhausted proof bounds do
+not qualify for that exemption. A completed quoted data-file write can retain
+the fail-open behavior. Window results use the normal decision ordering:
+concrete denial, incomplete analysis, then an `ask` finding. To deny every
+oversized raw input, set `general.fail_closed = true` (or `DCG_FAIL_CLOSED=1`).
+The data exception requires a complete parse view of at most 64 KiB after
+quoted bodies are compacted. Larger exterior source, including long quoted
+text or arithmetic, remains unverified when this proof cannot finish.
+Unpaired UTF-16 surrogate escapes (`\ud800`), which JavaScript hosts can emit,
+are replaced with U+FFFD before parsing rather than failing it.
 
 > A leading UTF-8 BOM (`EF BB BF`) is stripped before parsing in all hook
 > paths, so a BOM-prefixed but otherwise-valid command is correctly evaluated

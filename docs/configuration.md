@@ -305,9 +305,23 @@ label it `INACTIVE`; default reads operate on effective layers only.
 Scan hooks are loaded from `.dcg/hooks.toml` when present. See
 `docs/scan-precommit-guide.md` for hook configuration and pre-commit examples.
 
-## Heredoc Scanning
+## Heredoc and Inline-Script Scanning
 
-Heredoc scanning can be enabled or configured with:
+The `[heredoc]` section controls the shared embedded-code scanning tier:
+heredoc bodies, here-strings, and inline interpreter programs such as
+`python -c`, `perl -e`, and `node -e`. It is enabled by default.
+
+Setting `enabled = false`, `DCG_HEREDOC_ENABLED=false`, or
+`--no-heredoc-scan` disables this entire tier. Direct-command pack checks still
+run, but they do not replace language-aware inspection of interpreter source.
+For example, `perl -e "unlink '/etc/passwd'"` is detected by
+`heredoc.perl:unlink.catastrophic` with the tier enabled and can be allowed
+when it is disabled. The direct `unlink` rules apply to the executed program,
+not arbitrary text inside another program's arguments
+([#648](https://github.com/Dicklesworthstone/destructive_command_guard/issues/648)).
+Keep the tier enabled to retain inline-interpreter protection.
+
+Configuration:
 
 ```toml
 [heredoc]

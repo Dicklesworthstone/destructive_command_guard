@@ -771,14 +771,14 @@ fn try_deny_unparseable_payload(
     // destructive-then-padding.
     let max_command_bytes = config.general.max_command_bytes();
     let mut commands: Vec<String> = Vec::new();
-    // An over-length command whose heredoc a shell or interpreter runs as
-    // code (bd-ym0p). The windows below cut its body away from that program,
-    // so a scan that finds nothing has not judged the code. The normal path
-    // answers any command over `max_command_bytes` with the size-limit
-    // indeterminate; without this, the same `python3 - <<'EOF'` body allowed
-    // once the whole input also passed `max_hook_input_bytes`. A data
-    // receiver (`cat > file <<'EOF'`) and padding outside any heredoc keep
-    // the documented fail-open default.
+    // An over-length command whose heredoc has not been proved inert
+    // (bd-ym0p, bd-oversized-code-heredoc-receivers-azu4). The windows below
+    // cut its body away from its consumer: a pipe, wrapper or descriptor can
+    // feed code to an interpreter without spelling its name at the operator.
+    // Finding no window-level match therefore does not establish safety.
+    // Retain the ordinary size-limit indeterminate unless a bounded reading
+    // proves the heredoc is data. Proven quoted file writes and bounded
+    // padding without a `<<` marker retain the documented fail-open default.
     // Also retain a command whose recovered bytes do not fit in the bounded
     // scan. Limits restrict work; they do not establish that omitted bytes are
     // safe. A later window's concrete denial still takes precedence.
@@ -796,11 +796,11 @@ fn try_deny_unparseable_payload(
     for command in hook::extract_commands_from_truncated_json(prefix) {
         if command.len() > max_command_bytes
             && oversized_unverified_command.is_none()
-            && destructive_command_guard::heredoc::any_heredoc_runs_as_code(&command)
+            && destructive_command_guard::heredoc::oversized_heredoc_requires_analysis(&command)
         {
-            // The whole command is scanned, not just its first window: padding
-            // or an earlier data heredoc before the interpreter heredoc must
-            // not hide it (bd-oversized-code-heredoc-receivers-azu4).
+            // The proof sees the whole recovered command. An earlier data
+            // body cannot vouch for a later executable one, and a later
+            // command can run a file that an earlier data body wrote.
             oversized_unverified_command = Some(command.len());
         }
         if !windows_payload {
@@ -875,9 +875,9 @@ fn try_deny_unparseable_payload(
     // records its own audit row in `handle_unparseable_hook_input`, and a
     // refused payload must not provoke history-writer construction (worker
     // thread + database) unless a denial is actually published.
-    // Deny if ANY extracted occurrence (or scan window) resolves decisively;
-    // a benign decoy ahead of the real command must not be able to end the
-    // scan.
+    // A concrete denial in ANY extracted occurrence (or scan window) wins;
+    // an earlier Ask must not hide it or bypass an unverified-command Deny.
+    // Use the same Deny > Indeterminate > Ask ordering as `outcome_rank`.
     //
     // An exhausted deadline leaves windows unscanned, so "nothing found" is not
     // something this run established — and this loop used to `break` into the
@@ -905,6 +905,7 @@ fn try_deny_unparseable_payload(
     // Keep it until the scan ends, so a later window's proven Deny still
     // outranks it, and then publish it instead of allowing.
     let mut pending_indeterminate: Option<ResolvedCommandOutcome> = None;
+    let mut pending_ask: Option<ResolvedCommandOutcome> = None;
     for command in &commands {
         if deadline.is_exceeded() {
             let mut history_writer = if config.history.enabled {
@@ -943,9 +944,7 @@ fn try_deny_unparseable_payload(
         // size. A window of padding costs the evaluator one keyword scan.
         let outcome = resolve_hook_command(&eval_context, command, refined_dialect, None);
         match outcome {
-            ResolvedCommandOutcome::DenyFamily(resolved)
-                if matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask) =>
-            {
+            ResolvedCommandOutcome::DenyFamily(resolved) if resolved.mode == DecisionMode::Deny => {
                 let mut history_writer = if config.history.enabled {
                     let mut writer = create_history_writer(&config.history);
                     writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
@@ -963,6 +962,9 @@ fn try_deny_unparseable_payload(
                 drop_history_writer(history_writer);
                 return Some(exit_code);
             }
+            ResolvedCommandOutcome::DenyFamily(resolved) if resolved.mode == DecisionMode::Ask => {
+                pending_ask.get_or_insert(ResolvedCommandOutcome::DenyFamily(resolved));
+            }
             indeterminate @ (ResolvedCommandOutcome::DeadlineExhausted { .. }
             | ResolvedCommandOutcome::OversizedCommand { .. }) => {
                 pending_indeterminate.get_or_insert(indeterminate);
@@ -970,10 +972,12 @@ fn try_deny_unparseable_payload(
             ResolvedCommandOutcome::DenyFamily(_) | ResolvedCommandOutcome::Allow(_) => {}
         }
     }
-    let indeterminate = pending_indeterminate.or_else(|| {
-        oversized_unverified_command
-            .map(|command_len| ResolvedCommandOutcome::OversizedCommand { command_len })
-    })?;
+    let decisive = pending_indeterminate
+        .or_else(|| {
+            oversized_unverified_command
+                .map(|command_len| ResolvedCommandOutcome::OversizedCommand { command_len })
+        })
+        .or(pending_ask)?;
     let mut history_writer = if config.history.enabled {
         let mut writer = create_history_writer(&config.history);
         writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
@@ -981,7 +985,7 @@ fn try_deny_unparseable_payload(
     } else {
         None
     };
-    let exit_code = publish_decisive_response(&eval_context, indeterminate, &mut history_writer);
+    let exit_code = publish_decisive_response(&eval_context, decisive, &mut history_writer);
     drop_history_writer(history_writer);
     Some(exit_code)
 }
