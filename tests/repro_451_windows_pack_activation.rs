@@ -325,3 +325,124 @@ fn windows_cli_payload_defaults_respect_explicit_exclusions() {
         assert_eq!(diagnostic_json(&explicit)["decision"], "deny");
     }
 }
+
+/// #654: the body and the single-quoted rg argument both contain << as
+/// literal text. The apostrophe in the body is not a shell quote.
+const ISSUE_654_COMMAND: &str = r#"cat > /tmp/x/a.py <<'EOF'
+p = r"^<<<<<<< [^\n]*\n(.*?)^\|\|\|\|\|\|\| [^\n]*\n(.*?)"
+row's
+EOF
+python3 /tmp/x/a.py && for f in a.txt; do rg -c '^(<<<<<<<|=======|>>>>>>>)( |$)' "$f" || echo 0; done"#;
+
+#[test]
+fn issue_654_quoted_conflict_markers_keep_bash_hook_and_posix_cli_in_agreement() {
+    let commands = [
+        ISSUE_654_COMMAND.to_string(),
+        // Each of these minimal edits was allowed in the original report.
+        ISSUE_654_COMMAND.replace("row's\n", ""),
+        ISSUE_654_COMMAND
+            .lines()
+            .filter(|line| !line.starts_with("p = "))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        ISSUE_654_COMMAND.replace("'^(<<<<<<<|=======|>>>>>>>)( |$)'", "'x'"),
+        // The same literal body is data whether cat writes or appends it,
+        // and a later quoted pattern must not turn it into Windows syntax.
+        ISSUE_654_COMMAND.replace("python3 /tmp/x/a.py && ", ""),
+        ISSUE_654_COMMAND.replacen("cat >", "cat >>", 1),
+    ];
+    for command in &commands {
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        })
+        .to_string();
+        let hook = run_windows_diagnostic(&[], Some(&payload), Some("# empty\n"));
+        assert!(
+            hook.status.success(),
+            "hook failed for {command:?}: {}",
+            String::from_utf8_lossy(&hook.stderr)
+        );
+        // A deny or an incomplete-analysis ask is a JSON document, never a
+        // successful silent allow. Also check the CLI's explicit decision.
+        assert!(
+            hook.stdout.is_empty(),
+            "safe Bash heredoc must be allowed: {command:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&hook.stdout),
+            String::from_utf8_lossy(&hook.stderr)
+        );
+        let diagnostic = run_windows_diagnostic(
+            &["test", "--stdin", "--dialect", "posix", "--format", "json"],
+            Some(command),
+            Some("# empty\n"),
+        );
+        assert_eq!(
+            diagnostic.status.code(),
+            Some(0),
+            "POSIX CLI failed for {command:?}: {}",
+            String::from_utf8_lossy(&diagnostic.stderr)
+        );
+        assert_eq!(
+            diagnostic_json(&diagnostic)["decision"],
+            "allow",
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn issue_654_heredoc_data_does_not_hide_executed_destructive_commands() {
+    let trailing_delete = format!("{ISSUE_654_COMMAND}\nrm -rf ./important");
+    for command in [
+        trailing_delete.as_str(),
+        // The outer shell executes substitutions in an unquoted heredoc.
+        "cat > /tmp/x/a.py <<EOF\n$(rm -rf ./important)\nEOF\nrg '^(<<<<<<<|=======|>>>>>>>)( |$)' a.txt",
+        // A shell receives code, even when the delimiter is quoted.
+        "bash <<'EOF'\nrm -rf ./important\nEOF",
+        // A file written by cat and subsequently run as shell is also code.
+        "cat > /tmp/x/a.sh <<'EOF'\nrm -rf ./important\nEOF\nbash /tmp/x/a.sh\nrg '^(<<<<<<<|=======|>>>>>>>)( |$)' a.txt",
+    ] {
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        })
+        .to_string();
+        let hook = run_windows_diagnostic(&[], Some(&payload), Some("# empty\n"));
+        assert!(hook.status.success(), "structured hook denial exits zero");
+        let json = diagnostic_json(&hook);
+        let verdict = &json["hookSpecificOutput"];
+        assert_eq!(verdict["permissionDecision"], "deny", "{command}: {json}");
+        let rule = verdict["ruleId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a concrete destructive rule: {command}: {json}"));
+        assert!(
+            !rule.starts_with("windows.") && !rule.starts_with("heredoc.powershell:"),
+            "POSIX execution must be denied for its own rule, not the #654 false positive: {command}: {json}"
+        );
+    }
+}
+
+#[test]
+fn issue_654_preserves_explicit_and_mislabeled_windows_deletion_detection() {
+    for tool in ["PowerShell", "Bash"] {
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+            "tool_input": {"command": r"Remove-Item -Recurse -Force C:\important"},
+        })
+        .to_string();
+        let hook = run_windows_diagnostic(&[], Some(&payload), Some("# empty\n"));
+        assert!(hook.status.success(), "structured hook denial exits zero");
+        let json = diagnostic_json(&hook);
+        let verdict = &json["hookSpecificOutput"];
+        assert_eq!(verdict["permissionDecision"], "deny", "{tool}: {json}");
+        assert!(
+            verdict["ruleId"]
+                .as_str()
+                .is_some_and(|rule| rule.starts_with("windows.filesystem:")),
+            "the Windows filesystem rule must remain active: {tool}: {json}"
+        );
+    }
+}

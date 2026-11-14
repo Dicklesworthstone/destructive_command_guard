@@ -2787,6 +2787,10 @@ fn is_percent_expansion(token: &str) -> bool {
 /// change which executable runs. A quoted first token is data to whatever
 /// shell runs it, not an executable name being assembled, so it is excluded.
 fn segment_command_word_is_cmd_assembled(segment: &str) -> bool {
+    use crate::normalize::{
+        NormalizeTokenKind, ShellTokenDecoder, ShellTokenRole, tokenize_for_shell_dialect,
+    };
+
     let Some(first) = segment.split_whitespace().next() else {
         return false;
     };
@@ -2798,19 +2802,77 @@ fn segment_command_word_is_cmd_assembled(segment: &str) -> bool {
     // Only an unquoted caret can assemble a cmd executable; a quoted caret
     // is literal text. Keep real g^it / doc^ker evidence, including inside
     // interpreter strings passed through an opaque shell sink.
-    let mut quote = None;
-    for byte in first.bytes() {
-        if let Some(delimiter) = quote {
-            if byte == delimiter {
-                quote = None;
+    let has_unquoted_caret = |word: &str| {
+        let mut quote = None;
+        for byte in word.bytes() {
+            if let Some(delimiter) = quote {
+                if byte == delimiter {
+                    quote = None;
+                }
+            } else if matches!(byte, b'\'' | b'"') {
+                quote = Some(byte);
+            } else if byte == b'^' {
+                return true;
             }
-        } else if matches!(byte, b'\'' | b'"') {
-            quote = Some(byte);
-        } else if byte == b'^' {
+        }
+        false
+    };
+    if !has_unquoted_caret(first) {
+        return is_percent_expansion(first);
+    }
+
+    // The raw heredoc scan can split a regex at '(' and '|', presenting
+    // ".*?)^\" as an apparent command word (#654). Cmd reads that as ".*?",
+    // a closing group, and "^\": the only caret-bearing word decodes to a
+    // directory root, which cannot be an executable. Use the existing Cmd
+    // lexer so a real ")g^it" still supplies evidence. Do not infer anything
+    // about runtime expansions or quote boundaries: the initial whitespace
+    // split may end inside a quoted word, and Cmd does not quote apostrophes.
+    // Bound this optional proof, which also runs before the whole-command
+    // parse size gate.
+    const MAX_CMD_SHAPE_WORD_BYTES: usize = 4096;
+    // Another word beside the caret word may name an executable without
+    // using a caret itself. Only punctuation-only fragments can lose evidence.
+    if first.len() > MAX_CMD_SHAPE_WORD_BYTES
+        || first.contains(['%', '!', '\'', '"'])
+        || first
+            .bytes()
+            .any(|byte| byte.is_ascii_alphanumeric() || !byte.is_ascii())
+    {
+        return true;
+    }
+    // Cmd only splits ASCII whitespace. A Unicode whitespace byte can be
+    // part of an executable path, so the apparent word must also be complete
+    // under that rule before a directory-only fragment can withdraw evidence.
+    let cmd_word_start = segment.trim_ascii_start();
+    if !cmd_word_start.starts_with(first)
+        || cmd_word_start
+            .as_bytes()
+            .get(first.len())
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
+        return true;
+    }
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Cmd);
+    let mut saw_caret_word = false;
+    for word in tokenize_for_shell_dialect(first, ShellDialect::Cmd)
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(first))
+        .filter(|word| has_unquoted_caret(word))
+    {
+        saw_caret_word = true;
+        if decoder
+            .decode(word, ShellTokenRole::Syntax)
+            .is_none_or(|decoded| {
+                decoded.is_empty() || !decoded.bytes().all(|byte| matches!(byte, b'/' | b'\\'))
+            })
+        {
             return true;
         }
     }
-    is_percent_expansion(first)
+    // A different tokenization that loses the candidate supplies no proof.
+    !saw_caret_word
 }
 
 fn is_windows_path_token(token: &str) -> bool {
@@ -5619,6 +5681,68 @@ mod tests {
                 ShellDialect::Posix,
                 "a caret outside the command word must not widen: {command:?}"
             );
+        }
+    }
+
+    #[test]
+    fn issue_654_regex_group_fragments_do_not_name_cmd_executables() {
+        for fragment in [r".*?)^\", r".*?)^/^\", r".*?)^\^\"] {
+            assert!(
+                !segment_command_word_is_cmd_assembled(fragment),
+                "a caret that only escapes directory separators is not an executable: {fragment:?}"
+            );
+        }
+        for fragment in [
+            "g^it reset --hard",
+            "g\"\"^it reset --hard",
+            "foo)g^it reset --hard",
+            r"foo)^\)del/s/q C:\important",
+            r"del/s/q)^\ C:\important",
+            "g^)it reset --hard",
+            "g\")\"^it reset --hard",
+            "a')x'b^it reset --hard",
+            r#"^\"Program Files\g^it.exe" reset --hard"#,
+            "^\\\u{00a0}\\g^it reset --hard",
+            "\u{2003}^\\\u{00a0}\\g^it reset --hard",
+            r"r^d/s/q C:\Users",
+            r"foo)^\g^it reset --hard",
+            r"foo)^\%COMMAND%",
+            r"foo)^\!COMMAND!",
+            r"foo)^",
+            r"foo)^\'",
+        ] {
+            assert!(
+                segment_command_word_is_cmd_assembled(fragment),
+                "real or unresolved command words must keep their evidence: {fragment:?}"
+            );
+        }
+        let oversized = format!("{})^\\", "?".repeat(4096));
+        assert!(segment_command_word_is_cmd_assembled(&oversized));
+    }
+
+    #[test]
+    fn issue_654_conflict_marker_heredocs_keep_the_bash_dialect() {
+        let command = r#"cat > /tmp/x/a.py <<'EOF'
+p = r"^<<<<<<< [^\n]*\n(.*?)^\|\|\|\|\|\|\| [^\n]*\n(.*?)"
+row's
+EOF
+python3 /tmp/x/a.py && for f in a.txt; do rg -c '^(<<<<<<<|=======|>>>>>>>)( |$)' "$f" || echo 0; done"#;
+        for command in [
+            command.to_string(),
+            command.replace("python3 /tmp/x/a.py && ", ""),
+            command.replacen("cat >", "cat >>", 1),
+        ] {
+            assert_eq!(
+                refine_shell_dialect(&command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "quoted regex data must not contradict the Bash label: {command}"
+            );
+            for host_is_windows in [false, true] {
+                assert!(
+                    !command_is_windows_shell_payload_on_host(&command, host_is_windows),
+                    "quoted regex data must not activate Windows packs: {command}"
+                );
+            }
         }
     }
 
