@@ -379,7 +379,7 @@ jobs:
         run: ls -laR dist
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v4.1.2
+        uses: sigstore/cosign-installer@v4.1.3
 
       - name: Sign release artifacts (sigstore bundle)
         run: |
