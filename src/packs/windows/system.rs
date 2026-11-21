@@ -62,6 +62,20 @@ pub(crate) fn cmd_vssadmin_delete_spans(
     if !matches!(dialect, ShellDialect::Cmd | ShellDialect::Unknown) {
         return Ok(Vec::new());
     }
+    let data_view = if dialect == ShellDialect::Unknown {
+        crate::heredoc::mask_non_expanding_data_heredocs(command)
+    } else {
+        std::borrow::Cow::Borrowed(command)
+    };
+    let effective = if dialect == ShellDialect::Unknown
+        && !cfg!(windows)
+        && !crate::hook::names_windows_shell_route(command)
+    {
+        crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref())
+    } else {
+        data_view
+    };
+    let command = effective.as_ref();
     if !command.contains(['%', '!', '^'])
         && !command
             .as_bytes()

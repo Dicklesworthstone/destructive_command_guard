@@ -667,13 +667,27 @@ fn installed_command_with_shell_metacharacters_in_its_path_delivers_real_verdict
         .as_str()
         .unwrap();
     for (guarded_command, denied) in [("git status", false), ("git reset --hard HEAD", true)] {
-        let mut shell = Command::new("/bin/sh");
-        sandbox.configure(&mut shell);
-        let mut child = shell
-            .args(["-c", command])
-            .stdin(Stdio::piped())
-            .spawn()
-            .expect("run the installed hook through its shell");
+        // Copying an executable into a temp dir in a multithreaded test process
+        // can briefly trigger ETXTBSY on Linux while another test thread is
+        // between fork() and exec(). Retry only ExecutableFileBusy.
+        let mut child = {
+            let mut attempts = 0usize;
+            loop {
+                let mut shell = Command::new("/bin/sh");
+                sandbox.configure(&mut shell);
+                match shell.args(["-c", command]).stdin(Stdio::piped()).spawn() {
+                    Ok(child) => break child,
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            && attempts < 10 =>
+                    {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(err) => panic!("run the installed hook through its shell: {err}"),
+                }
+            }
+        };
         child
             .stdin
             .take()

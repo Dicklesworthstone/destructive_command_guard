@@ -395,13 +395,15 @@ fn test_audit_backtracking_requirements() {
                 // `git rm -f` must not fire with `--cached` (worktree kept) or
                 // a dry run anywhere in the segment: a negative lookahead.
                 "rm-force",
-                // The clean rules walk from the subcommand to their flag over
-                // git's real option-parsing window, which ends at a bare `--`
-                // (#429, #434). "Not a bare `--`" is a negative lookahead, so
-                // these three moved off the linear engine.
+                // The clean and reset rules walk from the subcommand to their
+                // flag over git's real option-parsing window, which ends at a
+                // bare `--` (#429, #434). "Not a bare `--`" is a negative
+                // lookahead, so these rules run on the backtracking engine.
                 "clean-dry-run-long",
                 "clean-dry-run-short",
                 "clean-force",
+                "reset-hard",
+                "reset-merge",
                 "push-force-long",
                 "restore-staged-long",
                 "restore-staged-short",

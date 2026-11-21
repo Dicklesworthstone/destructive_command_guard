@@ -3459,6 +3459,46 @@ EOF
     assert_codex_first_bash_hook_command "$DEST/dcg"
 }
 
+@test "configure_codex: sets default statusMessage and preserves operator override (#669)" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    setup_mock_codex
+
+    configure_codex
+    [ "$CODEX_STATUS" = "created" ]
+    python3 - "$CODEX_SETTINGS" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+hook = data["hooks"]["PreToolUse"][0]["hooks"][0]
+assert hook.get("statusMessage") == "dcg (destructive command guard)", hook
+PY
+
+    # Operator-customized statusMessage must survive stale-path updates.
+    cat > "$CODEX_SETTINGS" <<'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "/old/path/dcg", "statusMessage": "custom guard"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+    configure_codex
+    [ "$CODEX_STATUS" = "merged" ]
+    python3 - "$CODEX_SETTINGS" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+hook = data["hooks"]["PreToolUse"][0]["hooks"][0]
+assert hook.get("statusMessage") == "custom guard", hook
+PY
+}
+
 @test "configure_codex: is idempotent when current hook already exists" {
     log_test "Testing Codex idempotent already status..."
 

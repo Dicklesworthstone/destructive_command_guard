@@ -12772,15 +12772,93 @@ fn is_spx_session_handoff_stdin_data_sink(command: &str, heredoc_start: usize) -
     )
 }
 
+/// Check whether the command owning the heredoc is a `dcg` diagnostic subcommand
+/// (`dcg test`, `dcg explain`, `dcg classify`) with `--stdin` (#665).
+///
+/// The hook's own denial tip recommends `dcg test --stdin --explain` so agents
+/// can inspect a command without shell-quoting headaches.  When stdin is fed by
+/// a heredoc, the body is candidate data that `dcg` classifies and never
+/// executes.  Global options use the same arity rules as
+/// `allowlist::segment_is_dcg_inspection_call` so `dcg --agent test allow-once`
+/// never matches, and unquoted heredocs still keep their outer-shell
+/// expansions live via `mask_non_expanding_data_heredocs`.
+fn is_dcg_diagnostic_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
+    if heredoc_start == 0 {
+        return false;
+    }
+
+    let prefix = &command[..heredoc_start];
+    let line_start = prefix.rfind(['\n', '\r']).map_or(0, |i| i + 1);
+    let before = prefix[line_start..].trim_end();
+    if before.is_empty() {
+        return false;
+    }
+
+    let mut tokens = tokenize_backwards(before);
+    tokens.reverse();
+
+    let mut idx = 0;
+    while let Some(token) = tokens.get(idx) {
+        if is_shell_env_assignment(token) || SHELL_WRAPPER_COMMANDS.contains(&token.as_str()) {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+
+    let Some(program) = tokens.get(idx) else {
+        return false;
+    };
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let stem = base
+        .get(..base.len().saturating_sub(4))
+        .filter(|_| {
+            base.get(base.len().saturating_sub(4)..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+        })
+        .unwrap_or(base);
+    if !(stem.eq_ignore_ascii_case("dcg") || stem.eq_ignore_ascii_case("destructive_command_guard"))
+    {
+        return false;
+    }
+    idx += 1;
+
+    while let Some(token) = tokens.get(idx) {
+        match token.as_str() {
+            "--agent" => idx += 2,
+            "--robot" | "--verbose" | "--quiet" | "--legacy-output" | "--no-color"
+            | "--no-suggestions" | "-q" => idx += 1,
+            _ if token.starts_with("--agent=") => idx += 1,
+            _ if token.starts_with('-') => {
+                if token.len() > 1 && token[1..].bytes().all(|byte| byte == b'v') {
+                    idx += 1;
+                } else {
+                    return false;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    let Some(subcommand) = tokens.get(idx) else {
+        return false;
+    };
+    if !matches!(subcommand.as_str(), "test" | "explain" | "classify") {
+        return false;
+    }
+
+    tokens[idx + 1..].iter().any(|arg| arg == "--stdin")
+}
+
 /// Check whether the heredoc/here-string at `heredoc_start` feeds a command
 /// with a documented structured-stdin DATA contract (`git commit -F -` and
-/// friends, `gh … --body-file -`, `spx session handoff`). Such bodies are
-/// consumed as data (a commit message, an issue comment, a handoff
-/// document), never executed as shell (#277, #393).
+/// friends, `gh … --body-file -`, `spx session handoff`, `dcg test|explain|classify --stdin`).
+/// Such bodies are consumed as data, never executed as shell (#277, #393, #665).
 pub(crate) fn is_structured_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
     is_git_stdin_data_sink(command, heredoc_start)
         || is_gh_stdin_data_sink(command, heredoc_start)
         || is_spx_session_handoff_stdin_data_sink(command, heredoc_start)
+        || is_dcg_diagnostic_stdin_data_sink(command, heredoc_start)
 }
 
 /// Mask heredoc content when the target command doesn't execute it.
@@ -17800,9 +17878,11 @@ mod tests {
         assert!(oversized_heredoc_requires_analysis(&large_exterior));
 
         let body = "x".repeat(3 * 1024 * 1024);
-        let unmatched = (0..5)
-            .map(|at| format!("# <<'MISSING{at}'\n"))
-            .collect::<String>();
+        let mut unmatched = String::new();
+        for at in 0..5 {
+            use std::fmt::Write as _;
+            let _ = writeln!(unmatched, "# <<'MISSING{at}'");
+        }
         let exhausted = format!("{unmatched}cat > notes.txt <<'EOF'\n{body}\nEOF\n");
         assert!(exhausted.len() < MAX_OVERSIZED_HEREDOC_SOURCE_BYTES);
         assert!(oversized_heredoc_requires_analysis(&exhausted));
@@ -19825,18 +19905,25 @@ mod tests {
             );
             // A partial range, or a second unproved edit, invalidates the
             // entire proof rather than silently keeping the successful part.
+            let partial_replacement = replacement.start..replacement.end - 1;
+            let unproved_pair = [0..proof.len(), replacement];
             for replacements in [
-                vec![replacement.start..replacement.end - 1],
-                vec![0..proof.len(), replacement],
+                std::slice::from_ref(&partial_replacement),
+                unproved_pair.as_slice(),
             ] {
                 assert_eq!(
-                    nested_arithmetic_replacements_proven(&ast, &replacements, &mut 1024),
+                    nested_arithmetic_replacements_proven(&ast, replacements, &mut 1024),
                     Some(false)
                 );
             }
             let bare = AstGrep::new("((1<<1))", SupportLang::Bash);
+            let bare_range = 0..8;
             assert_eq!(
-                nested_arithmetic_replacements_proven(&bare, &[0..8], &mut 1024),
+                nested_arithmetic_replacements_proven(
+                    &bare,
+                    std::slice::from_ref(&bare_range),
+                    &mut 1024
+                ),
                 Some(false),
                 "a bare arithmetic/subshell ambiguity cannot prove an edit"
             );

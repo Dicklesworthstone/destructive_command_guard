@@ -7297,10 +7297,41 @@ fn collect_powershell_substitution_bodies(command: &str) -> Result<Vec<String>, 
     let mut index = 0usize;
     while index < bytes.len() {
         if let Some((quote, width)) = powershell_quote_at(bytes, index) {
-            let end = powershell_quoted_region_end(command, index, 0)?;
-            if quote == b'"' {
-                collect_powershell_expandable_region(command, index + width, end, &mut bodies)?;
+            if quote == b'\'' {
+                index = skip_powershell_single_quote(command, index);
+                continue;
             }
+            // Scan an expandable double-quoted string (ASCII or smart quotes).
+            // Unclosed quotes (e.g. an unmasked POSIX heredoc containing
+            // `say "hi`) finish cleanly at EOF so unrelated quote fragments
+            // do not fail closed, while unclosed `$(` and nesting bounds still
+            // return `Err(())`.
+            let mut cursor = index + width;
+            let mut end = bytes.len();
+            while cursor < bytes.len() {
+                if bytes[cursor] == b'`' {
+                    cursor = escape_sequence_end(command, cursor);
+                } else if bytes[cursor] == b'$' && bytes.get(cursor + 1) == Some(&b'(') {
+                    let close =
+                        find_powershell_subexpression_close_at_depth(command, cursor + 2, 1)?;
+                    cursor = close + 1;
+                } else if let Some((closing, closing_width)) = powershell_quote_at(bytes, cursor)
+                    && closing == b'"'
+                {
+                    cursor += closing_width;
+                    if let Some((next, next_width)) = powershell_quote_at(bytes, cursor)
+                        && next == b'"'
+                    {
+                        cursor += next_width;
+                    } else {
+                        end = cursor;
+                        break;
+                    }
+                } else {
+                    cursor += 1;
+                }
+            }
+            collect_powershell_expandable_region(command, index + width, end, &mut bodies)?;
             index = end;
             continue;
         }
@@ -7949,7 +7980,31 @@ fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) 
             // Skip every stacked precommand wrapper, not just one:
             // `builtin command eval '…'` still runs the eval.
             if is_posix_precommand_wrapper(decoded.as_ref()) {
+                let is_command = decoded.as_ref() == "command";
                 index += 1;
+                if is_command {
+                    // `command -p eval …` runs `eval` with the default PATH,
+                    // whereas `-v`/`-V` (or any option cluster containing them)
+                    // turn `command` into a non-executing query. Only skip
+                    // bare `-p` and a terminating `--`.
+                    while let Some(opt_token) = words.get(index) {
+                        let Some(opt_raw) = opt_token.text(segment) else {
+                            break;
+                        };
+                        let Some(opt_decoded) = decoder.decode(opt_raw, ShellTokenRole::Syntax)
+                        else {
+                            break;
+                        };
+                        if opt_decoded.as_ref() == "-p" {
+                            index += 1;
+                        } else if opt_decoded.as_ref() == "--" {
+                            index += 1;
+                            break;
+                        } else {
+                            break;
+                        }
+                    }
+                }
                 continue;
             }
             break;
@@ -12582,8 +12637,13 @@ fn powershell_pipeline_words(
         {
             index += 1;
         }
+        let is_heredoc_operator = raw
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .starts_with("<<");
         let positional = classify_shell_positional(raw);
-        if matches!(positional, ShellPositional::StdinReassignRedirect { .. }) {
+        if !is_heredoc_operator
+            && matches!(positional, ShellPositional::StdinReassignRedirect { .. })
+        {
             stdin_redirect = true;
         }
         if let Some(bare) = positional.redirect_is_bare() {
@@ -12735,6 +12795,11 @@ fn powershell_pipeline_source(stage: &str) -> IndirectInputSource {
     {
         stage = stage[prefix.byte_range.end..].trim_start();
     }
+    if stage.contains("<<")
+        && let Some(heredoc_source) = literal_heredoc_producer_source(stage)
+    {
+        return heredoc_source;
+    }
     if let Ok(value) = parse_static_powershell_source(stage) {
         return powershell_pipeline_literal_source(value);
     }
@@ -12748,7 +12813,9 @@ fn powershell_pipeline_source(stage: &str) -> IndirectInputSource {
         return IndirectInputSource::File(PathBuf::new());
     }
     if !matches!(name.as_str(), "write-output" | "echo" | "write") {
-        return unverified();
+        return IndirectInputSource::Unverified(format!(
+            "producer {name:?} is not a statically modeled literal source"
+        ));
     }
     let Ok((words, redirected)) = powershell_pipeline_words(&stage[span.end..], true) else {
         return unverified();
@@ -12847,11 +12914,14 @@ fn powershell_pipeline_sets_interpreter_environment(stage: &str) -> bool {
 /// program that does not execute stdin cannot supply this proof. Parse/budget
 /// uncertainty remains a candidate so it reaches the normal incomplete rule.
 fn powershell_pipeline_scan_required(command: &str) -> bool {
-    if !command.as_bytes().contains(&b'|') {
+    let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    let visible = crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
+    let visible = visible.as_ref();
+    if !visible.as_bytes().contains(&b'|') {
         return false;
     }
     let mut sinks = Vec::new();
-    collect_powershell_pipeline_stdin_sinks(command, &mut sinks, 0, 0, &mut (1024 * 1024), true);
+    collect_powershell_pipeline_stdin_sinks(visible, &mut sinks, 0, 0, &mut (1024 * 1024), true);
     !sinks.is_empty()
 }
 
@@ -17347,6 +17417,16 @@ fn powershell_invocation_reaches_pack_keyword(
     }
     match crate::packs::core::credential_files::powershell_literal_invocations(command) {
         Ok(invocations) => invocations.iter().any(|invocation| {
+            // Under Unknown dialect, bare lowercase `& tee` is a POSIX
+            // backgrounded `tee` whose keyword POSIX already saw; do not fan
+            // out to PowerShell just for bare `& tee` (quoted `& 'tee'`,
+            // computed `& ('t'+'ee')`, dot-sourced `. tee`, and `Tee-Object`
+            // still fan out).
+            if command.get(invocation.operator_span.clone()) == Some("&")
+                && command.get(invocation.span.clone()) == Some("tee")
+            {
+                return false;
+            }
             keyword_index
                 .is_none_or(|index| index.has_any_keyword(&invocation.name.to_ascii_lowercase()))
         }),
@@ -17974,23 +18054,35 @@ fn evaluate_command_in_dialect_union(
         return primary;
     }
 
+    let fanout_data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    let fanout_source = if !cfg!(windows) && !crate::hook::names_windows_shell_route(command) {
+        crate::heredoc::mask_inert_interpreter_stdin(fanout_data_view.as_ref())
+    } else {
+        fanout_data_view
+    };
+    let fanout_command = fanout_source.as_ref();
+
     let powershell_execution_proof = std::cell::OnceCell::new();
     let may_expose_powershell_execution = || {
         *powershell_execution_proof.get_or_init(|| {
-            powershell_invocation_reaches_pack_keyword(command, keyword_index)
-                || powershell_pipeline_scan_required(command)
+            powershell_invocation_reaches_pack_keyword(fanout_command, keyword_index)
+                || powershell_pipeline_scan_required(fanout_command)
         })
     };
-    if !unknown_dialect_fanout_candidate(command, keyword_index)
+    if !unknown_dialect_fanout_candidate(fanout_command, keyword_index)
         && !may_expose_powershell_execution()
     {
         return primary;
     }
 
     for view in [ShellDialect::Cmd, ShellDialect::PowerShell] {
-        let reveals_execution =
-            dialect_view_may_expose_hidden_execution(command, view, keyword_index, ordered_packs)
-                || (view == ShellDialect::PowerShell && may_expose_powershell_execution());
+        let reveals_execution = dialect_view_may_expose_hidden_execution(
+            fanout_command,
+            view,
+            keyword_index,
+            ordered_packs,
+        ) || (view == ShellDialect::PowerShell
+            && may_expose_powershell_execution());
         if !reveals_execution {
             continue;
         }
@@ -18266,41 +18358,6 @@ fn evaluate_command_in_single_dialect_view(
             )
         {
             return denial;
-        }
-    }
-    // A checked producer's output can still be an option of its consumer:
-    // `git reset $(echo --hard)` executes a harmless echo, then a destructive
-    // reset. Judge proven argument values before the data sanitizer erases
-    // the producer spelling (bd-substitution-supplied-flags-1n9a).
-    if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
-        match posix_literal_argument_view(command, deadline) {
-            Ok(Some(expanded)) => {
-                let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
-                    &expanded,
-                    enabled_keywords,
-                    ordered_packs,
-                    keyword_index,
-                    compiled_overrides,
-                    allowlists,
-                    heredoc_settings,
-                    None,
-                    project_path,
-                    deadline,
-                    ShellDialect::Posix,
-                    nested_command_depth + 1,
-                    inherited_automated_stdin,
-                );
-                if nested_result_decides(&result) {
-                    if let Some(info) = result.pattern_info.as_mut() {
-                        info.matched_span = None;
-                        info.matched_text_preview = None;
-                    }
-                    return result;
-                }
-                record_nested_allowlist_hit(&mut heredoc_allowlist_hit, &mut result);
-            }
-            Ok(None) => {}
-            Err(()) => return EvaluationResult::indeterminate_due_to_budget(),
         }
     }
 
@@ -18766,6 +18823,29 @@ fn evaluate_command_in_single_dialect_view(
         return EvaluationResult::indeterminate_due_to_budget();
     };
     if quick_reject {
+        let primary = if let Some((matched, layer, reason)) = heredoc_allowlist_hit.clone() {
+            EvaluationResult::allowed_by_allowlist(matched, layer, reason)
+        } else {
+            EvaluationResult::allowed_by_quick_reject()
+        };
+        if let Some(expanded_result) = evaluate_posix_literal_argument_view(
+            command,
+            &primary,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            project_path,
+            deadline,
+            shell_dialect,
+            nested_command_depth,
+            inherited_automated_stdin,
+            &mut heredoc_allowlist_hit,
+        ) {
+            return expanded_result;
+        }
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
@@ -18921,6 +19001,29 @@ fn evaluate_command_in_single_dialect_view(
         return EvaluationResult::indeterminate_due_to_budget();
     };
     if quick_reject {
+        let primary = if let Some((matched, layer, reason)) = heredoc_allowlist_hit.clone() {
+            EvaluationResult::allowed_by_allowlist(matched, layer, reason)
+        } else {
+            EvaluationResult::allowed_by_quick_reject()
+        };
+        if let Some(expanded_result) = evaluate_posix_literal_argument_view(
+            command,
+            &primary,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            project_path,
+            deadline,
+            shell_dialect,
+            nested_command_depth,
+            inherited_automated_stdin,
+            &mut heredoc_allowlist_hit,
+        ) {
+            return expanded_result;
+        }
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
@@ -19121,6 +19224,34 @@ fn evaluate_command_in_single_dialect_view(
             }
         }
     }
+    let should_try_literal_args = result.decision == EvaluationDecision::Allow
+        || (result.decision == EvaluationDecision::Deny
+            && result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref())
+                == Some(crate::packs::core::git::GIT_ALIAS_UNVERIFIED_RULE));
+    if should_try_literal_args
+        && let Some(expanded_result) = evaluate_posix_literal_argument_view(
+            command,
+            &result,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            project_path,
+            deadline,
+            shell_dialect,
+            nested_command_depth,
+            inherited_automated_stdin,
+            &mut heredoc_allowlist_hit,
+        )
+    {
+        return expanded_result;
+    }
+
     // Attribute an ALLOW outcome to the recorded heredoc/launcher allowlist
     // grant — but never let that attribution replace a pack denial or an
     // indeterminate verdict. A grant scoped to e.g.
@@ -19134,6 +19265,84 @@ fn evaluate_command_in_single_dialect_view(
     }
 
     result
+}
+
+/// Evaluate proven literal POSIX argument values (e.g. `git reset $(echo --hard)`,
+/// `F=--hard; git reset "$F"`) as an additive check after the primary single-dialect
+/// evaluation allows the command.
+///
+/// Running after the primary pass preserves native original-source spans for
+/// indirect-destination findings (#609/#613) and lets executable-sink bounds
+/// deny oversized pipelines (#498) before argument-proof budget checks ask.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_posix_literal_argument_view(
+    command: &str,
+    primary: &EvaluationResult,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    shell_dialect: ShellDialect,
+    nested_command_depth: usize,
+    inherited_automated_stdin: bool,
+    heredoc_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    if !matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return None;
+    }
+    match posix_literal_argument_view(command, deadline) {
+        Ok(Some(expanded)) => {
+            let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+                &expanded,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path,
+                deadline,
+                ShellDialect::Posix,
+                nested_command_depth + 1,
+                inherited_automated_stdin,
+            );
+            let adopt = if primary.is_denied() {
+                result.is_denied()
+                    && result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref())
+                        != Some(crate::packs::core::git::GIT_ALIAS_UNVERIFIED_RULE)
+            } else {
+                match result.decision {
+                    EvaluationDecision::Deny | EvaluationDecision::Indeterminate => true,
+                    EvaluationDecision::Allow => {
+                        primary.effective_mode.is_none()
+                            && result.effective_mode.is_some()
+                            && result.allowlist_override.is_none()
+                    }
+                }
+            };
+            if adopt {
+                if let Some(info) = result.pattern_info.as_mut() {
+                    info.matched_span = None;
+                    info.matched_text_preview = None;
+                }
+                return Some(result);
+            }
+            if !primary.is_denied() {
+                record_nested_allowlist_hit(heredoc_allowlist_hit, &mut result);
+            }
+            None
+        }
+        Ok(None) => None,
+        Err(()) => (!primary.is_denied()).then(EvaluationResult::indeterminate_due_to_budget),
+    }
 }
 
 /// The four pack-evaluation views of a command's argv view (see
@@ -20278,6 +20487,7 @@ fn posix_literal_argument_view(
     if root.get_inner_node().has_error() {
         return Ok(None);
     }
+    let data_masked = crate::heredoc::mask_non_expanding_data_heredocs(command);
     let ranges = command_segment_ranges(command);
     let mut replacements = Vec::new();
     let mut attempts = 0usize;
@@ -20296,16 +20506,40 @@ fn posix_literal_argument_view(
         {
             continue;
         }
+        // If an earlier command in the prefix may have rebound this command name
+        // (e.g. `hash -p /usr/bin/printf tee; tee "$f"`, #609/#613), expanding
+        // its arguments into a literal command would synthesize a false finding
+        // on a rebound command name.
+        if let Some(name_node) = node.field("name") {
+            let cmd_name = name_node.text();
+            if !cmd_name.contains('/') {
+                let mut prefix = command[..node.range().start].to_owned();
+                prefix.push_str(cmd_name.as_ref());
+                if crate::heredoc::shell_name_may_be_rebound(&prefix, cmd_name.as_ref()) {
+                    continue;
+                }
+            }
+        }
         // Only earlier shell state can affect this command's field splitting.
         // A wholly double-quoted argument is not split, even with a custom IFS.
         let ifs_may_be_set = segment_text_may_assign(&command[..node.range().start], "IFS");
+        let mut saw_unresolved_expansion = false;
         for argument in node.field_children("argument") {
             let range = argument.range();
             let raw = &command[range.clone()];
             if argument.kind().as_ref() == "raw_string" || !raw.contains(['$', '`']) {
                 continue;
             }
+            // A proven non-expanding data heredoc inside a command substitution
+            // (e.g. `git commit -m "$(cat <<'TEXT' ... TEXT)"`, #555) is literal
+            // multi-line data, never a single-atom flag, and must not fail the
+            // argument-size bound.
+            if data_masked.len() == command.len() && data_masked.get(range.clone()) != Some(raw) {
+                saw_unresolved_expansion = true;
+                continue;
+            }
             if ifs_may_be_set && argument.kind().as_ref() != "string" {
+                saw_unresolved_expansion = true;
                 continue;
             }
             attempts += 1;
@@ -20328,8 +20562,17 @@ fn posix_literal_argument_view(
                 node.range().start,
                 argument.kind().as_ref() == "string",
             ) else {
+                saw_unresolved_expansion = true;
                 continue;
             };
+            // An earlier unresolved expansion in the same command may carry
+            // options that shift positional roles (e.g. `options='-t /tmp';
+            // cp $options "$f"` makes `$f` a source rather than destination,
+            // #609). Still expand proven option flags (`-…`, `of=…`), while
+            // leaving later positional operands to native destination analysis.
+            if saw_unresolved_expansion && !value.starts_with('-') && !value.starts_with("of=") {
+                continue;
+            }
             output_bytes = output_bytes - range.len() + value.len();
             if output_bytes > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
                 return Err(());
@@ -30727,10 +30970,35 @@ fn posix_output_redirects_for_proof(
             let operator = index;
             let output = bytes[index] == b'>';
             index += 1;
-            // Here-documents, here-strings and process substitutions need
-            // their own ownership analysis. They cannot lend this proof.
+            // Here-strings and unquoted heredocs expand their input and may
+            // mutate shell state, so they cannot lend this proof. A quoted
+            // heredoc (`<<'EOF'`, `<<"EOF"`, `<<-'EOF'`, `<<\EOF`) performs no
+            // expansion on either delimiter or body (#439), so consume its
+            // delimiter word and continue proving the segment's output targets.
             if !output && bytes.get(index) == Some(&b'<') {
-                return None;
+                if bytes.get(index + 1) == Some(&b'<') {
+                    return None;
+                }
+                index += 1;
+                if bytes.get(index) == Some(&b'-') {
+                    index += 1;
+                }
+                while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+                    index += 1;
+                }
+                if bytes.get(index) == Some(&b'#') {
+                    return None;
+                }
+                let end = posix_word_end_without_side_effects(segment, index, false)?;
+                let delimiter = segment.get(index..end)?;
+                if delimiter.is_empty()
+                    || delimiter.contains(['$', '`'])
+                    || !delimiter.contains(['\'', '"', '\\'])
+                {
+                    return None;
+                }
+                index = end;
+                continue;
             }
             let append = output && bytes.get(index) == Some(&b'>');
             let read_write = !output && bytes.get(index) == Some(&b'>');
@@ -34464,15 +34732,17 @@ fn redirect_targets_are_new_home_files(command: &str, dialect: ShellDialect) -> 
 /// append/variable selection have already been decided by the shared parser.
 fn powershell_file_truncation_hits(
     source: &str,
+    dialect: ShellDialect,
 ) -> Result<
     Vec<crate::packs::core::credential_files::CredentialFileWrite>,
     crate::packs::core::credential_files::WindowsShellParseIncomplete,
 > {
     use crate::packs::core::credential_files::{
-        CredentialFileWrite, PowerShellTruncationTarget, powershell_file_truncation_targets,
+        CredentialFileWrite, PowerShellTruncationTarget,
+        powershell_file_truncation_targets_in_dialect,
     };
 
-    Ok(powershell_file_truncation_targets(source)?
+    Ok(powershell_file_truncation_targets_in_dialect(source, dialect)?
         .into_iter()
         .filter_map(|target: PowerShellTruncationTarget| {
             // Credential and .git writes retain their stronger, independent
@@ -35154,14 +35424,17 @@ fn evaluate_core_filesystem_pack(
             )
         {
             powershell_truncation_scanned = true;
+            let masked_for_powershell;
             let (writer_source, writer_offset) = if shell_dialect == ShellDialect::PowerShell {
                 (original_command, Some(0))
             } else {
                 // Unknown is a union of readings, but must not restore text
                 // already proven to be inert heredoc/program data.
-                (native_semantic_source, Some(0))
+                masked_for_powershell =
+                    crate::heredoc::mask_inert_interpreter_stdin(native_semantic_source);
+                (masked_for_powershell.as_ref(), Some(0))
             };
-            match powershell_file_truncation_hits(writer_source) {
+            match powershell_file_truncation_hits(writer_source, shell_dialect) {
                 Ok(hits) => {
                     protected_hits.extend(hits.into_iter().map(|hit| (hit, 0, writer_offset)));
                 }
@@ -66025,10 +66298,91 @@ mod tests {
     #[test]
     fn powershell_literal_call_view_reports_analysis_limits() {
         let mut command = "'git'".to_string();
-        for _ in 0..64 {
+        for _ in 0..=64 {
             command = format!("({command})");
         }
         assert!(powershell_call_operator_view(&format!("& {command} reset --hard")).is_err());
+    }
+
+    #[test]
+    fn issue_665_dcg_diagnostic_stdin_heredoc_is_data_while_controls_still_deny() {
+        for allowed in [
+            "dcg test --stdin --explain <<'EOF'\nrm -rf ~/projects\nEOF",
+            "dcg explain --stdin <<'EOF'\nrm -rf ~/projects\nEOF",
+            "dcg classify --stdin <<'EOF'\ngit reset --hard\nEOF",
+            "/usr/bin/dcg test --stdin --format json <<-'EOF'\n\trm -rf /\n\tEOF",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result = evaluate_with_pack_ids_in_dialect(
+                    allowed,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "{allowed:?} must allow under {dialect:?}: {result:?}"
+                );
+            }
+        }
+        for denied in [
+            "dcg test --stdin <<EOF\n$(rm -rf /)\nEOF",
+            "dcg test --stdin <<'EOF'\nls\nEOF\nrm -rf ~",
+            "dcg test --stdin <<'EOF' | bash\nrm -rf ~\nEOF",
+            "dcg test <<'EOF'\nrm -rf ~\nEOF",
+            "dcg --agent test allow-once abc <<'EOF'\nrm -rf ~\nEOF",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                denied,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "{denied:?} must stay denied: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_p_eval_still_blocks_while_command_v_stays_allowed() {
+        for destructive in [
+            "command -p eval 'git reset --hard'",
+            "command -p -- eval 'git reset --hard'",
+            "command -p -p eval 'git reset --hard'",
+            "command -p eval 'rm -rf /'",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result = evaluate_with_pack_ids_in_dialect(
+                    destructive,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(
+                    result.is_denied(),
+                    "{destructive:?} must deny under {dialect:?}: {result:?}"
+                );
+            }
+        }
+        for query in [
+            "command -v eval",
+            "command -V eval",
+            "command -p -v eval",
+            "command -pv eval",
+            "command -pV eval",
+            "command -p eval 'git status'",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result = evaluate_with_pack_ids_in_dialect(
+                    query,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "{query:?} must stay allowed under {dialect:?}: {result:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -426,23 +426,50 @@ fn issue_654_heredoc_data_does_not_hide_executed_destructive_commands() {
 
 #[test]
 fn issue_654_preserves_explicit_and_mislabeled_windows_deletion_detection() {
-    for tool in ["PowerShell", "Bash"] {
-        let payload = serde_json::json!({
-            "hook_event_name": "PreToolUse",
-            "tool_name": tool,
-            "tool_input": {"command": r"Remove-Item -Recurse -Force C:\important"},
-        })
-        .to_string();
-        let hook = run_windows_diagnostic(&[], Some(&payload), Some("# empty\n"));
-        assert!(hook.status.success(), "structured hook denial exits zero");
-        let json = diagnostic_json(&hook);
-        let verdict = &json["hookSpecificOutput"];
-        assert_eq!(verdict["permissionDecision"], "deny", "{tool}: {json}");
-        assert!(
-            verdict["ruleId"]
-                .as_str()
-                .is_some_and(|rule| rule.starts_with("windows.filesystem:")),
-            "the Windows filesystem rule must remain active: {tool}: {json}"
-        );
+    for (command, tools, expected_prefix) in [
+        // core.filesystem owns PowerShell Remove-Item -Recurse with higher priority.
+        (
+            r"Remove-Item -Recurse -Force C:\important",
+            &["PowerShell", "Bash"][..],
+            "core.filesystem:",
+        ),
+        // windows.filesystem owns Clear-Content and cmd rd /s /q.
+        (
+            r"Clear-Content C:\important",
+            &["PowerShell", "Bash"][..],
+            "windows.filesystem:",
+        ),
+        (
+            r"rd /s /q C:\important",
+            &["cmd.exe", "Bash"][..],
+            "windows.filesystem:",
+        ),
+    ] {
+        for &tool in tools {
+            let payload = serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool,
+                "tool_input": {"command": command},
+            })
+            .to_string();
+            let hook = run_windows_diagnostic(&[], Some(&payload), Some("# empty\n"));
+            assert!(hook.status.success(), "structured hook denial exits zero");
+            let json = diagnostic_json(&hook);
+            let verdict = &json["hookSpecificOutput"];
+            assert_eq!(
+                verdict["permissionDecision"], "deny",
+                "{tool} {command}: {json}"
+            );
+            let rule = verdict["ruleId"].as_str().or_else(|| {
+                verdict["permissionDecisionReason"]
+                    .as_str()?
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Rule: "))
+            });
+            assert!(
+                rule.is_some_and(|rule| rule.starts_with(expected_prefix)),
+                "expected {expected_prefix} rule to remain active: {tool} {command}: {json}"
+            );
+        }
     }
 }

@@ -33,8 +33,8 @@ mod windows_shells;
 
 pub(crate) use windows_shells::{
     PowerShellInvokedCommand, PowerShellTruncationTarget, WindowsShellParseIncomplete,
-    powershell_file_truncation_targets, powershell_file_writer_scan_required,
-    powershell_literal_invocations,
+    powershell_file_truncation_targets, powershell_file_truncation_targets_in_dialect,
+    powershell_file_writer_scan_required, powershell_literal_invocations,
 };
 
 /// Rule name under `core.filesystem`. The pattern entry in
@@ -3297,8 +3297,13 @@ fn skip_wrapper(name: &str, args: &[&Word]) -> Option<usize> {
             // `env -S` re-splits a string into words dcg cannot see.
             return None;
         }
-        if name == "command" && matches!(text.as_str(), "-v" | "-V") {
-            // A query, not an execution.
+        if name == "command"
+            && text.len() > 1
+            && text.starts_with('-')
+            && !text.starts_with("--")
+            && text[1..].chars().any(|flag| matches!(flag, 'v' | 'V'))
+        {
+            // A query (`-v`, `-V`, `-pv`, `-pV`, etc.), not an execution.
             return None;
         }
         if let Some(long) = text.strip_prefix("--") {

@@ -2821,6 +2821,20 @@ fn segment_command_word_is_cmd_assembled(segment: &str) -> bool {
         return is_percent_expansion(first);
     }
 
+    // A regex negated character class (`[^\n]*\n`, `[^a-z]+`) produced by
+    // splitting a quoted regex at `|` starts with `[^` and closes `]`. In
+    // cmd.exe `[` is a literal filename byte, never a separator or stripped
+    // escape, so a solitary caret inside `[...]` cannot assemble a destructive
+    // executable name. Preserve evidence if another unquoted caret, `%VAR%`,
+    // or `!VAR!` appears in the same token.
+    if let Some(after_negated_class) = first.strip_prefix("[^")
+        && after_negated_class.contains(']')
+        && !has_unquoted_caret(after_negated_class)
+        && !first.contains(['%', '!'])
+    {
+        return false;
+    }
+
     // The raw heredoc scan can split a regex at '(' and '|', presenting
     // ".*?)^\" as an apparent command word (#654). Cmd reads that as ".*?",
     // a closing group, and "^\": the only caret-bearing word decodes to a
@@ -3152,7 +3166,7 @@ fn command_is_windows_shell_payload_on_host(command: &str, host_is_windows: bool
 /// or any `.exe` program (WSL interop and Wine run them, and their implicit
 /// shell is cmd.exe). Deliberately loose: it only ever keeps conservative
 /// evidence.
-fn names_windows_shell_route(command: &str) -> bool {
+pub(crate) fn names_windows_shell_route(command: &str) -> bool {
     command
         .split(|character: char| !character.is_ascii_alphanumeric())
         .any(|word| word.eq_ignore_ascii_case("pwsh") || word.eq_ignore_ascii_case("powershell"))

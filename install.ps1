@@ -1,4 +1,4 @@
-# dcg PowerShell installer
+﻿# dcg PowerShell installer
 #
 # Authenticate this script before execution using the pinned release recipe:
 #   https://github.com/Dicklesworthstone/destructive_command_guard/blob/main/docs/windows.md#verified-release-installation
@@ -718,7 +718,11 @@ function Configure-CodexHook {
     New-Item -ItemType Directory -Force -Path $codexDir | Out-Null
   }
 
-  $dcgHook = [pscustomobject][ordered]@{ type = "command"; command = $DcgPath }
+  $dcgHook = [pscustomobject][ordered]@{
+    type = "command"
+    command = $DcgPath
+    statusMessage = "dcg (destructive command guard)"
+  }
   Merge-AgentHookFile -HooksFile $hooksFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "Bash" -Label "Codex hooks.json"
 }
 

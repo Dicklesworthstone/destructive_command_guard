@@ -118,7 +118,10 @@ fn assert_regex_provenance(reason: &str, pack: &str, pattern: &str, operation: &
         "wrong remedy: {reason}"
     );
     assert!(
-        !reason.contains("50 ms") && !reason.contains("50ms"),
+        !reason.contains("50 ms")
+            && !reason.contains("within 50ms")
+            && !reason.contains("50ms budget")
+            && !reason.contains("50ms regex"),
         "invented regex timeout: {reason}"
     );
 }

@@ -13604,7 +13604,8 @@ fn collect_doctor_report(
 
 const CLAUDE_SHELL_MATCHER: &str = "Bash|PowerShell|Monitor";
 const LEGACY_CLAUDE_SHELL_MATCHERS: &[&str] = &["Bash", "Bash|PowerShell"];
-const ANTIGRAVITY_SHELL_MATCHER: &str = "Bash";
+const ANTIGRAVITY_SHELL_MATCHER: &str = "run_command";
+const LEGACY_ANTIGRAVITY_SHELL_MATCHERS: &[&str] = &["Bash"];
 
 fn current_dcg_executable() -> std::io::Result<std::path::PathBuf> {
     let executable = std::env::current_exe().map_err(|error| {
@@ -14347,7 +14348,7 @@ fn install_antigravity_hook_into_settings(
         settings,
         force,
         ANTIGRAVITY_SHELL_MATCHER,
-        &[],
+        LEGACY_ANTIGRAVITY_SHELL_MATCHERS,
         desired_hook,
     )
 }
@@ -14678,7 +14679,8 @@ fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::erro
 /// `~/.gemini/antigravity-cli/hooks.json` is symlinked to it). The file uses
 /// the same `{"hooks":{"PreToolUse":[{"matcher":...,"hooks":[{"type":
 /// "command","command":"/absolute/path/to/dcg"}]}]}}` shape as Claude's
-/// `settings.json`, while retaining agy's Bash-only matcher. When dcg returns a block decision
+/// `settings.json`, using agy's `run_command` tool matcher (migrating any
+/// legacy `Bash` matcher entry written by older releases). When dcg returns a block decision
 /// (stdout `{"decision":"block",...}`), `agy` aborts its `run_command` tool.
 ///
 /// With `--project`, writes to `<repo>/.gemini/config/hooks.json` instead.
@@ -33100,7 +33102,7 @@ console.log(JSON.stringify({
             .expect("hooks.PreToolUse must be an array");
         assert_eq!(pre_tool_use.len(), 1, "exactly one dcg hook entry");
         let entry = &pre_tool_use[0];
-        assert_eq!(entry["matcher"], "Bash");
+        assert_eq!(entry["matcher"], "run_command");
         let cmd = &entry["hooks"][0];
         assert_eq!(
             cmd,
@@ -33117,6 +33119,40 @@ console.log(JSON.stringify({
         let changed_again =
             install_antigravity_hook_into_settings(&mut settings, false).expect("second install");
         assert!(!changed_again, "second install should be idempotent");
+    }
+
+    #[test]
+    fn test_install_antigravity_hook_migrates_legacy_bash_matcher() {
+        let desired = antigravity_dcg_hook().expect("desired Antigravity hook");
+        let mut legacy_hook = desired.clone();
+        legacy_hook["timeout"] = serde_json::json!(15);
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [legacy_hook]
+                    }
+                ]
+            }
+        });
+
+        let changed =
+            install_antigravity_hook_into_settings(&mut settings, false).expect("migrate legacy");
+        assert!(changed, "legacy Bash matcher must migrate to run_command");
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["matcher"], "run_command");
+        let hook = &entries[0]["hooks"][0];
+        assert!(hook_has_dcg_identity(hook, &desired));
+        assert_eq!(
+            hook["timeout"], 15,
+            "operator fields must survive migration"
+        );
+
+        let changed_again =
+            install_antigravity_hook_into_settings(&mut settings, false).expect("idempotent");
+        assert!(!changed_again, "migrated entry should be idempotent");
     }
 
     // ========================================================================

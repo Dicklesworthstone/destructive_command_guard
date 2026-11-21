@@ -155,6 +155,22 @@ pub(crate) struct PowerShellTruncationTarget {
 pub(crate) fn powershell_file_truncation_targets(
     source: &str,
 ) -> Result<Vec<PowerShellTruncationTarget>, WindowsShellParseIncomplete> {
+    powershell_file_truncation_targets_in_dialect(source, ShellDialect::PowerShell)
+}
+
+/// Dialect-aware counterpart to [`powershell_file_truncation_targets`].
+///
+/// Under [`ShellDialect::PowerShell`], bare `tee` is both PowerShell's
+/// `Tee-Object` alias and the Unix executable. Under [`ShellDialect::Unknown`],
+/// plain POSIX `tee` (e.g. `tee /dev/sda` or `IFS=@; tee $S`) already has its
+/// own dedicated device, credential, and Git rules, so only treat bare
+/// lowercase `tee` as a PowerShell truncating writer when its arguments carry
+/// PowerShell/Windows evidence (while explicit `Tee-Object`, `Out-File`,
+/// invoked `& 'tee'`, and non-lowercase aliases always run).
+pub(crate) fn powershell_file_truncation_targets_in_dialect(
+    source: &str,
+    dialect: ShellDialect,
+) -> Result<Vec<PowerShellTruncationTarget>, WindowsShellParseIncomplete> {
     Ok(lex(source, ShellDialect::PowerShell)?
         .into_iter()
         .filter_map(|command| {
@@ -172,6 +188,11 @@ pub(crate) fn powershell_file_truncation_targets(
                     .chars()
                     .next()
                     .is_some_and(|ch| is_single_quote(ch) || is_double_quote(ch))
+            {
+                return None;
+            }
+            if dialect != ShellDialect::PowerShell
+                && !is_powershell_tee_invocation(source, name, rest)
             {
                 return None;
             }
@@ -251,6 +272,37 @@ fn truncating_file_cmdlet_name(word: &Word) -> Option<&'static str> {
         "out-file" | "microsoft.powershell.utility/out-file" => Some("out-file"),
         _ => None,
     }
+}
+
+fn is_powershell_tee_invocation(source: &str, name: &Arg, rest: &[Arg]) -> bool {
+    if name.word.as_string() != "tee" {
+        return true;
+    }
+    // Under Unknown dialect, a POSIX backgrounded `cmd & tee $S` lexes as
+    // PowerShell's `&` call operator with `name.invoked == true` on bare `tee`.
+    // Only treat `name.invoked` as PowerShell evidence when the command word
+    // itself is quoted or computed (`& 'tee'`, `& "tee"`, `& t`e`e`).
+    if name.invoked && source.get(name.word.range.clone()) != Some("tee") {
+        return true;
+    }
+    rest.iter().any(|arg| {
+        let raw = arg.word.as_string();
+        let lower = raw.to_ascii_lowercase();
+        raw.starts_with('@')
+            || lower.starts_with("$env:")
+            || lower.starts_with("filesystem::")
+            || lower.starts_with("microsoft.powershell.core\\filesystem::")
+            || lower.starts_with("microsoft.powershell.core/filesystem::")
+            || raw.starts_with("\\\\")
+            || (raw.len() >= 3
+                && raw.as_bytes()[0].is_ascii_alphabetic()
+                && raw.as_bytes()[1] == b':'
+                && matches!(raw.as_bytes()[2], b'\\' | b'/'))
+            || (raw.starts_with(['-', '\u{2013}', '\u{2014}', '\u{2015}'])
+                && !raw.starts_with("--")
+                && raw.len() >= 3
+                && !raw[1..].chars().all(|c| matches!(c, 'a' | 'i' | 'p')))
+    })
 }
 
 /// Select the filesystem pack for every decoded file-output invocation.

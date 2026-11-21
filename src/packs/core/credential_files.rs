@@ -20,7 +20,8 @@ pub(crate) use shell::{
     classify_credential_file_write, classify_git_redirect_writes,
     classify_powershell_credential_writes, names_protected_file, names_protected_git_internal,
     names_windows_shell_writer, powershell_file_truncation_targets,
-    powershell_file_writer_scan_required, powershell_literal_invocations,
+    powershell_file_truncation_targets_in_dialect, powershell_file_writer_scan_required,
+    powershell_literal_invocations,
 };
 
 use crate::normalize::ShellDialect;

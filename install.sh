@@ -5,7 +5,7 @@
 # Authenticate a pinned release installer before running this script:
 #   https://github.com/Dicklesworthstone/destructive_command_guard#quick-install-verified-release
 # After verifying the signature and pinned digest, run the local file:
-#   bash ./install.sh --version v0.16.0 --require-minisign
+#   bash ./install.sh --version v0.17.0 --require-minisign
 #
 # Options:
 #   --version vX.Y.Z   Install specific version (default: latest)
@@ -31,7 +31,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
   printf '%s\n' \
     'dcg installer: this script needs bash. Authenticate the release installer first:' \
     '  https://github.com/Dicklesworthstone/destructive_command_guard#quick-install-verified-release' \
-    'Then run the verified local file with bash ./install.sh --version v0.16.0 --require-minisign' >&2
+    'Then run the verified local file with bash ./install.sh --version v0.17.0 --require-minisign' >&2
   exit 1
 fi
 # bash run as `sh` starts in POSIX mode, which rejects the process
@@ -2715,7 +2715,7 @@ def configure():
     command = shlex.quote(dcg_path)
     event, matcher, defaults = {
         "gemini": ("BeforeTool", "run_shell_command", {"name": "dcg", "timeout": 5000}),
-        "codex": ("PreToolUse", "Bash", {}),
+        "codex": ("PreToolUse", "Bash", {"statusMessage": "dcg (destructive command guard)"}),
         "posit": ("PreToolUse", "bash|powershell", {"timeout": 10}),
     }[host]
     if host == "posit":
