@@ -2992,10 +2992,10 @@ The release build uses aggressive optimization settings:
 
 ```toml
 [profile.release]
-opt-level = "z"     # Optimize for size (lean binary)
+opt-level = 3       # Optimize for speed (the hook runs on every shell command)
 lto = true          # Link-time optimization across crates
 codegen-units = 1   # Single codegen unit for better optimization
-panic = "abort"     # Smaller binary, no unwinding overhead
+panic = "abort"     # No unwinding overhead
 strip = true        # Remove debug symbols
 ```
 

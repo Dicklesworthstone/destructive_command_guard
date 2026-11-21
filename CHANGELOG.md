@@ -11,7 +11,86 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## Unreleased
+## [v0.17.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.17.0) -- 2026-11-21 [Release]
+
+This release closes more commands that ran unguarded (PowerShell
+`Tee-Object`/`Out-File` truncation, commands behind `builtin`, zsh
+precommand modifiers and macOS launchers, shell variables past neutral
+commands, `command -p eval`), fixes the Antigravity installer so its hook
+actually fires, names the Codex hook, stops the hook from blocking its own
+recommended `dcg test --stdin` heredoc form, and builds release binaries
+for speed instead of size. The full test suite and `clippy -D warnings` are
+green again; 52 tests that had started failing after 0.16.0 are fixed.
+
+**Release binaries are now built with `opt-level = 3`.** Earlier releases
+were size-optimized (`opt-level = "z"`) with only the regex crates built for
+speed. The hook runs on every agent shell command, so the whole binary is
+now built for speed. Paired A/B benchmarks on the same commit show 16/16
+measured hook workloads faster in CPU p50 (up to 39%–43% lower wall p50 on
+300-line heredocs) with identical verdicts.
+
+**`dcg install --agy` now registers a hook Antigravity calls (#652).** The
+installer wrote `"matcher": "Bash"`, but Antigravity's shell tool is
+`run_command`, so the hook loaded and never fired. The matcher is now
+`run_command`, and re-running `dcg install --agy` migrates an existing
+`Bash` entry in place.
+
+**The Codex hook has a name (#669).** `install.sh` and `install.ps1` now
+write `"statusMessage": "dcg (destructive command guard)"`, so Codex's
+`/hooks` review lists dcg instead of "Unnamed hook". A label you set
+yourself is kept.
+
+**`dcg test|explain|classify --stdin` fed by a quoted heredoc is no longer
+blocked (#665).** The hook's own denial tip recommends that form. A quoted
+heredoc whose only reader is a bare `dcg test|explain|classify --stdin` is
+now data, like the inline-argument and `< file` forms. An unquoted
+delimiter still exposes its `$(...)` expansions, and a heredoc piped on to
+a shell, or a command after it, is still judged.
+
+**`command -p eval …` is judged as `eval`.** `-p` only changes the search
+path, so `command -p eval 'rm -rf ~'` runs the `eval`; it was allowed.
+`command -v`/`-V` (and `-pv`) remain lookups.
+
+**PowerShell `Tee-Object` and `Out-File` truncation is guarded (#642).**
+Without `-Append`, both overwrite their target like `>` does; they now get
+the same `core.filesystem` verdicts as the redirect, with credential and
+`.git` targets keeping their stronger rules (8f9af5f7, 3cdb2240). Bare
+lowercase `tee` in an unknown dialect is read as the Unix program unless
+the command shows PowerShell evidence.
+
+**Fewer false positives in quoted heredocs and interpreter source.**
+Arithmetic shifts such as `$((1<<2))` no longer make a logged rule deny
+(#649); a quoted conflict-marker or regex body (`[^\n]*`) no longer reads as
+a cmd.exe caret word (#654); long quoted Python bodies no longer hit the
+Windows filesystem analysis bound or an incomplete PowerShell scan off
+Windows (#647, #569); a quoted string inside `python3 -c` that is only
+compared is no longer read as an `rm -rf` (#645); quoted `python3 -`
+heredocs containing `>` and backticks followed by shell commands stay
+allowed (#660); literal interpreter bindings (`PY=/usr/bin/python3; $PY -c
+…`) and quoted `>` in unresolved-command arguments stay allowed (#608,
+#621); and a quoted `<<'EOF'` heredoc no longer hides the redirect proof of
+an earlier `$VAR` target (#439).
+
+**More arguments are judged as what they expand to.** Proven literal
+arguments such as `git reset $(echo --hard)` or `F=--hard; git reset "$F"`
+now reach the plain command's rules (18687c83), and a name rebound with
+`hash -p` cannot supply a false finding.
+
+**Other fixes.** OpenCode receives a verdict for warn decisions (#639); an
+incomplete analysis no longer reports a deadline that never ran out (#643);
+the installers authenticate pinned release scripts before running them
+(#638); and the 52 test regressions and 3 clippy lints introduced since
+0.16.0 are resolved (#670).
+
+**Dependencies.** `tru` 0.3.0 (library only), `rusqlite` 0.43, `vergen-gix`
+10.0.4 and current patch releases across the tree. `cargo audit` reports no
+vulnerabilities; the remaining advisories are informational (`heapless`,
+reached only through the build script's git metadata, and the
+unmaintained `chrono` and `unsafe-libyaml`).
+
+**Known issues.** Nine pre-existing tests across six targets (`#623` and
+one oversized-input test in `repro_290`) remain red, down from ten in
+0.16.0; none weakens a denial, and there are zero new test regressions.
 
 **A dynamic command word or malformed shell before an interpreter heredoc no
 longer crashes the hook (#628).** In 0.16.0, `P=x; $P; python3 - <<'EOF'`,

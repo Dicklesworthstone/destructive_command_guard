@@ -115,14 +115,14 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 ### Release Profile
 
-The release build optimizes for binary size:
+The release build optimizes for hook latency (every agent shell command runs it):
 
 ```toml
 [profile.release]
-opt-level = "z"     # Optimize for size (lean binary for distribution)
+opt-level = 3       # Optimize for speed
 lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
-panic = "abort"     # Smaller binary, no unwinding overhead
+panic = "abort"     # No unwinding overhead
 strip = true        # Remove debug symbols
 ```
 

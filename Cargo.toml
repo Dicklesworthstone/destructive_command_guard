@@ -1,6 +1,6 @@
 [package]
 name = "destructive_command_guard"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 resolver = "2"
 authors = [
@@ -93,7 +93,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.11"
 hmac = "0.13"  # HMAC for optional short-code hardening (ksk.1.10)
 fs2 = "0.4"
-rusqlite = { version = "0.42.0", default-features = false, features = ["bundled"] }  # Stable bundled SQLite for history telemetry
+rusqlite = { version = "0.43.0", default-features = false, features = ["bundled"] }  # Stable bundled SQLite for history telemetry
 ctrlc = "3.5.1"
 flate2 = "1.0"  # Gzip compression for history export
 
@@ -107,7 +107,9 @@ indicatif = "0.18"
 console = "0.16"
 inquire = "0.9"
 rand = { version = "0.10", default-features = false, features = ["std", "thread_rng"] }
-tru = "0.2.2"
+# TOON output for `dcg test --format toon`. The library alone (plus serde_json
+# conversions) is all dcg needs; the CLI feature would pull clap twice.
+tru = { version = "0.3.0", default-features = false, features = ["serde"] }
 
 # rich_rust for premium terminal output (rich_rust epic). Keep only the
 # Markdown renderer used by dcg; the syntax feature pulls in an obsolete parser
@@ -164,34 +166,15 @@ name = "hook_latency"
 harness = false
 
 [profile.release]
-opt-level = "z"     # Optimize for size (lean binary for distribution)
+# The hook runs on every agent shell command, so latency matters more than a
+# few hundred KiB of binary size. `opt-level = "z"` slowed regex compilation
+# and the evaluator itself (#245/#248); the whole binary is now built for
+# speed, which also covers the regex crates that used to be special-cased.
+opt-level = 3
 lto = true          # Link-time optimization across crates
 codegen-units = 1   # Single codegen unit for better optimization
-panic = "abort"     # Smaller binary, no unwinding overhead
+panic = "abort"     # No unwinding overhead
 strip = true        # Remove debug symbols
-
-# The hook is a one-shot process: every enabled pack whose keywords match the
-# command compiles its full pattern set from scratch on each invocation.
-# Profiling (#245/#248) showed >90% of the ~150-200ms full-evaluation cost was
-# regex COMPILATION inside these crates, which `opt-level = "z"` slows several
-# fold. Building only the regex family for speed recovers most of that latency
-# while keeping the rest of the binary size-optimized.
-[profile.release.package.regex-automata]
-opt-level = 3
-[profile.release.package.regex-syntax]
-opt-level = 3
-[profile.release.package.regex]
-opt-level = 3
-[profile.release.package.fancy-regex]
-opt-level = 3
-[profile.release.package.aho-corasick]
-opt-level = 3
-[profile.release.package.memchr]
-opt-level = 3
-[profile.release.package.bit-set]
-opt-level = 3
-[profile.release.package.bit-vec]
-opt-level = 3
 
 # Profilable build for `profiling-software-performance` / samply. Inherits the
 # shipping release optimizations but keeps frame pointers and line tables so
