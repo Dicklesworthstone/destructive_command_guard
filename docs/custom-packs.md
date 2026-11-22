@@ -193,6 +193,11 @@ Omit the key to leave the rule unscoped, matching anywhere in the command as
 before. An explicitly empty list is rejected so a misspelled scope cannot
 silently become broader or turn into a dead rule.
 
+Unscoped rules retain the complete matching context across shell separators,
+including text read by lookahead and lookbehind assertions outside the consumed
+match. Safe-pattern exemptions still apply to the segment they authorize;
+skipping an exempt match does not hide later matches of the same rule.
+
 ### Safe Pattern Fields
 
 | Field | Type | Required | Description |

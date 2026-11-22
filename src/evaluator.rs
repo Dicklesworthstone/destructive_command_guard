@@ -765,6 +765,56 @@ impl<'a> SafePatternInputs<'a> {
                     }))
         })
     }
+
+    /// A full-command match is exempt only when its own segment has a safe
+    /// grant. Its consumed span does not bound the context read by lookarounds.
+    fn match_is_exempt(
+        &self,
+        pack: &crate::packs::Pack,
+        detection_command: &str,
+        span: MatchSpan,
+        segment_ranges: &[(usize, usize)],
+        sanitize_segment: bool,
+        deadline: Option<&Deadline>,
+    ) -> bool {
+        if pack.safe_patterns.is_empty() {
+            return false;
+        }
+        let trimmed_span = detection_command
+            .get(span.start..span.end)
+            .and_then(|matched| {
+                let trimmed = matched.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                let start = span.start + matched.len() - matched.trim_start().len();
+                Some(MatchSpan {
+                    start,
+                    end: start + trimmed.len(),
+                })
+            });
+        segment_ranges.iter().any(|&(start, end)| {
+            let contains = |candidate: MatchSpan| {
+                candidate.start >= start
+                    && candidate.end <= end
+                    && (candidate.start < end || start == end)
+            };
+            if !(contains(span) || trimmed_span.is_some_and(contains)) {
+                return false;
+            }
+            let Some(segment) = detection_command.get(start..end) else {
+                return false;
+            };
+            // Keep the same detection input as the corresponding segment
+            // pass. The custom source view already carries its own masks.
+            let detection_input = if sanitize_segment {
+                sanitize_for_pattern_matching(segment)
+            } else {
+                Cow::Borrowed(segment)
+            };
+            self.matches(pack, detection_input.as_ref(), Some((start, end)), deadline)
+        })
+    }
 }
 
 fn compute_normalized_offset(command_for_match: &str, normalized: &str) -> Option<usize> {
@@ -28616,6 +28666,9 @@ fn evaluate_packs_with_allowlists_at_depth(
     let original_len = original_command.len();
     let segment_ranges = command_segment_ranges_in_dialect(command_for_packs, shell_dialect);
     let safe_inputs = SafePatternInputs::new(command_for_packs, input_command, shell_dialect);
+    // Only external policies need the source-preserving view. Share its
+    // segment correspondence between the local pass and full-context retry.
+    let custom_pattern_inputs = std::cell::OnceCell::new();
     let has_cmd_grouping_or_separator = shell_dialect == ShellDialect::Cmd
         && tokenize_for_shell_dialect(command_for_packs, ShellDialect::Cmd)
             .iter()
@@ -28781,6 +28834,7 @@ fn evaluate_packs_with_allowlists_at_depth(
         } else {
             continue;
         };
+        let is_external_pack = REGISTRY.get_entry(pack_id).is_none();
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
             return EvaluationResult::indeterminate_due_to_budget();
         }
@@ -28831,15 +28885,18 @@ fn evaluate_packs_with_allowlists_at_depth(
         // in their destructive regex (#598). Keep that detection input in
         // addition to the normalized one. It also retains substitution syntax
         // in data arguments (#614), while the prose and checked bodies stay masked.
-        if REGISTRY.get_entry(pack_id).is_none() && custom_command_for_match != command_for_packs {
+        if is_external_pack && custom_command_for_match != command_for_packs {
             // Both views preserve source offsets. Split the source: blanking a
             // checked child body removes its segment from the detection view,
             // but must not break the correspondence used to authorize a safe
             // pattern against the complete original parent or a later sibling.
-            let raw_ranges = command_segment_ranges_in_dialect(original_command, shell_dialect);
-            let raw_safe_inputs =
-                SafePatternInputs::new(original_command, input_command, shell_dialect);
-            for &(start, end) in &raw_ranges {
+            let (raw_ranges, raw_safe_inputs) = custom_pattern_inputs.get_or_init(|| {
+                (
+                    command_segment_ranges_in_dialect(original_command, shell_dialect),
+                    SafePatternInputs::new(original_command, input_command, shell_dialect),
+                )
+            });
+            for &(start, end) in raw_ranges {
                 let segment = &custom_command_for_match[start..end];
                 // A checked child's body can be entirely masked. It remains
                 // in the source map, but is not a new empty command to match.
@@ -29646,14 +29703,69 @@ fn evaluate_packs_with_allowlists_at_depth(
             // All severity levels are now evaluated. The policy layer in main.rs
             // determines whether to deny, warn, or log based on severity and config.
 
-            let matched_span = find_actionable_command_pattern_span(
+            // Unscoped custom rules may inspect sibling segments through
+            // lookarounds even when they consume text in just one segment
+            // (#671). Only an actual safe grant can suppress such a match.
+            // Keep searching after an exempt occurrence of the same rule.
+            let unscoped_external = is_external_pack && pattern.executables.is_none();
+            let mut matching_command = command_for_packs;
+            let mut matching_offset = normalized_offset;
+            let mut matched_span = find_actionable_command_pattern_span(
                 pack_id,
                 pattern.name,
                 &pattern.regex,
-                command_for_packs,
-                normalized_offset.map(|offset| (original_command, offset)),
+                matching_command,
+                matching_offset.map(|offset| (original_command, offset)),
                 shell_dialect,
+                deadline,
+                |span| {
+                    !unscoped_external
+                        || !has_compound_segments
+                        || !safe_inputs.match_is_exempt(
+                            pack,
+                            matching_command,
+                            span,
+                            &segment_ranges,
+                            true,
+                            deadline,
+                        )
+                },
             );
+            if matched_span.is_none()
+                && unscoped_external
+                && custom_command_for_match != command_for_packs
+            {
+                // Normalization may remove an assignment or wrapper read by
+                // the assertion. Retry the complete source-preserving view,
+                // retaining its masks and byte-for-byte source mapping.
+                let (raw_ranges, raw_safe_inputs) = custom_pattern_inputs.get_or_init(|| {
+                    (
+                        command_segment_ranges_in_dialect(original_command, shell_dialect),
+                        SafePatternInputs::new(original_command, input_command, shell_dialect),
+                    )
+                });
+                matching_command = custom_command_for_match;
+                matching_offset = Some(0);
+                matched_span = find_actionable_command_pattern_span(
+                    pack_id,
+                    pattern.name,
+                    &pattern.regex,
+                    matching_command,
+                    Some((original_command, 0)),
+                    shell_dialect,
+                    deadline,
+                    |span| {
+                        !raw_safe_inputs.match_is_exempt(
+                            pack,
+                            matching_command,
+                            span,
+                            raw_ranges,
+                            false,
+                            deadline,
+                        )
+                    },
+                );
+            }
 
             if deadline_exceeded(deadline) {
                 return EvaluationResult::indeterminate_due_to_budget();
@@ -29662,6 +29774,8 @@ fn evaluate_packs_with_allowlists_at_depth(
             let Some(span) = matched_span else {
                 continue;
             };
+            let command_for_packs = matching_command;
+            let normalized_offset = matching_offset;
 
             let _filesystem_scope = NonlocalFilesystemScope::enter(
                 pack_id == "core.filesystem"
@@ -29763,11 +29877,13 @@ fn evaluate_packs_with_allowlists_at_depth(
                 continue;
             }
 
-            // Non-filesystem packs already checked each segment above, so skip
-            // duplicate full-command matches that sit wholly inside one segment.
+            // Built-in and executable-scoped patterns already checked each
+            // segment above. Unscoped custom rules instead retain their full
+            // assertion context, with safe grants filtered during the search.
             // core.filesystem uses its specialized rm parser instead of that
             // segment loop; keep its full-command regex fallback visible.
             if has_compound_segments
+                && !unscoped_external
                 && pack_id != "core.filesystem"
                 && (span_is_inside_any_segment(span, &segment_ranges)
                     || command_for_packs
@@ -36526,7 +36642,12 @@ fn find_actionable_command_pattern_span(
     command: &str,
     source_context: Option<(&str, usize)>,
     shell_dialect: ShellDialect,
+    deadline: Option<&Deadline>,
+    mut accepts_span: impl FnMut(MatchSpan) -> bool,
 ) -> Option<MatchSpan> {
+    if deadline_exceeded(deadline) {
+        return None;
+    }
     // The guardrails regex also covers environment/control mutations. Add a
     // native argv proof for its DCG-command branches so an escaped space in
     // one --agent value cannot hide the following real subcommand. Keep the
@@ -36558,7 +36679,8 @@ fn find_actionable_command_pattern_span(
             command,
             span,
             source_context,
-        ) {
+        ) && accepts_span(span)
+        {
             return Some(span);
         }
     }
@@ -36576,8 +36698,18 @@ fn find_actionable_command_pattern_span(
         };
     let mut search_start = 0usize;
     loop {
+        if deadline_exceeded(deadline) {
+            return None;
+        }
         let (start, end) = regex.find_from(command, search_start)?;
         let span = MatchSpan { start, end };
+        if !accepts_span(span) {
+            // Preserve the entire subject for anchors and lookbehind. A
+            // later match can overlap an exempt one, so advance one complete
+            // UTF-8 character from its start, not past its consumed span.
+            search_start = start + command[start..].chars().next()?.len_utf8();
+            continue;
+        }
         if let Some(operator) = command[start..end].find('>').map(|offset| start + offset)
             && (written_arrows.contains(&source_base.saturating_add(operator))
                 || proven_bash_redirects.contains(&source_base.saturating_add(operator)))
@@ -37823,6 +37955,8 @@ fn evaluate_pack_destructive_patterns(
                     normalized_offset
                         .map(|offset| (original_command, offset.saturating_add(slice_offset))),
                     shell_dialect,
+                    deadline,
+                    |_| true,
                 )
                 .map(|span| MatchSpan {
                     start: span.start + slice_offset,

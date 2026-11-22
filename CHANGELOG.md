@@ -11,6 +11,17 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+**Unscoped custom-pack lookarounds retain whole-command context (#671).** A
+lookahead or lookbehind can depend on text across a shell separator even when
+the rule consumes text inside only one segment. Those matches no longer get
+discarded as duplicates of a segment-only evaluation. Source-preserving custom
+matching also retains assignments and wrappers needed by such assertions.
+Safe-pattern exemptions and rule allowlists still apply; an exempt occurrence
+cannot hide a later or overlapping match of the same rule. Searches preserve
+anchors, lookbehind, UTF-8 boundaries, and the evaluation deadline.
+
 ## [v0.17.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.17.0) -- 2026-11-21 [Release]
 
 This release closes more commands that ran unguarded (PowerShell

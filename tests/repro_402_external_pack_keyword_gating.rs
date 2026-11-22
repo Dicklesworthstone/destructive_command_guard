@@ -542,7 +542,292 @@ destructive_patterns:
     }
 }
 
+/// #671: only the consumed match span is segment-local. The lookarounds
+/// still need the complete command, including sibling shell segments.
+const LOOKAROUND_PACK: &str = r"schema_version: 1
+id: probe.c2
+name: Lookaround horizon regression
+version: 1.0.0
+keywords: [zzka, zzkb, zzkc]
+destructive_patterns:
+  - name: la-only
+    pattern: 'zzka(?=[^\r\n]*?zzend)'
+    severity: critical
+    description: Lookahead reads beyond the consumed match
+  - name: la-consume
+    pattern: 'zzkb(?=[^\r\n]*?zzend)[^\r\n]*?zzend'
+    severity: critical
+    description: Consuming cross-segment control
+  - name: lb-only
+    pattern: '(?<=zzpre[^\r\n]{3})zzkc'
+    severity: critical
+    description: Lookbehind reads before the consumed match
+";
+
+#[test]
+fn issue_671_lookarounds_read_across_shell_segments() {
+    let fixture = Fixture::new();
+    let config = fixture.lookaround_config(LOOKAROUND_PACK);
+    for separator in [";", "&&", "|", "||", "&"] {
+        for (prefix, rule) in [("zzka", "probe.c2:la-only"), ("zzkb", "probe.c2:la-consume")] {
+            fixture.assert_lookaround_verdict(
+                &config,
+                &format!("{prefix} abc{separator} zzend"),
+                Some(rule),
+            );
+        }
+    }
+    // Exactly three characters must separate zzpre from the consumed zzkc.
+    for command in [
+        "zzpre ; zzkc",
+        "zzpre &&zzkc",
+        "zzpre | zzkc",
+        "zzpre ||zzkc",
+        "zzpre & zzkc",
+    ] {
+        fixture.assert_lookaround_verdict(&config, command, Some("probe.c2:lb-only"));
+    }
+    for (command, rule) in [
+        ("zzka abc zzend", "probe.c2:la-only"),
+        (r#"zzka "abc; zzend""#, "probe.c2:la-only"),
+        ("zzkb abc zzend", "probe.c2:la-consume"),
+        ("zzpre , zzkc", "probe.c2:lb-only"),
+    ] {
+        fixture.assert_lookaround_verdict(&config, command, Some(rule));
+    }
+    // A missing assertion is a completed nonmatch, not an incomplete result.
+    for command in ["zzka abc; zzother", "zzkb abc; zzother", "zzother ; zzkc"] {
+        fixture.assert_lookaround_verdict(&config, command, None);
+    }
+}
+
+#[test]
+fn issue_671_safe_segments_do_not_hide_later_lookaround_matches() {
+    let fixture = Fixture::new();
+    let config = fixture.lookaround_config(&format!(
+        "{LOOKAROUND_PACK}safe_patterns:\n  - name: safe-command\n    pattern: '^zzka safe$'\n"
+    ));
+    fixture.assert_lookaround_verdict(&config, "zzka safe; zzend", None);
+    // The first full-command match is exempt. Continue searching with the
+    // original lookaround context so the later occurrence cannot disappear.
+    for command in ["zzka safe; zzka abc; zzend", "zzka abc; zzka safe; zzend"] {
+        fixture.assert_lookaround_verdict(&config, command, Some("probe.c2:la-only"));
+    }
+}
+
+#[test]
+fn issue_671_lookaround_rule_allowlists_remain_rule_scoped() {
+    let fixture = Fixture::new();
+    let config = fixture.lookaround_config(LOOKAROUND_PACK);
+    fs::create_dir_all(fixture.root.join("config/dcg")).unwrap();
+    fs::write(
+        fixture.root.join("config/dcg/allowlist.toml"),
+        "[[allow]]\nrule = \"probe.c2:la-only\"\nreason = \"Authorize only this probe rule\"\n",
+    )
+    .unwrap();
+    fixture.assert_lookaround_verdict(&config, "zzka abc; zzend", None);
+    fixture.assert_lookaround_verdict(&config, "zzpre ; zzkc", Some("probe.c2:lb-only"));
+    fixture.assert_lookaround_verdict(
+        &config,
+        "zzka abc; zzend; zzpre ; zzkc",
+        Some("probe.c2:lb-only"),
+    );
+}
+
+#[test]
+fn issue_671_source_preserving_lookarounds_keep_assignment_context() {
+    let fixture = Fixture::new();
+    let config = fixture.lookaround_config(
+        r"schema_version: 1
+id: probe.assignment
+name: Source-preserving lookaround
+version: 1.0.0
+keywords: [zzka]
+destructive_patterns:
+  - name: assignment-lookaround
+    pattern: '(?<=ZZENV=deny )zzka(?=[^\r\n]*?zzend)'
+    severity: critical
+    description: Both the assignment and a later segment are required
+",
+    );
+    for command in ["ZZENV=deny zzka abc zzend", "ZZENV=deny zzka abc; zzend"] {
+        fixture.assert_lookaround_verdict(
+            &config,
+            command,
+            Some("probe.assignment:assignment-lookaround"),
+        );
+    }
+    fixture.assert_lookaround_verdict(&config, "ZZENV=allow zzka abc; zzend", None);
+}
+
+#[test]
+fn issue_671_lookarounds_respect_executable_scope() {
+    let fixture = Fixture::new();
+    let config = fixture.lookaround_config(
+        r"schema_version: 1
+id: probe.scoped
+name: Scoped lookaround
+version: 1.0.0
+keywords: [zzka]
+destructive_patterns:
+  - name: la-only
+    pattern: 'zzka(?=[^\r\n]*?zzend)'
+    executables: [zzka]
+    severity: critical
+    description: Match only inside a zzka invocation
+",
+    );
+    fixture.assert_lookaround_verdict(&config, "zzka abc zzend", Some("probe.scoped:la-only"));
+    fixture.assert_lookaround_verdict(&config, "zzother zzka abc; zzend", None);
+}
+
+#[test]
+fn issue_671_filtered_matches_keep_regex_context_and_overlaps() {
+    let fixture = Fixture::new();
+    for (pattern, safe, command, denied) in [
+        // A single-command safe grant requires the complete original spelling.
+        (r"zzka", Some("^zzka safe$"), "  zzka safe  ", true),
+        // Rejecting a safe first match must not re-anchor ^ to a later segment.
+        (
+            r"^zzka(?=[^\r\n]*zzend)",
+            Some("^zzka safe$"),
+            "zzka safe; zzka abc; zzend",
+            false,
+        ),
+        // Negative assertions must retain the later text they rule out.
+        (
+            r"zzka(?=[^\r\n]*zzend)(?![^\r\n]*zzskip)",
+            None,
+            "zzka abc; zzend; zzskip",
+            false,
+        ),
+        // A later overlapping match is not confined to the exempt segment.
+        (
+            r"zzab|zab[^\r\n]*zzend",
+            Some("^zzab$"),
+            "zzab; zzend",
+            true,
+        ),
+        // After skipping the first match, lookbehind still sees earlier text.
+        (
+            r"zzka(?=[^\r\n]*zzend)|(?<=zzpre[^\r\n]{3})zzkc",
+            Some("^zzka safe$"),
+            "zzka safe; zzpre ; zzkc; zzend",
+            true,
+        ),
+        (
+            r"zzka(?=[^\r\n]*zzend)",
+            None,
+            "zzunicode café; zzka abc; zzend",
+            true,
+        ),
+        // Advancing past an exempt match must land on a UTF-8 boundary.
+        (
+            r"é|zzka(?=[^\r\n]*zzend)",
+            Some("^zzunicode café$"),
+            "zzunicode café; zzka abc; zzend",
+            true,
+        ),
+    ] {
+        let safe = safe.map_or_else(String::new, |pattern| {
+            format!("safe_patterns:\n  - name: exempt-first\n    pattern: '{pattern}'\n")
+        });
+        let config = fixture.lookaround_config(&format!(
+            r"schema_version: 1
+id: probe.context
+name: Filter context regression
+version: 1.0.0
+keywords: [zzka, zzkc, zzab, zzunicode]
+destructive_patterns:
+  - name: context
+    pattern: '{pattern}'
+    severity: critical
+    description: Full-context filtering regression
+{safe}"
+        ));
+        fixture.assert_lookaround_verdict(
+            &config,
+            command,
+            denied.then_some("probe.context:context"),
+        );
+    }
+}
+
 impl Fixture {
+    fn lookaround_config(&self, pack: &str) -> PathBuf {
+        let path = self.root.join("packs/lookaround.yaml");
+        fs::write(&path, pack).expect("write lookaround pack");
+        self.config(
+            "lookaround.toml",
+            &format!(
+                "[general]\nunverified_decision = \"ask\"\nfail_closed = true\n\
+                 [packs]\nenabled = []\ncustom_paths = [{}]\n",
+                serde_json::to_string(&path).unwrap()
+            ),
+        )
+    }
+
+    fn assert_lookaround_verdict(&self, config: &Path, command: &str, rule: Option<&str>) {
+        for (tool, dialect) in [("Bash", "posix"), ("PowerShell", "ps")] {
+            let input = serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_use_id": "toolu_dcg_671_regression",
+                "tool_name": tool,
+                "tool_input": {"command": command},
+                "cwd": self.root.to_string_lossy(),
+            })
+            .to_string();
+            let hook = self.isolated_run(
+                config,
+                &["--agent", "claude-code", "hook"],
+                input.as_bytes(),
+                &[],
+            );
+            assert!(hook.status.success(), "{tool}: {command:?}: {hook:?}");
+            if let Some(rule) = rule {
+                let json: serde_json::Value = serde_json::from_slice(&hook.stdout)
+                    .unwrap_or_else(|error| panic!("{tool}: {command:?}: {error}: {hook:?}"));
+                assert_eq!(
+                    json["hookSpecificOutput"]["permissionDecision"],
+                    "deny",
+                    "{tool}: {command:?}: {json}"
+                );
+                assert_eq!(
+                    json["hookSpecificOutput"]["ruleId"],
+                    rule,
+                    "{tool}: {command:?}: {json}"
+                );
+            } else {
+                assert!(
+                    hook.stdout.is_empty(),
+                    "{tool}: {command:?} must be silently allowed: {hook:?}"
+                );
+            }
+
+            let tested = self.isolated_run(
+                config,
+                &["test", "--stdin", "--dialect", dialect, "--format", "json"],
+                command.as_bytes(),
+                &[],
+            );
+            assert_eq!(
+                tested.status.code(),
+                Some(i32::from(rule.is_some())),
+                "test {dialect}: {command:?}: {tested:?}"
+            );
+            let json: serde_json::Value = serde_json::from_slice(&tested.stdout)
+                .unwrap_or_else(|error| panic!("test {dialect}: {command:?}: {error}: {tested:?}"));
+            assert_eq!(
+                json["decision"],
+                if rule.is_some() { "deny" } else { "allow" },
+                "test {dialect}: {command:?}: {json}"
+            );
+            if let Some(rule) = rule {
+                assert_eq!(json["rule_id"], rule, "test {dialect}: {command:?}: {json}");
+            }
+        }
+    }
+
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().to_path_buf();
