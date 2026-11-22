@@ -569,7 +569,10 @@ fn issue_671_lookarounds_read_across_shell_segments() {
     let fixture = Fixture::new();
     let config = fixture.lookaround_config(LOOKAROUND_PACK);
     for separator in [";", "&&", "|", "||", "&"] {
-        for (prefix, rule) in [("zzka", "probe.c2:la-only"), ("zzkb", "probe.c2:la-consume")] {
+        for (prefix, rule) in [
+            ("zzka", "probe.c2:la-only"),
+            ("zzkb", "probe.c2:la-consume"),
+        ] {
             fixture.assert_lookaround_verdict(
                 &config,
                 &format!("{prefix} abc{separator} zzend"),
@@ -788,13 +791,11 @@ impl Fixture {
                 let json: serde_json::Value = serde_json::from_slice(&hook.stdout)
                     .unwrap_or_else(|error| panic!("{tool}: {command:?}: {error}: {hook:?}"));
                 assert_eq!(
-                    json["hookSpecificOutput"]["permissionDecision"],
-                    "deny",
+                    json["hookSpecificOutput"]["permissionDecision"], "deny",
                     "{tool}: {command:?}: {json}"
                 );
                 assert_eq!(
-                    json["hookSpecificOutput"]["ruleId"],
-                    rule,
+                    json["hookSpecificOutput"]["ruleId"], rule,
                     "{tool}: {command:?}: {json}"
                 );
             } else {

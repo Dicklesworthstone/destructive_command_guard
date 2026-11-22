@@ -193,10 +193,14 @@ Omit the key to leave the rule unscoped, matching anywhere in the command as
 before. An explicitly empty list is rejected so a misspelled scope cannot
 silently become broader or turn into a dead rule.
 
-Unscoped rules retain the complete matching context across shell separators,
-including text read by lookahead and lookbehind assertions outside the consumed
-match. Safe-pattern exemptions still apply to the segment they authorize;
-skipping an exempt match does not hide later matches of the same rule.
+Unscoped destructive rules are checked against individual segments and the
+complete, data-sanitized command. In the complete-command check, lookarounds
+retain that full context even when the text they consume stays inside one
+segment. For example, `mytool(?=[^\r\n]*?publish)` can match `mytool status;
+publish`: the lookahead reads the later segment without including it in the
+highlighted match. This also applies to the original custom-policy view that
+preserves assignments and wrappers. Rules with `executables` keep their
+segment-local matching context.
 
 ### Safe Pattern Fields
 
@@ -267,6 +271,14 @@ segment; a substring in quoted data or removed wrapper text cannot supply a
 new exemption. Use anchors to constrain the command forms you authorize.
 Losing a safe match means destructive evaluation continues; it does not by
 itself deny a command that no destructive rule covers.
+
+A whole-command search continues past an occurrence covered by its innermost
+segment's safe exemption, so an exempt earlier occurrence cannot hide a later
+one. An enclosing segment's local safe match cannot be borrowed to authorize a
+child. Grants from a complete carrier still follow the inheritance rules above.
+A match that consumes text from multiple segments cannot borrow the safe
+exemption of just one segment. Exempt segments remain visible as context for
+other matches' lookarounds.
 
 ### Substitutions inside prose arguments
 

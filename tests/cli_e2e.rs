@@ -10904,11 +10904,6 @@ safe_patterns:
             destructive_pattern: &str,
             keywords: &[&str],
         ) -> Self {
-            let root = tempfile::tempdir().expect("isolated safe-pattern fixture");
-            for directory in ["home", "tmp", "cwd", "xdg"] {
-                std::fs::create_dir_all(root.path().join(directory)).expect("fixture directory");
-            }
-            let pack_path = root.path().join("pack.yaml");
             let mut pack = format!(
                 "schema_version: 1\nid: synthetic.environment\nname: Environment exemption regression\n\
                  version: 1.0.0\nkeywords: {}\ndestructive_patterns:\n  - name: requires-review\n    pattern: {}\n    severity: critical\n    description: This command requires explicit review\nsafe_patterns:\n",
@@ -10927,6 +10922,15 @@ safe_patterns:
                     .expect("append safe pattern");
                 }
             }
+            Self::from_pack(&pack)
+        }
+
+        fn from_pack(pack: &str) -> Self {
+            let root = tempfile::tempdir().expect("isolated safe-pattern fixture");
+            for directory in ["home", "tmp", "cwd", "xdg"] {
+                std::fs::create_dir_all(root.path().join(directory)).expect("fixture directory");
+            }
+            let pack_path = root.path().join("pack.yaml");
             std::fs::write(&pack_path, pack).expect("write custom pack");
             let config = root.path().join("config.toml");
             std::fs::write(
@@ -11128,6 +11132,387 @@ safe_patterns:
             assert_eq!(json["decision"], expected, "{candidate:?}: {json}");
             assert_eq!(json["rule_id"].as_str(), rule, "{candidate:?}: {json}");
             json
+        }
+    }
+
+    // The exact pack from #671. Every candidate below is passed as data to
+    // dcg; none of these synthetic programs is executed.
+    const LOOKAROUND_PACK: &str = r"schema_version: 1
+id: probe.c2
+name: Probe claim 2, lookaround horizon
+version: 1.0.0
+keywords: [zzka, zzkb, zzkc]
+destructive_patterns:
+  - name: la-only
+    pattern: 'zzka(?=[^\r\n]*?zzend)'
+    severity: critical
+    description: probe rule
+  - name: la-consume
+    pattern: 'zzkb(?=[^\r\n]*?zzend)[^\r\n]*?zzend'
+    severity: critical
+    description: probe rule
+  - name: lb-only
+    pattern: '(?<=zzpre[^\r\n]{3})zzkc'
+    severity: critical
+    description: probe rule
+";
+
+    fn lookaround_fixture(pack: &str) -> SafePatternFixture {
+        let fixture = SafePatternFixture::from_pack(pack);
+        std::fs::write(
+            &fixture.config,
+            format!(
+                "[general]\nself_heal_hook = false\nunverified_decision = \"ask\"\n\
+                 fail_closed = true\nhook_timeout_ms = 3000\n\
+                 [packs]\nenabled = []\ncustom_paths = [{}]\n",
+                serde_json::to_string(&fixture.root.path().join("pack.yaml"))
+                    .expect("serialize reporter pack path")
+            ),
+        )
+        .expect("write reporter configuration");
+        fixture
+    }
+
+    fn assert_lookaround_test(
+        fixture: &SafePatternFixture,
+        candidate: &str,
+        dialect: &str,
+        rule: Option<&str>,
+    ) -> serde_json::Value {
+        let mut child = fixture
+            .command()
+            .args(["test", "--stdin", "--dialect", dialect, "--format", "json"])
+            .spawn()
+            .expect("spawn lookaround CLI test");
+        child
+            .stdin
+            .take()
+            .expect("CLI stdin")
+            .write_all(candidate.as_bytes())
+            .expect("write candidate as stdin data");
+        let output = child.wait_with_output().expect("lookaround CLI output");
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(rule.is_some())),
+            "[{dialect}] {candidate:?}: {output:?}"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("[{dialect}] {candidate:?}: {error}; {output:?}"));
+        assert_eq!(
+            json["decision"],
+            if rule.is_some() { "deny" } else { "allow" },
+            "[{dialect}] {candidate:?}: {json}"
+        );
+        assert_eq!(json["rule_id"].as_str(), rule, "{candidate:?}: {json}");
+        json
+    }
+
+    fn assert_lookaround_hook(
+        fixture: &SafePatternFixture,
+        candidate: &str,
+        tool: &str,
+        rule: Option<&str>,
+    ) {
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+            "tool_input": {"command": candidate},
+        });
+        let mut child = fixture
+            .command()
+            .args(["--agent", "claude-code", "hook"])
+            .spawn()
+            .expect("spawn lookaround hook");
+        child
+            .stdin
+            .take()
+            .expect("hook stdin")
+            .write_all(payload.to_string().as_bytes())
+            .expect("write candidate as hook JSON data");
+        let output = child.wait_with_output().expect("lookaround hook output");
+        assert!(
+            output.status.success(),
+            "[{tool}] {candidate:?}: {output:?}"
+        );
+        if let Some(rule) = rule {
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .unwrap_or_else(|error| panic!("[{tool}] {candidate:?}: {error}; {output:?}"));
+            assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+            assert_eq!(json["hookSpecificOutput"]["ruleId"], rule);
+        } else {
+            assert!(
+                output.stdout.is_empty(),
+                "[{tool}] {candidate:?}: {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_671_unscoped_lookahead_keeps_whole_command_visibility() {
+        let fixture = lookaround_fixture(LOOKAROUND_PACK);
+        for dialect in ["posix", "ps", "unknown"] {
+            for separator in ["", ";", "&&", "|", "||", "&"] {
+                for (word, rule) in [
+                    ("zzka", "probe.c2:la-only"),
+                    ("zzkb", "probe.c2:la-consume"),
+                ] {
+                    let candidate = format!("{word} abc{separator} zzend");
+                    let json = assert_lookaround_test(&fixture, &candidate, dialect, Some(rule));
+                    let end = if word == "zzka" { 4 } else { candidate.len() };
+                    assert_eq!(json["matched_span"], serde_json::json!([0, end]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn issue_671_unscoped_lookbehind_keeps_whole_command_visibility() {
+        let fixture = lookaround_fixture(LOOKAROUND_PACK);
+        for dialect in ["posix", "ps", "unknown"] {
+            for separator in [",", ";", "|", "&"] {
+                let candidate = format!("zzpre {separator} zzkc");
+                let json =
+                    assert_lookaround_test(&fixture, &candidate, dialect, Some("probe.c2:lb-only"));
+                assert_eq!(json["matched_span"], serde_json::json!([8, 12]));
+            }
+        }
+    }
+
+    #[test]
+    fn issue_671_hook_denies_reported_lookarounds_in_both_shells() {
+        let fixture = lookaround_fixture(LOOKAROUND_PACK);
+        for tool in ["Bash", "PowerShell"] {
+            for separator in [";", "&&", "|", "||", "&"] {
+                assert_lookaround_hook(
+                    &fixture,
+                    &format!("zzka abc{separator} zzend"),
+                    tool,
+                    Some("probe.c2:la-only"),
+                );
+            }
+            assert_lookaround_hook(
+                &fixture,
+                "zzkb abc; zzend",
+                tool,
+                Some("probe.c2:la-consume"),
+            );
+            assert_lookaround_hook(&fixture, "zzpre ; zzkc", tool, Some("probe.c2:lb-only"));
+            assert_lookaround_hook(&fixture, "zzka abc; harmless", tool, None);
+        }
+    }
+
+    #[test]
+    fn issue_671_lookarounds_keep_nonmatches_data_and_original_offsets() {
+        let fixture = lookaround_fixture(LOOKAROUND_PACK);
+        for candidate in [
+            "zzka abc; harmless",
+            "zzkb abc; harmless",
+            "zzpre; zzkc",
+            "zzka abc;\nzzend",
+            "zzkb abc;\nzzend",
+            "echo 'zzka abc; zzend'",
+            "echo 'zzpre ; zzkc'",
+            "zzka abc; echo 'zzend'",
+        ] {
+            assert_lookaround_test(&fixture, candidate, "posix", None);
+        }
+        assert_lookaround_test(
+            &fixture,
+            "zzka \"abc; zzend\"",
+            "posix",
+            Some("probe.c2:la-only"),
+        );
+        let candidate = "printf 'café'; zzka abc; zzend";
+        let json = assert_lookaround_test(&fixture, candidate, "posix", Some("probe.c2:la-only"));
+        let start = candidate.find("zzka").expect("consumed match in source");
+        assert_eq!(json["matched_span"], serde_json::json!([start, start + 4]));
+    }
+
+    #[test]
+    fn issue_671_unscoped_lookarounds_keep_original_assignments_and_wrappers() {
+        for (pattern, candidate, matched) in [
+            (
+                r"^NAME=value zzka(?=[^\r\n]*?zzend)",
+                "NAME=value zzka abc; zzend",
+                "NAME=value zzka",
+            ),
+            (
+                r"^env NAME=value zzka(?=[^\r\n]*?zzend)",
+                "env NAME=value zzka abc; zzend",
+                "env NAME=value zzka",
+            ),
+            (
+                r"(?<=NAME=value zzpre ; )zzkc",
+                "NAME=value zzpre ; zzkc",
+                "zzkc",
+            ),
+        ] {
+            let fixture = SafePatternFixture::new_with_keywords(&[], pattern, &["NAME"]);
+            let json = assert_lookaround_test(&fixture, candidate, "posix", Some(REVIEW_RULE));
+            let start = candidate.find(matched).expect("raw match in source");
+            assert_eq!(
+                json["matched_span"],
+                serde_json::json!([start, start + matched.len()])
+            );
+        }
+    }
+
+    #[test]
+    fn issue_671_checked_children_do_not_create_custom_whitespace_matches() {
+        let body_only = SafePatternFixture::new_with_keywords(&[], r"(?<=\$\()\s+(?=\))", &["$("]);
+        let visible_delimiters = SafePatternFixture::new_with_keywords(&[], r"\$\(\s+\)", &["$("]);
+        for candidate in [r#"echo "$(id)""#, r#"gh pr comment 1 --body "$(id)""#] {
+            // The checked child body becomes spaces in the custom matching
+            // view. Those placeholder bytes are not a new whitespace command.
+            assert_lookaround_test(&body_only, candidate, "posix", None);
+
+            // Visible carrier syntax still belongs to its parent policy:
+            // excluding a child's bytes must not erase the $(...) delimiters.
+            let json =
+                assert_lookaround_test(&visible_delimiters, candidate, "posix", Some(REVIEW_RULE));
+            let start = candidate.find("$(").expect("substitution syntax in source");
+            assert_eq!(json["matched_span"], serde_json::json!([start, start + 5]));
+        }
+    }
+
+    #[test]
+    fn issue_671_executable_scopes_keep_lookarounds_inside_their_segment() {
+        let scoped = LOOKAROUND_PACK.replace(
+            "    severity:",
+            "    executables: [zzka, zzkb, zzpre, zzkc]\n    severity:",
+        );
+        let fixture = lookaround_fixture(&scoped);
+        for dialect in ["posix", "ps", "unknown"] {
+            for candidate in ["zzka abc; zzend", "zzkb abc; zzend", "zzpre ; zzkc"] {
+                assert_lookaround_test(&fixture, candidate, dialect, None);
+            }
+            for (candidate, rule) in [
+                ("zzka abc zzend", "probe.c2:la-only"),
+                ("zzkb abc zzend", "probe.c2:la-consume"),
+                ("zzpre , zzkc", "probe.c2:lb-only"),
+            ] {
+                assert_lookaround_test(&fixture, candidate, dialect, Some(rule));
+            }
+        }
+    }
+
+    #[test]
+    fn issue_671_safe_segments_do_not_hide_later_lookaround_matches() {
+        let pack = format!(
+            "{LOOKAROUND_PACK}safe_patterns:
+  - name: reviewed
+    pattern: '^zzk[ab] reviewed$'
+  - name: reviewed-lookbehind
+    pattern: '^zzpre , zzkc$'
+"
+        );
+        let fixture = lookaround_fixture(&pack);
+        for dialect in ["posix", "ps", "unknown"] {
+            assert_lookaround_test(&fixture, "zzka reviewed; zzend", dialect, None);
+            let candidate = "zzka reviewed; zzka unreviewed; zzend";
+            let json =
+                assert_lookaround_test(&fixture, candidate, dialect, Some("probe.c2:la-only"));
+            let start = candidate.rfind("zzka").expect("later unexempt match");
+            assert_eq!(json["matched_span"], serde_json::json!([start, start + 4]));
+
+            // A consuming cross-segment rule cannot borrow an exemption
+            // belonging to only one of the commands it matched.
+            assert_lookaround_test(
+                &fixture,
+                "zzkb reviewed; zzend",
+                dialect,
+                Some("probe.c2:la-consume"),
+            );
+
+            // Searching beyond the first exempt hit must retain the original
+            // left context needed by a later lookbehind.
+            let candidate = "zzpre , zzkc; zzpre ; zzkc";
+            let json =
+                assert_lookaround_test(&fixture, candidate, dialect, Some("probe.c2:lb-only"));
+            let start = candidate.rfind("zzkc").expect("later lookbehind match");
+            assert_eq!(json["matched_span"], serde_json::json!([start, start + 4]));
+        }
+
+        // Discarding an exempt match must not skip an overlapping candidate
+        // that starts inside it and extends beyond the exempt segment.
+        for (pattern, candidate, start) in [
+            (
+                r"zzka(?=[^\r\n]*zzend)|zka[^\r\n]*zzend",
+                "zzka reviewed; zzend",
+                1,
+            ),
+            (
+                r"ézzka(?=[^\r\n]*zzend)|zzka[^\r\n]*zzend",
+                "ézzka reviewed; zzend",
+                2,
+            ),
+        ] {
+            let fixture =
+                SafePatternFixture::new_with_keywords(&[r"^é?zzka reviewed$"], pattern, &["zzka"]);
+            let json = assert_lookaround_test(&fixture, candidate, "posix", Some(REVIEW_RULE));
+            assert_eq!(
+                json["matched_span"],
+                serde_json::json!([start, candidate.len()])
+            );
+        }
+
+        // A nonempty whitespace match belongs to its exact safe segment;
+        // whitespace between segments has no such owner.
+        let fixture = SafePatternFixture::new_with_keywords(&[r"^zzka safe$"], r"\s+", &["zzka"]);
+        assert_lookaround_test(&fixture, "zzka safe;true", "posix", None);
+        assert_lookaround_test(&fixture, "zzka unreviewed;true", "posix", Some(REVIEW_RULE));
+        let between = SafePatternFixture::new_with_keywords(&[r"^zzka$"], r"\s+", &["zzka"]);
+        assert_lookaround_test(&between, "zzka; true", "posix", Some(REVIEW_RULE));
+
+        // An unanchored safe match on the parent must not authorize an
+        // innermost child whose lookahead reaches a later sibling command.
+        let child = SafePatternFixture::new_with_keywords(
+            &["zzouter"],
+            r"zzchild(?=[^\r\n]*zzend)",
+            &["zzouter", "zzchild"],
+        );
+        let candidate = "zzouter $(zzchild); zzend";
+        let json = assert_lookaround_test(&child, candidate, "posix", Some(REVIEW_RULE));
+        let start = candidate.find("zzchild").expect("nested child match");
+        assert_eq!(json["matched_span"], serde_json::json!([start, start + 7]));
+
+        // Nullable consuming patterns can produce empty matches. A point
+        // inside a safe segment inherits its grant, but its endpoint does not.
+        let nullable = r"(?=zzka[^\r\n]*zzend)q*";
+        let safe =
+            SafePatternFixture::new_with_keywords(&[r"^zzka reviewed$"], nullable, &["zzka"]);
+        let candidate = "zzka reviewed; zzend";
+        assert_lookaround_test(&safe, candidate, "posix", None);
+        let unreviewed = SafePatternFixture::new_with_keywords(&[], nullable, &["zzka"]);
+        let json = assert_lookaround_test(&unreviewed, candidate, "posix", Some(REVIEW_RULE));
+        assert_eq!(json["matched_span"], serde_json::json!([0, 0]));
+
+        for (pattern, candidate, position) in [
+            (r"(?=;zzend)q*", "zzka reviewed;zzend", 13),
+            (r"(?<=reviewed)q*$", "true;zzka reviewed", 18),
+        ] {
+            let boundary =
+                SafePatternFixture::new_with_keywords(&[r"^zzka reviewed$"], pattern, &["zzka"]);
+            let json = assert_lookaround_test(&boundary, candidate, "posix", Some(REVIEW_RULE));
+            assert_eq!(
+                json["matched_span"],
+                serde_json::json!([position, position])
+            );
+        }
+    }
+
+    #[test]
+    fn issue_671_rule_allowlists_do_not_authorize_other_lookarounds() {
+        let fixture =
+            lookaround_fixture(LOOKAROUND_PACK).with_allowlist("rule", "probe.c2:la-only");
+        let allowed = assert_lookaround_test(&fixture, "zzka abc; zzend", "posix", None);
+        assert_eq!(allowed["allowlist"]["reason"], "Reviewed command form");
+        for (candidate, rule) in [
+            ("zzka abc; zzkb abc; zzend", "probe.c2:la-consume"),
+            ("zzka abc; zzpre ; zzkc; zzend", "probe.c2:lb-only"),
+        ] {
+            assert_lookaround_test(&fixture, candidate, "posix", Some(rule));
+            assert_lookaround_hook(&fixture, candidate, "Bash", Some(rule));
         }
     }
 

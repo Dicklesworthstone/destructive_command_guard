@@ -766,8 +766,9 @@ impl<'a> SafePatternInputs<'a> {
         })
     }
 
-    /// A full-command match is exempt only when its own segment has a safe
-    /// grant. Its consumed span does not bound the context read by lookarounds.
+    /// A whole-command match belongs to its innermost segment. An enclosing
+    /// segment's local safe match cannot replace a child's own or inherited
+    /// grant. An already-checked masked child must not become a new match.
     fn match_is_exempt(
         &self,
         pack: &crate::packs::Pack,
@@ -777,43 +778,49 @@ impl<'a> SafePatternInputs<'a> {
         sanitize_segment: bool,
         deadline: Option<&Deadline>,
     ) -> bool {
+        if sanitize_segment && pack.safe_patterns.is_empty() {
+            return false;
+        }
+        let Some(matched) = detection_command.get(span.start..span.end) else {
+            return false;
+        };
+        let trimmed = matched.trim();
+        let (match_start, match_end) = if trimmed.is_empty() {
+            // Preserve authored whitespace and zero-width positions rather
+            // than moving them into a neighboring command's grant.
+            (span.start, span.end)
+        } else {
+            let start = span.start + matched.len() - matched.trim_start().len();
+            (start, start + trimmed.len())
+        };
+        // A zero-width point belongs to a half-open segment, never to the
+        // previous segment's closing boundary or an empty segment.
+        let Some(&(start, end)) = segment_ranges
+            .iter()
+            .filter(|&&(start, end)| match_start >= start && match_end <= end && match_start < end)
+            .min_by_key(|&&(start, end)| end - start)
+        else {
+            return false;
+        };
+        let Some(segment) = detection_command.get(start..end) else {
+            return false;
+        };
+        if !sanitize_segment && segment.trim().is_empty() {
+            // The raw segment pass already skipped this checked child. Keep
+            // that exclusion even when the pack has no safe patterns.
+            return true;
+        }
         if pack.safe_patterns.is_empty() {
             return false;
         }
-        let trimmed_span = detection_command
-            .get(span.start..span.end)
-            .and_then(|matched| {
-                let trimmed = matched.trim();
-                if trimmed.is_empty() {
-                    return None;
-                }
-                let start = span.start + matched.len() - matched.trim_start().len();
-                Some(MatchSpan {
-                    start,
-                    end: start + trimmed.len(),
-                })
-            });
-        segment_ranges.iter().any(|&(start, end)| {
-            let contains = |candidate: MatchSpan| {
-                candidate.start >= start
-                    && candidate.end <= end
-                    && (candidate.start < end || start == end)
-            };
-            if !(contains(span) || trimmed_span.is_some_and(contains)) {
-                return false;
-            }
-            let Some(segment) = detection_command.get(start..end) else {
-                return false;
-            };
-            // Keep the same detection input as the corresponding segment
-            // pass. The custom source view already carries its own masks.
-            let detection_input = if sanitize_segment {
-                sanitize_for_pattern_matching(segment)
-            } else {
-                Cow::Borrowed(segment)
-            };
-            self.matches(pack, detection_input.as_ref(), Some((start, end)), deadline)
-        })
+        // Keep the same detection input as the corresponding segment pass.
+        // The custom source view already carries its own masks.
+        let detection_input = if sanitize_segment {
+            sanitize_for_pattern_matching(segment)
+        } else {
+            Cow::Borrowed(segment)
+        };
+        self.matches(pack, detection_input.as_ref(), Some((start, end)), deadline)
     }
 }
 
