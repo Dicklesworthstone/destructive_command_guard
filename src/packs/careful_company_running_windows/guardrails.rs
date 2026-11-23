@@ -76,6 +76,42 @@ macro_rules! dcg_global_options {
     };
 }
 
+/// Tri-state outcome of native argv analysis for a single top-level `dcg`
+/// command segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DcgSegmentAction {
+    /// Native argv parsing proved this segment performs `expected_rule` over
+    /// the returned byte range.
+    Action(Range<usize>),
+    /// Native argv parsing proved this segment is a complete, static,
+    /// top-level `dcg` invocation that does NOT perform `expected_rule`
+    /// (covering the full segment byte range).
+    Inert(Range<usize>),
+    /// Native argv parsing could not certify the segment (not a literal `dcg`
+    /// invocation, dynamic/unquoted expansion, unknown option, redirection,
+    /// incomplete quoting, or grouped syntax). The regex fallback must remain
+    /// active on this segment.
+    Unprovable,
+}
+
+/// Result of native `dcg` guardrail proof across all top-level segments of a
+/// command string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DcgControlActionProof {
+    /// Native argv or authorization-store analysis proved `expected_rule` at
+    /// this byte range.
+    Action(Range<usize>),
+    /// No action was proved. `proven_inert_segments` contains byte ranges of
+    /// complete top-level `dcg` invocations proven inert for `expected_rule`
+    /// under native dialect argv semantics; `dcg`-command regex hits lying
+    /// wholly inside one of those ranges are command-looking argument data,
+    /// while env-var / `uninstall.ps1` branches and unproved segments still
+    /// fall through to the regex.
+    NoAction {
+        proven_inert_segments: Vec<Range<usize>>,
+    },
+}
+
 /// Prove a dcg control action from native argv boundaries without rewriting
 /// opaque agent values. This supplements the regex view, whose whitespace
 /// boundaries cannot represent unquoted escaped spaces in one argv word.
@@ -88,22 +124,28 @@ pub(crate) fn dcg_control_action_span(
     dialect: ShellDialect,
     expected_rule: &str,
 ) -> Option<std::ops::Range<usize>> {
-    dcg_control_action_span_in_source(command, dialect, expected_rule, None)
+    match dcg_control_action_proof_in_source(command, dialect, expected_rule, None) {
+        DcgControlActionProof::Action(span) => Some(span),
+        DcgControlActionProof::NoAction { .. } => None,
+    }
 }
 
 /// Preserve the enclosing request when a pack evaluates one command segment.
 /// Relative write destinations depend on directory changes before that segment.
-pub(crate) fn dcg_control_action_span_in_source(
+pub(crate) fn dcg_control_action_proof_in_source(
     command: &str,
     dialect: ShellDialect,
     expected_rule: &str,
     source_context: Option<(&str, usize)>,
-) -> Option<std::ops::Range<usize>> {
+) -> DcgControlActionProof {
+    let no_action = || DcgControlActionProof::NoAction {
+        proven_inert_segments: Vec::new(),
+    };
     if !matches!(
         expected_rule,
         "dcg-bypass-or-uninstall" | "dcg-policy-self-weakening"
     ) {
-        return None;
+        return no_action();
     }
     let dialect = if dialect == ShellDialect::Unknown {
         ShellDialect::Posix
@@ -114,15 +156,20 @@ pub(crate) fn dcg_control_action_span_in_source(
         && let Some(span) =
             authorization_store_write_span_from_source(command, dialect, source_context)
     {
-        return Some(span);
+        return DcgControlActionProof::Action(span);
     }
     let tokens = tokenize_for_shell_dialect(command, dialect);
+    let mut proven_inert_segments = Vec::new();
     let mut start = 0;
     let mut depth = 0usize;
     let mut grouped = false;
     let mut comment = false;
     for (index, token) in tokens.iter().enumerate() {
-        let raw = token.text(command)?;
+        let Some(raw) = token.text(command) else {
+            return DcgControlActionProof::NoAction {
+                proven_inert_segments,
+            };
+        };
         let newline = matches!(raw, "\n" | "\r" | "\r\n");
         if comment {
             if newline {
@@ -134,16 +181,19 @@ pub(crate) fn dcg_control_action_span_in_source(
         }
         if token.kind == NormalizeTokenKind::Word {
             if dialect != ShellDialect::Cmd && raw.starts_with('#') {
-                if depth == 0
-                    && !grouped
-                    && let Some(span) = dcg_segment_action_span(
+                if depth == 0 && !grouped {
+                    match dcg_segment_action_span(
                         command,
                         &tokens[start..index],
                         dialect,
                         expected_rule,
-                    )
-                {
-                    return Some(span);
+                    ) {
+                        DcgSegmentAction::Action(span) => {
+                            return DcgControlActionProof::Action(span);
+                        }
+                        DcgSegmentAction::Inert(span) => proven_inert_segments.push(span),
+                        DcgSegmentAction::Unprovable => {}
+                    }
                 }
                 comment = true;
             } else if dcg_word_updates_group_depth(raw, dialect, &mut depth) {
@@ -160,15 +210,26 @@ pub(crate) fn dcg_control_action_span_in_source(
             _ if depth > 0 => {}
             "&" if dialect == ShellDialect::PowerShell && index == start => {}
             _ => {
-                if !grouped
-                    && let Some(span) = dcg_segment_action_span(
+                // Redirection operators (`>`, `<`, `>>`, ...) do not terminate
+                // a shell command: more argv words may follow the redirect
+                // target (e.g., `dcg --robot > /tmp/out uninstall`). Never
+                // certify a redirection-split prefix as inert.
+                let is_redirect_sep = raw.contains(['<', '>']);
+                if !grouped {
+                    match dcg_segment_action_span(
                         command,
                         &tokens[start..index],
                         dialect,
                         expected_rule,
-                    )
-                {
-                    return Some(span);
+                    ) {
+                        DcgSegmentAction::Action(span) => {
+                            return DcgControlActionProof::Action(span);
+                        }
+                        DcgSegmentAction::Inert(span) if !is_redirect_sep => {
+                            proven_inert_segments.push(span);
+                        }
+                        DcgSegmentAction::Inert(_) | DcgSegmentAction::Unprovable => {}
+                    }
                 }
                 // A leading PowerShell & invokes the next command. Retain
                 // it so a quoted executable is distinguished from a string
@@ -182,10 +243,15 @@ pub(crate) fn dcg_control_action_span_in_source(
             }
         }
     }
-    if comment || grouped || depth != 0 {
-        None
-    } else {
-        dcg_segment_action_span(command, &tokens[start..], dialect, expected_rule)
+    if !comment && !grouped && depth == 0 {
+        match dcg_segment_action_span(command, &tokens[start..], dialect, expected_rule) {
+            DcgSegmentAction::Action(span) => return DcgControlActionProof::Action(span),
+            DcgSegmentAction::Inert(span) => proven_inert_segments.push(span),
+            DcgSegmentAction::Unprovable => {}
+        }
+    }
+    DcgControlActionProof::NoAction {
+        proven_inert_segments,
     }
 }
 
@@ -241,53 +307,119 @@ fn dcg_word_updates_group_depth(raw: &str, dialect: ShellDialect, depth: &mut us
     changed
 }
 
+/// Known non-mutating `dcg` subcommands and help/version flags whose
+/// presence at the subcommand slot proves the invocation does not execute
+/// `uninstall`, `allow`, `allow-once`, or `allowlist add|add-command|import`.
+/// Unknown options/words deliberately return `false` so unrecognised CLI
+/// shapes stay `Unprovable` (fail-closed).
+fn is_known_benign_dcg_subcommand(after_allowlist: bool, word: &str) -> bool {
+    if after_allowlist {
+        matches!(
+            word,
+            "--help" | "-h" | "help" | "list" | "remove" | "validate" | "prune"
+        )
+    } else {
+        matches!(
+            word,
+            "--help"
+                | "-h"
+                | "--version"
+                | "-V"
+                | "help"
+                | "doctor"
+                | "hook"
+                | "unallow"
+                | "rebase-recover"
+                | "create-new"
+                | "install"
+                | "setup"
+                | "update"
+                | "completions"
+                | "packs"
+                | "pack"
+                | "test"
+                | "init"
+                | "config"
+                | "scan"
+                | "simulate"
+                | "explain"
+                | "corpus"
+                | "stats"
+                | "history"
+                | "suggest-allowlist"
+                | "dev"
+                | "classify"
+                | "mcp-server"
+        )
+    }
+}
+
 fn dcg_segment_action_span(
     command: &str,
     tokens: &[NormalizeToken],
     dialect: ShellDialect,
     expected_rule: &str,
-) -> Option<std::ops::Range<usize>> {
+) -> DcgSegmentAction {
     let mut words = tokens.iter();
-    let first = words.next()?;
+    let Some(first) = words.next() else {
+        return DcgSegmentAction::Unprovable;
+    };
+    let Some(last) = tokens.last() else {
+        return DcgSegmentAction::Unprovable;
+    };
+    let segment_span = first.byte_range.start..last.byte_range.end;
     let called = dialect == ShellDialect::PowerShell && first.text(command) == Some("&");
-    let executable = if called { words.next()? } else { first };
+    let Some(executable) = (if called { words.next() } else { Some(first) }) else {
+        return DcgSegmentAction::Unprovable;
+    };
     if executable.kind != NormalizeTokenKind::Word {
-        return None;
+        return DcgSegmentAction::Unprovable;
     }
-    let raw_executable = executable.text(command)?;
+    let Some(raw_executable) = executable.text(command) else {
+        return DcgSegmentAction::Unprovable;
+    };
     if dialect == ShellDialect::PowerShell && !called && raw_executable.starts_with(['\'', '"']) {
-        return None; // A quoted PowerShell string does not execute itself.
+        return DcgSegmentAction::Unprovable; // A quoted PowerShell string does not execute itself.
     }
-    let program = decode_dcg_literal_word(raw_executable, dialect)?;
+    let Some(program) = decode_dcg_literal_word(raw_executable, dialect) else {
+        return DcgSegmentAction::Unprovable;
+    };
     let name = if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Cmd) {
-        program.rsplit(['/', '\\']).next()?
+        program.rsplit(['/', '\\']).next()
     } else {
-        program.rsplit('/').next()?
+        program.rsplit('/').next()
+    };
+    let Some(name) = name else {
+        return DcgSegmentAction::Unprovable;
     };
     if !name.eq_ignore_ascii_case("dcg") && !name.eq_ignore_ascii_case("dcg.exe") {
-        return None;
+        return DcgSegmentAction::Unprovable;
     }
 
     let mut after_allowlist = false;
     let mut agent_value = false;
-    for token in words {
+    while let Some(token) = words.next() {
         if token.kind != NormalizeTokenKind::Word {
-            return None;
+            return DcgSegmentAction::Unprovable;
         }
         // The literal proof establishes one actual argv word; its value is
         // never scanned for subcommands, split on decoded spaces, or copied
         // into a new matching view. Runtime field splitting stays unproven.
-        let raw = token.text(command)?;
+        let Some(raw) = token.text(command) else {
+            return DcgSegmentAction::Unprovable;
+        };
         if std::mem::take(&mut agent_value) {
             if !dcg_literal_word_is_static(raw, dialect) {
-                return None;
+                return DcgSegmentAction::Unprovable;
             }
             continue;
         }
         if is_dcg_literal_agent_assignment(raw, dialect) {
             continue;
         }
-        let word = decode_dcg_literal_word(raw, dialect)?;
+        let Some(word) = decode_dcg_literal_word(raw, dialect) else {
+            return DcgSegmentAction::Unprovable;
+        };
         if word == "--agent" {
             agent_value = true;
             continue;
@@ -299,17 +431,41 @@ fn dcg_segment_action_span(
             after_allowlist = true;
             continue;
         }
-        let rule = match (after_allowlist, word.as_ref()) {
-            (false, "uninstall") => "dcg-bypass-or-uninstall",
+        let matched_rule = match (after_allowlist, word.as_ref()) {
+            (false, "uninstall") => Some("dcg-bypass-or-uninstall"),
             (false, "allow" | "allow-once") | (true, "add" | "add-command" | "import") => {
-                "dcg-policy-self-weakening"
+                Some("dcg-policy-self-weakening")
             }
-            _ => return None, // Includes help/version, unknown options and data.
+            _ => None,
         };
-        return (rule == expected_rule)
-            .then_some(executable.byte_range.start..token.byte_range.end);
+        if matched_rule == Some(expected_rule) {
+            return DcgSegmentAction::Action(executable.byte_range.start..token.byte_range.end);
+        }
+        if matched_rule.is_none() && !is_known_benign_dcg_subcommand(after_allowlist, word.as_ref())
+        {
+            return DcgSegmentAction::Unprovable;
+        }
+        // Only certify the segment inert once EVERY trailing token is also a
+        // static literal word (so nested command substitutions or dynamic
+        // expansions remain Unprovable and hit the fallback checks).
+        for rest in words {
+            if rest.kind != NormalizeTokenKind::Word {
+                return DcgSegmentAction::Unprovable;
+            }
+            let Some(rest_raw) = rest.text(command) else {
+                return DcgSegmentAction::Unprovable;
+            };
+            if !dcg_literal_word_is_static(rest_raw, dialect) {
+                return DcgSegmentAction::Unprovable;
+            }
+        }
+        return DcgSegmentAction::Inert(segment_span);
     }
-    None
+    if agent_value {
+        DcgSegmentAction::Unprovable
+    } else {
+        DcgSegmentAction::Inert(segment_span)
+    }
 }
 
 /// Add destructive evidence only for a write to a DCG authorization store.
@@ -2332,6 +2488,194 @@ mod tests {
         ];
         for (command, expected) in checks {
             assert_blocks_reachably(&pack, command, expected);
+        }
+    }
+
+    #[test]
+    fn tri_state_proof_distinguishes_action_inert_and_unprovable() {
+        let uninstall = "dcg-bypass-or-uninstall";
+        let grant = "dcg-policy-self-weakening";
+
+        // Proven actions (all 6 baseline cases + Cmd single-quote split).
+        for (dialect, command, rule) in [
+            (ShellDialect::Posix, "dcg allow-once abc123 --yes", grant),
+            (
+                ShellDialect::Posix,
+                "dcg --robot allow-once abc123 --yes",
+                grant,
+            ),
+            (
+                ShellDialect::Posix,
+                "dcg allowlist add core.git:reset-hard --reason approved",
+                grant,
+            ),
+            (
+                ShellDialect::Posix,
+                "dcg --robot allowlist add core.git:reset-hard --reason approved",
+                grant,
+            ),
+            (ShellDialect::Posix, "dcg uninstall --yes", uninstall),
+            (
+                ShellDialect::Posix,
+                "dcg --robot uninstall --yes",
+                uninstall,
+            ),
+            // In cmd.exe single quotes do not quote spaces, so allow-once is live.
+            (
+                ShellDialect::Cmd,
+                "dcg --agent='dcg --robot allow-once abc --yes' allowlist list",
+                grant,
+            ),
+            (
+                ShellDialect::Posix,
+                r#"dcg --agent="x\" --robot allow-once" doctor && dcg --robot uninstall"#,
+                uninstall,
+            ),
+        ] {
+            assert!(
+                matches!(
+                    dcg_control_action_proof_in_source(command, dialect, rule, None),
+                    DcgControlActionProof::Action(_)
+                ),
+                "expected Action: {dialect:?} {rule} {command:?}"
+            );
+        }
+
+        // Proven inert segments (command-looking data inside static --agent values).
+        for (dialect, command, rule) in [
+            (
+                ShellDialect::Posix,
+                r#"dcg --agent="dcg --robot allow-once abc --yes" allowlist list"#,
+                grant,
+            ),
+            (
+                ShellDialect::PowerShell,
+                r#"dcg --agent="dcg --robot allow-once abc --yes" allowlist list"#,
+                grant,
+            ),
+            (
+                ShellDialect::Cmd,
+                r#"dcg --agent="dcg --robot allow-once abc --yes" allowlist list"#,
+                grant,
+            ),
+            (
+                ShellDialect::Posix,
+                "dcg --agent='dcg --robot allow-once abc --yes' allowlist list",
+                grant,
+            ),
+            (
+                ShellDialect::PowerShell,
+                "dcg --agent='dcg --robot allow-once abc --yes' allowlist list",
+                grant,
+            ),
+            (
+                ShellDialect::Posix,
+                r#"dcg --agent="x\" --robot allow-once abc --yes" allowlist list"#,
+                grant,
+            ),
+            (
+                ShellDialect::Posix,
+                r#"dcg --agent="x\" --robot uninstall" doctor"#,
+                uninstall,
+            ),
+            (
+                ShellDialect::Posix,
+                r#"dcg --agent "x\" --robot allow-once abc --yes" allowlist list"#,
+                grant,
+            ),
+            (
+                ShellDialect::Posix,
+                "dcg --agent=$'x\\' --robot allow-once abc --yes' allowlist list",
+                grant,
+            ),
+            (
+                ShellDialect::PowerShell,
+                r#"dcg --agent="x`" --robot allow-once abc --yes" allowlist list"#,
+                grant,
+            ),
+            (
+                ShellDialect::PowerShell,
+                r#"dcg --agent="x`" --robot uninstall" doctor"#,
+                uninstall,
+            ),
+            (
+                ShellDialect::Posix,
+                r#"dcg --agent="x\" --robot allow-once" --help"#,
+                grant,
+            ),
+        ] {
+            match dcg_control_action_proof_in_source(command, dialect, rule, None) {
+                DcgControlActionProof::NoAction {
+                    proven_inert_segments,
+                } => {
+                    assert_eq!(
+                        proven_inert_segments,
+                        vec![0..command.len()],
+                        "expected full segment Inert: {dialect:?} {rule} {command:?}"
+                    );
+                }
+                other => panic!("expected Inert, got {other:?}: {dialect:?} {rule} {command:?}"),
+            }
+        }
+
+        // Unprovable commands must NOT produce any proven-inert ranges.
+        for (dialect, command, rule) in [
+            (
+                ShellDialect::Posix,
+                "env dcg --robot allow-once abc --yes",
+                grant,
+            ),
+            (ShellDialect::Posix, "DCG_BYPASS=1 dcg doctor", uninstall),
+            (
+                ShellDialect::Posix,
+                r#"dcg --agent="$(dcg --robot uninstall)" doctor"#,
+                uninstall,
+            ),
+            (
+                ShellDialect::Posix,
+                r#"dcg doctor "$(dcg --robot allow-once abc --yes)""#,
+                grant,
+            ),
+            (
+                ShellDialect::Posix,
+                "dcg --unknown-opt allow-once abc --yes",
+                grant,
+            ),
+            (ShellDialect::Posix, r#"dcg --agent="x" > /tmp/out"#, grant),
+            (
+                ShellDialect::Posix,
+                r#"{ dcg --agent="x\" --robot allow-once" doctor; }"#,
+                grant,
+            ),
+        ] {
+            match dcg_control_action_proof_in_source(command, dialect, rule, None) {
+                DcgControlActionProof::NoAction {
+                    proven_inert_segments,
+                } => {
+                    assert!(
+                        proven_inert_segments.is_empty(),
+                        "expected Unprovable (no inert spans), got {proven_inert_segments:?}: {dialect:?} {command:?}"
+                    );
+                }
+                other => {
+                    panic!("expected Unprovable, got {other:?}: {dialect:?} {rule} {command:?}")
+                }
+            }
+        }
+
+        // Compound inert + env-var segment only certifies the inert prefix.
+        let compound = r#"dcg --agent="x\" --robot allow-once" doctor && DCG_BYPASS=1 git status"#;
+        match dcg_control_action_proof_in_source(compound, ShellDialect::Posix, uninstall, None) {
+            DcgControlActionProof::NoAction {
+                proven_inert_segments,
+            } => {
+                assert_eq!(proven_inert_segments.len(), 1);
+                assert_eq!(
+                    &compound[proven_inert_segments[0].clone()],
+                    r#"dcg --agent="x\" --robot allow-once" doctor"#
+                );
+            }
+            other => panic!("expected partial Inert for compound command, got {other:?}"),
         }
     }
 

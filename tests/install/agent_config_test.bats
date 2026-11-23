@@ -6393,3 +6393,78 @@ MOCKEOF
     [ -x "$HOME/.local/bin/dcg" ]
     cmp -s "$TEST_TMPDIR/escaped-factory-before.json" "$HOME/.factory/settings.json"
 }
+
+@test "installer: minimal container without python3 and existing Claude settings completes cleanly" {
+    log_test "Testing full install.sh without python3 when settings.json already exists..."
+
+    make_claude_installer_artifact
+    mkdir -p "$HOME/.claude"
+    printf '%s\n' '{"theme":"dark","hooks":{"PreToolUse":[{"matcher":"Read","hooks":[{"type":"command","command":"unrelated"}]}]}}' > "$HOME/.claude/settings.json"
+    cp "$HOME/.claude/settings.json" "$TEST_TMPDIR/before-nopy.json"
+
+    # Build a PATH without python3 while retaining standard POSIX utilities.
+    local no_python_path="$TEST_TMPDIR/minimal-path"
+    mkdir -p "$no_python_path"
+    local tool
+    for tool in bash sh env uname id dirname basename mkdir rm mv cp cat chmod head tail grep sed awk tr wc cut sort uniq date mktemp tar xz gzip curl touch ln ls find printf true false ps pgrep; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            ln -sf "$(command -v "$tool")" "$no_python_path/$tool"
+        fi
+    done
+
+    run env PATH="$no_python_path" HOME="$HOME" DCG_SELF_HEAL_HOOK=0 SHELL=/bin/false \
+        bash "$INSTALL_SCRIPT" \
+            --version v9.9.9 \
+            --artifact-url "file://$CLAUDE_FIXTURE_ARTIFACT" \
+            --dest "$HOME/.local/bin" \
+            --easy-mode --offline --no-verify --no-gum
+    log_test "status=$status output=$output"
+
+    [ "$status" -eq 0 ]
+    [ -x "$HOME/.local/bin/dcg" ]
+    [[ "$output" == *"Claude Code: Configuration failed (python3 required for merge)"* ]]
+    cmp -s "$TEST_TMPDIR/before-nopy.json" "$HOME/.claude/settings.json"
+}
+
+@test "configure_claude_code: delegates to native dcg install when python3 is absent" {
+    log_test "Testing native dcg install fallback when python3 is unavailable..."
+
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude" "$DEST"
+    printf '%s\n' '{"theme":"dark"}' > "$CLAUDE_SETTINGS"
+
+    # Mock native dcg binary implementing `dcg install`
+    cat > "$DEST/dcg" <<'MOCKEOF'
+#!/bin/bash
+if [ "${1:-}" = "install" ]; then
+    target="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+    printf '{"theme":"dark","hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell|Monitor","hooks":[{"type":"command","command":"%s"}]}]}}
+' "$0" > "$target"
+    printf 'Hook installed successfully!\n'
+    exit 0
+fi
+exit 1
+MOCKEOF
+    chmod +x "$DEST/dcg"
+
+    local no_python_path="$TEST_TMPDIR/no-python-native"
+    mkdir -p "$no_python_path"
+    local tool
+    for tool in dirname mkdir cp date grep sed tr rm mv cat printf bash; do
+        ln -sf "$(command -v "$tool")" "$no_python_path/$tool"
+    done
+
+    local old_path="$PATH"
+    PATH="$no_python_path"
+    local rc=0
+    configure_claude_code "$CLAUDE_SETTINGS" "0" || rc=$?
+    PATH="$old_path"
+
+    log_test "CLAUDE_STATUS=$CLAUDE_STATUS rc=$rc backup=$CLAUDE_BACKUP"
+    [ "$rc" -eq 0 ]
+    [ "$CLAUDE_STATUS" = "merged" ]
+    [ -n "$CLAUDE_BACKUP" ]
+    [ -f "$CLAUDE_BACKUP" ]
+    grep -qF '"theme":"dark"' "$CLAUDE_SETTINGS"
+    grep -qF 'Bash|PowerShell|Monitor' "$CLAUDE_SETTINGS"
+}

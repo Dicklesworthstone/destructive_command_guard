@@ -5,7 +5,7 @@
 # Authenticate a pinned release installer before running this script:
 #   https://github.com/Dicklesworthstone/destructive_command_guard#quick-install-verified-release
 # After verifying the signature and pinned digest, run the local file:
-#   bash ./install.sh --version v0.17.0 --require-minisign
+#   bash ./install.sh --version v0.17.1 --require-minisign
 #
 # Options:
 #   --version vX.Y.Z   Install specific version (default: latest)
@@ -31,7 +31,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
   printf '%s\n' \
     'dcg installer: this script needs bash. Authenticate the release installer first:' \
     '  https://github.com/Dicklesworthstone/destructive_command_guard#quick-install-verified-release' \
-    'Then run the verified local file with bash ./install.sh --version v0.17.0 --require-minisign' >&2
+    'Then run the verified local file with bash ./install.sh --version v0.17.1 --require-minisign' >&2
   exit 1
 fi
 # bash run as `sh` starts in POSIX mode, which rejects the process
@@ -436,6 +436,36 @@ reasonix_home_dir() {
   printf '%s\n' "$dir"
 }
 
+# Check whether a Cursor IDE process is running without matching a sibling
+# grep process or macOS CursorUIViewService system helpers.
+# On Linux procps-ng, `pgrep -fl` prints only the short process name (not full
+# args, which requires `-fa`), so piping into `grep -qv CursorUIViewService`
+# matched the grep sibling itself on bare Linux containers. Capturing pgrep
+# output first avoids any live grep sibling, and `-fa` (Linux) / `-fl` (macOS)
+# inspects full command lines cleanly.
+cursor_process_running() {
+  command -v pgrep >/dev/null 2>&1 || return 1
+  local procs=""
+  local pgrep_rc=0
+  case "$(uname -s 2>/dev/null || true)" in
+    Darwin)
+      procs=$(pgrep -fl "[Cc]ursor" 2>/dev/null) || return 1
+      ;;
+    *)
+      procs=$(pgrep -fa "[Cc]ursor" 2>/dev/null) || pgrep_rc=$?
+      if [ "$pgrep_rc" -gt 1 ]; then
+        procs=$(pgrep -fl "[Cc]ursor" 2>/dev/null) || return 1
+      elif [ "$pgrep_rc" -ne 0 ]; then
+        return 1
+      fi
+      ;;
+  esac
+  [ -n "$procs" ] || return 1
+  printf '%s\n' "$procs" |
+    grep -Ev 'CursorUIViewService|/System/Library/' |
+    grep -qvE '^[0-9]+[[:space:]]+(pgrep|grep)([[:space:]]|$)'
+}
+
 detect_agents() {
   DETECTED_AGENTS=()
 
@@ -484,10 +514,8 @@ detect_agents() {
   local cursor_settings_linux="$HOME/.config/Cursor/User/settings.json"
   if [[ -d "$HOME/.cursor" ]] || [[ -f "$cursor_settings_mac" ]] || [[ -f "$cursor_settings_linux" ]] || command -v cursor &>/dev/null; then
     cursor_detected=1
-  elif command -v pgrep >/dev/null 2>&1; then
-    if pgrep -fl "[Cc]ursor" 2>/dev/null | grep -qv 'CursorUIViewService\|/System/Library/'; then
-      cursor_detected=1
-    fi
+  elif cursor_process_running; then
+    cursor_detected=1
   fi
 
   if [ "$cursor_detected" -eq 1 ]; then
@@ -2316,8 +2344,54 @@ PYEOF
     fi
 
     if ! command -v python3 >/dev/null 2>&1; then
+      # Without python3, delegate to the freshly installed native dcg binary
+      # when available and no legacy git_safety_guard predecessor cleanup is
+      # needed. `dcg install` applies the same #582 atomic, host-field-preserving
+      # JSON merge semantics in pure Rust without requiring Python.
+      local settings_base="${settings_file##*/}"
+      if [ "$settings_base" = "settings.json" ] && [ -x "$DEST/dcg" ] &&
+         { [ "$cleanup_predecessor" -eq 0 ] || ! grep -qF "git_safety_guard" "$settings_file" 2>/dev/null; }; then
+        local backup_base backup_suffix=0
+        backup_base="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
+        CLAUDE_BACKUP="$backup_base"
+        while [ -e "$CLAUDE_BACKUP" ] || [ -L "$CLAUDE_BACKUP" ]; do
+          backup_suffix=$((backup_suffix + 1))
+          CLAUDE_BACKUP="${backup_base}.${backup_suffix}"
+        done
+        if ! cp "$settings_file" "$CLAUDE_BACKUP"; then
+          CLAUDE_STATUS="failed"
+          CLAUDE_FAILURE_REASON="could not back up existing settings.json; left unchanged"
+          CLAUDE_BACKUP=""
+          return 0
+        fi
+        local native_out=""
+        local native_rc=0
+        native_out=$(CLAUDE_CONFIG_DIR="$settings_dir" NO_COLOR=1 "$DEST/dcg" install 2>&1) || native_rc=$?
+        if [ "$native_rc" -eq 0 ]; then
+          if printf '%s\n' "$native_out" | grep -qF "Hook installed successfully!"; then
+            CLAUDE_STATUS="merged"
+            AUTO_CONFIGURED=1
+            return 0
+          elif printf '%s\n' "$native_out" | grep -qF "Hook already installed!"; then
+            rm -f "$CLAUDE_BACKUP" 2>/dev/null || true
+            CLAUDE_BACKUP=""
+            CLAUDE_STATUS="already"
+            AUTO_CONFIGURED=1
+            return 0
+          fi
+        fi
+        rm -f "$CLAUDE_BACKUP" 2>/dev/null || true
+        CLAUDE_BACKUP=""
+        if [ "$native_rc" -ne 0 ] && [ -n "$native_out" ]; then
+          CLAUDE_STATUS="failed"
+          CLAUDE_FAILURE_REASON="native merge failed; existing settings left unchanged"
+          warn "Claude Code native hook merge failed; leaving existing settings unchanged: $settings_file"
+          return 1
+        fi
+      fi
       CLAUDE_STATUS="failed"
       CLAUDE_FAILURE_REASON="python3 required for merge"
+      warn "Claude Code hook merge skipped ($CLAUDE_FAILURE_REASON); run 'dcg install' or install python3 and re-run installer"
       return 1
     fi
 
@@ -2573,12 +2647,24 @@ PYEOF
       return 0
     fi
 
-    # Without Python, only paths needing neither shell nor JSON escaping can
-    # be safely emitted. Existing settings are never rewritten by this path.
+    # Without Python, delegate paths requiring shell/JSON quoting to the native
+    # dcg binary when available; otherwise only plain paths can be safely
+    # emitted. Existing settings are never rewritten by this path.
     case "$DEST/dcg" in
       *[!a-zA-Z0-9_./-]*)
+        local settings_base="${settings_file##*/}"
+        if [ "$settings_base" = "settings.json" ] && [ -x "$DEST/dcg" ]; then
+          local native_out=""
+          if native_out=$(CLAUDE_CONFIG_DIR="$settings_dir" NO_COLOR=1 "$DEST/dcg" install 2>&1) &&
+             printf '%s\n' "$native_out" | grep -qF "Hook installed successfully!"; then
+            CLAUDE_STATUS="created"
+            AUTO_CONFIGURED=1
+            return 0
+          fi
+        fi
         CLAUDE_STATUS="failed"
         CLAUDE_FAILURE_REASON="python3 required to quote the hook command"
+        warn "Claude Code hook creation skipped ($CLAUDE_FAILURE_REASON); run 'dcg install' or install python3 and re-run installer"
         return 1
         ;;
     esac
@@ -3277,10 +3363,8 @@ configure_cursor() {
   local cursor_installed=0
   if [[ -d "$HOME/.cursor" ]] || [[ -f "$CURSOR_SETTINGS_MAC" ]] || [[ -f "$CURSOR_SETTINGS_LINUX" ]] || command -v cursor >/dev/null 2>&1; then
     cursor_installed=1
-  elif command -v pgrep >/dev/null 2>&1; then
-    if pgrep -fl "[Cc]ursor" 2>/dev/null | grep -qv 'CursorUIViewService\|/System/Library/'; then
-      cursor_installed=1
-    fi
+  elif cursor_process_running; then
+    cursor_installed=1
   fi
 
   if [ "$cursor_installed" -eq 0 ]; then
@@ -4232,35 +4316,40 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
     fi
   fi
 
+  # Each configure_* helper records its own terminal *_STATUS and
+  # *_FAILURE_REASON rendered in the final summary; do not let `set -e` abort
+  # remaining agent configuration or hide the summary on a non-fatal failure
+  # (e.g., missing python3 in a minimal container).
+
   # Always configure Claude Code (creates directory if needed)
-  configure_claude_code "$CLAUDE_SETTINGS" "$REMOVE_PREDECESSOR"
+  configure_claude_code "$CLAUDE_SETTINGS" "$REMOVE_PREDECESSOR" || true
 
   # Configure Gemini CLI (if installed)
-  configure_gemini "$GEMINI_SETTINGS"
+  configure_gemini "$GEMINI_SETTINGS" || true
 
   # Configure Aider (if installed)
-  configure_aider "$AIDER_SETTINGS"
+  configure_aider "$AIDER_SETTINGS" || true
 
   # Configure Continue (if installed)
-  configure_continue
+  configure_continue || true
 
   # Configure Codex CLI (if installed)
-  configure_codex
+  configure_codex || true
 
   # Configure GitHub Copilot CLI's user-level hook (all workspaces).
-  configure_copilot
+  configure_copilot || true
 
   # Configure Cursor IDE (if installed)
-  configure_cursor
+  configure_cursor || true
 
   # Configure Hermes Agent (if installed)
-  configure_hermes
+  configure_hermes || true
 
   # Configure Posit Assistant (if installed)
-  configure_posit_assistant
+  configure_posit_assistant || true
 
   # Configure OpenCode (if installed)
-  configure_opencode
+  configure_opencode || true
 
   # Configure Crush (if installed). A failure is a terminal CRUSH_STATUS
   # rendered in the summary; do not let `set -e` abort other install work.

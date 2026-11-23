@@ -29738,40 +29738,70 @@ fn evaluate_packs_with_allowlists_at_depth(
                         )
                 },
             );
+            let guardrail_env_rule = pack_id == "careful_company_running_windows.guardrails"
+                && matches!(
+                    pattern.name,
+                    Some("dcg-bypass-or-uninstall" | "dcg-policy-self-weakening")
+                );
             if matched_span.is_none()
-                && unscoped_external
+                && (unscoped_external || guardrail_env_rule)
                 && custom_command_for_match != command_for_packs
             {
-                // Normalization may remove an assignment or wrapper read by
-                // the assertion. Retry the complete source-preserving view,
-                // retaining its masks and byte-for-byte source mapping.
-                let (raw_ranges, raw_safe_inputs) = custom_pattern_inputs.get_or_init(|| {
-                    (
-                        command_segment_ranges_in_dialect(original_command, shell_dialect),
-                        SafePatternInputs::new(original_command, input_command, shell_dialect),
-                    )
-                });
+                // Normalization strips leading `NAME=value` assignments and
+                // wrappers. Retry the complete source-preserving view for
+                // unscoped custom rules (#671) and for guardrail env-var
+                // branches (`DCG_BYPASS=1 ...`, `DCG_DISABLE=...`), accepting
+                // only non-`dcg`-command branches on the guardrail retry so a
+                // harmless leading `FOO=bar` never bypasses a proven-inert
+                // `dcg` segment.
                 matching_command = custom_command_for_match;
                 matching_offset = Some(0);
-                matched_span = find_actionable_command_pattern_span(
-                    pack_id,
-                    pattern.name,
-                    &pattern.regex,
-                    matching_command,
-                    Some((original_command, 0)),
-                    shell_dialect,
-                    deadline,
-                    |span| {
-                        !raw_safe_inputs.match_is_exempt(
-                            pack,
-                            matching_command,
-                            span,
-                            raw_ranges,
-                            false,
-                            deadline,
+                if unscoped_external {
+                    let (raw_ranges, raw_safe_inputs) = custom_pattern_inputs.get_or_init(|| {
+                        (
+                            command_segment_ranges_in_dialect(original_command, shell_dialect),
+                            SafePatternInputs::new(original_command, input_command, shell_dialect),
                         )
-                    },
-                );
+                    });
+                    matched_span = find_actionable_command_pattern_span(
+                        pack_id,
+                        pattern.name,
+                        &pattern.regex,
+                        matching_command,
+                        Some((original_command, 0)),
+                        shell_dialect,
+                        deadline,
+                        |span| {
+                            !raw_safe_inputs.match_is_exempt(
+                                pack,
+                                matching_command,
+                                span,
+                                raw_ranges,
+                                false,
+                                deadline,
+                            )
+                        },
+                    );
+                } else {
+                    matched_span = find_actionable_command_pattern_span(
+                        pack_id,
+                        pattern.name,
+                        &pattern.regex,
+                        matching_command,
+                        Some((original_command, 0)),
+                        shell_dialect,
+                        deadline,
+                        |span| {
+                            !matching_command
+                                .get(span.start..span.end)
+                                .and_then(|matched| matched.split_ascii_whitespace().next())
+                                .is_some_and(|word| {
+                                    word.eq_ignore_ascii_case("dcg")
+                                        || word.eq_ignore_ascii_case("dcg.exe")
+                                })
+                        },
+                    );
+                }
             }
 
             if deadline_exceeded(deadline) {
@@ -36655,40 +36685,56 @@ fn find_actionable_command_pattern_span(
     if deadline_exceeded(deadline) {
         return None;
     }
-    // The guardrails regex also covers environment/control mutations. Add a
-    // native argv proof for its DCG-command branches so an escaped space in
-    // one --agent value cannot hide the following real subcommand. Keep the
-    // existing rule identity, source-data checks and regex fallback.
+    // The guardrails regex also covers environment/control mutations. Run the
+    // native argv proof for its DCG-command branches:
+    // - `Action(range)` proves a real DCG control change (including across
+    //   escaped spaces or obfuscated options).
+    // - `NoAction { proven_inert_segments }` records top-level `dcg` segments
+    //   whose native argv proves they do NOT perform `rule`, so the regex
+    //   fallback skips `dcg`-command matches wholly within those segments
+    //   (preventing false blocks on command-looking `--agent` argument data
+    //   with escaped quotes) while keeping env-var / `uninstall.ps1` branches
+    //   and all unproved segments fully active.
+    let mut proven_inert_dcg_segments = Vec::new();
     if pack_id == "careful_company_running_windows.guardrails"
         && let Some(rule @ ("dcg-bypass-or-uninstall" | "dcg-policy-self-weakening")) = pattern_name
-        && let Some(range) =
-            crate::packs::careful_company_running_windows::guardrails::dcg_control_action_span_in_source(
-                command,
-                shell_dialect,
-                rule,
-                source_context,
-            )
     {
-        let span = MatchSpan {
-            start: range.start,
-            end: range.end,
-        };
-        if !command_pattern_match_is_inert_quoted_data(
-            pack_id,
-            pattern_name,
+        match crate::packs::careful_company_running_windows::guardrails::dcg_control_action_proof_in_source(
             command,
-            span,
-            source_context,
             shell_dialect,
-        ) && !command_match_is_literal_safe_inline_script(
-            pack_id,
-            pattern_name,
-            command,
-            span,
+            rule,
             source_context,
-        ) && accepts_span(span)
-        {
-            return Some(span);
+        ) {
+            crate::packs::careful_company_running_windows::guardrails::DcgControlActionProof::Action(
+                range,
+            ) => {
+                let span = MatchSpan {
+                    start: range.start,
+                    end: range.end,
+                };
+                if !command_pattern_match_is_inert_quoted_data(
+                    pack_id,
+                    pattern_name,
+                    command,
+                    span,
+                    source_context,
+                    shell_dialect,
+                ) && !command_match_is_literal_safe_inline_script(
+                    pack_id,
+                    pattern_name,
+                    command,
+                    span,
+                    source_context,
+                ) && accepts_span(span)
+                {
+                    return Some(span);
+                }
+            }
+            crate::packs::careful_company_running_windows::guardrails::DcgControlActionProof::NoAction {
+                proven_inert_segments,
+            } => {
+                proven_inert_dcg_segments = proven_inert_segments;
+            }
         }
     }
     let (source, source_base) = source_context.unwrap_or((command, 0));
@@ -36725,6 +36771,22 @@ fn find_actionable_command_pattern_span(
             // arrow expression or proven redirect may be followed by another
             // real, unproven redirect that must still be considered.
             search_start = operator + 1;
+            continue;
+        }
+        if !proven_inert_dcg_segments.is_empty()
+            && command
+                .get(start..end)
+                .and_then(|matched| matched.split_ascii_whitespace().next())
+                .is_some_and(|word| {
+                    word.eq_ignore_ascii_case("dcg") || word.eq_ignore_ascii_case("dcg.exe")
+                })
+            && proven_inert_dcg_segments
+                .iter()
+                .any(|seg| seg.start <= start && end <= seg.end)
+        {
+            // Advance one UTF-8 char (not past `end`) so an env-var branch
+            // inside or after this inert `dcg` segment is never skipped.
+            search_start = start + command[start..].chars().next()?.len_utf8();
             continue;
         }
         if !command_pattern_match_is_inert_quoted_data(

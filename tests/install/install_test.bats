@@ -1449,3 +1449,36 @@ MOCKEOF
             ;;
     esac
 }
+
+@test "cursor_process_running: ignores Linux procps-ng pgrep -fl grep self-match and macOS helper" {
+    log_test "Testing cursor_process_running pgrep edge cases..."
+
+    # Simulate Linux procps-ng `pgrep -fl` printing short process name `grep`
+    # when `-fa` is unavailable, plus macOS CursorUIViewService helper.
+    cat > "$TEST_TMPDIR/bin/pgrep" <<'MOCKEOF'
+#!/bin/bash
+if [ "${1:-}" = "-fa" ]; then
+    exit 2
+fi
+printf '12345 grep\n'
+printf '12346 /System/Library/Frameworks/ApplicationServices.framework/CursorUIViewService\n'
+MOCKEOF
+    chmod +x "$TEST_TMPDIR/bin/pgrep"
+
+    run cursor_process_running
+    [ "$status" -eq 1 ]
+
+    # Now simulate an actual running Cursor IDE process via `pgrep -fa`.
+    cat > "$TEST_TMPDIR/bin/pgrep" <<'MOCKEOF'
+#!/bin/bash
+if [ "${1:-}" = "-fa" ] || [ "${1:-}" = "-fl" ]; then
+    printf '54321 /usr/share/cursor/cursor --no-sandbox\n'
+    exit 0
+fi
+exit 1
+MOCKEOF
+    chmod +x "$TEST_TMPDIR/bin/pgrep"
+
+    run cursor_process_running
+    [ "$status" -eq 0 ]
+}

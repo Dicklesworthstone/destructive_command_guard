@@ -11,7 +11,15 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## Unreleased
+## [v0.17.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.17.1) -- 2026-11-23 [Release]
+
+This patch release ships whole-command lookaround preservation for custom
+packs (`#671`), finishes the `careful_company_running_windows.guardrails`
+tri-state native argv proof so command-looking `--agent` argument data with
+escaped quotes is not falsely blocked while preserving all self-weakening and
+environment-override blocks, fixes `install.sh` on minimal containers lacking
+`python3` (plus Linux `procps-ng` Cursor detection), and resolves
+`RUSTSEC-2026-0594` (`cookie` `0.18.3`).
 
 **Unscoped custom-pack lookarounds retain whole-command context (#671).** A
 lookahead or lookbehind can depend on text across a shell separator even when
@@ -21,6 +29,30 @@ matching also retains assignments and wrappers needed by such assertions.
 Safe-pattern exemptions and rule allowlists still apply; an exempt occurrence
 cannot hide a later or overlapping match of the same rule. Searches preserve
 anchors, lookbehind, UTF-8 boundaries, and the evaluation deadline.
+
+**Guardrails pack tri-state argv proof & leading env-var overrides (`bd-guardrails-global-options`).**
+`dcg_segment_action_span` now returns a tri-state proof (`Action` / `Inert` /
+`Unprovable`). Proven-inert top-level `dcg` invocations with command-looking
+`--agent` values (including escaped quotes such as POSIX `"`, ANSI-C `\'`
+and PowerShell backtick-escaped quotes) no longer trigger the regex fallback's
+`dcg`-command branch, while all self-weakening subcommands (`allow-once`,
+`allow`, `allowlist add|add-command|import`, `uninstall`), unprovable segments
+(wrappers, substitutions, unknown flags, redirections), and environment
+override branches (`DCG_BYPASS=1`, `DCG_DISABLE=...`, `Set-Item env:DCG_BYPASS`,
+including leading `NAME=value` prefixes) remain strictly blocked.
+
+**Minimal-container `install.sh` without `python3` & Linux `pgrep` Cursor detection.**
+When `python3` is unavailable and `~/.claude/settings.json` already exists,
+`configure_claude_code` now delegates to the freshly installed native `dcg
+install` binary (atomic, host-field-preserving pure-Rust merge) and falls back
+gracefully with a non-fatal warning when native merge is inapplicable; all
+`configure_*` calls in `install.sh` are guarded so a hook-merge failure never
+aborts installation under `set -e`. Cursor process detection now captures
+`pgrep -fa` on Linux (`-fl` on macOS) before filtering so `procps-ng`'s short
+process name output no longer matches its own `grep` sibling on bare containers.
+
+**Security advisory fix (`RUSTSEC-2026-0594`).** Updated `cookie` from
+`0.18.2` to `0.18.3` in `Cargo.lock` (`cargo audit`: 0 vulnerabilities).
 
 ## [v0.17.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.17.0) -- 2026-11-21 [Release]
 

@@ -593,9 +593,9 @@ dependencies = [
 
 [[package]]
 name = "cookie"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
 dependencies = [
  "percent-encoding",
  "time",
@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "destructive_command_guard"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "aho-corasick",
  "assert_cmd",

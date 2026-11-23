@@ -607,6 +607,334 @@ fn hook_protocol_keeps_guardrails_active_with_global_options() {
 
 /// #647: a bounded semantic scan must inspect the whole supported program.
 /// These commands are classifier input on stdin; no PowerShell is executed.
+#[test]
+fn tri_state_guardrails_allows_escaped_quote_argument_data_and_preserves_security_controls() {
+    // All 6 baseline self-weakening DENY cases (direct and --robot prefixed).
+    for (command, rule) in [
+        (
+            "dcg allow-once abc123 --yes",
+            "careful_company_running_windows.guardrails:dcg-policy-self-weakening",
+        ),
+        (
+            "dcg --robot allow-once abc123 --yes",
+            "careful_company_running_windows.guardrails:dcg-policy-self-weakening",
+        ),
+        (
+            "dcg allowlist add core.git:reset-hard --reason approved",
+            "careful_company_running_windows.guardrails:dcg-policy-self-weakening",
+        ),
+        (
+            "dcg --robot allowlist add core.git:reset-hard --reason approved",
+            "careful_company_running_windows.guardrails:dcg-policy-self-weakening",
+        ),
+        (
+            "dcg uninstall --yes",
+            "careful_company_running_windows.guardrails:dcg-bypass-or-uninstall",
+        ),
+        (
+            "dcg --robot uninstall --yes",
+            "careful_company_running_windows.guardrails:dcg-bypass-or-uninstall",
+        ),
+    ] {
+        for dialect in ["posix", "powershell", "cmd", "unknown"] {
+            let (result, full) = dcg_test_in_dialect(command, dialect);
+            assert!(
+                result.starts_with("Result: BLOCKED"),
+                "[{dialect}] {command:?}: {full}"
+            );
+            let pattern = rule.split_once(':').unwrap().1;
+            assert!(
+                full.contains(&format!("Pattern: {pattern}")),
+                "[{dialect}] expected {rule} for {command:?}: {full}"
+            );
+        }
+    }
+
+    // Command-looking argument data must NOT be blocked by the regex fallback
+    // when native argv parsing proves the segment inert.
+    for (dialect, command) in [
+        (
+            "posix",
+            r#"dcg --agent="dcg --robot allow-once abc --yes" allowlist list"#,
+        ),
+        (
+            "powershell",
+            r#"dcg --agent="dcg --robot allow-once abc --yes" allowlist list"#,
+        ),
+        (
+            "cmd",
+            r#"dcg --agent="dcg --robot allow-once abc --yes" allowlist list"#,
+        ),
+        (
+            "unknown",
+            r#"dcg --agent="dcg --robot allow-once abc --yes" allowlist list"#,
+        ),
+        (
+            "posix",
+            "dcg --agent='dcg --robot allow-once abc --yes' allowlist list",
+        ),
+        (
+            "powershell",
+            "dcg --agent='dcg --robot allow-once abc --yes' allowlist list",
+        ),
+        (
+            "posix",
+            r#"dcg --agent="x\" --robot allow-once abc --yes" allowlist list"#,
+        ),
+        ("posix", r#"dcg --agent="x\" --robot uninstall" doctor"#),
+        (
+            "posix",
+            r#"dcg --agent="x\" allowlist add core.git:reset-hard" allowlist list"#,
+        ),
+        (
+            "posix",
+            r#"dcg --agent "x\" --robot allow-once abc --yes" allowlist list"#,
+        ),
+        (
+            "posix",
+            "dcg --agent=$'x\\' --robot allow-once abc --yes' allowlist list",
+        ),
+        ("posix", r#"dcg --agent="x\" --robot allow-once" --help"#),
+        (
+            "powershell",
+            r#"dcg --agent="x`" --robot allow-once abc --yes" allowlist list"#,
+        ),
+        (
+            "powershell",
+            r#"dcg --agent="x`" --robot uninstall" doctor"#,
+        ),
+    ] {
+        let (result, full) = dcg_test_in_dialect(command, dialect);
+        assert_eq!(result, "Result: ALLOWED", "[{dialect}] {command:?}: {full}");
+    }
+
+    // Planted negatives: env-var branches, follow-on destructive commands,
+    // wrappers, and command substitutions must STILL be blocked!
+    for (dialect, command, expected_pattern) in [
+        (
+            "posix",
+            r#"dcg --agent="x\" --robot allow-once" doctor && DCG_BYPASS=1 git status"#,
+            Some("dcg-bypass-or-uninstall"),
+        ),
+        (
+            "posix",
+            r#"dcg --agent="x\" --robot allow-once" doctor; DCG_DISABLE=core.git git status"#,
+            Some("dcg-policy-self-weakening"),
+        ),
+        (
+            "posix",
+            r#"DCG_BYPASS=1 dcg --agent="x\" --robot allow-once" doctor"#,
+            Some("dcg-bypass-or-uninstall"),
+        ),
+        (
+            "posix",
+            r#"DCG_DISABLE=core.git dcg --agent="x\" --robot allow-once" allowlist list"#,
+            Some("dcg-policy-self-weakening"),
+        ),
+        (
+            "posix",
+            r#"dcg --agent="x\" --robot allow-once" allowlist list && dcg --robot allow-once abc --yes"#,
+            Some("dcg-policy-self-weakening"),
+        ),
+        (
+            "posix",
+            r#"dcg --agent="x\" --robot allow-once" doctor; env dcg --robot allow-once abc --yes"#,
+            Some("dcg-policy-self-weakening"),
+        ),
+        (
+            "posix",
+            r#"dcg --agent="x\" --robot allow-once" doctor; dcg --robot uninstall --yes"#,
+            Some("dcg-bypass-or-uninstall"),
+        ),
+        (
+            "posix",
+            r#"dcg --agent="x\" --robot allow-once" doctor && powershell -File C:\tools\uninstall.ps1"#,
+            Some("dcg-bypass-or-uninstall"),
+        ),
+        (
+            "powershell",
+            r#"dcg --agent="x`" --robot allow-once" doctor; Set-Item env:DCG_BYPASS 1"#,
+            Some("dcg-bypass-or-uninstall"),
+        ),
+        (
+            "posix",
+            r#"dcg --agent="$(dcg --robot uninstall)" doctor"#,
+            None,
+        ),
+        (
+            "posix",
+            r#"dcg doctor "$(dcg --robot allow-once abc --yes)""#,
+            None,
+        ),
+    ] {
+        let (result, full) = dcg_test_in_dialect(command, dialect);
+        assert!(
+            result.starts_with("Result: BLOCKED"),
+            "[{dialect}] planted negative must block: {command:?}: {full}"
+        );
+        if let Some(pattern) = expected_pattern {
+            assert!(
+                full.contains(&format!("Pattern: {pattern}")),
+                "[{dialect}] expected Pattern: {pattern} for {command:?}: {full}"
+            );
+        }
+    }
+
+    // Native hook protocol verification (Bash & PowerShell) with isolated config.
+    use std::io::Write;
+    let temp = tempfile::tempdir().expect("isolated hook test");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("isolated home");
+    let config = temp.path().join("config.toml");
+    std::fs::write(&config, "[history]\nenabled = false\n").expect("hook config");
+    for (tool_name, command, expected_rule) in [
+        (
+            "Bash",
+            "dcg allow-once abc123 --yes",
+            Some("dcg-policy-self-weakening"),
+        ),
+        (
+            "Bash",
+            "dcg --robot allow-once abc123 --yes",
+            Some("dcg-policy-self-weakening"),
+        ),
+        (
+            "Bash",
+            "dcg allowlist add core.git:reset-hard --reason approved",
+            Some("dcg-policy-self-weakening"),
+        ),
+        (
+            "Bash",
+            "dcg --robot allowlist add core.git:reset-hard --reason approved",
+            Some("dcg-policy-self-weakening"),
+        ),
+        (
+            "Bash",
+            "dcg uninstall --yes",
+            Some("dcg-bypass-or-uninstall"),
+        ),
+        (
+            "Bash",
+            "dcg --robot uninstall --yes",
+            Some("dcg-bypass-or-uninstall"),
+        ),
+        (
+            "Bash",
+            r#"dcg --agent="x\" --robot allow-once abc --yes" allowlist list"#,
+            None,
+        ),
+        (
+            "Bash",
+            r#"dcg --agent="x\" --robot uninstall" doctor"#,
+            None,
+        ),
+        (
+            "Bash",
+            "dcg --agent=$'x\\' --robot allow-once abc --yes' allowlist list",
+            None,
+        ),
+        (
+            "Bash",
+            r#"dcg --agent="x\" --robot allow-once" doctor && DCG_BYPASS=1 git status"#,
+            Some("dcg-bypass-or-uninstall"),
+        ),
+        (
+            "PowerShell",
+            r#"dcg --agent="x`" --robot allow-once abc --yes" allowlist list"#,
+            None,
+        ),
+        (
+            "PowerShell",
+            r#"dcg --agent="x`" --robot allow-once" doctor; Set-Item env:DCG_BYPASS 1"#,
+            Some("dcg-bypass-or-uninstall"),
+        ),
+    ] {
+        let payload = serde_json::json!({
+            "tool_name": tool_name,
+            "tool_input": { "command": command }
+        })
+        .to_string();
+        let mut child = Command::new(dcg_binary())
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", temp.path().join("xdg"))
+            .env("DCG_CONFIG", &config)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .env("DCG_PACKS", PACKS)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn dcg hook");
+        child
+            .stdin
+            .as_mut()
+            .expect("hook stdin")
+            .write_all(payload.as_bytes())
+            .expect("write hook stdin");
+        let output = child.wait_with_output().expect("wait dcg hook");
+        assert!(
+            output.status.success(),
+            "[{tool_name}] hook failed for {command:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(rule) = expected_rule {
+            let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|err| {
+                panic!("[{tool_name}] expected deny JSON for {command:?}: {err}: {stdout:?}")
+            });
+            assert_eq!(
+                json["hookSpecificOutput"]["permissionDecision"], "deny",
+                "[{tool_name}] {command:?}: {stdout}"
+            );
+            let expected_full = format!("careful_company_running_windows.guardrails:{rule}");
+            let reason = json["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap_or("");
+            assert!(
+                json["hookSpecificOutput"]["ruleId"].as_str() == Some(expected_full.as_str())
+                    || reason.contains(&format!("Rule: {expected_full}")),
+                "[{tool_name}] expected {expected_full} for {command:?}: {stdout}"
+            );
+        } else {
+            assert!(
+                stdout.trim().is_empty(),
+                "[{tool_name}] expected allow for {command:?}, got {stdout:?}"
+            );
+        }
+    }
+
+    // Default enabled-pack policy (without guardrails opt-in) remains unchanged.
+    let default_out = Command::new(dcg_binary())
+        .args([
+            "test",
+            "--dialect",
+            "posix",
+            "dcg --robot allow-once abc123 --yes",
+        ])
+        .env_clear()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", temp.path().join("xdg"))
+        .env("DCG_CONFIG", &config)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run default policy test");
+    let default_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&default_out.stdout),
+        String::from_utf8_lossy(&default_out.stderr)
+    );
+    assert!(
+        default_text.contains("Result: ALLOWED"),
+        "default pack policy should remain unchanged: {default_text}"
+    );
+}
+
 mod issue_647 {
     use super::dcg_binary;
     use destructive_command_guard::config::DEFAULT_MAX_COMMAND_BYTES;
