@@ -122,7 +122,7 @@ rich_rust = { version = "0.2.2", features = ["markdown"], optional = true }
 # nix is already compiled in through ctrlc; this only turns on two of its
 # features, so no new crate enters the graph and `#![forbid(unsafe_code)]`
 # still holds here.
-nix ={ version = "0.31", default-features = false, features = ["hostname", "resource"] }
+nix ={ version = "0.32", default-features = false, features = ["hostname", "resource"] }
 # Safe descriptor-based ownership and Linux extended-attribute preservation
 # during atomic settings replacement. Already present in the dependency graph.
 rustix = { version = "1.1.5", features = ["fs"] }
