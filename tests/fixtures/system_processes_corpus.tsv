@@ -1,0 +1,133 @@
+# system.processes corpus (bd-wx2x). Format: expect<TAB>command.
+# DATA ONLY: each command is passed to `dcg test` as an argument and classified; none is executed.
+# Two incidents on one developer Mac:
+deny	kill_tree() { local p=$1; for c in $(pgrep -P $p); do kill_tree $c; done; kill -TERM $p 2>/dev/null; }
+deny	kill_tree() { local p=$1; for c in $(pgrep -P $p); do kill_tree $c; done; kill -TERM $p 2>/dev/null; }; for p in $(pgrep -f 'verify_loop[.]sh'); do kill_tree $(ps -o ppid= -p $p | tr -d ' '); done; sleep 2
+deny	pkill -f 'sleep 90' -P 1
+# Pattern and name kills
+deny	pkill -f my-unique-job
+deny	/usr/bin/pkill node
+deny	/usr/bin/pkill -f foo
+deny	sudo pkill -9 cargo
+deny	sudo pkill -f foo
+deny	env FOO=1 pkill node
+deny	nohup pkill -f foo
+deny	timeout 5 pkill -f foo
+deny	killall Finder
+deny	killall -9 rustc
+# Broadcast: every process the caller may signal
+deny	kill -TERM -1
+deny	kill -9 -1
+deny	kill -- -1
+deny	kill -s KILL -1
+deny	kill -1
+deny	/bin/kill -9 -1
+deny	builtin kill -9 -1
+deny	command kill -9 -1
+deny	command -p kill -TERM -1
+deny	env kill -9 -1
+deny	sudo kill -9 -1
+# Computed PIDs
+deny	kill $(pgrep -f verify_loop)
+deny	kill -9 $(lsof -t -i:3000)
+deny	kill -TERM `pgrep rustc`
+deny	kill $(ps -o ppid= -p 1234)
+deny	kill -TERM $(ps -o ppid= -p $$)
+deny	/bin/kill $(pgrep -f foo)
+deny	builtin kill $(pgrep -f foo)
+deny	command kill $(pgrep -f foo)
+deny	sudo kill $(pgrep -f foo)
+# Lookup piped or looped into a kill
+deny	pgrep -f foo | xargs kill
+deny	lsof -ti:8080 | xargs kill -9
+deny	pgrep -f foo | xargs -r kill -TERM
+deny	find /tmp -name '*.pid' -exec kill {} \;
+deny	for p in $(pgrep -f 'ab_driver[.]sh'); do kill -TERM $p; done
+deny	p=$(pgrep -f myjob); kill $p
+deny	P=$(pgrep -f x); kill -TERM "$P"
+deny	for p in $(ps -axo pid,command | awk '/myjob/{print $1}'); do kill $p; done
+deny	for c in $(ps -axo pid=,ppid= | awk '$2==123{print $1}'); do kill $c; done
+deny	ps -axo pid,command | grep myjob | awk '{print $1}' | while read p; do kill $p; done
+deny	for g in $(ps -eo pgid,args | grep k310 | awk '{print $1}'); do kill -TERM -- -$g; done
+# Shell wrappers and inline scripts
+deny	bash -c 'pkill -f foo'
+deny	sh -c 'pkill -f foo'
+deny	sh -c 'kill -9 -1'
+deny	zsh -c "kill -TERM -1"
+deny	zsh -c "for p in \$(pgrep -f x); do kill \$p; done"
+deny	nohup sh -c 'sleep 5; pkill -f x' &
+deny	python3 -c 'import os; os.kill(-1, 9)'
+deny	python3 -c 'import os; os.killpg(0, 15)'
+deny	python3 -c 'import os, psutil; [p.kill() for p in psutil.process_iter() if "x" in " ".join(p.cmdline())]'
+deny	node -e 'process.kill(-1, "SIGTERM")'
+# Remote pattern kills
+deny	ssh build-1 'pkill -f cargo'
+deny	ssh build-2 "killall rustc"
+deny	ssh build-3 'for p in $(pgrep -f x); do kill $p; done'
+deny	ssh -o ConnectTimeout=5 build-1 "pgrep -f cargo | while read p; do kill -9 \$p; done"
+deny	ssh build-4 'kill -TERM $(pgrep -P 4007490) 4007490'
+deny	ssh build-5 'kill $(pgrep -f foo)'
+deny	ssh build-5 'kill_tree() { for c in $(pgrep -P $1); do kill_tree $c; done; kill -TERM $1; }; kill_tree $(cat /x.pid)'
+deny	timeout 60 ssh build-4 'for g in $(ps -eo pgid,args | grep k310 | awk "{print \$1}"); do kill -TERM -- -$g; done'
+# launchd domains
+deny	launchctl bootout gui/501
+deny	launchctl bootout gui/$UID
+deny	launchctl bootout user/$(id -u)
+# Recorded PIDs and process groups
+allow	kill 12345
+allow	kill -TERM 12345
+allow	kill -9 12345 12346
+allow	kill -s TERM 12345
+allow	kill -HUP 4242
+allow	/bin/kill -TERM 12345
+allow	sudo kill -HUP 4321
+allow	kill -0 12345
+allow	kill -0 $pid
+allow	kill -l
+allow	kill %1
+allow	kill $!
+allow	kill -TERM "$PID"
+allow	kill "$(cat /tmp/job.pid)"
+allow	kill -TERM $(cat "$S/lane.pid")
+allow	kill $(< /tmp/job.pid)
+allow	kill $(cat /var/tmp/w/gate.pid) 2>/dev/null; ls
+allow	kill -TERM -12345
+allow	kill -- -12345
+allow	kill -TERM -$PGID
+allow	kill -9 -- -$pg
+allow	kill -s TERM -- -4242
+allow	P=$(cat gate.pid) && G=$(ps -o pgid= -p $P | tr -d " ") && kill -TERM -- -$G
+allow	PID=$(cat job.pid); ps -o pid,ppid,pgid,command -p $PID; kill $PID
+allow	if ! kill -0 $(cat /var/tmp/w/gate.pid) 2>/dev/null; then echo DEAD; fi
+allow	kill -TERM 12345 && sleep 2 && ps -o pid,command -p 12345
+allow	kill 12345; sleep 1; pgrep -fl myjob
+allow	pgrep -fl myjob; kill 12345
+allow	ssh build-2 'kill 12345'
+allow	ssh build-5 'P=$(cat /x.pid); kill "$P"'
+# Looking, not killing
+allow	ps -o ppid= -p 4242
+allow	ps -o pid,ppid,pgid,command -p 12345
+allow	pgrep -fl verify_loop
+allow	pgrep -f 'ab_driver[.]sh' | head
+allow	command -v kill
+allow	type kill
+allow	timeout -k 10 600 cargo test
+allow	timeout --kill-after=5 60 ./run.sh; pgrep -fl run
+allow	python3 -c 'import os; os.kill(12345, 15)'
+allow	python3 -c 'import psutil; print(len(list(psutil.process_iter())))'
+allow	ssh build-1 'uptime; df -h /data'
+allow	ssh build-3 'pgrep -fl rustc'
+allow	ssh -o BatchMode=yes build-1 'cat /var/tmp/build-disk/ledger.json'
+allow	ssh build-4 'ps -eo pid,args | grep -iE "reap|pkill|killall|guard" | head'
+allow	git clone ssh://git@github.com/x/y.git
+allow	launchctl bootout gui/501/com.example.agent
+allow	launchctl bootout user/$(id -u)/com.example.userdomain-probe
+allow	launchctl kickstart -k gui/501/com.example.agent
+# Words in data
+allow	echo "never use pkill or killall"
+allow	git commit -m "block pkill and kill -1 in dcg"
+allow	rg -n 'pkill|killall' docs/
+allow	rg -n -E 'pgrep -P|pkill -P|kill the parent|parent tree' notes.md
+allow	grep -rn os.kill src/
+allow	cargo test -p skill
+allow	ls /tmp/killer_app

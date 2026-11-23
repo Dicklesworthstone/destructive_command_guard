@@ -41,7 +41,7 @@ enabled = ["kubernetes", "database", "containers"]
 | [secrets](secrets.md) | 5 | HashiCorp Vault, AWS Secrets Manager, 1Password CLI, ... |
 | [storage](storage.md) | 4 | AWS S3, Google Cloud Storage, MinIO, ... |
 | [strict_git](strict_git.md) | 1 | Strict Git |
-| [system](system.md) | 3 | Disk Operations, Permissions, Services |
+| [system](system.md) | 4 | Disk Operations, Permissions, Services, ... |
 | [windows](windows.md) | 4 | Windows Filesystem, Windows Disk & System, Windows Misc (registry/accounts/wsl), ... |
 
 ## All Pack IDs
@@ -137,6 +137,7 @@ enabled = ["kubernetes", "database", "containers"]
 - [`system.disk`](system.md#systemdisk)
 - [`system.permissions`](system.md#systempermissions)
 - [`system.services`](system.md#systemservices)
+- [`system.processes`](system.md#systemprocesses)
 - [`strict_git`](strict_git.md#strict_git)
 - [`package_managers`](package_managers.md#package_managers)
 - [`windows.filesystem`](windows.md#windowsfilesystem)

@@ -318,6 +318,7 @@ it to `[packs] enabled` — see [Enable More Protection](#enable-more-protection
 - `system.disk` - Protects against destructive disk operations including dd to devices, mkfs, partition table modifications (fdisk/parted), RAID management (mdadm), btrfs filesystem operations, device-mapper (dmsetup), network block devices (nbd-client), and LVM commands (pvremove, vgremove, lvremove, lvreduce, pvmove).
 - `system.permissions` - Protects against dangerous permission changes like chmod 777, recursive chmod/chown on system directories.
 - `system.services` - Protects against dangerous service operations like stopping critical services and modifying init configuration.
+- `system.processes` - Opt-in. Blocks kills that pick their targets by pattern, parent-tree walk or broadcast (`pkill`, `killall`, `kill -1`, pgrep/lsof/ps-fed kill loops, remote pattern kills over ssh, `launchctl bootout gui/<uid>`), while kills of recorded PIDs and process groups stay allowed. Meant for machines shared by several coding agents.
 
 When `system.permissions` is enabled, POSIX `chmod`, `chown`, and `chgrp`
 checks use the complete invocation: recursive options can occur after targets

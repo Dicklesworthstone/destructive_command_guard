@@ -5764,6 +5764,7 @@ verbose = false
 #   infrastructure.atmos     - Atmos terraform deploy/clean, helmfile destroy
 #   system.permissions    - Dangerous permission changes
 #   system.services       - Service management commands
+#   system.processes      - Pattern/tree/broadcast kills: pkill, killall, kill -1 (opt-in)
 #   strict_git            - Extra paranoid git protections
 #   package_managers      - npm unpublish, cargo yank, etc.
 

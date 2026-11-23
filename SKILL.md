@@ -159,6 +159,7 @@ DCG uses a modular "pack" system to organize patterns by category:
 | `system.disk` | dd, mkfs, fdisk operations |
 | `system.permissions` | Dangerous chmod/chown patterns |
 | `system.services` | systemctl stop/disable patterns |
+| `system.processes` | pkill, killall, kill -1, pgrep-fed kill loops (opt-in) |
 
 ### Other Packs
 

@@ -1683,7 +1683,7 @@ pub fn preset_members(id: &str) -> Option<&'static [&'static str]> {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 103] = [
+static PACK_ENTRIES: [PackEntry; 104] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
@@ -2627,6 +2627,12 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "rmmod",
         ],
         system::services::create_pack,
+    ),
+    // Opt-in. The row shares the pack's own list so the two cannot drift (#441).
+    PackEntry::new(
+        "system.processes",
+        system::processes::KEYWORDS,
+        system::processes::create_pack,
     ),
     PackEntry::new("strict_git", &["git"], strict_git::create_pack),
     PackEntry::new(

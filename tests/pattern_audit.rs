@@ -1255,6 +1255,25 @@ fn test_audit_backtracking_requirements() {
             ]),
         ),
         (
+            "system.processes",
+            HashSet::from([
+                // bd-wx2x: lookbehinds keep `kill` from matching inside
+                // `pkill`, `skill`, `kill_tree` or `foo-kill`; lookaheads exempt
+                // `kill -0` probes, keep `-1` from matching `-12345`, and end the
+                // launchctl domain at the end of its word. The pack is opt-in and
+                // runs only on its own keywords (kill, pkill, killall, killall5,
+                // launchctl, ssh, psutil).
+                "kill-recorded-pidfile",
+                "kill-every-process",
+                "kill-computed-pids",
+                "xargs-kill",
+                "find-exec-kill",
+                "pid-lookup-feeds-kill",
+                "ssh-remote-pattern-kill",
+                "launchctl-bootout-domain",
+            ]),
+        ),
+        (
             "windows.filesystem",
             HashSet::from([
                 "whatif-preview",

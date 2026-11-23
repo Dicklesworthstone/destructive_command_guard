@@ -7,6 +7,7 @@ This document describes packs in the `system` category.
 - [Disk Operations](#systemdisk)
 - [Permissions](#systempermissions)
 - [Services](#systemservices)
+- [Processes](#systemprocesses)
 
 ---
 
@@ -309,6 +310,70 @@ To allowlist all rules from this pack (use with caution):
 ```toml
 [[allow]]
 rule = "system.services:*"
+reason = "Your reason here"
+risk_acknowledged = true
+```
+
+---
+
+## Processes
+
+**Pack ID:** `system.processes`
+
+Protects shared machines against kills that pick their targets by pattern, parent-tree walk or broadcast: pkill, killall, kill -1, pgrep/lsof/ps-fed kill loops, xargs/find kills, remote pattern kills over ssh, interpreter broadcast kills and launchctl domain bootouts (opt-in)
+
+### Keywords
+
+Commands containing these keywords are checked against this pack:
+
+- `kill`
+- `pkill`
+- `killall`
+- `killall5`
+- `launchctl`
+- `ssh`
+- `psutil`
+
+### Safe Patterns (Allowed)
+
+These patterns match safe commands that are always allowed:
+
+| Pattern Name | Pattern |
+|--------------|----------|
+| `kill-recorded-pidfile` | `^\s*kill(?:\s+-[A-Za-z0-9]+\|\s+-[sn]\s+\S+)?(?:\s+--)?(?:\s+"?(?:\$\(\s*(?:cat\s+\|<\s*)(?:[^()`;\|&$]\|\$(?!\())+\)\|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?\|\$!\|[0-9]+\|%[0-9]+)"?)+(?:\s+[0-9]?>>?\s*(?:&[0-9]\|/dev/null))*\s*$` |
+
+### Destructive Patterns (Blocked)
+
+These patterns match potentially destructive commands:
+
+| Pattern Name | Reason | Severity |
+|--------------|--------|----------|
+| `pkill` | pkill signals every process whose name or command line matches a pattern. | high |
+| `killall` | killall signals every process with a given name, including other users' work. | high |
+| `kill-every-process` | kill -1 signals every process the user owns (every app, terminal and agent). | critical |
+| `kill-computed-pids` | The PIDs to kill are computed by a command substitution at run time. | high |
+| `xargs-kill` | Piping a PID lookup into xargs kill signals whatever the lookup matched. | high |
+| `find-exec-kill` | find -exec kill signals processes chosen by a file search. | high |
+| `pid-lookup-feeds-kill` | A process lookup by pattern (pgrep, pidof, lsof -t, a ps listing or ps -o ppid=) feeds a kill in the same command. | high |
+| `ssh-remote-pattern-kill` | The remote command kills processes by pattern on another host. | high |
+| `interpreter-signals-everything` | An inline script signals every process (-1, process group 0 or 1) or kills processes found by a psutil scan. | high |
+| `launchctl-bootout-domain` | Booting out a whole launchd domain stops every app and agent in the user session. | critical |
+
+### Allowlist Guidance
+
+To allowlist a specific rule from this pack, add to your allowlist:
+
+```toml
+[[allow]]
+rule = "system.processes:<pattern-name>"
+reason = "Your reason here"
+```
+
+To allowlist all rules from this pack (use with caution):
+
+```toml
+[[allow]]
+rule = "system.processes:*"
 reason = "Your reason here"
 risk_acknowledged = true
 ```
