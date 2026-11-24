@@ -89,7 +89,7 @@ allow	kill $!
 allow	kill -TERM "$PID"
 allow	kill "$(cat /tmp/job.pid)"
 allow	kill -TERM $(cat "$S/lane.pid")
-allow	kill $(< /tmp/job.pid)
+allow	kill "$(< /tmp/job.pid)"
 allow	kill $(cat /var/tmp/w/gate.pid) 2>/dev/null; ls
 allow	kill -TERM -12345
 allow	kill -- -12345

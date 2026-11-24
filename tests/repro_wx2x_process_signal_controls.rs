@@ -137,6 +137,35 @@ fn the_pack_is_not_enabled_by_default() {
     }
 }
 
+/// Known false positive (bd-2mli): the semantic proof accepts an unquoted
+/// `$(< pidfile)`, but some evaluator view hides that body from it, so the
+/// unquoted spelling is still denied. The quoted spelling is in the corpus as
+/// an allow. This pins today's behaviour so a fix shows up as a deliberate
+/// change here, not as a silent flip.
+#[test]
+fn unquoted_redirect_substitution_pidfile_is_still_denied() {
+    for command in [
+        "kill $(< /tmp/job.pid)",
+        "kill $( < /tmp/job.pid )",
+        "kill -TERM $(< /tmp/job.pid)",
+    ] {
+        let verdict = verdict(command, "system.processes", true);
+        assert_eq!(
+            verdict["rule_id"].as_str(),
+            Some("system.processes:kill-computed-pids"),
+            "{command:?}: {verdict}"
+        );
+    }
+    for command in ["kill \"$(< /tmp/job.pid)\"", "kill -9 \"$(<job.pid)\" 2>/dev/null"] {
+        let verdict = verdict(command, "system.processes", true);
+        assert_eq!(
+            verdict["decision"].as_str(),
+            Some("allow"),
+            "{command:?}: {verdict}"
+        );
+    }
+}
+
 /// With the extractor off, the rules scoped to `pkill`, `killall` and `kill`
 /// never see a quoted remote command, so a deny by the ssh rule proves the
 /// backstop itself works. A remote lookup-fed kill loop is answered earlier by

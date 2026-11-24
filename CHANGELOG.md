@@ -23,9 +23,10 @@ interpreter broadcasts (`os.kill(-1, …)`, `os.killpg(0, …)`, `process.kill(-
 `psutil.process_iter()` kill loops) and `launchctl bootout gui/<uid>` of a whole
 domain. Kills of recorded PIDs stay allowed: literal PIDs, `$!`, job specs,
 recorded process groups (`kill -TERM -- -$PGID`), `kill -0` probes, and a pidfile
-read back with `kill "$(cat job.pid)"` or `kill $(< job.pid)`. The pidfile
+read back with `kill "$(cat job.pid)"` or `kill "$(< job.pid)"`. The pidfile
 exemption is a semantic proof on the unmasked segment, because built-in regexes
-never see the body of a `$(...)`. Two real incidents on one developer Mac shaped
+never see the body of a `$(...)`. Known false positive: the unquoted
+`kill $(< job.pid)` is still denied (`bd-2mli`). Two real incidents on one developer Mac shaped
 the rules (BSD `pkill` reading `-P 1` as patterns; a `kill_tree` walk from
 launchd). The pack is off by default.
 
