@@ -264,7 +264,7 @@ fn unset_modprobe_env_name(state: &mut ModprobeEnvState, raw_name: &str) {
 /// Whether a stripped `sudo ...` prefix explicitly preserves `var_name`
 /// (via `-E`, `--preserve-env`, or `--preserve-env=...,VAR,...`).
 fn sudo_preserves_env_var(stripped_sudo: &str, var_name: &str) -> bool {
-    const ARG_FLAGS: &[char] = &['u', 'g', 'h', 'p', 'C', 'r', 'U', 'D', 't', 'a', 'T'];
+    const ARG_FLAGS: &[char] = &['u', 'g', 'h', 'p', 'C', 'r', 'U', 'D', 'R', 't', 'a', 'T'];
     const ARG_LONG_OPTIONS: &[&str] = &[
         "--user",
         "--group",
@@ -274,6 +274,7 @@ fn sudo_preserves_env_var(stripped_sudo: &str, var_name: &str) -> bool {
         "--role",
         "--other-user",
         "--chdir",
+        "--chroot",
         "--type",
         "--command-timeout",
     ];
@@ -304,7 +305,8 @@ fn sudo_preserves_env_var(stripped_sudo: &str, var_name: &str) -> bool {
                         let decoded = decoder
                             .decode(raw_list, ShellTokenRole::Syntax)
                             .unwrap_or(Cow::Borrowed(raw_list));
-                        if decoded.split(',').any(|entry| entry.trim() == var_name) {
+                        // Real sudo splits --preserve-env=LIST strictly on comma without trimming.
+                        if decoded.split(',').any(|entry| entry == var_name) {
                             return true;
                         }
                     }
@@ -405,7 +407,12 @@ fn record_modprobe_env_prefix(state: &mut ModprobeEnvState, stripped_env: &str) 
                     *state = ModprobeEnvState::default();
                     index += 1;
                 }
-                "--null" | "--debug" => {
+                "--null"
+                | "--debug"
+                | "--list-signal-handling"
+                | "--ignore-signal"
+                | "--default-signal"
+                | "--block-signal" => {
                     index += 1;
                 }
                 "--unset" => {
@@ -419,7 +426,7 @@ fn record_modprobe_env_prefix(state: &mut ModprobeEnvState, stripped_env: &str) 
                         return;
                     }
                 }
-                "--chdir" | "--file" | "--argv0" | "--ignore-signal" => {
+                "--chdir" | "--file" | "--argv0" => {
                     index += if value_opt.is_some() { 1 } else { 2 };
                 }
                 "--split-string" => {
@@ -1029,10 +1036,10 @@ fn strip_sudo(command: &str) -> Option<(String, StrippedWrapper)> {
     // Options that take no argument
     // -s (shell) runs user's shell; if a command follows, it's passed via -c
     // -B (bell) rings bell on password prompt
-    const SIMPLE_FLAGS: &[char] = &['E', 'H', 'n', 'k', 'K', 'S', 's', 'b', 'i', 'P', 'A', 'B'];
+    const SIMPLE_FLAGS: &[char] = &['E', 'H', 'n', 'k', 'S', 's', 'b', 'i', 'P', 'A', 'B'];
     // Options that take an argument
-    // -D (chdir) changes to directory before running command
-    const ARG_FLAGS: &[char] = &['u', 'g', 'h', 'p', 'C', 'r', 'U', 'D', 't', 'a', 'T'];
+    // -D (chdir) / -R (chroot) change directory/root before running command
+    const ARG_FLAGS: &[char] = &['u', 'g', 'h', 'p', 'C', 'r', 'U', 'D', 'R', 't', 'a', 'T'];
 
     let trimmed = command.trim_start();
 
@@ -1105,7 +1112,6 @@ fn strip_sudo(command: &str) -> Option<(String, StrippedWrapper)> {
                 "--set-home",
                 "--non-interactive",
                 "--reset-timestamp",
-                "--remove-timestamp",
                 "--stdin",
                 "--shell",
                 "--background",
@@ -1123,6 +1129,7 @@ fn strip_sudo(command: &str) -> Option<(String, StrippedWrapper)> {
                 "--role",
                 "--other-user",
                 "--chdir",
+                "--chroot",
                 "--type",
                 "--command-timeout",
             ];
@@ -1307,8 +1314,8 @@ fn strip_env(command: &str) -> Option<(String, StrippedWrapper)> {
     }
 
     let remaining = &rest[idx..];
-    if remaining.is_empty() {
-        // env with no command (just assignments) - don't strip
+    if remaining.is_empty() || starts_with_shell_redirection(remaining) {
+        // env with no command (just assignments) or leading redirection - don't strip
         return None;
     }
 
@@ -1395,7 +1402,7 @@ fn parse_env_options(
             });
 
             match name {
-                "--ignore-environment" | "--null" | "--debug" => {
+                "--ignore-environment" | "--null" | "--debug" | "--list-signal-handling" => {
                     if value_opt.is_some() {
                         return EnvParseResult::Abort;
                     }
@@ -1403,7 +1410,18 @@ fn parse_env_options(
                     idx = word_end;
                     continue;
                 }
-                "--unset" | "--chdir" | "--file" | "--argv0" | "--ignore-signal" => {
+                "--ignore-signal" | "--default-signal" | "--block-signal" => {
+                    // GNU/uutils env signal options take an OPTIONAL =SIG
+                    // argument and NEVER consume a separate next argv word.
+                    if let Some(value) = value_opt
+                        && token_has_shell_effect(value.as_bytes())
+                    {
+                        return EnvParseResult::Abort;
+                    }
+                    idx = word_end;
+                    continue;
+                }
+                "--unset" | "--chdir" | "--file" | "--argv0" => {
                     *filesystem_context_changed |= matches!(name, "--chdir" | "--file");
                     if let Some(value) = value_opt {
                         if token_has_shell_effect(value.as_bytes()) {
@@ -1450,12 +1468,12 @@ fn parse_env_options(
                         idx += 1;
                     }
                     let rest_of_line = &rest[idx..];
-                    let remaining = if rest_of_line.is_empty() {
+                    let joined = if rest_of_line.is_empty() {
                         unquoted
                     } else {
                         format!("{unquoted} {rest_of_line}")
                     };
-                    return EnvParseResult::SplitString(idx, remaining);
+                    return EnvParseResult::SplitString(idx, joined);
                 }
                 _ => return EnvParseResult::Abort,
             }
@@ -1494,12 +1512,12 @@ fn parse_env_options(
                         idx += 1;
                     }
                     let rest_of_line = &rest[idx..];
-                    let remaining = if rest_of_line.is_empty() {
+                    let joined = if rest_of_line.is_empty() {
                         unquoted
                     } else {
                         format!("{unquoted} {rest_of_line}")
                     };
-                    return EnvParseResult::SplitString(idx, remaining);
+                    return EnvParseResult::SplitString(idx, joined);
                 }
                 'u' | 'P' | 'C' | 'f' | 'a' => {
                     *filesystem_context_changed |= matches!(flag, 'C' | 'f');
@@ -1855,16 +1873,37 @@ fn exec_wrapper_command_index(
         if word == "--" {
             return (index + 1 < tokens.len()).then_some(index + 1);
         }
-        if word == "-a" {
-            wrapper_word(command, tokens, index + 1)?;
-            index += 2;
-            continue;
-        }
-        if word.strip_prefix('-').is_some_and(|flags| {
-            !flags.is_empty() && flags.bytes().all(|b| matches!(b, b'c' | b'l'))
-        }) {
-            *filesystem_context_changed |= word.contains('c');
-            index += 1;
+        if word.starts_with('-') && word.len() > 1 && !word.starts_with("--") {
+            let mut chars = word[1..].chars().peekable();
+            let mut takes_next = false;
+            let mut valid = true;
+            let mut saw_clear = false;
+            while let Some(flag) = chars.next() {
+                match flag {
+                    'c' => saw_clear = true,
+                    'l' => {}
+                    'a' => {
+                        if chars.peek().is_none() {
+                            takes_next = true;
+                        }
+                        break;
+                    }
+                    _ => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if !valid {
+                return None;
+            }
+            *filesystem_context_changed |= saw_clear;
+            if takes_next {
+                wrapper_word(command, tokens, index + 1)?;
+                index += 2;
+            } else {
+                index += 1;
+            }
             continue;
         }
         return (!word.starts_with('-')).then_some(index);
@@ -7111,6 +7150,8 @@ mod tests {
             "env --file=environment.txt psql -c 'SELECT 1'",
             "exec -c psql -c 'SELECT 1'",
             "exec -lc -a label psql -c 'SELECT 1'",
+            "exec -ca label psql -c 'SELECT 1'",
+            "env --ignore-signal -C /elsewhere psql -X -f safe.sql",
             "mise exec -- psql -c 'SELECT 1'",
         ] {
             assert!(wrapper_changes_filesystem_context(command), "{command}");
@@ -7135,7 +7176,7 @@ mod tests {
             "env --unset=-C psql -X -f safe.sql",
             "env -a -C psql -X -f safe.sql",
             "env --argv0 HOME psql -X -f safe.sql",
-            "env --ignore-signal -C psql -X -f safe.sql",
+            "env --ignore-signal=-C psql -X -f safe.sql",
             "env -u '$HOME' psql -X -f safe.sql",
             "env -- psql -X -c '--chdir=/elsewhere'",
             "env -- -C /elsewhere psql -X -f safe.sql",
@@ -8206,4 +8247,69 @@ fn cmd_expansion_tokens_with_spaces_preserve_separators() {
         .filter(|t| t.kind == NormalizeTokenKind::Separator)
         .count();
     assert_eq!(seps, 2, "unpaired percent signs must never swallow `&`");
+}
+
+#[cfg(test)]
+#[test]
+fn fresh_eyes_wrapper_normalization_hardening() {
+    assert_eq!(
+        strip_wrapper_prefixes(
+            "MODPROBE_OPTIONS=-n sudo --preserve-env=\" MODPROBE_OPTIONS\" modprobe -r nvidia"
+        )
+        .normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes(
+            "MODPROBE_OPTIONS=-n sudo --preserve-env=MODPROBE_OPTIONS modprobe -r nvidia"
+        )
+        .normalized,
+        "modprobe -n -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-r sudo -R / modprobe nvidia").normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-n sudo -R / modprobe -r nvidia").normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-n sudo -E -R / modprobe -r nvidia").normalized,
+        "modprobe -n -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-n sudo --chroot / -E modprobe -r nvidia")
+            .normalized,
+        "modprobe -n -r nvidia"
+    );
+    assert!(
+        strip_wrapper_prefixes("sudo -K git reset --hard")
+            .normalized
+            .starts_with("sudo -K")
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("exec -ca fake git reset --hard").normalized,
+        "git reset --hard"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("exec -la fake git reset --hard").normalized,
+        "git reset --hard"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("exec -afake git reset --hard").normalized,
+        "git reset --hard"
+    );
+    for flag in [
+        "--ignore-signal",
+        "--block-signal",
+        "--default-signal",
+        "--list-signal-handling",
+    ] {
+        assert_eq!(
+            strip_wrapper_prefixes(&format!("env {flag} git reset --hard")).normalized,
+            "git reset --hard",
+            "flag {flag} must not consume command token"
+        );
+    }
 }

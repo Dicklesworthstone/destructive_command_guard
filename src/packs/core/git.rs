@@ -482,7 +482,9 @@ pub(crate) fn git_semantic_scan_required(command: &str, dialect: ShellDialect) -
     let dialect_obfuscation = match dialect {
         ShellDialect::Posix => command.contains("$'") || command.contains("$\""),
         ShellDialect::PowerShell => {
-            command.contains('`') || powershell_dynamic_call_operator(command)
+            command.contains('`')
+                || powershell_dynamic_call_operator(command)
+                || crate::evaluator::powershell_has_dynamic_call_expression(command)
         }
         ShellDialect::Cmd => command.contains('^'),
         // The early branch currently expands Unknown across every supported
@@ -2025,16 +2027,72 @@ fn git_semantic_command(command: &str, dialect: ShellDialect) -> std::borrow::Co
     }
 }
 
+fn strip_powershell_leading_trivia(mut s: &str) -> &str {
+    loop {
+        let trimmed = s.trim_start();
+        if trimmed.len() != s.len() {
+            s = trimmed;
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("<#") {
+            if let Some(close) = rest.find("#>") {
+                s = &rest[close + 2..];
+                continue;
+            }
+            return "";
+        }
+        if s.starts_with('#') {
+            s = s.find(['\n', '\r']).map_or("", |nl| &s[nl + 1..]);
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("`\r\n").or_else(|| s.strip_prefix("`\n")) {
+            s = rest;
+            continue;
+        }
+        return s;
+    }
+}
+
+fn strip_powershell_inline_trivia(mut s: &str) -> &str {
+    loop {
+        let trimmed = s.trim_start_matches([' ', '\t']);
+        if trimmed.len() != s.len() {
+            s = trimmed;
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("<#") {
+            if let Some(close) = rest.find("#>") {
+                s = &rest[close + 2..];
+                continue;
+            }
+            return "";
+        }
+        if let Some(rest) = s.strip_prefix("`\r\n").or_else(|| s.strip_prefix("`\n")) {
+            s = rest;
+            continue;
+        }
+        return s;
+    }
+}
+
+fn powershell_call_after_ampersand(rest: &str) -> Option<&str> {
+    if rest.starts_with('&') || rest.starts_with('>') {
+        return None;
+    }
+    let valid = rest.starts_with("<#")
+        || rest.starts_with("`\n")
+        || rest.starts_with("`\r\n")
+        || rest
+            .chars()
+            .next()
+            .is_some_and(|ch| matches!(ch, ' ' | '\t' | '(' | '$' | '@' | '\'' | '"'));
+    valid.then(|| strip_powershell_inline_trivia(rest))
+}
+
 fn powershell_call_expression(command: &str) -> bool {
-    command
-        .trim_start()
+    strip_powershell_leading_trivia(command)
         .strip_prefix('&')
-        .filter(|rest| {
-            rest.chars()
-                .next()
-                .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '(' | '$' | '@'))
-        })
-        .map(str::trim_start)
+        .and_then(powershell_call_after_ampersand)
         .is_some_and(|rest| {
             rest.starts_with('(') || rest.starts_with("$(") || rest.starts_with("@(")
         })
@@ -2060,15 +2118,9 @@ fn powershell_expression_statement_without_subexpression(statement: &str) -> boo
 }
 
 fn powershell_dynamic_call_operator(command: &str) -> bool {
-    command
-        .trim_start()
+    strip_powershell_leading_trivia(command)
         .strip_prefix('&')
-        .filter(|rest| {
-            rest.chars()
-                .next()
-                .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '(' | '$' | '@'))
-        })
-        .map(str::trim_start)
+        .and_then(powershell_call_after_ampersand)
         .is_some_and(|rest| {
             rest.starts_with('$') || rest.starts_with("@(") || rest.starts_with('(')
         })
@@ -2354,15 +2406,9 @@ pub(crate) fn decode_powershell_static_executable(
 }
 
 fn powershell_call_expression_parts(command: &str) -> Option<(&str, &str)> {
-    let rest = command
-        .trim_start()
+    let rest = strip_powershell_leading_trivia(command)
         .strip_prefix('&')
-        .filter(|rest| {
-            rest.chars()
-                .next()
-                .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '(' | '$' | '@'))
-        })?
-        .trim_start();
+        .and_then(powershell_call_after_ampersand)?;
     let open = if rest.starts_with("$(") || rest.starts_with("@(") {
         1
     } else if rest.starts_with('(') {
@@ -5498,13 +5544,12 @@ pub(crate) fn branch_command_decision_in_dialect(
     }
 
     if dialect == ShellDialect::Unknown {
-        let trimmed = command.trim_start();
-        if trimmed.strip_prefix('&').as_ref().is_some_and(|remainder| {
-            remainder
-                .chars()
-                .next()
-                .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '(' | '$' | '@' | '\'' | '"'))
-        }) {
+        let trimmed = strip_powershell_leading_trivia(command);
+        if trimmed
+            .strip_prefix('&')
+            .and_then(powershell_call_after_ampersand)
+            .is_some()
+        {
             // A leading call operator is unambiguously PowerShell syntax; in
             // POSIX shells `&` terminates the preceding command instead of
             // introducing an executable. Preserve quoted Windows paths and
@@ -5520,14 +5565,17 @@ pub(crate) fn branch_command_decision_in_dialect(
     let command = command.trim();
     let (command, _) = command_after_posix_control_prefixes(command, dialect);
     let command = if dialect == ShellDialect::PowerShell {
-        crate::normalize::powershell_assignment_rhs(command).unwrap_or(command)
+        let after_trivia = strip_powershell_leading_trivia(command);
+        crate::normalize::powershell_assignment_rhs(after_trivia)
+            .map(strip_powershell_leading_trivia)
+            .unwrap_or(after_trivia)
     } else {
         command
     };
     let semantic_command = command;
     let command = command
         .strip_prefix('&')
-        .map(str::trim_start)
+        .and_then(powershell_call_after_ampersand)
         .filter(|remainder| !remainder.is_empty())
         .unwrap_or(command);
     if dialect == ShellDialect::PowerShell

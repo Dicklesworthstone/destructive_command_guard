@@ -4074,13 +4074,31 @@ fn push_joined_payload(
     } else {
         inline_program(command, payload.content, skip_reasons)
     };
+    // When `env -S` splits a string beginning with an `env` option (e.g.
+    // `env -S "-i" ...` or `env -S "-C /tmp" ...`), re-parse the split words
+    // under `env` so leading options inside `-S` cannot strand a flag as argv0.
+    let env_prefixed;
+    let (content_str, content_range) = if target == "env" {
+        let trimmed = program.content.trim_start();
+        if trimmed.starts_with('-')
+            && !trimmed.starts_with("-S")
+            && !trimmed.starts_with("--split-string")
+        {
+            env_prefixed = format!("env {trimmed}");
+            (env_prefixed.as_str(), None)
+        } else {
+            (program.content.as_ref(), program.content_range)
+        }
+    } else {
+        (program.content.as_ref(), program.content_range)
+    };
     push_windows_inner(
         extracted,
         skip_reasons,
         limits,
-        &program.content,
+        content_str,
         payload.full,
-        program.content_range,
+        content_range,
         target,
     )
 }
@@ -7394,22 +7412,21 @@ fn command_string_runner_payloads(
                     break;
                 }
                 let unquoted = word.trim_matches(['\'', '"']);
-                if matches!(unquoted, "-S" | "--split-string") {
+                if unquoted == "--" {
+                    break;
+                }
+                if unquoted == "--split-string" {
                     payloads.extend(span(index + 1, index + 2));
                     payloads
                         .extend(span(index + 1, words.len()).filter(|_| index + 2 < words.len()));
                     break;
                 }
-                let value = ["--split-string=", "-S"]
-                    .iter()
-                    .find_map(|prefix| word.strip_prefix(prefix).map(|rest| (prefix.len(), rest)));
-                if let Some((prefix_len, rest)) = value
+                if let Some(rest) = word.strip_prefix("--split-string=")
                     && !rest.is_empty()
                 {
-                    let value_start = range.start + prefix_len;
+                    let value_start = range.start + "--split-string=".len();
                     payloads.push(attached(rest, value_start, range.end));
                     if let Some(last) = words.get(index + 1..).and_then(<[_]>::last) {
-                        // `env -S'git reset' --hard`: value plus trailing words.
                         payloads.push(SshRemotePayload {
                             content: value_start..last.1.end,
                             full: full_start..last.1.end,
@@ -7418,14 +7435,67 @@ fn command_string_runner_payloads(
                     }
                     break;
                 }
-                index += if matches!(
-                    unquoted,
-                    "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0" | "-f" | "--file"
-                ) {
-                    2
-                } else {
-                    1
-                };
+                if unquoted.starts_with("--") {
+                    index += if matches!(unquoted, "--unset" | "--chdir" | "--argv0" | "--file") {
+                        2
+                    } else {
+                        1
+                    };
+                    continue;
+                }
+                if unquoted.starts_with('-') && unquoted.len() > 1 {
+                    let bytes = unquoted.as_bytes();
+                    let mut pos = 1usize;
+                    let mut found_split = false;
+                    let mut advance = 1usize;
+                    while pos < bytes.len() {
+                        match bytes[pos] {
+                            b'i' | b'0' | b'v' => pos += 1,
+                            b'S' => {
+                                found_split = true;
+                                if pos + 1 == bytes.len() {
+                                    payloads.extend(span(index + 1, index + 2));
+                                    payloads.extend(
+                                        span(index + 1, words.len())
+                                            .filter(|_| index + 2 < words.len()),
+                                    );
+                                } else if let Some(s_offset) = word.find('S') {
+                                    let prefix_len = s_offset + 1;
+                                    let outer_quoted = word.len() >= 2
+                                        && matches!(word.as_bytes()[0], b'\'' | b'"')
+                                        && word.as_bytes().last() == Some(&word.as_bytes()[0]);
+                                    let trim_end = usize::from(outer_quoted);
+                                    let rest = &word[prefix_len..word.len() - trim_end];
+                                    let value_start = range.start + prefix_len;
+                                    let value_end = range.end - trim_end;
+                                    payloads.push(attached(rest, value_start, value_end));
+                                    if let Some(last) = words.get(index + 1..).and_then(<[_]>::last)
+                                    {
+                                        payloads.push(SshRemotePayload {
+                                            content: value_start..last.1.end,
+                                            full: full_start..last.1.end,
+                                            joined: true,
+                                        });
+                                    }
+                                }
+                                break;
+                            }
+                            b'u' | b'C' | b'a' | b'f' | b'P' => {
+                                if pos + 1 == bytes.len() {
+                                    advance = 2;
+                                }
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if found_split {
+                        break;
+                    }
+                    index += advance;
+                    continue;
+                }
+                index += 1;
             }
         }
     }
@@ -10523,6 +10593,20 @@ fn inert_interpreter_stdin_body(command: &str, heredoc: &ActiveHeredoc) -> Optio
 #[must_use]
 pub(crate) fn mask_inert_interpreter_stdin(command: &str) -> Cow<'_, str> {
     mask_interpreter_stdin_bodies(command, |_| true)
+}
+
+/// Mask only quoted Python/JavaScript interpreter heredoc bodies (the exact
+/// languages eligible for documentation-mask proofs), leaving other non-shell
+/// interpreters (perl, ruby, php) untouched.
+#[must_use]
+pub(crate) fn mask_python_js_interpreter_stdin(command: &str) -> Cow<'_, str> {
+    mask_interpreter_stdin_bodies(command, |target| {
+        let name = target.rsplit(['/', '\\']).next().unwrap_or(target);
+        matches!(
+            ScriptLanguage::from_command(name),
+            ScriptLanguage::Python | ScriptLanguage::JavaScript
+        )
+    })
 }
 
 /// The view for the POSIX `eval` reading alone. A body leaves that reading only
