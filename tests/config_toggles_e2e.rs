@@ -547,6 +547,60 @@ fn test_partial_config_only_explanations() {
     eprintln!("=== Partial config test PASSED ===");
 }
 
+/// `dcg config --format json` names the heredoc fallback settings by their
+/// configuration keys (#555). They used to appear as `fail_open_on_*`, which
+/// reads as "allow when analysis fails"; the settings select bounded fallback
+/// scanning, and a user reading the JSON should find the key they configure.
+#[test]
+fn config_json_names_heredoc_fallback_settings_by_their_config_keys() {
+    let env = TestEnv::new();
+    let read = |config: &str| -> serde_json::Value {
+        fs::write(&env.config_path, config).expect("write config");
+        let output = Command::new(dcg_binary())
+            .env_clear()
+            .env("HOME", &env.home_dir)
+            .env("USERPROFILE", &env.home_dir)
+            .env("XDG_CONFIG_HOME", &env.xdg_config_dir)
+            .env("DCG_CONFIG", &env.config_path)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .current_dir(env.temp_dir.path())
+            .args(["config", "--format", "json"])
+            .output()
+            .expect("run dcg config");
+        assert!(
+            output.status.success(),
+            "dcg config failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("config JSON")
+    };
+
+    for (config, expected) in [
+        ("[heredoc]\nenabled = true\n", true),
+        (
+            "[heredoc]\nfallback_on_parse_error = false\nfallback_on_timeout = false\n",
+            false,
+        ),
+    ] {
+        let json = read(config);
+        let heredoc = json["heredoc"].as_object().expect("heredoc section");
+        assert_eq!(
+            heredoc.get("fallback_on_parse_error"),
+            Some(&serde_json::Value::Bool(expected)),
+            "{config}: {heredoc:?}"
+        );
+        assert_eq!(
+            heredoc.get("fallback_on_timeout"),
+            Some(&serde_json::Value::Bool(expected)),
+            "{config}: {heredoc:?}"
+        );
+        assert!(
+            !heredoc.keys().any(|key| key.starts_with("fail_open")),
+            "{config}: {heredoc:?}"
+        );
+    }
+}
+
 // =============================================================================
 // Verbose Failure Logging Test
 // =============================================================================

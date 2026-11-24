@@ -30,6 +30,13 @@ never see the body of a `$(...)`. Known false positive: the unquoted
 the rules (BSD `pkill` reading `-P 1` as patterns; a `kill_tree` walk from
 launchd). The pack is off by default.
 
+**`dcg config --format json` reports the heredoc fallback settings under their
+config keys (#555).** The `heredoc` object listed `fallback_on_parse_error` and
+`fallback_on_timeout` as `fail_open_on_parse_error` and `fail_open_on_timeout`,
+which read as "allow when analysis fails". The settings choose bounded fallback
+scanning, and the JSON now uses the names you write in `[heredoc]`. Scripts that
+parse this output need the new key names.
+
 ---
 
 ## [v0.17.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.17.1) -- 2026-11-23 [Release]

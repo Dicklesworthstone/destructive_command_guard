@@ -7183,8 +7183,12 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
             "max_body_bytes": heredoc.limits.max_body_bytes,
             "max_body_lines": heredoc.limits.max_body_lines,
             "max_heredocs": heredoc.limits.max_heredocs,
-            "fail_open_on_parse_error": heredoc.fallback_on_parse_error,
-            "fail_open_on_timeout": heredoc.fallback_on_timeout,
+            // Named after the `[heredoc]` config keys they report. The settings
+            // select bounded fallback scanning when parsing fails or times out;
+            // the old `fail_open_on_*` names read as "allow when analysis
+            // fails", which is not what they do (#555).
+            "fallback_on_parse_error": heredoc.fallback_on_parse_error,
+            "fallback_on_timeout": heredoc.fallback_on_timeout,
             "languages": languages,
         },
         "overrides": {
