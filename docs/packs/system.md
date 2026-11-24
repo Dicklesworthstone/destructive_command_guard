@@ -334,14 +334,6 @@ Commands containing these keywords are checked against this pack:
 - `ssh`
 - `psutil`
 
-### Safe Patterns (Allowed)
-
-These patterns match safe commands that are always allowed:
-
-| Pattern Name | Pattern |
-|--------------|----------|
-| `kill-recorded-pidfile` | `^\s*kill(?:\s+-[A-Za-z0-9]+\|\s+-[sn]\s+\S+)?(?:\s+--)?(?:\s+"?(?:\$\(\s*(?:cat\s+\|<\s*)(?:[^()`;\|&$]\|\$(?!\())+\)\|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?\|\$!\|[0-9]+\|%[0-9]+)"?)+(?:\s+[0-9]?>>?\s*(?:&[0-9]\|/dev/null))*\s*$` |
-
 ### Destructive Patterns (Blocked)
 
 These patterns match potentially destructive commands:

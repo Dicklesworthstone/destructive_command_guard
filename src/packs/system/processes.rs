@@ -23,8 +23,35 @@
 //! dcg 0.15.3 and 0.17.0, and a replay of 3,541 real agent kill/launchctl
 //! commands in which nearly every denial was a genuine pattern kill (bd-wx2x).
 
-use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
-use crate::{destructive_pattern, safe_pattern};
+use crate::destructive_pattern;
+use crate::packs::{DestructivePattern, Pack, PatternSuggestion};
+use regex::Regex;
+use std::sync::LazyLock;
+
+/// A kill whose every operand is a literal PID, a job spec, `$!`, a plain
+/// variable or a pidfile read back with `$(cat f)` / `$(< f)`, and nothing else
+/// in the segment. The pidfile path may use variables (`$S/lane.pid`, `$$`) but
+/// never contains `(`, so no substitution can hide inside it. The whole segment
+/// is anchored, so a second operand (`kill $(cat x.pid) $(pgrep y)`) loses the
+/// exemption and `kill-computed-pids` still answers. Only a stderr/stdout
+/// redirect to a descriptor or /dev/null may follow.
+static RECORDED_PID_KILL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"^\s*kill(?:\s+-[A-Za-z0-9]+|\s+-[sn]\s+\S+)?(?:\s+--)?(?:\s+"?(?:\$\(\s*(?:cat\s+|<\s*)(?:[^()`;|&$]|\$[^()`;|&])+\)|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$!|[0-9]+|%[0-9]+)"?)+(?:\s+[0-9]?>>?\s*(?:&[0-9]|/dev/null))*\s*$"#,
+    )
+    .expect("recorded-PID kill regex is valid")
+});
+
+/// Whether `cmd` is one kill that signals only PIDs the caller recorded.
+///
+/// This is a semantic proof rather than a safe pattern because the evaluator
+/// masks the body of every nested `$(...)` before built-in safe and destructive
+/// regexes run, so no regex can see that the substitution is `cat job.pid`
+/// rather than `pgrep -f x`. The proof reads the unmasked segment.
+#[must_use]
+pub(crate) fn kill_signals_only_recorded_pids(cmd: &str) -> bool {
+    RECORDED_PID_KILL.is_match(cmd)
+}
 
 /// Keywords shared by the pack and its `PACK_ENTRIES` row, so the two lists
 /// cannot drift (#441).
@@ -98,27 +125,15 @@ pub fn create_pack() -> Pack {
                       over ssh, interpreter broadcast kills and launchctl domain bootouts \
                       (opt-in)",
         keywords: KEYWORDS,
-        safe_patterns: create_safe_patterns(),
+        // No regex safe patterns: the recorded-PID exemption is the semantic
+        // proof `kill_signals_only_recorded_pids`, which
+        // `Pack::semantic_safe_decision` applies to the unmasked segment.
+        safe_patterns: Vec::new(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
         safe_regex_set: None,
         safe_regex_set_is_complete: false,
     }
-}
-
-fn create_safe_patterns() -> Vec<SafePattern> {
-    vec![
-        // A kill whose every operand is a literal PID, a job spec, `$!`, a plain
-        // variable or a pidfile read back with `$(cat f)` / `$(< f)`, and nothing
-        // else in the segment. The whole segment is anchored, so text after the
-        // operands (`kill $(cat x.pid) $(pgrep y)`) loses the exemption and
-        // `kill-computed-pids` still answers. Only a stderr/stdout redirect to a
-        // descriptor or /dev/null may follow.
-        safe_pattern!(
-            "kill-recorded-pidfile",
-            r#"^\s*kill(?:\s+-[A-Za-z0-9]+|\s+-[sn]\s+\S+)?(?:\s+--)?(?:\s+"?(?:\$\(\s*(?:cat\s+|<\s*)(?:[^()`;|&$]|\$(?!\())+\)|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$!|[0-9]+|%[0-9]+)"?)+(?:\s+[0-9]?>>?\s*(?:&[0-9]|/dev/null))*\s*$"#
-        ),
-    ]
 }
 
 #[allow(clippy::too_many_lines)]
@@ -169,7 +184,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         // The PIDs come from a command substitution evaluated at run time. A
         // pidfile read back on its own (`kill "$(cat job.pid)"`) is exempted by
-        // the safe pattern above; `kill -0` only probes.
+        // `kill_signals_only_recorded_pids`; `kill -0` only probes.
         destructive_pattern!(
             "kill-computed-pids",
             r#"(?<![\w.-])kill(?!\s+-0\b)(?:\s+[^\s;&|]+)*?\s+"?(?:\$\(|`)"#,
@@ -355,8 +370,11 @@ mod tests {
             "kill -TERM $(cat \"$S/lane.pid\")",
             "kill $(< /tmp/job.pid)",
             "kill $(cat /var/run/job/gate.pid) 2>/dev/null",
+            "kill $(cat /tmp/$$.pid)",
+            "kill -9 $(cat \"${RUN_DIR}/w.pid\")",
         ] {
             assert_safe_pattern_matches(&pack, command);
+            assert_allows(&pack, command);
         }
     }
 
@@ -369,6 +387,11 @@ mod tests {
             "kill $(cat job.pid) $(pgrep -f other)",
             "kill $(cat job.pid; pgrep -f other)",
             "kill -9 $(pgrep -f foo)",
+            // The path itself must not hide a substitution or a pipeline.
+            "kill $(cat $(pgrep -f other))",
+            "kill $(cat /tmp/$$(pgrep -f other))",
+            "kill $(cat job.pid | head -1)",
+            "kill `cat job.pid`",
         ] {
             assert_no_safe_match(&pack, command);
             assert!(pack.check(command).is_some(), "{command:?} must be denied");

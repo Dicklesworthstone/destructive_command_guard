@@ -735,6 +735,10 @@ impl Pack {
             "system.permissions" => {
                 crate::packs::system::permissions::posix_chmod_is_safe(cmd).then_some(true)
             }
+            "system.processes" => {
+                crate::packs::system::processes::kill_signals_only_recorded_pids(cmd)
+                    .then_some(true)
+            }
             "kubernetes.kubectl" => {
                 crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd).then_some(true)
             }

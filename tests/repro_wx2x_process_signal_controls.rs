@@ -137,20 +137,25 @@ fn the_pack_is_not_enabled_by_default() {
     }
 }
 
-/// With the extractor off, the ssh rule is the only one that sees a quoted
-/// remote command, so a deny there proves the backstop itself works.
+/// With the extractor off, the rules scoped to `pkill`, `killall` and `kill`
+/// never see a quoted remote command, so a deny by the ssh rule proves the
+/// backstop itself works. A remote lookup-fed kill loop is answered earlier by
+/// the unscoped `pid-lookup-feeds-kill`, which reads quoted text too.
 #[test]
 fn ssh_backstop_answers_when_the_remote_command_is_not_extracted() {
-    for command in [
-        "ssh build-1 'pkill -f cargo'",
-        "ssh build-2 \"killall rustc\"",
-        "ssh build-3 'for p in $(pgrep -f x); do kill $p; done'",
-        "ssh build-3 'kill -9 -1'",
+    for (command, rule) in [
+        ("ssh build-1 'pkill -f cargo'", "ssh-remote-pattern-kill"),
+        ("ssh build-2 \"killall rustc\"", "ssh-remote-pattern-kill"),
+        ("ssh build-3 'kill -9 -1'", "ssh-remote-pattern-kill"),
+        (
+            "ssh build-3 'for p in $(pgrep -f x); do kill $p; done'",
+            "pid-lookup-feeds-kill",
+        ),
     ] {
         let verdict = verdict(command, "system.processes", false);
         assert_eq!(
             verdict["rule_id"].as_str(),
-            Some("system.processes:ssh-remote-pattern-kill"),
+            Some(format!("system.processes:{rule}").as_str()),
             "{command:?}: {verdict}"
         );
     }

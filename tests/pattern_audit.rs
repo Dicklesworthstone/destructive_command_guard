@@ -1263,7 +1263,6 @@ fn test_audit_backtracking_requirements() {
                 // launchctl domain at the end of its word. The pack is opt-in and
                 // runs only on its own keywords (kill, pkill, killall, killall5,
                 // launchctl, ssh, psutil).
-                "kill-recorded-pidfile",
                 "kill-every-process",
                 "kill-computed-pids",
                 "xargs-kill",
