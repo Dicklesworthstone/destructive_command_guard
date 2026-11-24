@@ -667,6 +667,7 @@ const OVERSIZED_SCAN_MAX_WINDOWS: usize = 128;
 /// dropped. Windows always start and end on char boundaries. Returns whether
 /// the windows cover every byte of the command: a zero limit, exhausted window
 /// cap, or a code point wider than a window must not look like a completed scan.
+#[cfg_attr(not(test), allow(dead_code))]
 fn push_oversized_scan_windows(
     out: &mut Vec<String>,
     command: &str,
@@ -712,6 +713,1243 @@ fn push_oversized_scan_windows(
         start += stride;
     }
     false
+}
+
+const MAX_OVERSIZED_LEX_DEPTH: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OversizedQuoteContext {
+    Unquoted,
+    Single,
+    Double,
+    AnsiC,
+    PowerShellHereSingle,
+    PowerShellHereDouble,
+    PowerShellBlockComment,
+    LineComment,
+}
+
+impl OversizedQuoteContext {
+    const fn opening_prefix(self) -> &'static str {
+        match self {
+            Self::Unquoted => "",
+            Self::Single => "'",
+            Self::Double => "\"",
+            Self::AnsiC => "$'",
+            Self::PowerShellHereSingle => "@'\n",
+            Self::PowerShellHereDouble => "@\"\n",
+            Self::PowerShellBlockComment => "<#",
+            Self::LineComment => "#",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OversizedLexKind {
+    Single,
+    Double,
+    AnsiC,
+    PowerShellHereSingle,
+    PowerShellHereDouble,
+    PowerShellBlockComment,
+    LineComment,
+    Paren,
+    DollarParen,
+    Backtick,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OversizedLexFrame {
+    kind: OversizedLexKind,
+    open_offset: usize,
+}
+
+struct OversizedLexCursor<'a> {
+    source: &'a str,
+    bytes: &'a [u8],
+    dialect: ShellDialect,
+    pos: usize,
+    stack: Vec<OversizedLexFrame>,
+    at_word_start: bool,
+    at_line_start: bool,
+    powershell_literal_mode: bool,
+    last_word_start: Option<usize>,
+    depth_overflow: bool,
+}
+
+impl<'a> OversizedLexCursor<'a> {
+    fn new(source: &'a str, dialect: ShellDialect) -> Self {
+        Self {
+            source,
+            bytes: source.as_bytes(),
+            dialect,
+            pos: 0,
+            stack: Vec::new(),
+            at_word_start: true,
+            at_line_start: true,
+            powershell_literal_mode: false,
+            last_word_start: None,
+            depth_overflow: false,
+        }
+    }
+
+    fn push_frame(&mut self, kind: OversizedLexKind, open_offset: usize) {
+        if self.stack.len() >= MAX_OVERSIZED_LEX_DEPTH {
+            self.depth_overflow = true;
+            return;
+        }
+        self.stack.push(OversizedLexFrame { kind, open_offset });
+    }
+
+    fn char_width_at(&self, index: usize) -> usize {
+        self.source
+            .get(index..)
+            .and_then(|tail| tail.chars().next())
+            .map_or(1, char::len_utf8)
+    }
+
+    fn active_quote_context(&self, unclosed_opens: &[usize]) -> OversizedQuoteContext {
+        let Some(top) = self.stack.last() else {
+            return OversizedQuoteContext::Unquoted;
+        };
+        let context = match top.kind {
+            OversizedLexKind::Single => OversizedQuoteContext::Single,
+            OversizedLexKind::Double => OversizedQuoteContext::Double,
+            OversizedLexKind::AnsiC => OversizedQuoteContext::AnsiC,
+            OversizedLexKind::PowerShellHereSingle => OversizedQuoteContext::PowerShellHereSingle,
+            OversizedLexKind::PowerShellHereDouble => OversizedQuoteContext::PowerShellHereDouble,
+            OversizedLexKind::PowerShellBlockComment => {
+                OversizedQuoteContext::PowerShellBlockComment
+            }
+            OversizedLexKind::LineComment => return OversizedQuoteContext::LineComment,
+            OversizedLexKind::Paren
+            | OversizedLexKind::DollarParen
+            | OversizedLexKind::Backtick => return OversizedQuoteContext::Unquoted,
+        };
+        if unclosed_opens.contains(&top.open_offset) {
+            OversizedQuoteContext::Unquoted
+        } else {
+            context
+        }
+    }
+
+    /// Advance by one atomic lexical step (never splitting a multi-byte UTF-8
+    /// character or an escape sequence). Returns `Some((sep_start, sep_end))`
+    /// when a top-level neutral list/statement separator was just consumed
+    /// (excluding pipeline operators `|`/`|&`, which couple adjacent stages).
+    fn step(&mut self) -> Option<(usize, usize)> {
+        let len = self.bytes.len();
+        if self.pos >= len {
+            return None;
+        }
+        match self.dialect {
+            ShellDialect::Cmd => self.step_cmd(),
+            ShellDialect::PowerShell => self.step_powershell(),
+            ShellDialect::Posix | ShellDialect::Unknown => self.step_posix(),
+        }
+    }
+
+    fn step_cmd(&mut self) -> Option<(usize, usize)> {
+        let len = self.bytes.len();
+        let i = self.pos;
+        let b = self.bytes[i];
+
+        // In cmd.exe, a physical newline ends the command and resets double quotes.
+        if b == b'\r' || b == b'\n' {
+            let step = if b == b'\r' && self.bytes.get(i + 1) == Some(&b'\n') {
+                2
+            } else {
+                1
+            };
+            self.pos = i + step;
+            if matches!(
+                self.stack.last().map(|f| f.kind),
+                Some(OversizedLexKind::Double)
+            ) {
+                self.stack.pop();
+            }
+            self.at_word_start = true;
+            self.at_line_start = true;
+            self.last_word_start = None;
+            return (self.stack.is_empty() && !self.depth_overflow).then_some((i, self.pos));
+        }
+
+        if matches!(
+            self.stack.last().map(|f| f.kind),
+            Some(OversizedLexKind::Double)
+        ) {
+            if b == b'"' {
+                self.stack.pop();
+                self.pos = i + 1;
+            } else {
+                self.pos = i + self.char_width_at(i);
+            }
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'^' {
+            let next = i + 1;
+            let step = if next >= len {
+                1
+            } else if self.bytes[next] == b'\r' && self.bytes.get(next + 1) == Some(&b'\n') {
+                3
+            } else {
+                1 + self.char_width_at(next)
+            };
+            self.pos = i + step;
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'"' {
+            self.push_frame(OversizedLexKind::Double, i);
+            self.pos = i + 1;
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b' ' || b == b'\t' {
+            self.pos = i + 1;
+            self.at_word_start = true;
+            self.at_line_start = false;
+            self.last_word_start = None;
+            return None;
+        }
+
+        if b == b'(' {
+            let after_echo = self.last_word_start.is_some_and(|ws| {
+                self.source
+                    .get(ws..i)
+                    .is_some_and(|w| w.eq_ignore_ascii_case("echo"))
+            });
+            self.pos = i + 1;
+            self.at_line_start = false;
+            if !after_echo && self.at_word_start {
+                self.push_frame(OversizedLexKind::Paren, i);
+                self.at_word_start = true;
+            } else {
+                self.at_word_start = false;
+            }
+            self.last_word_start = None;
+            return None;
+        }
+
+        if b == b')' {
+            if matches!(
+                self.stack.last().map(|f| f.kind),
+                Some(OversizedLexKind::Paren)
+            ) {
+                self.stack.pop();
+            }
+            self.pos = i + 1;
+            self.at_word_start = true;
+            self.at_line_start = false;
+            self.last_word_start = None;
+            return None;
+        }
+
+        if b == b'&' || b == b'|' {
+            let is_redirect = b == b'&' && i > 0 && matches!(self.bytes[i - 1], b'<' | b'>');
+            if !is_redirect {
+                let doubled = self.bytes.get(i + 1) == Some(&b);
+                let width = usize::from(doubled) + 1;
+                self.pos = i + width;
+                self.at_word_start = true;
+                self.at_line_start = false;
+                self.last_word_start = None;
+                // Keep single `|` pipelines coupled in one segment; split on `&`, `&&`, `||`.
+                let is_list_sep = b == b'&' || doubled;
+                return (is_list_sep && self.stack.is_empty() && !self.depth_overflow)
+                    .then_some((i, self.pos));
+            }
+        }
+
+        if self.at_word_start {
+            self.last_word_start = Some(i);
+        }
+        self.pos = i + self.char_width_at(i);
+        self.at_word_start = false;
+        self.at_line_start = false;
+        None
+    }
+
+    fn step_powershell(&mut self) -> Option<(usize, usize)> {
+        let len = self.bytes.len();
+        let i = self.pos;
+        let b = self.bytes[i];
+
+        match self.stack.last().map(|f| f.kind) {
+            Some(OversizedLexKind::LineComment) => {
+                if b == b'\r' || b == b'\n' {
+                    self.stack.pop();
+                    let step = if b == b'\r' && self.bytes.get(i + 1) == Some(&b'\n') {
+                        2
+                    } else {
+                        1
+                    };
+                    self.pos = i + step;
+                    self.at_word_start = true;
+                    self.at_line_start = true;
+                    self.powershell_literal_mode = false;
+                    return (self.stack.is_empty() && !self.depth_overflow)
+                        .then_some((i, self.pos));
+                }
+                self.pos = i + self.char_width_at(i);
+                self.at_line_start = false;
+                return None;
+            }
+            Some(OversizedLexKind::PowerShellBlockComment) => {
+                if b == b'#' && self.bytes.get(i + 1) == Some(&b'>') {
+                    self.stack.pop();
+                    self.pos = i + 2;
+                    self.at_word_start = true;
+                    self.at_line_start = false;
+                    return None;
+                }
+                if b == b'\r' || b == b'\n' {
+                    let step = if b == b'\r' && self.bytes.get(i + 1) == Some(&b'\n') {
+                        2
+                    } else {
+                        1
+                    };
+                    self.pos = i + step;
+                    self.at_line_start = true;
+                    return None;
+                }
+                self.pos = i + self.char_width_at(i);
+                self.at_line_start = false;
+                return None;
+            }
+            Some(
+                kind @ (OversizedLexKind::PowerShellHereSingle
+                | OversizedLexKind::PowerShellHereDouble),
+            ) => {
+                let close_quote = if kind == OversizedLexKind::PowerShellHereSingle {
+                    b'\''
+                } else {
+                    b'"'
+                };
+                if self.at_line_start && b == close_quote && self.bytes.get(i + 1) == Some(&b'@') {
+                    self.stack.pop();
+                    self.pos = i + 2;
+                    self.at_word_start = false;
+                    self.at_line_start = false;
+                    return None;
+                }
+                if b == b'\r' || b == b'\n' {
+                    let step = if b == b'\r' && self.bytes.get(i + 1) == Some(&b'\n') {
+                        2
+                    } else {
+                        1
+                    };
+                    self.pos = i + step;
+                    self.at_line_start = true;
+                    return None;
+                }
+                self.pos = i + self.char_width_at(i);
+                self.at_line_start = false;
+                return None;
+            }
+            Some(OversizedLexKind::Single) => {
+                if b == b'\'' {
+                    if self.bytes.get(i + 1) == Some(&b'\'') {
+                        self.pos = i + 2;
+                    } else {
+                        self.stack.pop();
+                        self.pos = i + 1;
+                    }
+                    self.at_line_start = false;
+                    return None;
+                }
+                if b == b'\r' || b == b'\n' {
+                    let step = if b == b'\r' && self.bytes.get(i + 1) == Some(&b'\n') {
+                        2
+                    } else {
+                        1
+                    };
+                    self.pos = i + step;
+                    self.at_line_start = true;
+                    return None;
+                }
+                self.pos = i + self.char_width_at(i);
+                self.at_line_start = false;
+                return None;
+            }
+            Some(OversizedLexKind::Double) => {
+                if b == b'`' {
+                    let next = i + 1;
+                    let step = if next >= len {
+                        1
+                    } else if self.bytes[next] == b'\r' && self.bytes.get(next + 1) == Some(&b'\n')
+                    {
+                        3
+                    } else {
+                        1 + self.char_width_at(next)
+                    };
+                    self.pos = i + step;
+                    self.at_line_start = false;
+                    return None;
+                }
+                if b == b'$' && self.bytes.get(i + 1) == Some(&b'(') {
+                    self.push_frame(OversizedLexKind::DollarParen, i);
+                    self.pos = i + 2;
+                    self.at_word_start = true;
+                    self.at_line_start = false;
+                    return None;
+                }
+                if b == b'"' {
+                    if self.bytes.get(i + 1) == Some(&b'"') {
+                        self.pos = i + 2;
+                    } else {
+                        self.stack.pop();
+                        self.pos = i + 1;
+                    }
+                    self.at_line_start = false;
+                    return None;
+                }
+                if b == b'\r' || b == b'\n' {
+                    let step = if b == b'\r' && self.bytes.get(i + 1) == Some(&b'\n') {
+                        2
+                    } else {
+                        1
+                    };
+                    self.pos = i + step;
+                    self.at_line_start = true;
+                    return None;
+                }
+                self.pos = i + self.char_width_at(i);
+                self.at_line_start = false;
+                return None;
+            }
+            None
+            | Some(
+                OversizedLexKind::Paren
+                | OversizedLexKind::DollarParen
+                | OversizedLexKind::Backtick,
+            ) => {}
+            Some(OversizedLexKind::AnsiC) => {
+                unreachable!("POSIX-only frame in PowerShell lexer")
+            }
+        }
+
+        // Unquoted PowerShell state (top-level or inside `(...)` / `$(...)`).
+        if b == b'\r' || b == b'\n' {
+            let step = if b == b'\r' && self.bytes.get(i + 1) == Some(&b'\n') {
+                2
+            } else {
+                1
+            };
+            self.pos = i + step;
+            self.at_word_start = true;
+            self.at_line_start = true;
+            self.powershell_literal_mode = false;
+            return (self.stack.is_empty() && !self.depth_overflow).then_some((i, self.pos));
+        }
+
+        if self.powershell_literal_mode {
+            if b == b'|' {
+                let is_or = self.bytes.get(i + 1) == Some(&b'|');
+                let width =
+                    usize::from(matches!(self.bytes.get(i + 1), Some(&b'|') | Some(&b'&'))) + 1;
+                self.pos = i + width;
+                self.powershell_literal_mode = false;
+                self.at_word_start = true;
+                self.at_line_start = false;
+                return (is_or && self.stack.is_empty() && !self.depth_overflow)
+                    .then_some((i, self.pos));
+            }
+            self.pos = i + self.char_width_at(i);
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'`' {
+            let next = i + 1;
+            let step = if next >= len {
+                1
+            } else if self.bytes[next] == b'\r' && self.bytes.get(next + 1) == Some(&b'\n') {
+                3
+            } else {
+                1 + self.char_width_at(next)
+            };
+            self.pos = i + step;
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b' ' || b == b'\t' {
+            self.pos = i + 1;
+            self.at_word_start = true;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if self.at_word_start && b == b'#' {
+            self.push_frame(OversizedLexKind::LineComment, i);
+            self.pos = i + 1;
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'<' && self.bytes.get(i + 1) == Some(&b'#') {
+            self.push_frame(OversizedLexKind::PowerShellBlockComment, i);
+            self.pos = i + 2;
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'@' && matches!(self.bytes.get(i + 1), Some(&b'\'') | Some(&b'"')) {
+            let quote = self.bytes[i + 1];
+            let mut j = i + 2;
+            while j < len && matches!(self.bytes[j], b' ' | b'\t') {
+                j += 1;
+            }
+            let nl_width =
+                if self.bytes.get(j) == Some(&b'\r') && self.bytes.get(j + 1) == Some(&b'\n') {
+                    Some(2)
+                } else if matches!(self.bytes.get(j), Some(&b'\n') | Some(&b'\r')) {
+                    Some(1)
+                } else {
+                    None
+                };
+            if let Some(w) = nl_width {
+                let kind = if quote == b'\'' {
+                    OversizedLexKind::PowerShellHereSingle
+                } else {
+                    OversizedLexKind::PowerShellHereDouble
+                };
+                self.push_frame(kind, i);
+                self.pos = j + w;
+                self.at_word_start = false;
+                self.at_line_start = true;
+                return None;
+            }
+        }
+
+        if self.at_word_start
+            && self.bytes.get(i..i + 3) == Some(b"--%")
+            && self.bytes.get(i + 3).is_none_or(u8::is_ascii_whitespace)
+        {
+            self.powershell_literal_mode = true;
+            self.pos = i + 3;
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'\'' {
+            self.push_frame(OversizedLexKind::Single, i);
+            self.pos = i + 1;
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'"' {
+            self.push_frame(OversizedLexKind::Double, i);
+            self.pos = i + 1;
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'$' && self.bytes.get(i + 1) == Some(&b'(') {
+            self.push_frame(OversizedLexKind::DollarParen, i);
+            self.pos = i + 2;
+            self.at_word_start = true;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'(' {
+            self.push_frame(OversizedLexKind::Paren, i);
+            self.pos = i + 1;
+            self.at_word_start = true;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b')' {
+            if matches!(
+                self.stack.last().map(|f| f.kind),
+                Some(OversizedLexKind::Paren | OversizedLexKind::DollarParen)
+            ) {
+                self.stack.pop();
+            }
+            self.pos = i + 1;
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        // PowerShell statement boundaries: `;`, `||`, and `&&`.
+        // Single `&` is the call operator (`& 'Remove-Item' ...`) and single
+        // `|`/`|&` couples pipeline stages, so neither splits a segment.
+        if b == b';' {
+            self.pos = i + 1;
+            self.at_word_start = true;
+            self.at_line_start = false;
+            return (self.stack.is_empty() && !self.depth_overflow).then_some((i, self.pos));
+        }
+        if b == b'|' {
+            let is_or = self.bytes.get(i + 1) == Some(&b'|');
+            let width = usize::from(matches!(self.bytes.get(i + 1), Some(&b'|') | Some(&b'&'))) + 1;
+            self.pos = i + width;
+            self.at_word_start = true;
+            self.at_line_start = false;
+            return (is_or && self.stack.is_empty() && !self.depth_overflow)
+                .then_some((i, self.pos));
+        }
+        if b == b'&' && self.bytes.get(i + 1) == Some(&b'&') {
+            self.pos = i + 2;
+            self.at_word_start = true;
+            self.at_line_start = false;
+            return (self.stack.is_empty() && !self.depth_overflow).then_some((i, self.pos));
+        }
+
+        self.pos = i + self.char_width_at(i);
+        self.at_word_start = false;
+        self.at_line_start = false;
+        None
+    }
+
+    fn step_posix(&mut self) -> Option<(usize, usize)> {
+        let len = self.bytes.len();
+        let i = self.pos;
+        let b = self.bytes[i];
+
+        match self.stack.last().map(|f| f.kind) {
+            Some(OversizedLexKind::LineComment) => {
+                if b == b'\n' {
+                    self.stack.pop();
+                    self.pos = i + 1;
+                    self.at_word_start = true;
+                    self.at_line_start = true;
+                    return (self.stack.is_empty() && !self.depth_overflow)
+                        .then_some((i, self.pos));
+                }
+                self.pos = i + self.char_width_at(i);
+                self.at_line_start = false;
+                return None;
+            }
+            Some(OversizedLexKind::Single) => {
+                if b == b'\'' {
+                    self.stack.pop();
+                    self.pos = i + 1;
+                } else {
+                    self.pos = i + self.char_width_at(i);
+                }
+                self.at_line_start = b == b'\n';
+                return None;
+            }
+            Some(OversizedLexKind::AnsiC) => {
+                if b == b'\\' {
+                    let next = i + 1;
+                    let step = if next >= len {
+                        1
+                    } else {
+                        1 + self.char_width_at(next)
+                    };
+                    self.pos = i + step;
+                    self.at_line_start = false;
+                    return None;
+                }
+                if b == b'\'' {
+                    self.stack.pop();
+                    self.pos = i + 1;
+                } else {
+                    self.pos = i + self.char_width_at(i);
+                }
+                self.at_line_start = b == b'\n';
+                return None;
+            }
+            Some(OversizedLexKind::Double) => {
+                if b == b'\\' {
+                    let next = i + 1;
+                    let step = if next >= len {
+                        1
+                    } else if self.bytes[next] == b'\r' && self.bytes.get(next + 1) == Some(&b'\n')
+                    {
+                        3
+                    } else {
+                        1 + self.char_width_at(next)
+                    };
+                    self.pos = i + step;
+                    self.at_line_start = false;
+                    return None;
+                }
+                if b == b'$' && self.bytes.get(i + 1) == Some(&b'(') {
+                    self.push_frame(OversizedLexKind::DollarParen, i);
+                    self.pos = i + 2;
+                    self.at_word_start = true;
+                    self.at_line_start = false;
+                    return None;
+                }
+                if b == b'`' {
+                    self.push_frame(OversizedLexKind::Backtick, i);
+                    self.pos = i + 1;
+                    self.at_word_start = true;
+                    self.at_line_start = false;
+                    return None;
+                }
+                if b == b'"' {
+                    self.stack.pop();
+                    self.pos = i + 1;
+                } else {
+                    self.pos = i + self.char_width_at(i);
+                }
+                self.at_line_start = b == b'\n';
+                return None;
+            }
+            None
+            | Some(
+                OversizedLexKind::Paren
+                | OversizedLexKind::DollarParen
+                | OversizedLexKind::Backtick,
+            ) => {}
+            Some(
+                OversizedLexKind::PowerShellHereSingle
+                | OversizedLexKind::PowerShellHereDouble
+                | OversizedLexKind::PowerShellBlockComment,
+            ) => unreachable!("PowerShell-only frame in POSIX lexer"),
+        }
+
+        // Unquoted POSIX state (top-level or inside `(...)`, `$(...)`, `` `...` ``).
+        if b == b'\\' {
+            let next = i + 1;
+            let step = if next >= len {
+                1
+            } else if self.bytes[next] == b'\r' && self.bytes.get(next + 1) == Some(&b'\n') {
+                3
+            } else {
+                1 + self.char_width_at(next)
+            };
+            self.pos = i + step;
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'\n' {
+            self.pos = i + 1;
+            self.at_word_start = true;
+            self.at_line_start = true;
+            return (self.stack.is_empty() && !self.depth_overflow).then_some((i, self.pos));
+        }
+
+        if b == b' ' || b == b'\t' || b == b'\r' {
+            self.pos = i + 1;
+            self.at_word_start = true;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if self.at_word_start && b == b'#' {
+            self.push_frame(OversizedLexKind::LineComment, i);
+            self.pos = i + 1;
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'$' && self.bytes.get(i + 1) == Some(&b'\'') {
+            self.push_frame(OversizedLexKind::AnsiC, i);
+            self.pos = i + 2;
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'\'' {
+            self.push_frame(OversizedLexKind::Single, i);
+            self.pos = i + 1;
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'"' {
+            self.push_frame(OversizedLexKind::Double, i);
+            self.pos = i + 1;
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'$' && self.bytes.get(i + 1) == Some(&b'(') {
+            self.push_frame(OversizedLexKind::DollarParen, i);
+            self.pos = i + 2;
+            self.at_word_start = true;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'`' {
+            if matches!(
+                self.stack.last().map(|f| f.kind),
+                Some(OversizedLexKind::Backtick)
+            ) {
+                self.stack.pop();
+                self.at_word_start = false;
+            } else {
+                self.push_frame(OversizedLexKind::Backtick, i);
+                self.at_word_start = true;
+            }
+            self.pos = i + 1;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b'(' {
+            self.push_frame(OversizedLexKind::Paren, i);
+            self.pos = i + 1;
+            self.at_word_start = true;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b')' {
+            if matches!(
+                self.stack.last().map(|f| f.kind),
+                Some(OversizedLexKind::Paren | OversizedLexKind::DollarParen)
+            ) {
+                self.stack.pop();
+            }
+            self.pos = i + 1;
+            self.at_word_start = false;
+            self.at_line_start = false;
+            return None;
+        }
+
+        if b == b';' {
+            self.pos = i + 1;
+            self.at_word_start = true;
+            self.at_line_start = false;
+            return (self.stack.is_empty() && !self.depth_overflow).then_some((i, self.pos));
+        }
+
+        if b == b'&' {
+            let is_redirect = (i > 0 && matches!(self.bytes[i - 1], b'<' | b'>'))
+                || self.bytes.get(i + 1) == Some(&b'>');
+            if !is_redirect {
+                let width = usize::from(self.bytes.get(i + 1) == Some(&b'&')) + 1;
+                self.pos = i + width;
+                self.at_word_start = true;
+                self.at_line_start = false;
+                return (self.stack.is_empty() && !self.depth_overflow).then_some((i, self.pos));
+            }
+        }
+
+        if b == b'|' {
+            let is_clobber = i > 0 && self.bytes[i - 1] == b'>';
+            if !is_clobber {
+                let is_or = self.bytes.get(i + 1) == Some(&b'|');
+                let width =
+                    usize::from(matches!(self.bytes.get(i + 1), Some(&b'|') | Some(&b'&'))) + 1;
+                self.pos = i + width;
+                self.at_word_start = true;
+                self.at_line_start = false;
+                // Keep `|`/`|&` pipelines coupled in one segment; split on `||`.
+                return (is_or && self.stack.is_empty() && !self.depth_overflow)
+                    .then_some((i, self.pos));
+            }
+        }
+
+        self.pos = i + self.char_width_at(i);
+        self.at_word_start = false;
+        self.at_line_start = false;
+        None
+    }
+}
+
+fn scan_oversized_top_level_segments(
+    command: &str,
+    dialect: ShellDialect,
+) -> (Vec<std::ops::Range<usize>>, bool) {
+    let mut cursor = OversizedLexCursor::new(command, dialect);
+    let mut segments = Vec::new();
+    let mut seg_start = 0usize;
+    while cursor.pos < command.len() {
+        if let Some((sep_start, sep_end)) = cursor.step() {
+            if seg_start < sep_start {
+                segments.push(seg_start..sep_start);
+            }
+            seg_start = sep_end;
+        }
+    }
+    if seg_start < command.len() {
+        segments.push(seg_start..command.len());
+    }
+    (segments, !cursor.depth_overflow)
+}
+
+/// Strictly narrow proof that a single oversized statement (> `max_command_bytes`)
+/// cannot execute arbitrary commands or hide destructive arguments across window
+/// boundaries: whitespace-only, a single-line `#` comment (non-Cmd), or a plain
+/// literal `echo`/`Write-Output` with zero metacharacters, expansions,
+/// redirections, escapes, or shell-function overrides.
+fn command_may_rebind_inert_head(command: &str, dialect: ShellDialect) -> bool {
+    match dialect {
+        ShellDialect::Cmd => {
+            // doskey macros can rebind cmd built-ins/commands.
+            command
+                .as_bytes()
+                .windows(6)
+                .any(|w| w.eq_ignore_ascii_case(b"doskey"))
+        }
+        ShellDialect::PowerShell => {
+            let bytes = command.as_bytes();
+            bytes
+                .windows(8)
+                .any(|w| w.eq_ignore_ascii_case(b"function"))
+                || bytes.windows(6).any(|w| w.eq_ignore_ascii_case(b"filter"))
+                || bytes.windows(5).any(|w| w.eq_ignore_ascii_case(b"alias"))
+                || bytes
+                    .windows(9)
+                    .any(|w| w.eq_ignore_ascii_case(b"function:"))
+        }
+        ShellDialect::Posix | ShellDialect::Unknown => {
+            command.contains("alias")
+                || command.contains("function")
+                || command.contains("echo(")
+                || command.contains("echo (")
+                || command.contains("PATH=")
+        }
+    }
+}
+
+fn oversized_segment_is_proven_inert(
+    segment: &str,
+    full_command: &str,
+    dialect: ShellDialect,
+) -> bool {
+    if segment.bytes().all(|byte| byte.is_ascii_whitespace()) {
+        return true;
+    }
+    // Trim a single trailing statement terminator (`;`, `&&`, `||`, or Cmd/POSIX
+    // `&`) attached by `scan_oversized_top_level_segments`, but NEVER strip a
+    // single pipe (`|` or `|&`) because piping stdout can feed a later
+    // interpreter (`echo '<70 KiB>' | sh`).
+    let body = segment.trim_matches(|ch: char| ch.is_ascii_whitespace());
+
+    if body.is_empty() {
+        return true;
+    }
+
+    // Single-line `#` comment (POSIX / PowerShell only; Cmd has no `#` comment).
+    if dialect != ShellDialect::Cmd && body.starts_with('#') && !body.contains(['\n', '\r']) {
+        return true;
+    }
+
+    // A single bare ASCII identifier longer than NAME_MAX (255 bytes) with zero
+    // whitespace, paths, flags, or metacharacters (e.g. `"x".repeat(300 * 1024)`
+    // padding payloads) carries no arguments, expansions, or shell operators.
+    let Some(split) = body.find([' ', '\t']) else {
+        return body.len() > 255
+            && !command_may_rebind_inert_head(full_command, dialect)
+            && body
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    };
+    let head = &body[..split];
+    let rest = body[split..].trim_matches(|ch: char| ch == ' ' || ch == '\t');
+    let head_ok = match dialect {
+        ShellDialect::Cmd => head.eq_ignore_ascii_case("echo"),
+        ShellDialect::PowerShell => {
+            head.eq_ignore_ascii_case("echo") || head.eq_ignore_ascii_case("Write-Output")
+        }
+        ShellDialect::Posix | ShellDialect::Unknown => {
+            head == "echo" && std::env::var_os("BASH_FUNC_echo%%").is_none()
+        }
+    };
+    if !head_ok || rest.is_empty() || command_may_rebind_inert_head(full_command, dialect) {
+        return false;
+    }
+
+    // Option 1: unquoted strictly safe ASCII word characters + horizontal whitespace.
+    if rest.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b' ' | b'\t' | b'_' | b'-' | b'.' | b',' | b':' | b'/' | b'=' | b'+'
+            )
+    }) {
+        return true;
+    }
+
+    // Option 2: single literal `'...'` string (POSIX / PowerShell only; no embedded `'`).
+    if dialect != ShellDialect::Cmd
+        && rest.len() >= 2
+        && rest.starts_with('\'')
+        && rest.ends_with('\'')
+        && !rest[1..rest.len() - 1].contains('\'')
+    {
+        return true;
+    }
+
+    // Option 3: single literal `"..."` string in Cmd with no `%`, `!`, `"`, or newline.
+    if dialect == ShellDialect::Cmd
+        && rest.len() >= 2
+        && rest.starts_with('"')
+        && rest.ends_with('"')
+        && !rest[1..rest.len() - 1].contains(['"', '%', '!', '\r', '\n'])
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Emit quote-parity-preserving overlapping windows for a single oversized
+/// segment (`segment.len() > max_command_bytes`) while consuming from
+/// `remaining_windows`. Returns whether every byte of `segment` was covered
+/// contiguously within the remaining window budget.
+fn push_oversized_segment_windows(
+    out: &mut Vec<String>,
+    segment: &str,
+    dialect: ShellDialect,
+    max_command_bytes: usize,
+    remaining_windows: &mut usize,
+) -> bool {
+    if segment.is_empty() {
+        return true;
+    }
+    if max_command_bytes == 0 {
+        return false;
+    }
+    // Single pass to record any quote/comment frames that never close in this
+    // segment, so we never prepend a synthetic quote onto a window whose
+    // apparent opener was actually an unmatched apostrophe (e.g. inside an
+    // unmasked heredoc body).
+    let mut probe = OversizedLexCursor::new(segment, dialect);
+    while probe.pos < segment.len() {
+        let _ = probe.step();
+    }
+    let unclosed_opens: Vec<usize> = probe.stack.iter().map(|frame| frame.open_offset).collect();
+
+    let mut cursor = OversizedLexCursor::new(segment, dialect);
+    let mut target = 0usize;
+    let mut covered_end = 0usize;
+    let mut contiguous = true;
+
+    while *remaining_windows > 0 && target < segment.len() {
+        // Advance the cursor to the last atomic lexer boundary `<= target`, so
+        // `begin` never splits a UTF-8 character or an escape sequence (`\"`,
+        // `` `" ``, `^"`, `''`). Only snapshot state when near `target` so the
+        // advance stays allocation-free across multi-megabyte segments.
+        while cursor.pos < target {
+            let prev_pos = cursor.pos;
+            let near_target = cursor.pos + 4 >= target
+                || (dialect == ShellDialect::PowerShell && cursor.bytes[cursor.pos] == b'@');
+            if !near_target {
+                let _ = cursor.step();
+                if cursor.pos == prev_pos {
+                    break;
+                }
+                continue;
+            }
+            let saved_stack = cursor.stack.clone();
+            let saved_word_start = cursor.at_word_start;
+            let saved_line_start = cursor.at_line_start;
+            let saved_literal = cursor.powershell_literal_mode;
+            let saved_last_word = cursor.last_word_start;
+            let saved_overflow = cursor.depth_overflow;
+            let _ = cursor.step();
+            if cursor.pos > target {
+                cursor.pos = prev_pos;
+                cursor.stack = saved_stack;
+                cursor.at_word_start = saved_word_start;
+                cursor.at_line_start = saved_line_start;
+                cursor.powershell_literal_mode = saved_literal;
+                cursor.last_word_start = saved_last_word;
+                cursor.depth_overflow = saved_overflow;
+                break;
+            }
+            if cursor.pos == prev_pos {
+                break;
+            }
+        }
+
+        let begin = cursor.pos;
+        let prefix = cursor
+            .active_quote_context(&unclosed_opens)
+            .opening_prefix();
+        let Some(payload_budget) = max_command_bytes.checked_sub(prefix.len()) else {
+            return false;
+        };
+        if payload_budget == 0 {
+            return false;
+        }
+
+        let mut end = (begin + payload_budget).min(segment.len());
+        while end > begin && !segment.is_char_boundary(end) {
+            end -= 1;
+        }
+        if begin < end {
+            contiguous &= begin <= covered_end;
+            covered_end = covered_end.max(end);
+            *remaining_windows -= 1;
+            if prefix.is_empty() {
+                out.push(segment[begin..end].to_string());
+            } else {
+                let mut window = String::with_capacity(prefix.len() + (end - begin));
+                window.push_str(prefix);
+                window.push_str(&segment[begin..end]);
+                out.push(window);
+            }
+        } else {
+            // A single UTF-8 character at `begin` exceeded `payload_budget`.
+            return false;
+        }
+
+        if end >= segment.len() {
+            return contiguous && covered_end == segment.len();
+        }
+        let stride = payload_budget
+            .saturating_sub(OVERSIZED_SCAN_WINDOW_OVERLAP)
+            .max(1);
+        let next_target = begin.saturating_add(stride);
+        target = if next_target <= target {
+            target + 1
+        } else {
+            next_target
+        };
+    }
+
+    false
+}
+
+/// Dialect-aware oversized windowing (bd-oversized-window-coverage-o36a):
+///
+/// 1. Splits `command` on neutral top-level statement boundaries so any single
+///    command up to `max_command_bytes` (even > 4 KiB overlap) is evaluated
+///    whole rather than straddling a window boundary.
+/// 2. Greedily packs consecutive small statements up to `max_command_bytes`,
+///    starting every window in neutral lexical state (preventing quote-parity
+///    flips across Cmd, PowerShell, and POSIX).
+/// 3. For any single statement exceeding `max_command_bytes`, slices overlapping
+///    sub-windows with quote-parity restoration AND marks coverage incomplete
+///    unless the statement is strictly proven inert (whitespace, single-line
+///    non-Cmd comment, or metacharacter-free literal `echo`/`Write-Output`).
+/// 4. Enforces `OVERSIZED_SCAN_MAX_WINDOWS`, `max_command_bytes == 0`, and
+///    UTF-8 char-boundary coverage fail-closed.
+fn push_oversized_scan_windows_for_dialect(
+    out: &mut Vec<String>,
+    command: &str,
+    max_command_bytes: usize,
+    dialect: ShellDialect,
+) -> bool {
+    if command.is_empty() {
+        return true;
+    }
+    if max_command_bytes == 0 {
+        return false;
+    }
+    if command.len() <= max_command_bytes {
+        out.push(command.to_string());
+        return true;
+    }
+
+    let (segments, well_formed) = scan_oversized_top_level_segments(command, dialect);
+    let mut remaining_windows = OVERSIZED_SCAN_MAX_WINDOWS;
+    let mut complete_coverage = well_formed;
+    let mut chunk_start: Option<usize> = None;
+    let mut chunk_end = 0usize;
+
+    let flush_chunk = |out: &mut Vec<String>,
+                       remaining_windows: &mut usize,
+                       complete_coverage: &mut bool,
+                       chunk_start: &mut Option<usize>,
+                       chunk_end: usize| {
+        let Some(start) = chunk_start.take() else {
+            return;
+        };
+        let slice = &command[start..chunk_end];
+        if slice.bytes().all(|byte| byte.is_ascii_whitespace()) {
+            return;
+        }
+        if *remaining_windows == 0 {
+            *complete_coverage = false;
+            return;
+        }
+        *remaining_windows -= 1;
+        out.push(slice.to_string());
+    };
+
+    for range in segments {
+        let seg = &command[range.clone()];
+        let seg_is_whitespace = seg.bytes().all(|byte| byte.is_ascii_whitespace());
+        if seg_is_whitespace {
+            if let Some(start) = chunk_start {
+                if range.end - start <= max_command_bytes {
+                    chunk_end = range.end;
+                    continue;
+                }
+                flush_chunk(
+                    out,
+                    &mut remaining_windows,
+                    &mut complete_coverage,
+                    &mut chunk_start,
+                    chunk_end,
+                );
+            }
+            continue;
+        }
+
+        if seg.len() <= max_command_bytes {
+            if let Some(start) = chunk_start {
+                if range.end - start <= max_command_bytes {
+                    chunk_end = range.end;
+                    continue;
+                }
+                flush_chunk(
+                    out,
+                    &mut remaining_windows,
+                    &mut complete_coverage,
+                    &mut chunk_start,
+                    chunk_end,
+                );
+            }
+            chunk_start = Some(range.start);
+            chunk_end = range.end;
+        } else {
+            flush_chunk(
+                out,
+                &mut remaining_windows,
+                &mut complete_coverage,
+                &mut chunk_start,
+                chunk_end,
+            );
+            if !oversized_segment_is_proven_inert(seg, command, dialect) {
+                complete_coverage = false;
+            }
+            if !push_oversized_segment_windows(
+                out,
+                seg,
+                dialect,
+                max_command_bytes,
+                &mut remaining_windows,
+            ) {
+                complete_coverage = false;
+            }
+        }
+    }
+
+    flush_chunk(
+        out,
+        &mut remaining_windows,
+        &mut complete_coverage,
+        &mut chunk_start,
+        chunk_end,
+    );
+    complete_coverage
 }
 
 /// Best-effort evaluation of an oversized hook payload's truncated prefix
@@ -794,24 +2032,52 @@ fn try_deny_unparseable_payload(
     // scan loop below refines each window.
     let mut windows_payload = false;
     for command in hook::extract_commands_from_truncated_json(prefix) {
-        if command.len() > max_command_bytes
-            && oversized_unverified_command.is_none()
-            && destructive_command_guard::heredoc::oversized_heredoc_requires_analysis(&command)
-        {
+        let scan_command: std::borrow::Cow<'_, str> = if command.len() > max_command_bytes {
             // The proof sees the whole recovered command. An earlier data
             // body cannot vouch for a later executable one, and a later
-            // command can run a file that an earlier data body wrote.
-            oversized_unverified_command = Some(command.len());
+            // command can run a file that an earlier data body wrote. Only
+            // AST-proven inert quoted data-heredoc bodies are masked (strictly
+            // length-preserving) before dialect refinement and window slicing
+            // (bd-oversized-data-heredoc-window-fp-jj7f).
+            let (heredoc_requires_analysis, masked) =
+                destructive_command_guard::heredoc::analyze_and_mask_oversized_heredocs(&command);
+            if heredoc_requires_analysis {
+                oversized_unverified_command.get_or_insert(command.len());
+            }
+            masked
+        } else {
+            std::borrow::Cow::Borrowed(command.as_str())
+        };
+        let command_dialect = hook::refine_shell_dialect(scan_command.as_ref(), shell_dialect);
+        let command_is_windows = match command_dialect {
+            ShellDialect::PowerShell | ShellDialect::Cmd => true,
+            ShellDialect::Unknown => hook::command_is_windows_shell_payload(scan_command.as_ref()),
+            ShellDialect::Posix => false,
+        };
+        if command_is_windows {
+            windows_payload = true;
         }
-        if !windows_payload {
-            windows_payload = match hook::refine_shell_dialect(&command, shell_dialect) {
-                ShellDialect::PowerShell | ShellDialect::Cmd => true,
-                ShellDialect::Unknown => hook::command_is_windows_shell_payload(&command),
-                ShellDialect::Posix => false,
-            };
-        }
-        if !push_oversized_scan_windows(&mut commands, &command, max_command_bytes) {
+        if !push_oversized_scan_windows_for_dialect(
+            &mut commands,
+            scan_command.as_ref(),
+            max_command_bytes,
+            command_dialect,
+        ) {
             oversized_unverified_command.get_or_insert(command.len());
+            // When the tool label was ambiguous (`Unknown`) and the command
+            // carries Windows shell markers, a trailing backslash before a
+            // closing quote (`"C:\path\" ; Remove-Item ...`) is literal in
+            // PowerShell/Cmd even though POSIX reads `\"` as escaped. Run a
+            // bounded PowerShell boundary pass so a concrete denial behind
+            // `\"` still wins over the indeterminate fallback.
+            if command_dialect == ShellDialect::Unknown && command_is_windows {
+                let _ = push_oversized_scan_windows_for_dialect(
+                    &mut commands,
+                    scan_command.as_ref(),
+                    max_command_bytes,
+                    ShellDialect::PowerShell,
+                );
+            }
         }
     }
     if commands.is_empty() && oversized_unverified_command.is_none() {
@@ -3029,6 +4295,238 @@ mod tests {
         assert!(!push_oversized_scan_windows(&mut windows, &command, limit));
         assert_eq!(windows.len(), OVERSIZED_SCAN_MAX_WINDOWS);
         assert!(windows.iter().all(|window| !window.contains('x')));
+    }
+
+    #[test]
+    fn oversized_scan_dialect_preserves_quote_parity_across_cmd_powershell_and_posix() {
+        let pad = "a".repeat(70 * 1024);
+
+        // Cmd: closing `"` followed by `&` splits cleanly so the tail starts unquoted.
+        let cmd_line = format!("echo \"{pad}\" & rd /s /q C:\\ & echo \"done\"");
+        let mut windows = Vec::new();
+        assert!(push_oversized_scan_windows_for_dialect(
+            &mut windows,
+            &cmd_line,
+            64 * 1024,
+            ShellDialect::Cmd,
+        ));
+        assert!(
+            windows
+                .iter()
+                .any(|window| window.trim().starts_with("rd /s /q C:\\")),
+            "expected neutral window starting at rd: {windows:?}"
+        );
+
+        // Cmd: apostrophes are ordinary characters and trailing backslashes do not escape `"`.
+        // The mixed unquoted+quoted `echo it's "..."` prefix (> 64 KiB) conservatively
+        // marks coverage incomplete (fail-closed) while still splitting cleanly at `&`
+        // so `rd /s /q C:\\` gets a neutral window and produces a concrete deny.
+        let cmd_bs = format!("echo it's \"C:\\dir\\{pad}\\\" & rd /s /q C:\\ & echo \"done\"");
+        windows.clear();
+        assert!(!push_oversized_scan_windows_for_dialect(
+            &mut windows,
+            &cmd_bs,
+            64 * 1024,
+            ShellDialect::Cmd,
+        ));
+        assert!(
+            windows
+                .iter()
+                .any(|window| window.trim().starts_with("rd /s /q C:\\")),
+            "expected neutral window after Cmd backslash-quote: {windows:?}"
+        );
+
+        // PowerShell: single-quoted string and here-string both isolate the tail neutrally.
+        let ps_single =
+            format!("Write-Output '{pad}'; Remove-Item -Recurse -Force C:\\; Write-Output 'done'");
+        windows.clear();
+        assert!(push_oversized_scan_windows_for_dialect(
+            &mut windows,
+            &ps_single,
+            64 * 1024,
+            ShellDialect::PowerShell,
+        ));
+        assert!(
+            windows.iter().any(|window| window
+                .trim()
+                .starts_with("Remove-Item -Recurse -Force C:\\")),
+            "expected neutral window for PowerShell tail: {windows:?}"
+        );
+
+        // PowerShell mid-statement inside `(...)`: sub-window starting inside `'...'`
+        // must prepend `'` so `'aaaa'` closes before `$(Remove-Item ...)`.
+        let ps_paren =
+            format!("Write-Output ('{pad}' + $(Remove-Item -Recurse -Force C:\\) + '{pad}')");
+        windows.clear();
+        assert!(!push_oversized_scan_windows_for_dialect(
+            &mut windows,
+            &ps_paren,
+            64 * 1024,
+            ShellDialect::PowerShell,
+        ));
+        assert!(
+            windows.iter().any(|window| {
+                window.starts_with('\'')
+                    && window.contains("' + $(Remove-Item -Recurse -Force C:\\) + '")
+            }),
+            "expected quote-prefixed sub-window keeping Remove-Item unquoted"
+        );
+
+        // POSIX mid-statement concatenation `'...'$(rm -rf /)'...'`: sub-window
+        // prepends `'` so `$(rm -rf /)` stays unquoted rather than flipping parity.
+        let posix_concat = format!("echo '{pad}'$(rm -rf /)'{pad}'");
+        windows.clear();
+        assert!(!push_oversized_scan_windows_for_dialect(
+            &mut windows,
+            &posix_concat,
+            64 * 1024,
+            ShellDialect::Posix,
+        ));
+        assert!(
+            windows
+                .iter()
+                .any(|window| window.starts_with('\'') && window.contains("'$(rm -rf /)'")),
+            "expected quote-prefixed POSIX sub-window keeping $(rm -rf /) unquoted"
+        );
+
+        // Planted negative: an unmatched apostrophe inside an unmasked heredoc
+        // body must NOT cause synthetic quote prefixing over the tail command.
+        let unclosed_body = format!("mystery-reader <<'EOF'\nit's {pad}\nEOF\nunlink /etc/passwd");
+        windows.clear();
+        assert!(!push_oversized_scan_windows_for_dialect(
+            &mut windows,
+            &unclosed_body,
+            64 * 1024,
+            ShellDialect::Posix,
+        ));
+        assert!(
+            windows
+                .iter()
+                .any(|window| !window.starts_with('\'') && window.contains("unlink /etc/passwd")),
+            "unclosed apostrophe must not wrap trailing unlink in a synthetic quote"
+        );
+    }
+
+    #[test]
+    fn oversized_scan_dialect_keeps_long_commands_and_pipelines_whole_and_fails_closed() {
+        // A single 8 KiB statement (> 4 KiB overlap, <= 64 KiB) right across the
+        // 64 KiB mark must NOT be split across window boundaries.
+        let long_git = format!(
+            "# {}\ngit {} reset --hard\n# {}",
+            "p".repeat(60 * 1024),
+            " ".repeat(8 * 1024),
+            "q".repeat(60 * 1024)
+        );
+        let mut windows = Vec::new();
+        assert!(push_oversized_scan_windows_for_dialect(
+            &mut windows,
+            &long_git,
+            64 * 1024,
+            ShellDialect::Posix,
+        ));
+        assert!(
+            windows
+                .iter()
+                .any(|window| window.contains("git") && window.contains("reset --hard")),
+            "expected an unbroken window holding the entire 8 KiB git command"
+        );
+
+        // Pipelines must stay coupled in one window rather than splitting at `|`.
+        let pipeline = format!(
+            "# {}\necho 'rm -rf /' | sh\n# {}",
+            "p".repeat(64 * 1024 - 16),
+            "q".repeat(60 * 1024)
+        );
+        windows.clear();
+        assert!(push_oversized_scan_windows_for_dialect(
+            &mut windows,
+            &pipeline,
+            64 * 1024,
+            ShellDialect::Posix,
+        ));
+        assert!(
+            windows
+                .iter()
+                .any(|window| window.contains("echo 'rm -rf /' | sh")),
+            "pipeline must remain coupled in a single window"
+        );
+
+        // PowerShell call operator `&` must not detach from its quoted target.
+        let ps_call = format!(
+            "Write-Output '{}'; & 'Remove-Item' -Recurse -Force C:\\; Write-Output '{}'",
+            "p".repeat(63 * 1024),
+            "q".repeat(63 * 1024)
+        );
+        windows.clear();
+        assert!(push_oversized_scan_windows_for_dialect(
+            &mut windows,
+            &ps_call,
+            64 * 1024,
+            ShellDialect::PowerShell,
+        ));
+        assert!(
+            windows
+                .iter()
+                .any(|window| window.contains("& 'Remove-Item' -Recurse -Force C:\\")),
+            "PowerShell call operator must stay attached to its target"
+        );
+
+        // Planted negatives: single statements exceeding `max_command_bytes` that
+        // are not proven inert, piped oversized echo, rebound echo, deep nesting,
+        // and tiny/zero limits MUST all report incomplete coverage (false).
+        for (label, command, limit, dialect) in [
+            (
+                "single 70 KiB git command",
+                format!("git {} reset --hard", " ".repeat(70 * 1024)),
+                64 * 1024,
+                ShellDialect::Posix,
+            ),
+            (
+                "oversized piped echo",
+                format!("echo '{}' | sh", "a".repeat(70 * 1024)),
+                64 * 1024,
+                ShellDialect::Posix,
+            ),
+            (
+                "rebound echo via alias",
+                format!("alias echo='sh -c'; echo '{}'", "a".repeat(70 * 1024)),
+                64 * 1024,
+                ShellDialect::Posix,
+            ),
+            (
+                "deep paren nesting overflow",
+                format!(
+                    "{}rm -rf /{}{}",
+                    "(".repeat(80),
+                    ")".repeat(80),
+                    " ".repeat(70 * 1024)
+                ),
+                64 * 1024,
+                ShellDialect::Posix,
+            ),
+            (
+                "zero command limit",
+                "git reset --hard".to_string(),
+                0,
+                ShellDialect::Posix,
+            ),
+            (
+                "tiny limit smaller than quote prefix",
+                "@'\naaaa\n'@".to_string(),
+                2,
+                ShellDialect::PowerShell,
+            ),
+        ] {
+            windows.clear();
+            assert!(
+                !push_oversized_scan_windows_for_dialect(&mut windows, &command, limit, dialect),
+                "{label}: must report incomplete coverage (fail closed)"
+            );
+            assert!(
+                windows.iter().all(|window| window.len() <= limit),
+                "{label}: every emitted window must stay within max_command_bytes={limit}"
+            );
+        }
     }
 
     /// #358: Reasonix reads only the exit status, so every delivered blocking

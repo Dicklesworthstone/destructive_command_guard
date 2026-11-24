@@ -8749,37 +8749,120 @@ pub(crate) fn first_heredoc_target_command(command: &str) -> Option<String> {
 /// text or arithmetic is not exempt when its complete proof exceeds them.
 #[must_use]
 pub fn oversized_heredoc_requires_analysis(command: &str) -> bool {
-    const MAX_HEREDOC_OPERATORS: usize = 256;
-    if command.len() > MAX_OVERSIZED_HEREDOC_SOURCE_BYTES {
-        return true;
+    analyze_oversized_heredocs(command).requires_analysis
+}
+
+/// Analyze an oversized command's heredocs and mask AST-proven inert quoted data bodies.
+///
+/// When the whole command is AST-proven to consist exclusively of inert data
+/// commands with complete quoted-delimiter stdin heredocs, returns a strictly
+/// length-preserving view with those proven body ranges blanked (preserving
+/// newlines and all exterior bytes, headers, terminators, and trailing commands).
+///
+/// Fails closed: if the command exceeds size/work bounds, is unterminated, or
+/// contains any unproven receiver, pipe, substitution, override, or non-data
+/// command, returns `(true, Cow::Borrowed(command))` without masking any byte
+/// (bd-oversized-data-heredoc-window-fp-jj7f, bd-oversized-code-heredoc-receivers-azu4).
+#[must_use]
+pub fn analyze_and_mask_oversized_heredocs(command: &str) -> (bool, Cow<'_, str>) {
+    let analysis = analyze_oversized_heredocs(command);
+    if analysis.requires_analysis || analysis.inert_body_ranges.is_empty() {
+        return (analysis.requires_analysis, Cow::Borrowed(command));
     }
-    let bytes = command.as_bytes();
-    let mut search = 0usize;
-    let mut operators = Vec::new();
+    if !analysis.inert_body_ranges.iter().all(|range| {
+        range.start <= range.end
+            && range.end <= command.len()
+            && command.is_char_boundary(range.start)
+            && command.is_char_boundary(range.end)
+    }) {
+        return (true, Cow::Borrowed(command));
+    }
+    let masked = blank_ranges(command, &analysis.inert_body_ranges);
+    debug_assert_eq!(masked.len(), command.len());
+    (false, Cow::Owned(masked))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OversizedHeredocAnalysis {
+    requires_analysis: bool,
+    inert_body_ranges: Vec<Range<usize>>,
+}
+
+const MAX_OVERSIZED_HEREDOC_OPERATORS: usize = 256;
+
+fn next_non_herestring_heredoc_operator(bytes: &[u8], mut search: usize) -> Option<usize> {
     while let Some(relative) = memchr::memmem::find(&bytes[search..], b"<<") {
         let operator = search + relative;
         search = operator + 2;
         if bytes.get(operator + 2) == Some(&b'<') || (operator > 0 && bytes[operator - 1] == b'<') {
             continue;
         }
-        if operators.len() == MAX_HEREDOC_OPERATORS {
-            return true;
-        }
-        operators.push(operator);
+        return Some(operator);
     }
-    if operators.is_empty() {
-        return false;
+    None
+}
+
+fn analyze_oversized_heredocs(command: &str) -> OversizedHeredocAnalysis {
+    if command.len() > MAX_OVERSIZED_HEREDOC_SOURCE_BYTES {
+        return OversizedHeredocAnalysis {
+            requires_analysis: true,
+            inert_body_ranges: Vec::new(),
+        };
     }
+    let bytes = command.as_bytes();
+    let Some(first_operator) = next_non_herestring_heredoc_operator(bytes, 0) else {
+        return OversizedHeredocAnalysis {
+            requires_analysis: false,
+            inert_body_ranges: Vec::new(),
+        };
+    };
     // With no elisions, the complete tree can prove that a quoted `<<` or
     // numeric arithmetic is ordinary argv data. No outer heredoc nodes alone
     // would be insufficient: `bash -c '... <<EOF ...'` is an executable carrier.
+    // Only take the uncompacted path when the raw `<<` count is also within
+    // the operator bound; a large quoted file body carrying many literal `<<`
+    // tokens (e.g. C++/Rust shifts) falls through to streaming compaction,
+    // which jumps over compacted bodies while still bounding exterior `<<`.
     if command.len() <= MAX_OVERSIZED_HEREDOC_VIEW_BYTES {
-        return !oversized_heredoc_view_is_inert(command, &[]);
+        let mut count = 1usize;
+        let mut search = first_operator + 2;
+        while count <= MAX_OVERSIZED_HEREDOC_OPERATORS {
+            let Some(next) = next_non_herestring_heredoc_operator(bytes, search) else {
+                break;
+            };
+            count += 1;
+            search = next + 2;
+        }
+        if count <= MAX_OVERSIZED_HEREDOC_OPERATORS {
+            return match proven_inert_heredoc_bodies(command, &[]) {
+                Some(inert_body_ranges) => OversizedHeredocAnalysis {
+                    requires_analysis: false,
+                    inert_body_ranges,
+                },
+                None => OversizedHeredocAnalysis {
+                    requires_analysis: true,
+                    inert_body_ranges: Vec::new(),
+                },
+            };
+        }
     }
-    let Some((view, elisions)) = compact_oversized_heredocs(command, &operators) else {
-        return true;
+    let Some((view, elisions)) = compact_oversized_heredocs_streaming(command, first_operator)
+    else {
+        return OversizedHeredocAnalysis {
+            requires_analysis: true,
+            inert_body_ranges: Vec::new(),
+        };
     };
-    !oversized_heredoc_view_is_inert(&view, &elisions)
+    match proven_inert_heredoc_bodies(&view, &elisions) {
+        Some(inert_body_ranges) => OversizedHeredocAnalysis {
+            requires_analysis: false,
+            inert_body_ranges,
+        },
+        None => OversizedHeredocAnalysis {
+            requires_analysis: true,
+            inert_body_ranges: Vec::new(),
+        },
+    }
 }
 
 const MAX_OVERSIZED_HEREDOC_SOURCE_BYTES: usize = 4 * 1024 * 1024;
@@ -8787,130 +8870,226 @@ const MAX_OVERSIZED_HEREDOC_VIEW_BYTES: usize = 64 * 1024;
 const MAX_OVERSIZED_HEREDOC_NODES: usize = 16_384;
 
 /// Coordinates in a compact view, including the retained terminator's tab
-/// indentation in `body` when `<<-` makes it part of the grammar's body node.
+/// indentation in `body` when `<<-` makes it part of the grammar's body node,
+/// plus the exact body byte range (`body_start..terminator_start`) in the
+/// original uncompacted command.
 #[derive(Debug)]
 struct OversizedHeredocElision {
     operator: usize,
     body: Range<usize>,
     terminator: Range<usize>,
+    original_body: Range<usize>,
+}
+
+enum CompactionStep {
+    NotCompacted,
+    Compacted { next_copied_until: usize },
+    BudgetExceeded,
+}
+
+fn try_compact_single_heredoc(
+    command: &str,
+    operator: usize,
+    copied_until: usize,
+    search_bytes: &mut usize,
+    view: &mut String,
+    elisions: &mut Vec<OversizedHeredocElision>,
+) -> CompactionStep {
+    const MAX_DELIMITER_BYTES: usize = 256;
+    if operator < copied_until {
+        return CompactionStep::NotCompacted;
+    }
+    let header_bound = command
+        .len()
+        .min(operator + MAX_OVERSIZED_HEREDOC_VIEW_BYTES);
+    let header = &command.as_bytes()[operator..header_bound];
+    let bounded_header = &header[..header.len().min(*search_bytes)];
+    let newline = memchr(b'\n', bounded_header);
+    let Some(remaining) =
+        search_bytes.checked_sub(newline.map_or(bounded_header.len(), |at| at + 1))
+    else {
+        return CompactionStep::BudgetExceeded;
+    };
+    *search_bytes = remaining;
+    if newline.is_none() && bounded_header.len() < header.len() {
+        return CompactionStep::BudgetExceeded;
+    }
+    let Some(newline) = newline else {
+        return CompactionStep::NotCompacted;
+    };
+    let header_end = operator + newline;
+    let Some(captures) = HEREDOC_EXTRACTOR.captures(&command[operator..header_end]) else {
+        return CompactionStep::NotCompacted;
+    };
+    let Some(matched) = captures.get(0) else {
+        return CompactionStep::BudgetExceeded;
+    };
+    if matched.start() != 0
+        || captures
+            .get(1)
+            .is_some_and(|variant| variant.as_str() == "~")
+    {
+        return CompactionStep::NotCompacted;
+    }
+    let Some(word) = captures.get(2).map(|m| m.as_str()) else {
+        return CompactionStep::BudgetExceeded;
+    };
+    if !word.contains(['\'', '"', '\\']) || word.len() > MAX_DELIMITER_BYTES {
+        return CompactionStep::NotCompacted;
+    }
+    if command
+        .as_bytes()
+        .get(operator + matched.end())
+        .is_some_and(|byte| {
+            !byte.is_ascii_whitespace() && !matches!(byte, b';' | b'&' | b'|' | b')' | b'<' | b'>')
+        })
+    {
+        return CompactionStep::NotCompacted;
+    }
+    let Some((delimiter, _)) = literal_word_with_offsets(word) else {
+        return CompactionStep::NotCompacted;
+    };
+    if delimiter.contains(['\r', '\n', '\0']) {
+        return CompactionStep::NotCompacted;
+    }
+    let strip_tabs = captures
+        .get(1)
+        .is_some_and(|variant| variant.as_str() == "-");
+    let body_start = header_end + 1;
+    let mut line_start = body_start;
+    let mut terminator = None;
+    while line_start < command.len() {
+        let rest = &command.as_bytes()[line_start..];
+        let bounded_line = &rest[..rest.len().min(*search_bytes)];
+        let newline = memchr(b'\n', bounded_line);
+        if newline.is_none() && bounded_line.len() < rest.len() {
+            return CompactionStep::BudgetExceeded;
+        }
+        let line_length = newline.unwrap_or(rest.len());
+        let Some(remaining) =
+            search_bytes.checked_sub(line_length + usize::from(line_length < rest.len()))
+        else {
+            return CompactionStep::BudgetExceeded;
+        };
+        *search_bytes = remaining;
+        let line = &command[line_start..line_start + line_length];
+        let content = if strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        };
+        if content == delimiter {
+            terminator = Some((line_start, line.len() - content.len(), line_length));
+            break;
+        }
+        line_start += line_length + usize::from(line_length < rest.len());
+    }
+    let Some((terminator_start, indentation, terminator_length)) = terminator else {
+        // A quoted/arithmetic prefix may contain an unrelated `<<WORD`.
+        // Keep looking; only the complete final parse decides ownership.
+        return CompactionStep::NotCompacted;
+    };
+    let placeholder = if delimiter == "_" { "__\n" } else { "_\n" };
+    let Some(added) = body_start
+        .checked_sub(copied_until)
+        .and_then(|prefix| prefix.checked_add(placeholder.len()))
+    else {
+        return CompactionStep::BudgetExceeded;
+    };
+    let Some(next_view_len) = view.len().checked_add(added) else {
+        return CompactionStep::BudgetExceeded;
+    };
+    if next_view_len > MAX_OVERSIZED_HEREDOC_VIEW_BYTES {
+        return CompactionStep::BudgetExceeded;
+    }
+    let projected_operator = view.len() + operator - copied_until;
+    view.push_str(&command[copied_until..body_start]);
+    let projected_body_start = view.len();
+    view.push_str(placeholder);
+    let projected_terminator = view.len();
+    elisions.push(OversizedHeredocElision {
+        operator: projected_operator,
+        body: projected_body_start..projected_terminator + indentation,
+        terminator: projected_terminator + indentation..projected_terminator + terminator_length,
+        original_body: body_start..terminator_start,
+    });
+    // The actual terminator line is copied as exterior source, untouched.
+    CompactionStep::Compacted {
+        next_copied_until: terminator_start,
+    }
+}
+
+/// Streaming variant of [`compact_oversized_heredocs`] that advances past each
+/// compacted heredoc body before searching for the next `<<` operator, so a
+/// large file body containing hundreds of literal `<<` tokens (such as C++ or
+/// Rust bit-shift code) does not exhaust the exterior operator budget.
+fn compact_oversized_heredocs_streaming(
+    command: &str,
+    first_operator: usize,
+) -> Option<(String, Vec<OversizedHeredocElision>)> {
+    const MAX_SEARCH_BYTES: usize = 16 * 1024 * 1024;
+    let bytes = command.as_bytes();
+    let mut search_bytes = MAX_SEARCH_BYTES;
+    let mut view = String::new();
+    let mut elisions = Vec::new();
+    let mut copied_until = 0usize;
+    let mut seen_operators = 0usize;
+    let mut next_operator = Some(first_operator);
+    while let Some(operator) = next_operator {
+        if seen_operators == MAX_OVERSIZED_HEREDOC_OPERATORS {
+            return None;
+        }
+        seen_operators += 1;
+        let search_from = match try_compact_single_heredoc(
+            command,
+            operator,
+            copied_until,
+            &mut search_bytes,
+            &mut view,
+            &mut elisions,
+        ) {
+            CompactionStep::NotCompacted => operator + 2,
+            CompactionStep::Compacted { next_copied_until } => {
+                copied_until = next_copied_until;
+                next_copied_until
+            }
+            CompactionStep::BudgetExceeded => return None,
+        };
+        next_operator = next_non_herestring_heredoc_operator(bytes, search_from);
+    }
+    if view.len().checked_add(command.len() - copied_until)? > MAX_OVERSIZED_HEREDOC_VIEW_BYTES {
+        return None;
+    }
+    view.push_str(&command[copied_until..]);
+    Some((view, elisions))
 }
 
 /// Candidate discovery is deliberately not a shell proof. It only shortens
 /// quoted bodies for the bounded complete-tree proof below; a false candidate
 /// cannot become an exemption without its exact operator and body nodes.
+#[cfg_attr(not(test), allow(dead_code))]
 fn compact_oversized_heredocs(
     command: &str,
     operators: &[usize],
 ) -> Option<(String, Vec<OversizedHeredocElision>)> {
-    const MAX_DELIMITER_BYTES: usize = 256;
     const MAX_SEARCH_BYTES: usize = 16 * 1024 * 1024;
     let mut search_bytes = MAX_SEARCH_BYTES;
     let mut view = String::new();
     let mut elisions = Vec::new();
     let mut copied_until = 0usize;
     for &operator in operators {
-        if operator < copied_until {
-            continue;
+        match try_compact_single_heredoc(
+            command,
+            operator,
+            copied_until,
+            &mut search_bytes,
+            &mut view,
+            &mut elisions,
+        ) {
+            CompactionStep::NotCompacted => {}
+            CompactionStep::Compacted { next_copied_until } => copied_until = next_copied_until,
+            CompactionStep::BudgetExceeded => return None,
         }
-        let header_bound = command
-            .len()
-            .min(operator + MAX_OVERSIZED_HEREDOC_VIEW_BYTES);
-        let header = &command.as_bytes()[operator..header_bound];
-        let bounded_header = &header[..header.len().min(search_bytes)];
-        let newline = memchr(b'\n', bounded_header);
-        search_bytes =
-            search_bytes.checked_sub(newline.map_or(bounded_header.len(), |at| at + 1))?;
-        if newline.is_none() && bounded_header.len() < header.len() {
-            return None;
-        }
-        let Some(newline) = newline else {
-            continue;
-        };
-        let header_end = operator + newline;
-        let Some(captures) = HEREDOC_EXTRACTOR.captures(&command[operator..header_end]) else {
-            continue;
-        };
-        let matched = captures.get(0)?;
-        if matched.start() != 0
-            || captures
-                .get(1)
-                .is_some_and(|variant| variant.as_str() == "~")
-        {
-            continue;
-        }
-        let word = captures.get(2)?.as_str();
-        if !word.contains(['\'', '"', '\\']) || word.len() > MAX_DELIMITER_BYTES {
-            continue;
-        }
-        if command
-            .as_bytes()
-            .get(operator + matched.end())
-            .is_some_and(|byte| {
-                !byte.is_ascii_whitespace()
-                    && !matches!(byte, b';' | b'&' | b'|' | b')' | b'<' | b'>')
-            })
-        {
-            continue;
-        }
-        let Some((delimiter, _)) = literal_word_with_offsets(word) else {
-            continue;
-        };
-        if delimiter.contains(['\r', '\n', '\0']) {
-            continue;
-        }
-        let strip_tabs = captures
-            .get(1)
-            .is_some_and(|variant| variant.as_str() == "-");
-        let body_start = header_end + 1;
-        let mut line_start = body_start;
-        let mut terminator = None;
-        while line_start < command.len() {
-            let rest = &command.as_bytes()[line_start..];
-            let bounded_line = &rest[..rest.len().min(search_bytes)];
-            let newline = memchr(b'\n', bounded_line);
-            if newline.is_none() && bounded_line.len() < rest.len() {
-                return None;
-            }
-            let line_length = newline.unwrap_or(rest.len());
-            search_bytes =
-                search_bytes.checked_sub(line_length + usize::from(line_length < rest.len()))?;
-            let line = &command[line_start..line_start + line_length];
-            let content = if strip_tabs {
-                line.trim_start_matches('\t')
-            } else {
-                line
-            };
-            if content == delimiter {
-                terminator = Some((line_start, line.len() - content.len(), line_length));
-                break;
-            }
-            line_start += line_length + usize::from(line_length < rest.len());
-        }
-        let Some((terminator_start, indentation, terminator_length)) = terminator else {
-            // A quoted/arithmetic prefix may contain an unrelated `<<WORD`.
-            // Keep looking; only the complete final parse decides ownership.
-            continue;
-        };
-        let placeholder = if delimiter == "_" { "__\n" } else { "_\n" };
-        let added = body_start
-            .checked_sub(copied_until)?
-            .checked_add(placeholder.len())?;
-        if view.len().checked_add(added)? > MAX_OVERSIZED_HEREDOC_VIEW_BYTES {
-            return None;
-        }
-        let projected_operator = view.len() + operator - copied_until;
-        view.push_str(&command[copied_until..body_start]);
-        let projected_body_start = view.len();
-        view.push_str(placeholder);
-        let projected_terminator = view.len();
-        elisions.push(OversizedHeredocElision {
-            operator: projected_operator,
-            body: projected_body_start..projected_terminator + indentation,
-            terminator: projected_terminator + indentation
-                ..projected_terminator + terminator_length,
-        });
-        // The actual terminator line is copied as exterior source, untouched.
-        copied_until = terminator_start;
     }
     if view.len().checked_add(command.len() - copied_until)? > MAX_OVERSIZED_HEREDOC_VIEW_BYTES {
         return None;
@@ -8921,7 +9100,18 @@ fn compact_oversized_heredocs(
 
 /// A narrow whole-program proof excludes later file execution and name or fd
 /// mutation, instead of trying to infer those from a truncated command prefix.
+#[cfg_attr(not(test), allow(dead_code))]
 fn oversized_heredoc_view_is_inert(source: &str, elisions: &[OversizedHeredocElision]) -> bool {
+    proven_inert_heredoc_bodies(source, elisions).is_some()
+}
+
+/// Returns the proven original-command body ranges that can be safely masked
+/// when `source` is AST-proven to be an inert data-only program, or `None` on
+/// any unproven construct, error, or bound exhaustion.
+fn proven_inert_heredoc_bodies(
+    source: &str,
+    elisions: &[OversizedHeredocElision],
+) -> Option<Vec<Range<usize>>> {
     if source.len() > MAX_OVERSIZED_HEREDOC_VIEW_BYTES
         || source
             .bytes()
@@ -8930,13 +9120,13 @@ fn oversized_heredoc_view_is_inert(source: &str, elisions: &[OversizedHeredocEli
             .count()
             >= MAX_PARSED_PIPELINE_STAGES
     {
-        return false;
+        return None;
     }
     // Do not invoke context's recursive lexical scanner on adversarial input.
     // Quoted bodies need no joined-terminator canonicalization. The optional
     // arithmetic repair has independent aggregate byte/node/pass limits.
     let Ok(original) = AstGrep::try_new(source, SupportLang::Bash) else {
-        return false;
+        return None;
     };
     // The shared pipeline counter's quote walker is recursive. A raw count
     // above is a conservative pre-parse bound; only invoke arithmetic repair
@@ -8955,42 +9145,40 @@ fn oversized_heredoc_view_is_inert(source: &str, elisions: &[OversizedHeredocEli
     };
     let ast = recovered.as_ref().unwrap_or(&original);
     if ast.root().get_inner_node().has_error() {
-        return false;
+        return None;
     }
     let mut remaining = MAX_OVERSIZED_HEREDOC_NODES - 1;
     let mut pending = vec![ast.root()];
     let mut heredocs = Vec::new();
     while let Some(node) = pending.pop() {
         if node.is_error() || node.get_inner_node().is_missing() {
-            return false;
+            return None;
         }
         match node.kind().as_ref() {
             "program" | "list" | "redirected_statement" => {}
             "comment" => continue,
             "command" => {
                 if !oversized_data_command_is_inert(&node, &mut remaining) {
-                    return false;
+                    return None;
                 }
                 continue;
             }
             "file_redirect" => {
                 if !oversized_file_redirect_is_inert(&node, &mut remaining) {
-                    return false;
+                    return None;
                 }
                 continue;
             }
             "heredoc_redirect" => {
                 if !oversized_quoted_heredoc_is_complete(&node, source, &mut remaining) {
-                    return false;
+                    return None;
                 }
                 heredocs.push(node.clone());
                 for child in node
                     .children()
                     .filter(|child| child.kind() == "file_redirect")
                 {
-                    let Some(next) = remaining.checked_sub(1) else {
-                        return false;
-                    };
+                    let next = remaining.checked_sub(1)?;
                     remaining = next;
                     pending.push(child);
                 }
@@ -8998,12 +9186,10 @@ fn oversized_heredoc_view_is_inert(source: &str, elisions: &[OversizedHeredocEli
             }
             // This also rejects inline shell/ssh carriers, substitutions,
             // functions, assignments, pipelines and unknown control flow.
-            _ => return false,
+            _ => return None,
         }
         for child in node.children().filter(ast_grep_core::Node::is_named) {
-            let Some(next) = remaining.checked_sub(1) else {
-                return false;
-            };
+            let next = remaining.checked_sub(1)?;
             remaining = next;
             pending.push(child);
         }
@@ -9012,9 +9198,9 @@ fn oversized_heredoc_view_is_inert(source: &str, elisions: &[OversizedHeredocEli
         .iter()
         .any(|node| heredoc_output(node) != Some(HeredocOutput::Contained))
     {
-        return false;
+        return None;
     }
-    elisions.iter().all(|elision| {
+    let all_elisions_verified = elisions.iter().all(|elision| {
         heredocs.iter().any(|node| {
             node.children().any(|child| {
                 matches!(child.kind().as_ref(), "<<" | "<<-")
@@ -9026,7 +9212,40 @@ fn oversized_heredoc_view_is_inert(source: &str, elisions: &[OversizedHeredocEli
                     child.kind() == "heredoc_end" && child.range() == elision.terminator
                 })
         })
-    })
+    });
+    if !all_elisions_verified {
+        return None;
+    }
+    if !elisions.is_empty() {
+        return Some(
+            elisions
+                .iter()
+                .map(|elision| elision.original_body.clone())
+                .collect(),
+        );
+    }
+    let mut ranges = Vec::with_capacity(heredocs.len());
+    for node in &heredocs {
+        let mut body_range = None;
+        let mut terminator_start = None;
+        for child in node.children() {
+            match child.kind().as_ref() {
+                "heredoc_body" => body_range = Some(child.range()),
+                "heredoc_end" => terminator_start = Some(child.range().start),
+                _ => {}
+            }
+        }
+        let (Some(body), Some(term_start)) = (body_range, terminator_start) else {
+            return None;
+        };
+        let terminator_line_start = source[..term_start].rfind('\n').map_or(0, |at| at + 1);
+        let mask_end = body.end.min(terminator_line_start).max(body.start);
+        if body.start < mask_end {
+            ranges.push(body.start..mask_end);
+        }
+    }
+    ranges.sort_by_key(|range| range.start);
+    Some(ranges)
 }
 
 fn oversized_data_command_is_inert<D: ast_grep_core::Doc>(
@@ -17896,6 +18115,145 @@ mod tests {
         );
         assert!(nested.len() < MAX_OVERSIZED_HEREDOC_VIEW_BYTES);
         assert!(oversized_heredoc_requires_analysis(&nested));
+    }
+
+    #[test]
+    fn oversized_heredoc_masking_blanks_proven_quoted_data_bodies_length_preserving() {
+        let hazardous_prose = format!(
+            "rm -rf /\ngit reset --hard\neval(x);\n`rm -rf /`\nRemove-Item -Recurse -Force C:\\\n🛡 — 日本語\n{}",
+            "ordinary docs mentioning rm -rf / and 1 << 2\n".repeat(3_500)
+        );
+        let command = format!(
+            "cat > out.txt <<'EOF'\n{hazardous_prose}EOF\ncat <<-'END' > second.txt\n{hazardous_prose}\tEND\necho done\n"
+        );
+        assert!(command.len() > 256 * 1024);
+
+        let (requires_analysis, masked) = analyze_and_mask_oversized_heredocs(&command);
+        assert!(!requires_analysis, "proven quoted data heredocs are inert");
+        assert_eq!(
+            masked.len(),
+            command.len(),
+            "masking must be strictly length-preserving"
+        );
+        assert!(masked.starts_with("cat > out.txt <<'EOF'\n"));
+        assert!(masked.contains("\nEOF\ncat <<-'END' > second.txt\n"));
+        assert!(masked.ends_with("\tEND\necho done\n"));
+        assert!(!masked.contains("rm -rf"));
+        assert!(!masked.contains("git reset"));
+        assert!(!masked.contains("eval(x)"));
+        assert!(!masked.contains("Remove-Item"));
+        // Every newline offset must remain identical so windowing sees exact lines.
+        let orig_newlines: Vec<usize> = command.match_indices('\n').map(|(i, _)| i).collect();
+        let masked_newlines: Vec<usize> = masked.match_indices('\n').map(|(i, _)| i).collect();
+        assert_eq!(orig_newlines, masked_newlines);
+
+        // Bodies containing > 256 literal `<<` tokens (e.g. Rust/C++ shift code)
+        // must NOT trip the exterior operator bound.
+        let many_shifts = "let shifted = x << 1; // rm -rf /\n".repeat(4_000);
+        let shift_cmd = format!("cat > shifts.rs <<'EOF'\n{many_shifts}EOF\n");
+        let (shift_requires, shift_masked) = analyze_and_mask_oversized_heredocs(&shift_cmd);
+        assert!(
+            !shift_requires,
+            "interior << tokens must not trip operator cap"
+        );
+        assert_eq!(shift_masked.len(), shift_cmd.len());
+        assert!(!shift_masked.contains("rm -rf"));
+
+        // Small (<= 64 KiB) proven quoted data heredocs also mask cleanly.
+        let small = "cat > note.txt <<'EOF'\nrm -rf /\nEOF\n";
+        let (small_requires, small_masked) = analyze_and_mask_oversized_heredocs(small);
+        assert!(!small_requires);
+        assert_eq!(small_masked.len(), small.len());
+        assert!(!small_masked.contains("rm -rf"));
+        assert!(small_masked.ends_with("EOF\n"));
+    }
+
+    #[test]
+    fn oversized_heredoc_masking_fails_closed_without_masking_unverified_inputs() {
+        let body = "rm -rf /\n".repeat(16_000);
+        let over_cap = format!(
+            "cat > huge.txt <<'EOF'\n{}\nEOF\n",
+            "x".repeat(MAX_OVERSIZED_HEREDOC_SOURCE_BYTES)
+        );
+        for (label, command) in [
+            (
+                "destructive command after terminator",
+                format!("cat > out.txt <<'EOF'\n{body}EOF\nrm -rf /\n"),
+            ),
+            (
+                "unterminated quoted data heredoc",
+                format!("cat > out.txt <<'EOF'\n{body}"),
+            ),
+            (
+                "python code receiver",
+                format!("python3 - <<'EOF'\n{body}EOF\n"),
+            ),
+            ("bash code receiver", format!("bash <<'EOF'\n{body}EOF\n")),
+            (
+                "piped code receiver",
+                format!("cat <<'EOF' | python3 -\n{body}EOF\n"),
+            ),
+            (
+                "wrapped code receiver",
+                format!("sudo -u nobody python3 - <<'EOF'\n{body}EOF\n"),
+            ),
+            (
+                "fd heredoc",
+                format!("exec 3<<'EOF'\n{body}EOF\npython3 /dev/fd/3\n"),
+            ),
+            (
+                "same-line second code heredoc (;)",
+                format!("cat <<'A' > a.txt; python3 - <<'B'\n{body}A\nexec(x)\nB\n"),
+            ),
+            (
+                "same-line second code heredoc (&&)",
+                format!("cat <<'A' > a.txt && bash <<'B'\n{body}A\nrm -rf /\nB\n"),
+            ),
+            (
+                "unquoted expanding delimiter",
+                format!("cat > out.txt <<EOF\n{body}EOF\n"),
+            ),
+            (
+                "device file redirect",
+                format!("cat > /dev/sda <<'EOF'\n{body}EOF\n"),
+            ),
+            ("beyond 4 MiB cap", over_cap),
+        ] {
+            let (requires_analysis, masked) = analyze_and_mask_oversized_heredocs(&command);
+            assert!(requires_analysis, "{label}: must require analysis");
+            assert!(
+                matches!(masked, Cow::Borrowed(_)),
+                "{label}: fail-closed path must not mask any bytes"
+            );
+            assert_eq!(masked.as_ref(), command.as_str());
+        }
+    }
+
+    #[test]
+    fn oversized_heredoc_masking_4mib_prefix_stays_linear() {
+        let line = "let v = x << 2; // rm -rf / && git reset --hard\n";
+        let repeats = (3_900_000) / line.len();
+        let mut command = String::with_capacity(4 * 1024 * 1024);
+        command.push_str("cat > large.rs <<'DCG_4M_EOF'\n");
+        for _ in 0..repeats {
+            command.push_str(line);
+        }
+        command.push_str("DCG_4M_EOF\n");
+        assert!(command.len() > 3_800_000 && command.len() < MAX_OVERSIZED_HEREDOC_SOURCE_BYTES);
+
+        let started = std::time::Instant::now();
+        let (requires_analysis, masked) = analyze_and_mask_oversized_heredocs(&command);
+        let elapsed = started.elapsed();
+
+        assert!(!requires_analysis, "3.9 MiB quoted data heredoc is inert");
+        assert_eq!(masked.len(), command.len());
+        assert!(!masked.contains("rm -rf"));
+        assert!(!masked.contains("git reset"));
+        assert!(masked.ends_with("DCG_4M_EOF\n"));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "4 MiB masking must stay linear without quadratic blowup (took {elapsed:?})"
+        );
     }
 
     /// With an unquoted delimiter, bash and zsh end a body at a line joined

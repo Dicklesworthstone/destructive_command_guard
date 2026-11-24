@@ -1145,3 +1145,174 @@ fn antigravity_recovery_preserves_real_shell_batch_precedence() {
     assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
     assert!(json.get("decision").is_none(), "{json}");
 }
+
+#[test]
+fn oversized_quote_parity_does_not_hide_destructive_tails_o36a() {
+    let pad = "A".repeat(270 * 1024);
+    let mid_pad = "A".repeat(70 * 1024);
+    let tail_pad = "B".repeat(200 * 1024);
+    let envelope = |tool: &str, command: String| {
+        serde_json::json!({ "tool_name": tool, "tool_input": { "command": command } }).to_string()
+    };
+
+    // Every case below pairs a long quoted string before the real destructive
+    // command with a trailing quoted string after it, so blind windowing that
+    // started inside the first quote used to flip quote parity and read the
+    // destructive command as quoted data.
+    for (label, tool, command) in [
+        (
+            "cmd double-quote parity flip",
+            "cmd",
+            format!("echo \"{pad}\" & rd /s /q C:\\ & echo \"done\""),
+        ),
+        (
+            "cmd apostrophe + backslash-quote parity",
+            "cmd",
+            format!("echo it's \"C:\\dir\\{pad}\\\" & rd /s /q C:\\ & echo \"done\""),
+        ),
+        (
+            "cmd unclosed quote reset by newline",
+            "cmd",
+            format!("echo \"{pad}\nrd /s /q C:\\\n"),
+        ),
+        (
+            "powershell single-quote parity flip",
+            "PowerShell",
+            format!("Write-Output '{pad}'; Remove-Item -Recurse -Force C:\\; Write-Output 'done'"),
+        ),
+        (
+            "powershell double-quote trailing backslash parity",
+            "PowerShell",
+            format!(
+                "Write-Output \"C:\\dir\\{pad}\\\"; Remove-Item -Recurse -Force C:\\; Write-Output \"done\""
+            ),
+        ),
+        (
+            "powershell call operator after long prefix",
+            "PowerShell",
+            format!(
+                "Write-Output '{}'; & 'Remove-Item' -Recurse -Force C:\\; Write-Output '{tail_pad}'",
+                "A".repeat(63 * 1024)
+            ),
+        ),
+        (
+            "powershell mid-statement paren quote parity",
+            "PowerShell",
+            format!(
+                "Write-Output ('{mid_pad}' + $(Remove-Item -Recurse -Force C:\\) + '{tail_pad}')"
+            ),
+        ),
+        (
+            "powershell here-string parity",
+            "PowerShell",
+            format!("$x = @'\n{pad}\n'@; Remove-Item -Recurse -Force C:\\; Write-Output 'done'"),
+        ),
+        (
+            "posix single-quote parity flip",
+            "Bash",
+            format!("echo '{pad}'; rm -rf /; echo 'done'"),
+        ),
+        (
+            "posix mid-statement concat quote parity",
+            "Bash",
+            format!("echo '{mid_pad}'$(rm -rf /)'{tail_pad}'"),
+        ),
+        (
+            "mislabeled bash carrying powershell backslash-quote",
+            "Bash",
+            format!(
+                "Write-Output \"C:\\dir\\{pad}\\\"; Remove-Item -Recurse -Force C:\\; Write-Output \"done\""
+            ),
+        ),
+    ] {
+        assert_denied(label, &envelope(tool, command));
+    }
+}
+
+#[test]
+fn oversized_boundary_straddling_commands_and_pipelines_are_caught_o36a() {
+    let envelope = |tool: &str, command: String| {
+        serde_json::json!({ "tool_name": tool, "tool_input": { "command": command } }).to_string()
+    };
+
+    // Single commands longer than the 4 KiB window overlap (here ~8 KiB) placed
+    // directly across the 64 KiB window boundary must be evaluated whole and
+    // concretely denied rather than split across windows.
+    let prefix_60k = "p".repeat(60 * 1024);
+    let suffix_240k = "q".repeat(240 * 1024);
+    let gap_8k = " ".repeat(8 * 1024);
+    let rm_args_8k = "/tmp/a ".repeat(1_200);
+    for (label, tool, command) in [
+        (
+            "posix 8 KiB git command straddling 64 KiB",
+            "Bash",
+            format!("# {prefix_60k}\ngit{gap_8k}reset --hard\n# {suffix_240k}"),
+        ),
+        (
+            "posix 8 KiB rm command straddling 64 KiB",
+            "Bash",
+            format!("# {prefix_60k}\nrm {rm_args_8k}-rf /\n# {suffix_240k}"),
+        ),
+        (
+            "powershell 8 KiB Remove-Item straddling 64 KiB",
+            "PowerShell",
+            format!("# {prefix_60k}\nRemove-Item{gap_8k}-Recurse -Force C:\\\n# {suffix_240k}"),
+        ),
+        (
+            "cmd 8 KiB rd straddling 64 KiB",
+            "cmd",
+            format!("echo {prefix_60k} & rd{gap_8k}/s /q C:\\ & echo {suffix_240k}"),
+        ),
+        (
+            "posix pipeline straddling 64 KiB",
+            "Bash",
+            format!(
+                "# {}\necho 'rm -rf /' | sh\n# {suffix_240k}",
+                "p".repeat(64 * 1024 - 16)
+            ),
+        ),
+    ] {
+        assert_denied(label, &envelope(tool, command));
+    }
+
+    // Planted negatives: single statements exceeding max_command_bytes (64 KiB)
+    // that are NOT proven inert — a 70 KiB git command, an oversized piped echo,
+    // or a rebound echo alias — must return indeterminate (ask/deny), NEVER
+    // fail-open silent allow.
+    let big_gap = " ".repeat(70 * 1024);
+    let big_pad = "A".repeat(270 * 1024);
+    for (label, command) in [
+        (
+            "single 70 KiB git command exceeding max_command_bytes",
+            format!("git{big_gap}reset --hard\n# {suffix_240k}"),
+        ),
+        (
+            "oversized piped echo into sh",
+            format!("echo '{big_pad}' | sh"),
+        ),
+        (
+            "rebound echo via alias before oversized echo",
+            format!("alias echo='sh -c'; echo '{big_pad}'"),
+        ),
+    ] {
+        let input = envelope("Bash", command);
+        assert!(input.len() > 256 * 1024, "{label}: must be oversized");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (stdout, stderr, exit_code) =
+            run_hook_raw_with_budget(&input, temp.path(), Some(SALVAGE_SCAN_BUDGET_MS));
+        assert_eq!(exit_code, 0, "{label}: hook exits 0\nstderr: {stderr}");
+        assert!(
+            !stdout.trim().is_empty(),
+            "{label}: unverified oversized statement must not fail open; stderr={stderr:?}"
+        );
+        let json: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("{label}: invalid JSON ({e}): {stdout:?}"));
+        let decision = json["hookSpecificOutput"]["permissionDecision"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            matches!(decision, "ask" | "deny"),
+            "{label}: expected ask/deny, got {json}"
+        );
+    }
+}

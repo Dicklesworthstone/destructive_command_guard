@@ -444,3 +444,206 @@ fn oversized_exported_data_receiver_is_unverified_azu4() {
         assert!(!stderr.contains("fail-open"), "{stderr}");
     }
 }
+
+#[test]
+fn oversized_data_heredoc_real_repo_files_are_allowed_jj7f() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = fs::read_to_string(manifest_dir.join("README.md")).expect("read README.md");
+    let normalize =
+        fs::read_to_string(manifest_dir.join("src/normalize.rs")).expect("read src/normalize.rs");
+    let heredoc_rs =
+        fs::read_to_string(manifest_dir.join("src/heredoc.rs")).expect("read src/heredoc.rs");
+    let mut scripts_bundle = String::new();
+    for script in [
+        "scripts/e2e_test.sh",
+        "scripts/e2e_destructive_equivalents.sh",
+        "scripts/e2e_codex.sh",
+        "scripts/e2e_fleet_install.sh",
+        "scripts/e2e_harness_matrix.sh",
+    ] {
+        scripts_bundle.push_str(&fs::read_to_string(manifest_dir.join(script)).expect(script));
+        scripts_bundle.push('\n');
+    }
+    let synthetic_hazardous = format!(
+        "rm -rf /\ngit reset --hard\neval(x);\n`rm -rf /`\nRemove-Item -Recurse -Force C:\\\nformat C: /q /y\n🛡 UTF-8 prose\n{}",
+        "documentation line mentioning rm -rf / and git reset --hard and eval(x);\n".repeat(4_500)
+    );
+
+    // Ensure every case exceeds the 256 KiB hook input limit when wrapped in JSON.
+    let pad_to_oversized = |mut content: String| {
+        while content.len() < 270 * 1024 {
+            content.push_str("# padding line mentioning rm -rf / and git reset --hard\n");
+        }
+        content
+    };
+
+    let cases = [
+        (
+            "README.md",
+            "cat > out.md <<'DCG_FILE_EOF'",
+            pad_to_oversized(readme),
+            "DCG_FILE_EOF",
+        ),
+        (
+            "src/normalize.rs",
+            "cat > normalize.rs <<'DCG_FILE_EOF'",
+            pad_to_oversized(normalize),
+            "DCG_FILE_EOF",
+        ),
+        (
+            "src/heredoc.rs (>1000 interior <<)",
+            "cat > heredoc.rs <<'DCG_FILE_EOF'",
+            heredoc_rs,
+            "DCG_FILE_EOF",
+        ),
+        (
+            "scripts/*.sh bundle",
+            "cat <<-'DCG_FILE_EOF' > bundle.sh",
+            pad_to_oversized(scripts_bundle),
+            "\tDCG_FILE_EOF",
+        ),
+        (
+            "synthetic hazardous prose via tee",
+            "tee notes.txt <<\"DCG_FILE_EOF\"",
+            synthetic_hazardous,
+            "DCG_FILE_EOF",
+        ),
+    ];
+
+    for (label, header, content, terminator) in cases {
+        let command = format!("{header}\n{content}\n{terminator}\n");
+        let input = envelope(&command);
+        assert!(
+            input.len() > 256 * 1024,
+            "{label}: payload ({} bytes) must exceed 256 KiB",
+            input.len()
+        );
+        let home = tempfile::tempdir().expect("isolated hook home");
+        let (stdout, stderr, exit_code) = run_hook(&input, home.path());
+        assert_eq!(exit_code, 0, "{label}: hook exits 0\n{stderr}");
+        assert!(
+            stdout.trim().is_empty(),
+            "{label}: benign oversized quoted data heredoc must be allowed (fail-open), got: {stdout:?}\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("exceeds limit"),
+            "{label}: expected oversized warning on stderr, got: {stderr:?}"
+        );
+    }
+
+    // Multiple sequential quoted data heredocs in one command are also allowed.
+    let half = "docs mentioning rm -rf / and eval(x);\n".repeat(4_000);
+    let multi = format!(
+        "cat > a.txt <<'DCG_A'\n{half}DCG_A\ncat > b.txt <<'DCG_B'\n{half}DCG_B\necho done\n"
+    );
+    let multi_input = envelope(&multi);
+    assert!(multi_input.len() > 256 * 1024);
+    let home = tempfile::tempdir().expect("isolated hook home");
+    let (stdout, stderr, exit_code) = run_hook(&multi_input, home.path());
+    assert_eq!(exit_code, 0, "multi-heredoc: {stderr}");
+    assert!(
+        stdout.trim().is_empty(),
+        "multi-heredoc benign data write must be allowed: {stdout:?}\n{stderr}"
+    );
+}
+
+#[test]
+fn oversized_data_heredoc_planted_negatives_fail_closed_jj7f_azu4() {
+    let benign_body = body("done = 1");
+
+    // 1. Destructive command AFTER the heredoc terminator MUST be concretely denied.
+    for (label, tail, expected_rule) in [
+        (
+            "rm -rf / after terminator",
+            "rm -rf /",
+            "core.filesystem:rm-rf-root-home",
+        ),
+        (
+            "command substitution after terminator",
+            "echo $(rm -rf /)",
+            "core.filesystem:rm-rf-root-home",
+        ),
+        (
+            "git reset --hard after terminator",
+            "git reset --hard",
+            "core.git:reset-hard",
+        ),
+    ] {
+        let command = format!("cat > out.txt <<'EOF'\n{benign_body}EOF\n{tail}\n");
+        assert_concrete_rule_verdict(&command, "", "deny", expected_rule);
+        let _ = label;
+    }
+
+    // 2. Second code-executing heredoc on the same line or later line MUST block.
+    for (label, command) in [
+        (
+            "same-line second python heredoc (;)",
+            format!("cat <<'A' > a.txt; python3 - <<'B'\n{benign_body}A\nexec(x)\nB\n"),
+        ),
+        (
+            "same-line second bash heredoc (&&)",
+            format!("cat <<'A' > a.txt && bash <<'B'\n{benign_body}A\nrm -rf /\nB\n"),
+        ),
+        (
+            "unterminated quoted data heredoc",
+            format!("cat > out.txt <<'EOF'\n{benign_body}"),
+        ),
+        (
+            "unquoted expanding delimiter",
+            format!("cat > out.txt <<EOF\n{benign_body}EOF\n"),
+        ),
+        (
+            "device file sink",
+            format!("cat > /dev/sda <<'EOF'\n{benign_body}EOF\n"),
+        ),
+    ] {
+        let input = envelope(&command);
+        assert!(input.len() > 256 * 1024, "{label}: must be oversized");
+        let home = tempfile::tempdir().expect("isolated hook home");
+        let (stdout, stderr, exit_code) = run_hook(&input, home.path());
+        assert_eq!(exit_code, 0, "{label}: {stderr}");
+        assert!(
+            !stdout.trim().is_empty(),
+            "{label}: planted negative must NOT fail open allow; stderr={stderr:?}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("{label}: invalid JSON ({e}): {stdout:?}"));
+        let decision = json["hookSpecificOutput"]["permissionDecision"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            matches!(decision, "deny" | "ask"),
+            "{label}: expected deny/ask, got {json}"
+        );
+    }
+}
+
+#[test]
+fn oversized_data_heredoc_4mib_prefix_performance_jj7f() {
+    let line = "let shifted = v << 1; // docs: rm -rf / and git reset --hard\n";
+    let mut command = String::with_capacity(3_600_000);
+    command.push_str("cat > big_module.rs <<'DCG_4M_EOF'\n");
+    while command.len() < 3_500_000 {
+        command.push_str(line);
+    }
+    command.push_str("DCG_4M_EOF\n");
+    let input = envelope(&command);
+    assert!(
+        input.len() > 3_500_000 && input.len() < 4 * 1024 * 1024,
+        "payload size={}",
+        input.len()
+    );
+    let home = tempfile::tempdir().expect("isolated hook home");
+    let started = std::time::Instant::now();
+    let (stdout, stderr, exit_code) = run_hook(&input, home.path());
+    let elapsed = started.elapsed();
+    assert_eq!(exit_code, 0, "4 MiB hook exits 0\n{stderr}");
+    assert!(
+        stdout.trim().is_empty(),
+        "benign ~3.5 MiB quoted data heredoc must be allowed (took {elapsed:?}): {stdout:?}\n{stderr}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "4 MiB quoted data heredoc must stay linear (took {elapsed:?})"
+    );
+}
