@@ -11,6 +11,26 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+**Opt-in `system.processes` pack (`bd-wx2x`).** Enable it with
+`enabled = ["system.processes"]` on machines shared by several agents. It denies
+kills that pick their targets by pattern, parent-tree walk or broadcast: `pkill`,
+`killall`/`killall5`, `kill -1`, kills fed by `pgrep`/`pidof`/`lsof -t`/`ps`
+(including recursive `kill_tree` loops and `ps -o ppid=` of a `nohup`'d job, which
+is PID 1), `xargs kill`, `find -exec kill`, remote pattern kills over `ssh`,
+interpreter broadcasts (`os.kill(-1, …)`, `os.killpg(0, …)`, `process.kill(-1)`,
+`psutil.process_iter()` kill loops) and `launchctl bootout gui/<uid>` of a whole
+domain. Kills of recorded PIDs stay allowed: literal PIDs, `$!`, job specs,
+recorded process groups (`kill -TERM -- -$PGID`), `kill -0` probes, and a pidfile
+read back with `kill "$(cat job.pid)"` or `kill $(< job.pid)`. The pidfile
+exemption is a semantic proof on the unmasked segment, because built-in regexes
+never see the body of a `$(...)`. Two real incidents on one developer Mac shaped
+the rules (BSD `pkill` reading `-P 1` as patterns; a `kill_tree` walk from
+launchd). The pack is off by default.
+
+---
+
 ## [v0.17.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.17.1) -- 2026-11-23 [Release]
 
 This patch release ships whole-command lookaround preservation for custom
