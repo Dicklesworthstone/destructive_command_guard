@@ -8561,6 +8561,12 @@ fn appended_code_input_mode(
         }
     };
     for (index, argument) in args.iter().enumerate() {
+        // Only an option word can be a source flag. A script operand such as
+        // `~/.claude/run.sh` or `./e.rb` merely contains the flag's letter;
+        // reading it as a bundled `-c`/`-e` made every record "source".
+        if !argument.starts_with('-') {
+            continue;
+        }
         let normalized = argument.trim_start_matches('-');
         let is_source_flag = source_flags.iter().any(|flag| {
             normalized == *flag
@@ -54524,6 +54530,52 @@ mod tests {
             assert!(
                 result.is_allowed(),
                 "pipeline data that is not executable source must remain allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// A script operand whose path contains the interpreter's source-flag
+    /// letter (`c` for shells and Python, `e` for Ruby, Perl and Node) is a
+    /// file, not a bundled `-c`/`-e`: the records are its arguments. The
+    /// real source flags, bundled or long, still make each record source.
+    #[test]
+    fn xargs_script_operands_containing_the_flag_letter_are_not_source_flags() {
+        for command in [
+            "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 bash ~/.claude/skills/x/scripts/run.sh",
+            "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 /opt/homebrew/bin/bash /h/.config/c.sh",
+            "printf '%s\\n' 'rm -rf /home/example/data' | xargs python3 ~/code/s.py",
+            "printf '%s\\n' 'rm -rf /home/example/data' | xargs ruby ./e.rb",
+            "printf '%s\\n' 'rm -rf /home/example/data' | xargs perl ~/e/s.pl",
+            "printf '%s\\n' 'rm -rf /home/example/data' | xargs node ~/eval/s.js",
+            "printf '%s\\n' 'rm -rf /home/example/data' | parallel bash ~/.claude/s.sh",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "records are arguments to a script file, not source: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 bash -c",
+            "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 bash -xc",
+            "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 sh -ec",
+            r#"printf '%s\n' 'import shutil; shutil.rmtree("/home/example/data")' | xargs python3 -c"#,
+            r#"printf '%s\n' 'const fs = require("fs"); fs.rmSync("/home/example/data", { recursive: true, force: true })' | xargs node --eval"#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "a real source flag still makes each record source: {command:?}: {:?}",
                 result.pattern_info
             );
         }
