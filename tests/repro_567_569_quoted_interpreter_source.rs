@@ -473,3 +473,116 @@ fn issue_567_external_pack_still_judges_every_executed_shell_route() {
         }
     }
 }
+
+#[test]
+fn bd_oxtg_tight_heredoc_budget_reports_incomplete_analysis_not_literal_rule() {
+    let heredoc_data = "python3 - <<'EOF'\nprint('x|git reset --hard')\nEOF";
+    let exterior = "rm -rf / && python3 - <<'EOF'\nprint('x|git reset --hard')\nEOF";
+
+    let run_with_heredoc_budget = |source: &str, route: Route, heredoc_ms: &str| -> Verdict {
+        let temp = tempfile::tempdir().expect("isolated working directory");
+        let home = temp.path().join("home");
+        std::fs::create_dir(&home).expect("isolated home");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dcg"));
+        let hook_input = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": source},
+        })
+        .to_string();
+        let input = match route {
+            Route::Hook => {
+                command.args(["--agent", "claude-code"]);
+                hook_input
+            }
+            Route::Batch => {
+                command.args(["hook", "--batch"]);
+                hook_input
+            }
+            Route::CliPosix => {
+                command.args(["test", "--stdin", "--dialect", "posix", "--format", "json"]);
+                source.to_string()
+            }
+        };
+        command
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .env("DCG_NO_SELF_HEAL", "1")
+            .env("DCG_SELF_HEAL_HOOK", "0")
+            .env("DCG_HISTORY_DISABLED", "1")
+            .env("DCG_HOOK_TIMEOUT_MS", "5000")
+            .env("DCG_AST_TIMEOUT_MS", "5000")
+            .env("DCG_HEREDOC_TIMEOUT_MS", heredoc_ms)
+            .current_dir(temp.path());
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn classifier");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(input.as_bytes())
+            .expect("write input");
+        let output = child.wait_with_output().expect("wait");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if route == Route::Hook && stdout.trim().is_empty() {
+            assert!(output.status.success(), "{source:?}: {stderr}");
+            return Verdict {
+                decision: "allow".to_string(),
+                rule: None,
+            };
+        }
+        let value: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("{route:?}: {e}; stdout={stdout}; stderr={stderr}"));
+        if route == Route::Hook {
+            let out = &value["hookSpecificOutput"];
+            let rule = out["ruleId"].as_str().map(str::to_string);
+            let decision = match out["permissionDecision"].as_str() {
+                Some("deny") => "deny",
+                Some("ask") if rule.is_none() => "indeterminate",
+                other => panic!("unexpected hook decision {other:?}: {value}"),
+            };
+            return Verdict {
+                decision: decision.to_string(),
+                rule,
+            };
+        }
+        Verdict {
+            decision: value["decision"].as_str().unwrap_or("").to_string(),
+            rule: value["rule_id"].as_str().map(str::to_string),
+        }
+    };
+
+    for route in ROUTES {
+        // Forced hot-path heredoc timeout (0 ms) triggers bounded fallback:
+        // must report heredoc.shell:incomplete-analysis, never core.git:reset-hard.
+        let degraded = run_with_heredoc_budget(heredoc_data, route, "0");
+        assert_eq!(
+            (degraded.decision.as_str(), degraded.rule.as_deref()),
+            ("deny", Some("heredoc.shell:incomplete-analysis")),
+            "{route:?} degraded data heredoc: {degraded:?}"
+        );
+
+        // Exterior destructive command retains its real pack rule even at 0 ms.
+        let ext = run_with_heredoc_budget(exterior, route, "0");
+        assert_eq!(
+            (ext.decision.as_str(), ext.rule.as_deref()),
+            ("deny", Some("core.filesystem:rm-rf-root-home")),
+            "{route:?} exterior command: {ext:?}"
+        );
+
+        // Normal budget allows the data heredoc.
+        let normal = run_with_heredoc_budget(heredoc_data, route, "5000");
+        assert_eq!(
+            normal.decision, "allow",
+            "{route:?} normal budget: {normal:?}"
+        );
+    }
+}

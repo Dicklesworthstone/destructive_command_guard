@@ -1595,34 +1595,98 @@ fn scan_oversized_top_level_segments(
 /// boundaries: whitespace-only, a single-line `#` comment (non-Cmd), or a plain
 /// literal `echo`/`Write-Output` with zero metacharacters, expansions,
 /// redirections, escapes, or shell-function overrides.
+fn contains_ascii_word_ci(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return false;
+    }
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    h.windows(n.len()).enumerate().any(|(idx, window)| {
+        window.eq_ignore_ascii_case(n)
+            && (idx == 0 || !is_word(h[idx - 1]))
+            && (idx + n.len() == h.len() || !is_word(h[idx + n.len()]))
+    })
+}
+
 fn command_may_rebind_inert_head(command: &str, dialect: ShellDialect) -> bool {
-    match dialect {
-        ShellDialect::Cmd => {
-            // doskey macros can rebind cmd built-ins/commands.
-            command
-                .as_bytes()
-                .windows(6)
-                .any(|w| w.eq_ignore_ascii_case(b"doskey"))
-        }
-        ShellDialect::PowerShell => {
-            let bytes = command.as_bytes();
-            bytes
+    let cmd_rebind = || {
+        command
+            .as_bytes()
+            .windows(6)
+            .any(|w| w.eq_ignore_ascii_case(b"doskey"))
+    };
+    let ps_rebind = || {
+        let bytes = command.as_bytes();
+        bytes
+            .windows(8)
+            .any(|w| w.eq_ignore_ascii_case(b"function"))
+            || bytes.windows(6).any(|w| w.eq_ignore_ascii_case(b"filter"))
+            || bytes.windows(5).any(|w| w.eq_ignore_ascii_case(b"alias"))
+            || bytes
                 .windows(8)
-                .any(|w| w.eq_ignore_ascii_case(b"function"))
-                || bytes.windows(6).any(|w| w.eq_ignore_ascii_case(b"filter"))
-                || bytes.windows(5).any(|w| w.eq_ignore_ascii_case(b"alias"))
-                || bytes
-                    .windows(9)
-                    .any(|w| w.eq_ignore_ascii_case(b"function:"))
+                .any(|w| w.eq_ignore_ascii_case(b"set-item"))
+            || bytes
+                .windows(8)
+                .any(|w| w.eq_ignore_ascii_case(b"new-item"))
+            || bytes
+                .windows(17)
+                .any(|w| w.eq_ignore_ascii_case(b"invoke-expression"))
+            || bytes
+                .windows(13)
+                .any(|w| w.eq_ignore_ascii_case(b"import-module"))
+            || contains_ascii_word_ci(command, "sal")
+            || contains_ascii_word_ci(command, "nal")
+            || contains_ascii_word_ci(command, "iex")
+            || contains_ascii_word_ci(command, "ipmo")
+    };
+    let posix_rebind = || {
+        // Any `()` catches `echo  () { ... }`, `echo\t() { ... }`, `'echo'()`,
+        // and arbitrary shell function definitions without relying on exact
+        // spacing. `eval`, `source`, `enable`, `shopt`, and dot-sourcing can
+        // likewise define functions/aliases or override builtins.
+        command.contains("()")
+            || command.contains("PATH=")
+            || contains_ascii_word_ci(command, "alias")
+            || contains_ascii_word_ci(command, "function")
+            || contains_ascii_word_ci(command, "eval")
+            || contains_ascii_word_ci(command, "source")
+            || contains_ascii_word_ci(command, "enable")
+            || contains_ascii_word_ci(command, "shopt")
+            || command.starts_with(". ")
+            || command.starts_with(".\t")
+            || command.contains("; . ")
+            || command.contains("; .\t")
+            || command.contains("\n. ")
+            || command.contains("\n.\t")
+            || command.contains("&& . ")
+            || command.contains("|| . ")
+    };
+    match dialect {
+        ShellDialect::Cmd => cmd_rebind(),
+        ShellDialect::PowerShell => ps_rebind(),
+        ShellDialect::Posix => posix_rebind(),
+        ShellDialect::Unknown => posix_rebind() || ps_rebind() || cmd_rebind(),
+    }
+}
+
+/// Whether splitting an oversized command across multiple scan windows could
+/// sever a variable assignment in an earlier window from an expansion in a
+/// later window (e.g., `d=mkfs.ext4\n# <70 KiB>\n$d /dev/sda`).
+fn oversized_windows_may_sever_binding(windows: &[String]) -> bool {
+    if windows.len() <= 1 {
+        return false;
+    }
+    let mut saw_assignment_in_earlier_window = false;
+    for window in windows {
+        if saw_assignment_in_earlier_window && window.contains(['$', '%', '!']) {
+            return true;
         }
-        ShellDialect::Posix | ShellDialect::Unknown => {
-            command.contains("alias")
-                || command.contains("function")
-                || command.contains("echo(")
-                || command.contains("echo (")
-                || command.contains("PATH=")
+        if window.contains('=') {
+            saw_assignment_in_earlier_window = true;
         }
     }
+    false
 }
 
 fn oversized_segment_is_proven_inert(
@@ -1746,7 +1810,7 @@ fn push_oversized_segment_windows(
         // advance stays allocation-free across multi-megabyte segments.
         while cursor.pos < target {
             let prev_pos = cursor.pos;
-            let near_target = cursor.pos + 4 >= target
+            let near_target = cursor.pos + 5 >= target
                 || (dialect == ShellDialect::PowerShell && cursor.bytes[cursor.pos] == b'@');
             if !near_target {
                 let _ = cursor.step();
@@ -1858,6 +1922,7 @@ fn push_oversized_scan_windows_for_dialect(
     }
 
     let (segments, well_formed) = scan_oversized_top_level_segments(command, dialect);
+    let initial_windows = out.len();
     let mut remaining_windows = OVERSIZED_SCAN_MAX_WINDOWS;
     let mut complete_coverage = well_formed;
     let mut chunk_start: Option<usize> = None;
@@ -1949,6 +2014,13 @@ fn push_oversized_scan_windows_for_dialect(
         &mut chunk_start,
         chunk_end,
     );
+    let emitted = &out[initial_windows..];
+    if emitted.len() > 1
+        && (command_may_rebind_inert_head(command, dialect)
+            || oversized_windows_may_sever_binding(emitted))
+    {
+        complete_coverage = false;
+    }
     complete_coverage
 }
 
@@ -5708,6 +5780,60 @@ mod tests {
                 after > before,
                 "panicking action must not block subsequent ones; before={before} after={after}"
             );
+        }
+
+        #[test]
+        fn oversized_scan_windows_rejects_rebind_and_cross_window_bindings_fe5() {
+            let pad = "a".repeat(70 * 1024);
+
+            // Rebinding an inert head with whitespace before `()` must fail closed.
+            let fn_rebind = format!("echo  () {{ eval \"$1\"; }}; echo '{pad}'");
+            assert!(
+                !oversized_command_windows_complete(
+                    &fn_rebind,
+                    destructive_command_guard::normalize::ShellDialect::Posix,
+                ),
+                "rebound POSIX function head must fail closed"
+            );
+
+            // PowerShell alias rebind `sal echo iex` must fail closed.
+            let ps_rebind = format!("sal echo iex; echo '{pad}'");
+            assert!(
+                !oversized_command_windows_complete(
+                    &ps_rebind,
+                    destructive_command_guard::normalize::ShellDialect::PowerShell,
+                ),
+                "PowerShell `sal` rebind must fail closed"
+            );
+
+            // Cross-window variable assignment + later expansion must fail closed.
+            let comment_pad = "# ".to_string() + &"x".repeat(70 * 1024);
+            let split_binding = format!("d=mkfs.ext4\n{comment_pad}\n$d /dev/sda");
+            assert!(
+                !oversized_command_windows_complete(
+                    &split_binding,
+                    destructive_command_guard::normalize::ShellDialect::Posix,
+                ),
+                "cross-window assignment + expansion must not claim complete coverage"
+            );
+
+            // Benign negative: oversized metacharacter-free literal echo keeps complete coverage.
+            let benign_echo = format!("echo '{pad}'");
+            assert!(
+                oversized_command_windows_complete(
+                    &benign_echo,
+                    destructive_command_guard::normalize::ShellDialect::Posix,
+                ),
+                "benign oversized literal echo must stay complete"
+            );
+        }
+
+        fn oversized_command_windows_complete(
+            command: &str,
+            dialect: destructive_command_guard::normalize::ShellDialect,
+        ) -> bool {
+            let mut windows = Vec::new();
+            push_oversized_scan_windows_for_dialect(&mut windows, command, 65_536, dialect)
         }
     }
 }

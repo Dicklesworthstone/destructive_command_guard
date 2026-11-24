@@ -12802,6 +12802,27 @@ fn powershell_pipeline_consumer_mode(
         }
         _ => {}
     }
+    // Windows Python launcher (`py` / `py.exe`), optionally preceded by a
+    // `-3` / `-3.12` / `-2` version selector argument before Python's argv.
+    if executable == "py" {
+        let forwarded = match args.first().map(String::as_str) {
+            Some(first)
+                if first.starts_with('-')
+                    && first.len() >= 2
+                    && first[1..]
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || b == b'.' || b == b'-')
+                    && first.as_bytes()[1].is_ascii_digit() =>
+            {
+                &args[1..]
+            }
+            _ => args,
+        };
+        let mode =
+            python_pipeline_input_mode("", forwarded, crate::heredoc::ScriptLanguage::Python);
+        let terminal = mode == PipelineShellInputMode::DoesNotReadStdin;
+        return Some((mode, terminal));
+    }
     let language = crate::heredoc::ScriptLanguage::from_command(&executable);
     match language {
         crate::heredoc::ScriptLanguage::Python => {
@@ -13505,6 +13526,13 @@ fn find_powershell_scriptblock_create(command: &str, start: usize) -> Option<(us
 }
 
 fn local_powershell_prefix(prefix: &str) -> &str {
+    if prefix.contains("@'") || prefix.contains("@\"") {
+        if let Ok(statements) = split_top_level_powershell_statements(prefix)
+            && let Some(last) = statements.last()
+        {
+            return last;
+        }
+    }
     prefix.rsplit([';', '\n', '|']).next().unwrap_or(prefix)
 }
 
@@ -15383,6 +15411,33 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
     // dialects; the POSIX/Unknown pipe path is the bash-AST collector above.
     if matches!(dialect, ShellDialect::Cmd | ShellDialect::PowerShell) {
         collect_dialect_pipeline_stdin_sinks(command, dialect, &mut sinks);
+    } else if dialect == ShellDialect::Unknown
+        && command.contains('|')
+        && (command.contains("@'") || command.contains("@\""))
+    {
+        // A PowerShell here-string piped into an interpreter (`@'\n...\n'@ | python3`)
+        // looks like an unknown producer to POSIX; collect its native PowerShell
+        // pipeline payloads ahead of unverified POSIX sinks so concrete language
+        // rules win while preserving fail-closed posture.
+        let mut ps_sinks = Vec::new();
+        collect_dialect_pipeline_stdin_sinks(command, ShellDialect::PowerShell, &mut ps_sinks);
+        let has_concrete_payload = ps_sinks
+            .iter()
+            .any(|sink| matches!(sink, ExecutableTextSink::Payload { .. }));
+        if has_concrete_payload {
+            let mut ordered = Vec::with_capacity(ps_sinks.len() + sinks.len());
+            for sink in ps_sinks {
+                if matches!(sink, ExecutableTextSink::Payload { .. }) && !ordered.contains(&sink) {
+                    ordered.push(sink);
+                }
+            }
+            for sink in sinks {
+                if !ordered.contains(&sink) {
+                    ordered.push(sink);
+                }
+            }
+            return ordered;
+        }
     }
     sinks
 }
@@ -16237,7 +16292,9 @@ struct PosixExecutableAssignmentModel {
 }
 
 const MAX_POSIX_EXECUTABLE_BINDINGS: usize = 64;
-const MAX_POSIX_EXECUTABLE_SEGMENTS: usize = 128;
+const MAX_POSIX_EXECUTABLE_OVERFLOW_NAMES: usize = 512;
+const MAX_POSIX_EXECUTABLE_BRANCH_VALUES: usize = 4;
+const MAX_POSIX_EXECUTABLE_SEGMENTS: usize = 256;
 const MAX_POSIX_EXECUTABLE_FIELDS: usize = 128;
 const MAX_POSIX_EXECUTABLE_VALUE_BYTES: usize = 16 * 1024;
 const POSIX_EXECUTABLE_UNVERIFIED_RULE: &str = "heredoc.posix.executable-unverified";
@@ -16249,10 +16306,130 @@ enum ModeledPosixIfs {
     Unverified,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ModeledPosixBinding {
-    Literal(String),
+    /// One or more possible literal values (more than one only after merging
+    /// conditional `&&`/`||` branches in deny-only mode).
+    Literal(Vec<String>),
     Unverified(&'static str),
+}
+
+/// Bounded binding store: tracks up to `MAX_POSIX_EXECUTABLE_BINDINGS` (64)
+/// active variables in recency order, evicting the oldest into `overflowed`
+/// rather than blindly poisoning every later `$var` invocation
+/// (bd-binding-model-variants-fd5q).
+#[derive(Clone, Default)]
+struct ModeledPosixBindings {
+    entries: HashMap<String, ModeledPosixBinding>,
+    order: std::collections::VecDeque<String>,
+    overflowed: HashSet<String>,
+    overflow_exhausted: bool,
+}
+
+impl ModeledPosixBindings {
+    fn get(&self, name: &str) -> Option<&ModeledPosixBinding> {
+        self.entries.get(name)
+    }
+
+    fn is_overflowed(&self, name: &str) -> bool {
+        self.overflow_exhausted || self.overflowed.contains(name)
+    }
+
+    fn insert(&mut self, name: String, binding: ModeledPosixBinding) {
+        self.overflowed.remove(&name);
+        if self.entries.contains_key(&name) {
+            if let Some(pos) = self.order.iter().position(|existing| existing == &name) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(name.clone());
+            self.entries.insert(name, binding);
+            return;
+        }
+        while self.entries.len() >= MAX_POSIX_EXECUTABLE_BINDINGS {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&evicted);
+            if self.overflowed.len() >= MAX_POSIX_EXECUTABLE_OVERFLOW_NAMES {
+                self.overflow_exhausted = true;
+            } else {
+                self.overflowed.insert(evicted);
+            }
+        }
+        self.order.push_back(name.clone());
+        self.entries.insert(name, binding);
+    }
+
+    fn merge_from(&mut self, other: &Self) {
+        if other.overflow_exhausted {
+            self.overflow_exhausted = true;
+            self.invalidate_all();
+        }
+        for name in &other.overflowed {
+            if self.entries.contains_key(name) {
+                self.insert(
+                    name.clone(),
+                    ModeledPosixBinding::Unverified(
+                        "the executable variable exceeded the bounded binding limit on a branch",
+                    ),
+                );
+            } else if self.overflowed.len() >= MAX_POSIX_EXECUTABLE_OVERFLOW_NAMES {
+                self.overflow_exhausted = true;
+            } else {
+                self.overflowed.insert(name.clone());
+            }
+        }
+        for name in &other.order {
+            let Some(other_binding) = other.entries.get(name) else {
+                continue;
+            };
+            match (self.entries.get(name).cloned(), other_binding) {
+                (None, binding) => self.insert(name.clone(), binding.clone()),
+                (Some(ModeledPosixBinding::Unverified(reason)), _)
+                | (_, &ModeledPosixBinding::Unverified(reason)) => {
+                    self.insert(name.clone(), ModeledPosixBinding::Unverified(reason));
+                }
+                (
+                    Some(ModeledPosixBinding::Literal(mut values)),
+                    ModeledPosixBinding::Literal(other_values),
+                ) => {
+                    let mut overflowed = false;
+                    for value in other_values {
+                        if !values.contains(value) {
+                            if values.len() >= MAX_POSIX_EXECUTABLE_BRANCH_VALUES {
+                                overflowed = true;
+                                break;
+                            }
+                            values.push(value.clone());
+                        }
+                    }
+                    let merged = if overflowed {
+                        ModeledPosixBinding::Unverified(
+                            "the executable variable exceeds the bounded branch-value limit",
+                        )
+                    } else {
+                        ModeledPosixBinding::Literal(values)
+                    };
+                    self.insert(name.clone(), merged);
+                }
+            }
+        }
+    }
+
+    fn invalidate_all(&mut self) {
+        for binding in self.entries.values_mut() {
+            *binding = ModeledPosixBinding::Unverified(
+                "an earlier executable-variable invocation can change this shell binding",
+            );
+        }
+    }
+}
+
+fn is_valid_posix_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphabetic() || byte == b'_' || (index > 0 && byte.is_ascii_digit())
+        })
 }
 
 /// Return the two parts of one assignment-only POSIX segment. The value is
@@ -16279,11 +16456,7 @@ fn posix_assignment_word_parts(raw: &str) -> Option<(&str, &str)> {
     let equals = raw.find('=')?;
     let name = raw.get(..equals)?;
     let raw_value = raw.get(equals + 1..)?;
-    if name.is_empty()
-        || !name.bytes().enumerate().all(|(index, byte)| {
-            byte.is_ascii_alphabetic() || byte == b'_' || index > 0 && byte.is_ascii_digit()
-        })
-    {
+    if !is_valid_posix_identifier(name) {
         return None;
     }
     Some((name, raw_value))
@@ -16308,6 +16481,73 @@ fn posix_multiple_assignment_parts(segment: &str) -> Option<Vec<(&str, &str)>> {
     (parts.len() > 1).then_some(parts)
 }
 
+/// Literal scalar assignments performed via `export`, `readonly`, `declare`,
+/// `typeset`, or `local` with non-transforming flags (`-x`, `-r`, `-g`, `--`),
+/// e.g. `export d=git`, `readonly d=mkfs.ext4`, `declare -x d=git`, or bare
+/// attribute updates like `export d` (which returns `Some(vec![])` so existing
+/// bindings survive intact) (bd-binding-model-variants-fd5q).
+fn posix_declaration_assignment_parts(segment: &str) -> Option<Vec<(&str, &str)>> {
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    if tokens
+        .iter()
+        .any(|token| token.kind == NormalizeTokenKind::Separator)
+    {
+        return None;
+    }
+    let words: Vec<&str> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(segment))
+        .collect();
+    let (&decl, rest) = words.split_first()?;
+    if !matches!(
+        decl,
+        "export" | "readonly" | "declare" | "typeset" | "local"
+    ) || rest.is_empty()
+    {
+        return None;
+    }
+    let mut index = 0usize;
+    while index < rest.len() {
+        let word = rest[index];
+        if word == "--" {
+            index += 1;
+            break;
+        }
+        if !word.starts_with('-') || word.len() == 1 {
+            break;
+        }
+        // Only accept non-transforming scalar attribute flags; reject `-i`
+        // (arithmetic), `-l`/`-u` (case-fold), `-n` (nameref), `-a`/`-A`
+        // (arrays), `-f`/`-F` (functions), and `-p` (print).
+        let allowed = match decl {
+            "export" => word == "-n",
+            "readonly" => false,
+            "declare" | "typeset" => word[1..].bytes().all(|b| matches!(b, b'x' | b'r' | b'g')),
+            "local" => word[1..].bytes().all(|b| matches!(b, b'x' | b'r')),
+            _ => false,
+        };
+        if !allowed {
+            return None;
+        }
+        index += 1;
+    }
+    if index >= rest.len() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for &word in &rest[index..] {
+        if let Some(pair) = posix_assignment_word_parts(word) {
+            parts.push(pair);
+        } else if is_valid_posix_identifier(word) {
+            // Bare identifier (`export d` / `readonly d`): preserves value.
+        } else {
+            return None;
+        }
+    }
+    Some(parts)
+}
+
 /// Command names the executable-assignment model does not step over even
 /// though they assign nothing. Reserved words open compound commands whose
 /// bodies may assign. The rest change the shell's options or its command
@@ -16322,10 +16562,11 @@ const POSIX_BINDING_BOUNDARY_COMMANDS: &[&str] = &[
 ];
 
 /// Whether the executable-assignment model may step over `segment` with its
-/// bindings intact (bd-executable-assignment-scope): one simple command named
-/// by a plain literal word that cannot assign in this shell, such as `true`
-/// or `echo hi`. Anything else ends the model, as every intervening command
-/// used to.
+/// bindings intact (bd-executable-assignment-scope,
+/// bd-binding-model-variants-fd5q): one simple command (optionally preceded by
+/// `!` or temporary literal `K=V` env assignments such as `X=1 true`) named by
+/// a plain literal word or neutral builtin (`:`, `[`, `[[`, `test`, `true`,
+/// `echo`, ...) that cannot assign in this shell.
 fn posix_segment_keeps_bindings(segment: &str) -> bool {
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
     if tokens
@@ -16334,19 +16575,61 @@ fn posix_segment_keeps_bindings(segment: &str) -> bool {
     {
         return false;
     }
-    let Some(name) = tokens
+    let words: Vec<(&str, std::ops::Range<usize>)> = tokens
         .iter()
-        .find(|token| token.kind == NormalizeTokenKind::Word)
-        .and_then(|token| token.text(segment))
-    else {
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| Some((token.text(segment)?, token.byte_range.clone())))
+        .collect();
+    let mut index = 0usize;
+    if words.get(index).is_some_and(|(w, _)| *w == "!") {
+        index += 1;
+    }
+    // Step over temporary per-command literal env assignments (e.g. `X=1 true`,
+    // `FOO=bar echo hi`), which do not persist into the parent shell.
+    while let Some((raw, _)) = words.get(index) {
+        if let Some((_, raw_val)) = posix_assignment_word_parts(raw) {
+            if literal_posix_executable_value(raw_val).is_none() {
+                return false;
+            }
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    let Some((name, range)) = words.get(index) else {
         return false;
     };
-    !name.starts_with('-')
+    if matches!(*name, "[" | "[[") {
+        // `[` and `[[` are bracket-named test builtins; checking the whole
+        // segment with `contains_dynamic_shell_output` would falsely flag the
+        // leading `[` as a glob bracket. Inspect only the arguments after the
+        // command word, and for Bash `[[ ... ]]` also reject `=~` (which sets
+        // `BASH_REMATCH`) and arithmetic comparison operators (which evaluate
+        // arithmetic assignments like `[[ a++ -eq 0 ]]`).
+        let args = &segment[range.end..];
+        if contains_dynamic_shell_output(args) {
+            return false;
+        }
+        if *name == "[[" {
+            let has_mutating_cond = words[index + 1..].iter().any(|(w, _)| {
+                matches!(*w, "=~" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge")
+                    || w.contains(['(', ')'])
+            });
+            if has_mutating_cond {
+                return false;
+            }
+        }
+        return true;
+    }
+    let rest_segment = &segment[range.start..];
+    let neutral_builtin = *name == ":";
+    let plain_name = !name.starts_with('-')
         && name.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b'+')
-        })
-        && !POSIX_BINDING_BOUNDARY_COMMANDS.contains(&name)
-        && !modeled_posix_invocation_may_mutate_bindings(segment)
+        });
+    (neutral_builtin || plain_name)
+        && !POSIX_BINDING_BOUNDARY_COMMANDS.contains(name)
+        && !modeled_posix_invocation_may_mutate_bindings(rest_segment)
 }
 
 /// What recording one assignment word did to the model's bindings.
@@ -16360,9 +16643,8 @@ enum PosixAssignmentOutcome {
 fn record_posix_executable_assignment(
     name: &str,
     raw_value: &str,
-    bindings: &mut HashMap<String, ModeledPosixBinding>,
+    bindings: &mut ModeledPosixBindings,
     ifs: &mut ModeledPosixIfs,
-    binding_limit_exceeded: &mut bool,
 ) -> PosixAssignmentOutcome {
     let value = literal_posix_executable_value(raw_value);
     if name == "IFS" {
@@ -16382,10 +16664,6 @@ fn record_posix_executable_assignment(
         }
         return PosixAssignmentOutcome::Stop;
     };
-    if !bindings.contains_key(name) && bindings.len() >= MAX_POSIX_EXECUTABLE_BINDINGS {
-        *binding_limit_exceeded = true;
-        return PosixAssignmentOutcome::Skipped;
-    }
     let binding = if value.len() > MAX_POSIX_EXECUTABLE_VALUE_BYTES {
         ModeledPosixBinding::Unverified(
             "the executable variable exceeds the bounded literal-value limit",
@@ -16395,7 +16673,7 @@ fn record_posix_executable_assignment(
             "the executable variable is maintained by the shell rather than a stable scalar",
         )
     } else {
-        ModeledPosixBinding::Literal(value)
+        ModeledPosixBinding::Literal(vec![value])
     };
     bindings.insert(name.to_string(), binding);
     PosixAssignmentOutcome::Recorded
@@ -16421,12 +16699,238 @@ fn literal_posix_executable_value(raw: &str) -> Option<String> {
     }
 }
 
-/// Return an exact executable-position variable reference.
-fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>, bool)> {
-    let token = tokenize_for_shell_dialect(segment, ShellDialect::Posix)
-        .into_iter()
-        .find(|token| token.kind == NormalizeTokenKind::Word)?;
-    let raw = token.text(segment)?;
+/// Skip known POSIX execution wrappers (`sudo`, `env`, `time`, `exec`,
+/// `command`, `nohup`, `nice`, `!`, and leading literal `K=V` env assignments)
+/// to locate the wrapped command word index in `words`
+/// (bd-binding-model-variants-fd5q). Returns `(target_index, wrapped)`.
+fn skip_posix_use_site_wrappers(words: &[(&str, std::ops::Range<usize>)]) -> (usize, bool) {
+    let mut index = 0usize;
+    let mut wrapped = false;
+    for _ in 0..8 {
+        let Some(&(raw, _)) = words.get(index) else {
+            break;
+        };
+        if raw == "!" {
+            index += 1;
+            wrapped = true;
+            continue;
+        }
+        if posix_assignment_word_parts(raw).is_some() {
+            index += 1;
+            wrapped = true;
+            continue;
+        }
+        let base = raw.rsplit('/').next().unwrap_or(raw);
+        match base {
+            "sudo" => {
+                let mut next = index + 1;
+                while let Some(&(opt, _)) = words.get(next) {
+                    if opt == "--" {
+                        next += 1;
+                        break;
+                    }
+                    if !opt.starts_with('-') || opt.len() == 1 {
+                        break;
+                    }
+                    if opt.starts_with("--") {
+                        let takes_val = matches!(
+                            opt,
+                            "--user"
+                                | "--group"
+                                | "--host"
+                                | "--prompt"
+                                | "--close-from"
+                                | "--role"
+                                | "--other-user"
+                                | "--chdir"
+                                | "--type"
+                                | "--command-timeout"
+                        );
+                        next += if takes_val { 2 } else { 1 };
+                    } else {
+                        let mut takes_next = false;
+                        let mut chars = opt[1..].chars().peekable();
+                        while let Some(ch) = chars.next() {
+                            if matches!(
+                                ch,
+                                'u' | 'g' | 'h' | 'p' | 'C' | 'r' | 'U' | 'D' | 't' | 'a' | 'T'
+                            ) {
+                                takes_next = chars.peek().is_none();
+                                break;
+                            }
+                        }
+                        next += if takes_next { 2 } else { 1 };
+                    }
+                }
+                if next < words.len() {
+                    index = next;
+                    wrapped = true;
+                    continue;
+                }
+                break;
+            }
+            "env" => {
+                let mut next = index + 1;
+                while let Some(&(opt, _)) = words.get(next) {
+                    if opt == "--" {
+                        next += 1;
+                        break;
+                    }
+                    if opt == "-" {
+                        next += 1;
+                        continue;
+                    }
+                    if opt.starts_with('-') && opt.len() > 1 {
+                        if opt.starts_with("--") {
+                            let takes_val = matches!(
+                                opt,
+                                "--unset" | "--chdir" | "--file" | "--argv0" | "--ignore-signal"
+                            );
+                            next += if takes_val { 2 } else { 1 };
+                        } else {
+                            let mut takes_next = false;
+                            let mut chars = opt[1..].chars().peekable();
+                            while let Some(ch) = chars.next() {
+                                if matches!(ch, 'u' | 'C' | 'f' | 'a' | 'P') {
+                                    takes_next = chars.peek().is_none();
+                                    break;
+                                }
+                            }
+                            next += if takes_next { 2 } else { 1 };
+                        }
+                        continue;
+                    }
+                    if posix_assignment_word_parts(opt).is_some() {
+                        next += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if next < words.len() {
+                    index = next;
+                    wrapped = true;
+                    continue;
+                }
+                break;
+            }
+            "time" => {
+                let mut next = index + 1;
+                while let Some(&(opt, _)) = words.get(next) {
+                    if opt == "--" {
+                        next += 1;
+                        break;
+                    }
+                    if opt == "-p" {
+                        next += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if next < words.len() {
+                    index = next;
+                    wrapped = true;
+                    continue;
+                }
+                break;
+            }
+            "exec" => {
+                let mut next = index + 1;
+                while let Some(&(opt, _)) = words.get(next) {
+                    if opt == "--" {
+                        next += 1;
+                        break;
+                    }
+                    if opt == "-a" {
+                        next += 2;
+                        continue;
+                    }
+                    if opt.starts_with('-') && opt.len() > 1 {
+                        next += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if next < words.len() {
+                    index = next;
+                    wrapped = true;
+                    continue;
+                }
+                break;
+            }
+            "command" => {
+                let mut next = index + 1;
+                while let Some(&(opt, _)) = words.get(next) {
+                    if opt == "--" {
+                        next += 1;
+                        break;
+                    }
+                    if opt == "-p" {
+                        next += 1;
+                        continue;
+                    }
+                    // `-v`/`-V` only inspect, do not execute.
+                    if opt.starts_with('-') {
+                        return (index, wrapped);
+                    }
+                    break;
+                }
+                if next < words.len() {
+                    index = next;
+                    wrapped = true;
+                    continue;
+                }
+                break;
+            }
+            "nohup" => {
+                if index + 1 < words.len() {
+                    index += 1;
+                    wrapped = true;
+                    continue;
+                }
+                break;
+            }
+            "nice" => {
+                let mut next = index + 1;
+                while let Some(&(opt, _)) = words.get(next) {
+                    if opt == "--" {
+                        next += 1;
+                        break;
+                    }
+                    if opt == "-n" || opt == "--adjustment" {
+                        next += 2;
+                        continue;
+                    }
+                    if opt.starts_with('-') && opt.len() > 1 {
+                        next += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if next < words.len() {
+                    index = next;
+                    wrapped = true;
+                    continue;
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    (index, wrapped)
+}
+
+/// Return an exact executable-position variable reference, stepping past
+/// optional leading execution wrappers (`sudo`, `env`, `time`, `exec`,
+/// `command`, `nohup`, `nice`, and `K=V` env prefixes).
+fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>, bool, bool)> {
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    let words: Vec<(&str, std::ops::Range<usize>)> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| Some((token.text(segment)?, token.byte_range.clone())))
+        .collect();
+    let (target_index, wrapped) = skip_posix_use_site_wrappers(&words);
+    let (raw, byte_range) = words.get(target_index)?.clone();
     let (expansion, quoted) =
         if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
             (inner, true)
@@ -16440,14 +16944,10 @@ fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>
         .and_then(|value| value.strip_prefix('{'))
         .and_then(|value| value.strip_suffix('}'))
         .or_else(|| expansion.strip_prefix('$'))?;
-    if name.is_empty()
-        || !name.bytes().enumerate().all(|(index, byte)| {
-            byte.is_ascii_alphabetic() || byte == b'_' || index > 0 && byte.is_ascii_digit()
-        })
-    {
+    if !is_valid_posix_identifier(name) {
         return None;
     }
-    Some((name.to_string(), token.byte_range, quoted))
+    Some((name.to_string(), byte_range, quoted, wrapped))
 }
 
 /// A literal non-shell interpreter such as `/usr/bin/python3` is the same word
@@ -16478,6 +16978,9 @@ fn render_posix_executable_expansion(
     }
     let fields: Vec<&str> = if quoted {
         vec![value]
+    } else if value.is_empty() {
+        // An empty unquoted expansion always produces zero fields regardless of IFS.
+        Vec::new()
     } else {
         if matches!(ifs, ModeledPosixIfs::Unverified) {
             return Err("an unquoted executable variable uses a custom or dynamic IFS value");
@@ -16485,9 +16988,7 @@ fn render_posix_executable_expansion(
         if value.contains(['*', '?', '[']) {
             return Err("an unquoted executable variable can expand pathname patterns");
         }
-        if value.is_empty() {
-            Vec::new()
-        } else if matches!(ifs, ModeledPosixIfs::Empty) {
+        if matches!(ifs, ModeledPosixIfs::Empty) {
             vec![value]
         } else {
             // POSIX's default IFS is exactly space, tab and LF. CR, vertical
@@ -16579,26 +17080,50 @@ fn modeled_posix_invocation_may_mutate_bindings(command: &str) -> bool {
 }
 
 fn invalidate_modeled_posix_bindings(
-    bindings: &mut HashMap<String, ModeledPosixBinding>,
+    bindings: &mut ModeledPosixBindings,
     ifs: &mut ModeledPosixIfs,
 ) {
-    for binding in bindings.values_mut() {
-        *binding = ModeledPosixBinding::Unverified(
-            "an earlier executable-variable invocation can change this shell binding",
-        );
-    }
+    bindings.invalidate_all();
     *ifs = ModeledPosixIfs::Unverified;
+}
+
+/// Classify the top-level separator between two adjacent POSIX segments.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PosixListSeparator {
+    Sequential,
+    And,
+    Or,
+    Pipe,
+    Background,
+    Other,
+}
+
+fn classify_posix_list_separator(separator: &str) -> PosixListSeparator {
+    if separator
+        .chars()
+        .all(|ch| ch.is_ascii_whitespace() || ch == ';')
+    {
+        return PosixListSeparator::Sequential;
+    }
+    match separator.trim() {
+        "&&" => PosixListSeparator::And,
+        "||" => PosixListSeparator::Or,
+        "|" | "|&" => PosixListSeparator::Pipe,
+        "&" => PosixListSeparator::Background,
+        _ => PosixListSeparator::Other,
+    }
 }
 
 /// Build the bounded literal-assignment portion of #289's command model.
 ///
-/// Only a straight-line prefix separated by semicolons or newlines
-/// participates. Pipelines, boolean control flow, functions, and arbitrary
-/// intervening commands refuse the proof rather than guessing about shell
-/// state. Each resolved invocation is evaluated independently, then its source
-/// bytes and the assignment-only segments are masked from the ordinary
-/// whole-command pass so another pack cannot misattribute their tokens.
-#[allow(clippy::too_many_lines)] // One bounded state machine keeps assignments, taint and source masks in order.
+/// Handles straight-line sequential prefixes (masking proven inert assignment
+/// and resolved-use ranges), as well as per-segment transitions across `&&`,
+/// `||`, `|`, `|&`, `&`, neutral commands (`:`, `[`, `[[`, `test`, `true`,
+/// `echo`, `X=1 true`), declaration builtins (`export`, `readonly`, `declare`,
+/// `typeset`, `local`), and use-site wrappers (`sudo`, `env`, `time`, `exec`,
+/// `command`, `nohup`, `nice`) in deny-only mode
+/// (bd-executable-assignment-scope, bd-binding-model-variants-fd5q).
+#[allow(clippy::too_many_lines)] // One bounded state machine keeps assignments, branches, taint and source masks in order.
 fn model_literal_posix_executable_assignments(
     command: &str,
     dialect: ShellDialect,
@@ -16619,43 +17144,74 @@ fn model_literal_posix_executable_assignments(
     if ranges.len() < 2 {
         return PosixExecutableAssignmentModel::default();
     }
-    let separators: Vec<&str> = ranges
+    let separators: Vec<PosixListSeparator> = ranges
         .windows(2)
-        .map(|pair| command.get(pair[0].1..pair[1].0).unwrap_or_default())
+        .map(|pair| {
+            classify_posix_list_separator(command.get(pair[0].1..pair[1].0).unwrap_or_default())
+        })
         .collect();
-    let sequential = separators.iter().all(|separator| {
-        separator
-            .chars()
-            .all(|ch| ch.is_ascii_whitespace() || ch == ';')
-    });
-    // In a chain joined only by `&&`, each statement runs only after every
-    // earlier one succeeded, so each earlier assignment took effect. Mixed with
-    // `;` or `||` that no longer holds: `d=git && false && d=ls; $d …` runs Git.
-    let and_chain = !sequential && separators.iter().all(|separator| separator.trim() == "&&");
-    if !sequential && !and_chain {
+    if separators.contains(&PosixListSeparator::Other) {
         return PosixExecutableAssignmentModel::default();
     }
-    // Statements the model did not reach before bd-executable-assignment-scope
-    // (an `&&` chain, several assignments in one statement, a step past an
-    // unrelated command) resolve deny-only: a denial of the resolved command
-    // stands, but its source is not masked, so the ordinary pass still judges
-    // what is written and nothing can become allowed that was not before.
-    let mut deny_only = and_chain;
+    let all_sequential = separators
+        .iter()
+        .all(|sep| *sep == PosixListSeparator::Sequential);
+    // Any command containing non-sequential separators (`&&`, `||`, `|`, `&`),
+    // multiple assignments in one statement, declaration builtins, neutral
+    // commands, or use-site wrappers resolves deny-only: denials from resolved
+    // invocations stand, while original source is left unmasked so nothing can
+    // become allowed that was not already allowed.
+    let mut deny_only = !all_sequential;
 
-    // Tainted bindings remain known: forgetting one would let its later use
-    // silently fall back to an unresolved executable after eval changed it.
-    let mut bindings = HashMap::<String, ModeledPosixBinding>::new();
-    let mut binding_limit_exceeded = false;
+    // `bindings` holds the active state for the current statement/chain.
+    // `confirmed_before_branch` snapshots the state before a conditional
+    // (`&&`/`||`) or subshell (`|`/`&`) list so that when a `;`/newline closes
+    // that list, conditionally overwritten variables retain both their earlier
+    // confirmed value and their branch value in deny-only mode
+    // (e.g. `d=git && false && d=echo; $d reset --hard` still evaluates `git`).
+    let mut bindings = ModeledPosixBindings::default();
+    let mut confirmed_before_branch: Option<ModeledPosixBindings> = None;
     let mut ifs = ModeledPosixIfs::Default;
     let mut assignment_ranges = Vec::new();
     let mut reconstructed_bytes = 0usize;
     let mut model = PosixExecutableAssignmentModel::default();
     for (segment_index, &(start, end)) in ranges.iter().enumerate() {
+        if segment_index > 0 {
+            let prev_sep = separators[segment_index - 1];
+            match prev_sep {
+                PosixListSeparator::Sequential => {
+                    if let Some(mut confirmed) = confirmed_before_branch.take() {
+                        confirmed.merge_from(&bindings);
+                        bindings = confirmed;
+                    }
+                }
+                PosixListSeparator::And => {
+                    deny_only = true;
+                    if confirmed_before_branch.is_none() {
+                        confirmed_before_branch = Some(bindings.clone());
+                    }
+                }
+                PosixListSeparator::Or
+                | PosixListSeparator::Pipe
+                | PosixListSeparator::Background => {
+                    deny_only = true;
+                    if let Some(confirmed) = confirmed_before_branch.as_mut() {
+                        confirmed.merge_from(&bindings);
+                        bindings = confirmed.clone();
+                    } else {
+                        confirmed_before_branch = Some(bindings.clone());
+                    }
+                }
+                PosixListSeparator::Other => break,
+            }
+        }
         let Some(segment) = command.get(start..end) else {
             return model;
         };
         if segment_index >= MAX_POSIX_EXECUTABLE_SEGMENTS {
-            if posix_variable_argv0(segment).is_some() && !bindings.is_empty() {
+            if let Some((name, _, _, _)) = posix_variable_argv0(segment)
+                && (bindings.get(&name).is_some() || bindings.is_overflowed(&name))
+            {
                 model
                     .invocations
                     .push(ModeledPosixExecutableInvocation::Unverified {
@@ -16669,13 +17225,7 @@ fn model_literal_posix_executable_assignments(
             return model;
         }
         if let Some((name, raw_value)) = posix_executable_assignment_parts(segment) {
-            match record_posix_executable_assignment(
-                name,
-                raw_value,
-                &mut bindings,
-                &mut ifs,
-                &mut binding_limit_exceeded,
-            ) {
+            match record_posix_executable_assignment(name, raw_value, &mut bindings, &mut ifs) {
                 PosixAssignmentOutcome::Recorded => assignment_ranges.push(start..end),
                 PosixAssignmentOutcome::Skipped => {}
                 PosixAssignmentOutcome::Stop => break,
@@ -16687,13 +17237,7 @@ fn model_literal_posix_executable_assignments(
             let mut recorded = false;
             let mut stop = false;
             for (name, raw_value) in assignments {
-                match record_posix_executable_assignment(
-                    name,
-                    raw_value,
-                    &mut bindings,
-                    &mut ifs,
-                    &mut binding_limit_exceeded,
-                ) {
+                match record_posix_executable_assignment(name, raw_value, &mut bindings, &mut ifs) {
                     PosixAssignmentOutcome::Recorded => recorded = true,
                     PosixAssignmentOutcome::Skipped => {}
                     PosixAssignmentOutcome::Stop => {
@@ -16710,14 +17254,41 @@ fn model_literal_posix_executable_assignments(
             }
             continue;
         }
-        let Some((name, argv0_range, quoted)) = posix_variable_argv0(segment) else {
+        if let Some(assignments) = posix_declaration_assignment_parts(segment) {
+            deny_only = true;
+            let mut recorded = false;
+            let mut stop = false;
+            for (name, raw_value) in assignments {
+                match record_posix_executable_assignment(name, raw_value, &mut bindings, &mut ifs) {
+                    PosixAssignmentOutcome::Recorded => recorded = true,
+                    PosixAssignmentOutcome::Skipped => {}
+                    PosixAssignmentOutcome::Stop => {
+                        stop = true;
+                        break;
+                    }
+                }
+            }
+            if stop {
+                break;
+            }
+            if recorded {
+                assignment_ranges.push(start..end);
+            }
+            continue;
+        }
+        let Some((name, argv0_range, quoted, wrapped)) = posix_variable_argv0(segment) else {
             if posix_segment_keeps_bindings(segment) {
                 deny_only = true;
                 continue;
             }
             break;
         };
-        if binding_limit_exceeded {
+        if wrapped {
+            deny_only = true;
+        }
+        let binding = if let Some(binding) = bindings.get(&name).cloned() {
+            binding
+        } else if bindings.is_overflowed(&name) {
             model
                 .invocations
                 .push(ModeledPosixExecutableInvocation::Unverified {
@@ -16726,12 +17297,17 @@ fn model_literal_posix_executable_assignments(
                 });
             invalidate_modeled_posix_bindings(&mut bindings, &mut ifs);
             continue;
-        }
-        let Some(binding) = bindings.get(&name) else {
+        } else {
+            // `$name` was never bound in this command (nor evicted by the
+            // binding cap): keep stepping past neutral later segments or stop
+            // without falsely denying unrelated `$ENV_VAR` invocations.
+            if deny_only {
+                continue;
+            }
             break;
         };
-        let value = match binding {
-            ModeledPosixBinding::Literal(value) => value,
+        let values = match binding {
+            ModeledPosixBinding::Literal(values) => values,
             ModeledPosixBinding::Unverified(reason) => {
                 model
                     .invocations
@@ -16743,54 +17319,66 @@ fn model_literal_posix_executable_assignments(
                 continue;
             }
         };
-        let (replacement, split_inline_launcher) =
-            match render_posix_executable_expansion(value, quoted, ifs) {
-                Ok(expansion) => expansion,
-                Err(reason) => {
-                    model
-                        .invocations
-                        .push(ModeledPosixExecutableInvocation::Unverified {
-                            range: start + argv0_range.start..start + argv0_range.end,
-                            reason,
-                        });
-                    invalidate_modeled_posix_bindings(&mut bindings, &mut ifs);
-                    continue;
-                }
-            };
-        let resolved_bytes = segment.len() - argv0_range.len() + replacement.len();
-        reconstructed_bytes = reconstructed_bytes.saturating_add(resolved_bytes);
-        if reconstructed_bytes > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
+        let mut any_mutates = false;
+        let mut maskable_here = !deny_only && values.len() == 1;
+        for value in &values {
+            let (replacement, split_inline_launcher) =
+                match render_posix_executable_expansion(value, quoted, ifs) {
+                    Ok(expansion) => expansion,
+                    Err(reason) => {
+                        maskable_here = false;
+                        any_mutates = true;
+                        model
+                            .invocations
+                            .push(ModeledPosixExecutableInvocation::Unverified {
+                                range: start + argv0_range.start..start + argv0_range.end,
+                                reason,
+                            });
+                        continue;
+                    }
+                };
+            let resolved_bytes = segment.len() - argv0_range.len() + replacement.len();
+            reconstructed_bytes = reconstructed_bytes.saturating_add(resolved_bytes);
+            if reconstructed_bytes > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
+                model
+                    .invocations
+                    .push(ModeledPosixExecutableInvocation::Unverified {
+                        range: start..end,
+                        reason: "the executable assignments exceed the bounded reconstructed-command limit",
+                    });
+                return model;
+            }
+            if replacement.is_empty() {
+                // An empty unquoted expansion vanishes so the following words
+                // become the command and may still depend on earlier scalar
+                // bindings (such as `S=...; IFS=@; $E env -u "$N" tee $S`, #558).
+                // Keep the original source unmasked so whole-command checks run.
+                maskable_here = false;
+            }
+            let mut resolved = String::with_capacity(
+                segment.len() + replacement.len().saturating_sub(argv0_range.len()),
+            );
+            resolved.push_str(&segment[..argv0_range.start]);
+            resolved.push_str(&replacement);
+            resolved.push_str(&segment[argv0_range.end..]);
+            any_mutates |= modeled_posix_invocation_may_mutate_bindings(&resolved);
             model
                 .invocations
-                .push(ModeledPosixExecutableInvocation::Unverified {
-                    range: start..end,
-                    reason: "the executable assignments exceed the bounded reconstructed-command limit",
-                });
-            return model;
+                .push(ModeledPosixExecutableInvocation::Resolved(
+                    ResolvedPosixExecutableInvocation {
+                        segment_range: start..end,
+                        argv0_range: argv0_range.clone(),
+                        replacement_len: replacement.len(),
+                        command: resolved,
+                        split_inline_launcher,
+                    },
+                ));
         }
-        let mut resolved = String::with_capacity(
-            segment.len() + replacement.len().saturating_sub(argv0_range.len()),
-        );
-        resolved.push_str(&segment[..argv0_range.start]);
-        resolved.push_str(&replacement);
-        resolved.push_str(&segment[argv0_range.end..]);
-        let may_mutate_bindings = modeled_posix_invocation_may_mutate_bindings(&resolved);
-        if !deny_only {
+        if maskable_here {
             model.inert_ranges.append(&mut assignment_ranges);
             model.inert_ranges.push(start..end);
         }
-        model
-            .invocations
-            .push(ModeledPosixExecutableInvocation::Resolved(
-                ResolvedPosixExecutableInvocation {
-                    segment_range: start..end,
-                    argv0_range,
-                    replacement_len: replacement.len(),
-                    command: resolved,
-                    split_inline_launcher,
-                },
-            ));
-        if may_mutate_bindings {
+        if any_mutates {
             invalidate_modeled_posix_bindings(&mut bindings, &mut ifs);
         }
     }
@@ -17493,6 +18081,106 @@ fn powershell_invocation_reaches_pack_keyword(
     }
 }
 
+/// Whether `command` contains a statement-leading PowerShell call/dot-source
+/// expression (`& (...)`, `&(...)`, `& $(...)`, `& @(...)`, `& $var`,
+/// `. (...)`) whose target is computed or dynamic (bd-ps-cross-dialect-gaps-ewf3).
+///
+/// Only statement-leading `&` counts (start of command or after `;`, `\n`,
+/// `|`, `=`, `{`, `(`) so a POSIX backgrounded command (`echo a & (echo b)`)
+/// never triggers a PowerShell replay.
+fn powershell_has_dynamic_call_expression(command: &str) -> bool {
+    if !command.contains(['&', '.']) {
+        return false;
+    }
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    let mut at_statement_start = true;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_single {
+            if byte == b'\'' {
+                in_single = false;
+            }
+            index += 1;
+            continue;
+        }
+        if in_double {
+            // PowerShell escapes inside double quotes with backtick, never backslash.
+            if byte == b'`' {
+                index = (index + 2).min(bytes.len());
+                continue;
+            }
+            if byte == b'"' {
+                in_double = false;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b' ' | b'\t' | b'\r' => {
+                index += 1;
+            }
+            b'\n' | b';' | b'|' | b'=' | b'{' | b'(' => {
+                at_statement_start = true;
+                index += 1;
+            }
+            b'\'' => {
+                at_statement_start = false;
+                in_single = true;
+                index += 1;
+            }
+            b'"' => {
+                at_statement_start = false;
+                in_double = true;
+                index += 1;
+            }
+            b'&' if at_statement_start => {
+                // Ignore `&&` and redirections (`&>`).
+                if matches!(bytes.get(index + 1), Some(b'&' | b'>')) {
+                    at_statement_start = bytes.get(index + 1) == Some(&b'&');
+                    index += 2;
+                    continue;
+                }
+                let rest = command[index + 1..].trim_start();
+                if rest.starts_with('(')
+                    || rest.starts_with("$(")
+                    || rest.starts_with("@(")
+                    || rest.starts_with('$')
+                {
+                    return true;
+                }
+                at_statement_start = false;
+                index += 1;
+            }
+            b'.' if at_statement_start => {
+                let rest = &command[index + 1..];
+                if rest
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_whitespace() || ch == '(')
+                {
+                    let trimmed = rest.trim_start();
+                    if trimmed.starts_with('(')
+                        || trimmed.starts_with("$(")
+                        || trimmed.starts_with("@(")
+                    {
+                        return true;
+                    }
+                }
+                at_statement_start = false;
+                index += 1;
+            }
+            _ => {
+                at_statement_start = false;
+                index += 1;
+            }
+        }
+    }
+    false
+}
+
 /// Whether `view`'s own decode of `command` reveals an enabled-pack keyword
 /// that the raw text does not (dcg#294).
 ///
@@ -17589,7 +18277,10 @@ fn view_decode_exposes_pack_keyword(
         || elided.is_some_and(|elided| {
             index.exposes_keyword_absent_from(&elided, view_normalized.as_ref())
         })
-        || (view == ShellDialect::Cmd && cmd_elided_argv0_matches_keyword(command, index))
+        || (view == ShellDialect::Cmd
+            && (cmd_elided_argv0_matches_keyword(command, index)
+                || (index.has_any_keyword(command)
+                    && !cmd_elided_edits_inner(command, true).is_empty())))
 }
 
 /// The byte ranges of cmd.exe `%NAME%`, delayed `!NAME!` and batch-parameter
@@ -17696,16 +18387,19 @@ fn elide_cmd_percent_expansions(command: &str) -> Option<String> {
 fn cmd_elided_argv0_has_nonempty_basename(elided: &str) -> bool {
     let unquoted: String = elided.chars().filter(|&ch| ch != '"').collect();
     let trimmed = unquoted.trim_start_matches('@');
-    let after_backslash = trimmed.rsplit('\\').next().unwrap_or(trimmed).trim();
-    !after_backslash.is_empty() && after_backslash.chars().any(char::is_alphanumeric)
+    let after_sep = trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed).trim();
+    !after_sep.is_empty() && after_sep.chars().any(char::is_alphanumeric)
 }
 
-/// Elide active `%NAME%` and `!NAME!` expansions from one Cmd argv0 word.
+/// Elide active `%NAME%` and `!NAME!` expansions from one Cmd word.
 ///
 /// Matches cmd.exe's two-phase expansion precedence: `%NAME%` expands before
 /// caret removal (so `^%x%` still expands), whereas unquoted `^!` escapes `!`
 /// into a literal exclamation mark (so `vssad^!LITERAL^!%EMPTY%min` elides
-/// only `%EMPTY%` and does not collapse into `vssadmin`).
+/// only `%EMPTY%` and does not collapse into `vssadmin`). When eliding a
+/// trailing `^%x%` or `...^` leaves a dangling unquoted caret at the end of
+/// the word (e.g. `rm^%x%`, `g^i%x%t^`), strip that dangling caret too so
+/// Cmd syntax decoding does not bail on an incomplete escape.
 fn elide_cmd_argv0_word(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
     let mut spans = Vec::new();
@@ -17736,7 +18430,11 @@ fn elide_cmd_argv0_word(raw: &str) -> Option<String> {
                 if bytes.get(index + 1) == Some(&b'%')
                     && let Some(end) = crate::normalize::cmd_expansion_end(bytes, index + 1)
                 {
-                    spans.push(index + 1..end);
+                    if end == bytes.len() {
+                        spans.push(index..end);
+                    } else {
+                        spans.push(index + 1..end);
+                    }
                     index = end;
                 } else {
                     // Caret escapes the next byte (including `^!`).
@@ -17756,12 +18454,44 @@ fn elide_cmd_argv0_word(raw: &str) -> Option<String> {
         copied_from = span.end;
     }
     out.push_str(&raw[copied_from..]);
+    if !double && out.ends_with('^') && !out.ends_with("^^") {
+        out.pop();
+    }
     Some(out)
+}
+
+/// Whether an unquoted non-argv0 Cmd token carries a `%NAME%`/`!NAME!`
+/// expansion glued onto a literal subcommand or flag (such as `%a b%reset`,
+/// `%a b%--hard`, `%x%-rf`), rather than a standalone `%PATH%` or quoted
+/// argument value.
+fn cmd_glued_argument_elision_candidate(raw: &str, elided: &str) -> bool {
+    if raw.contains('"')
+        || elided.is_empty()
+        || raw.bytes().any(|b| {
+            matches!(
+                b,
+                b'&' | b'|' | b'<' | b'>' | b';' | b'(' | b')' | b'{' | b'}' | b'$' | b'\r' | b'\n'
+            )
+        })
+    {
+        return false;
+    }
+    // Option values after `=` (e.g. `git log --format=%H%n`) are ordinary
+    // format strings, not obfuscated option/subcommand names.
+    if let (Some(eq), Some(exp)) = (raw.find('='), raw.find(['%', '!']))
+        && eq < exp
+    {
+        return false;
+    }
+    let first = elided.as_bytes()[0];
+    (first == b'-' || first == b'/' || first.is_ascii_alphabetic())
+        && elided.chars().any(char::is_alphabetic)
 }
 
 fn cmd_elided_argv0_edits_for_tokens(
     command: &str,
     tokens: &[crate::normalize::NormalizeToken],
+    include_glued_args: bool,
 ) -> Vec<(std::ops::Range<usize>, String)> {
     let mut edits = Vec::new();
     let mut start = 0usize;
@@ -17772,6 +18502,7 @@ fn cmd_elided_argv0_edits_for_tokens(
         let statement = &tokens[start..end];
         start = end + 1;
         let mut next_is_redirect_target = false;
+        let mut seen_argv0 = false;
         for token in statement {
             let Some(raw) = token.text(command) else {
                 break;
@@ -17784,25 +18515,35 @@ fn cmd_elided_argv0_edits_for_tokens(
                 next_is_redirect_target = needs_target;
                 continue;
             }
-            if !raw.contains(['"', '%', '!'])
-                && raw.trim_start_matches('@').eq_ignore_ascii_case("call")
-            {
-                continue;
-            }
-            if raw.contains(['%', '!'])
-                && let Some(elided_word) = elide_cmd_argv0_word(raw)
-                && cmd_elided_argv0_has_nonempty_basename(&elided_word)
-            {
-                let is_obfuscated_call = !raw.contains('"')
-                    && elided_word
-                        .trim_start_matches('@')
-                        .eq_ignore_ascii_case("call");
-                edits.push((token.byte_range.clone(), elided_word));
-                if is_obfuscated_call {
+            if !seen_argv0 {
+                if !raw.contains(['"', '%', '!'])
+                    && raw.trim_start_matches('@').eq_ignore_ascii_case("call")
+                {
                     continue;
                 }
+                if raw.contains(['%', '!'])
+                    && let Some(elided_word) = elide_cmd_argv0_word(raw)
+                    && cmd_elided_argv0_has_nonempty_basename(&elided_word)
+                {
+                    let is_obfuscated_call = !raw.contains('"')
+                        && elided_word
+                            .trim_start_matches('@')
+                            .eq_ignore_ascii_case("call");
+                    edits.push((token.byte_range.clone(), elided_word));
+                    if is_obfuscated_call {
+                        continue;
+                    }
+                }
+                seen_argv0 = true;
+                if !include_glued_args {
+                    break;
+                }
+            } else if raw.contains(['%', '!'])
+                && let Some(elided_word) = elide_cmd_argv0_word(raw)
+                && cmd_glued_argument_elision_candidate(raw, &elided_word)
+            {
+                edits.push((token.byte_range.clone(), elided_word));
             }
-            break;
         }
     }
     edits
@@ -17813,22 +18554,32 @@ fn cmd_elided_argv0_edits_for_tokens(
 /// executable basename (bd-cmd-dynamic-argv0-windows-rules-j70t).
 ///
 /// Inspects both the expansion-preserving token view (so spaces/`&`/`|` inside
-/// a `%NAME%` variable name stay inside argv0) and the standard Cmd token view
-/// (so an earlier undefined `%undefined` token cannot swallow a later `& argv0`
-/// boundary). Argument words and wholly dynamic executables like `%TOOL%` are
-/// left untouched.
+/// a `%NAME%`/`!NAME!` variable name stay inside argv0) and the standard Cmd
+/// token view (so an earlier undefined `%undefined` token cannot swallow a
+/// later `& argv0` boundary). Argument words and wholly dynamic executables
+/// like `%TOOL%` are left untouched here; see `cmd_elided_command_view` for
+/// glued unquoted option/subcommand expansions.
 fn cmd_elided_argv0_edits(command: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    cmd_elided_edits_inner(command, false)
+}
+
+fn cmd_elided_edits_inner(
+    command: &str,
+    include_glued_args: bool,
+) -> Vec<(std::ops::Range<usize>, String)> {
     if !command.contains(['%', '!']) {
         return Vec::new();
     }
-    let mut edits = if command.contains('%') {
-        let expansion_tokens = crate::normalize::tokenize_cmd_expansion_view(command);
-        cmd_elided_argv0_edits_for_tokens(command, &expansion_tokens)
-    } else {
-        Vec::new()
-    };
+    // Expansion-preserving tokenization can cross `&`/`|` for argv0 variable
+    // names (e.g. `re%a&b%g`), so restrict it strictly to argv0 positions;
+    // otherwise an earlier unpaired `%undefined` could swallow `& argv0` as an
+    // argument word and block the real argv0 edit. Glued argument elision runs
+    // only on native Cmd tokens, whose safe paired-expansion scan stops at
+    // separators and metacharacters.
+    let expansion_tokens = crate::normalize::tokenize_cmd_expansion_view(command);
+    let mut edits = cmd_elided_argv0_edits_for_tokens(command, &expansion_tokens, false);
     let native_tokens = tokenize_for_shell_dialect(command, ShellDialect::Cmd);
-    for edit in cmd_elided_argv0_edits_for_tokens(command, &native_tokens) {
+    for edit in cmd_elided_argv0_edits_for_tokens(command, &native_tokens, include_glued_args) {
         let overlaps = edits
             .iter()
             .any(|(existing, _)| edit.0.start < existing.end && existing.start < edit.0.end);
@@ -17840,8 +18591,32 @@ fn cmd_elided_argv0_edits(command: &str) -> Vec<(std::ops::Range<usize>, String)
     edits
 }
 
+/// `command` with active `%NAME%`/`!NAME!` expansions elided in Cmd argv0
+/// positions and in unquoted glued option/subcommand argument words
+/// (e.g. `git reset %a b%--hard`, `rm %x%-rf /`).
+fn cmd_elided_command_view(command: &str) -> Option<String> {
+    let edits = cmd_elided_edits_inner(command, true);
+    if edits.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(command.len());
+    let mut copied_from = 0usize;
+    for (range, replacement) in edits {
+        if range.start > copied_from {
+            out.push_str(&command[copied_from..range.start]);
+        }
+        out.push_str(&replacement);
+        copied_from = range.end;
+    }
+    if copied_from < command.len() {
+        out.push_str(&command[copied_from..]);
+    }
+    Some(out)
+}
+
 /// `command` with `%NAME%`/`!NAME!` expansions elided ONLY in Cmd executable
 /// (argv0) positions, or `None` when no argv0 had such an expansion.
+#[cfg(test)]
 fn cmd_elided_argv0_view(command: &str) -> Option<String> {
     let edits = cmd_elided_argv0_edits(command);
     if edits.is_empty() {
@@ -18190,7 +18965,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         && result.decision == EvaluationDecision::Allow
         && result.bypass_method != Some(BypassMethod::AllowOnce)
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
-        && let Some(elided) = cmd_elided_argv0_view(command)
+        && let Some(elided) = cmd_elided_command_view(command)
     {
         let mut alternate = if deadline_exceeded(deadline) {
             EvaluationResult::indeterminate_due_to_budget()
@@ -18386,6 +19161,7 @@ fn evaluate_command_in_dialect_union(
     let may_expose_powershell_execution = || {
         *powershell_execution_proof.get_or_init(|| {
             powershell_invocation_reaches_pack_keyword(fanout_command, keyword_index)
+                || powershell_has_dynamic_call_expression(fanout_command)
                 || powershell_pipeline_scan_required(fanout_command)
         })
     };
@@ -19245,8 +20021,13 @@ fn evaluate_command_in_single_dialect_view(
     );
     let cmd_caret_syntax =
         restore_cmd_caret_syntax(cmd_safe_argument_mask.as_ref(), command, shell_dialect);
-    let heredoc_data_mask =
-        preserve_source_heredoc_data_mask(cmd_caret_syntax.as_ref(), command, shell_dialect);
+    let (heredoc_data_mask, mut documentation_mask_incomplete) =
+        preserve_source_heredoc_data_mask_with_status(
+            cmd_caret_syntax.as_ref(),
+            command,
+            shell_dialect,
+            deadline,
+        );
     let command_for_match = heredoc_data_mask.as_ref();
     let custom_substitution_view =
         checked_posix_substitutions.custom_matching_view(cmd_caret_syntax.as_ref(), command);
@@ -19255,7 +20036,14 @@ fn evaluate_command_in_single_dialect_view(
     let custom_heredoc_data_mask = if matches!(custom_substitution_view, Cow::Borrowed(_)) {
         Cow::Borrowed(command_for_match)
     } else {
-        preserve_source_heredoc_data_mask(custom_substitution_view.as_ref(), command, shell_dialect)
+        let (masked_custom, custom_incomplete) = preserve_source_heredoc_data_mask_with_status(
+            custom_substitution_view.as_ref(),
+            command,
+            shell_dialect,
+            deadline,
+        );
+        documentation_mask_incomplete |= custom_incomplete;
+        masked_custom
     };
     let custom_command_for_match = custom_heredoc_data_mask.as_ref();
 
@@ -19499,8 +20287,14 @@ fn evaluate_command_in_single_dialect_view(
         }
         let custom_argv_view =
             checked_posix_substitutions.custom_matching_view(&views.for_match, &views.command);
-        let custom_argv_data_mask =
-            preserve_source_heredoc_data_mask(custom_argv_view.as_ref(), command, shell_dialect);
+        let (custom_argv_data_mask, argv_doc_incomplete) =
+            preserve_source_heredoc_data_mask_with_status(
+                custom_argv_view.as_ref(),
+                command,
+                shell_dialect,
+                deadline,
+            );
+        documentation_mask_incomplete |= argv_doc_incomplete;
         let argv_result = evaluate_packs_with_allowlists_at_depth(
             &views.for_packs,
             &views.normalized,
@@ -19576,6 +20370,29 @@ fn evaluate_command_in_single_dialect_view(
     // grant — but never let that attribution replace a pack denial or an
     // indeterminate verdict. A grant scoped to e.g.
     // `heredoc.shell:launcher-unverified` skips only that fail-closed check;
+    // bd-oxtg: When the Python/JS interpreter documentation-mask proof did not
+    // complete within budget, Step 4 fell back to scanning the unmasked
+    // interpreter source with literal shell/external packs. If the resulting
+    // denial comes from inside an unproved quoted Python/JS body (rather than
+    // an exterior command), report `heredoc.shell:incomplete-analysis` so the
+    // caller sees what actually happened instead of a misattributed literal
+    // pack rule (while strictly preserving deny-wins safety).
+    if documentation_mask_incomplete && result.decision == EvaluationDecision::Deny {
+        result = attribute_incomplete_interpreter_documentation_denial(
+            command,
+            result,
+            ordered_packs,
+            allowlists,
+            keyword_index,
+            deadline,
+            project_path,
+            shell_dialect,
+            nested_command_depth,
+            Some(&nested_context),
+            inherited_automated_stdin,
+        );
+    }
+
     // `powershell -EncodedCommand … ; rm -rf /` must still be denied by the
     // packs on its own merits (bd-l9jf whole-command leg).
     if result.is_allowed() && result.allowlist_override.is_none() {
@@ -19744,24 +20561,38 @@ fn redirection_free_pack_views(
 /// inside a complete inline interpreter program (#645). Only bytes the source
 /// proof masks are changed here; existing sanitized data and live expansions
 /// retain their current representation. Explicit Windows dialects use their own syntax.
+#[cfg(test)]
 fn preserve_source_heredoc_data_mask<'a>(
     command_for_match: &'a str,
     source: &str,
     dialect: ShellDialect,
 ) -> Cow<'a, str> {
+    preserve_source_heredoc_data_mask_with_status(command_for_match, source, dialect, None).0
+}
+
+fn preserve_source_heredoc_data_mask_with_status<'a>(
+    command_for_match: &'a str,
+    source: &str,
+    dialect: ShellDialect,
+    deadline: Option<&Deadline>,
+) -> (Cow<'a, str>, bool) {
     if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
         || command_for_match.len() != source.len()
         || source.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
     {
-        return Cow::Borrowed(command_for_match);
+        return (Cow::Borrowed(command_for_match), false);
     }
     let data_view = crate::heredoc::mask_non_expanding_data_heredocs(source);
-    let documentation_view = mask_proven_interpreter_documentation(source);
+    let (documentation_view, documentation_incomplete) =
+        match mask_proven_interpreter_documentation_with_outcome(source, deadline) {
+            DocumentationMaskOutcome::Complete(view) => (view, false),
+            DocumentationMaskOutcome::Incomplete(view) => (Cow::Borrowed(view), true),
+        };
     if (data_view == source && documentation_view == source)
         || data_view.len() != source.len()
         || documentation_view.len() != source.len()
     {
-        return Cow::Borrowed(command_for_match);
+        return (Cow::Borrowed(command_for_match), documentation_incomplete);
     }
     let mut result = command_for_match.as_bytes().to_vec();
     for (((original, masked), documented), output) in source
@@ -19776,13 +20607,131 @@ fn preserve_source_heredoc_data_mask<'a>(
             *output = masked;
         }
     }
-    String::from_utf8(result).map_or(Cow::Borrowed(command_for_match), Cow::Owned)
+    (
+        String::from_utf8(result).map_or(Cow::Borrowed(command_for_match), Cow::Owned),
+        documentation_incomplete,
+    )
+}
+
+/// Convert a pack denial produced while the Python/JS interpreter documentation
+/// proof was incomplete (timed out / worker busy) into
+/// `heredoc.shell:incomplete-analysis` whenever the match lies inside an
+/// unproved quoted interpreter heredoc/inline body (bd-oxtg). Exterior matches
+/// (e.g. `rm -rf / && python3 - <<'EOF'...`) retain their concrete pack rule.
+#[allow(clippy::too_many_arguments)]
+fn attribute_incomplete_interpreter_documentation_denial(
+    command: &str,
+    denial: EvaluationResult,
+    ordered_packs: &[String],
+    allowlists: &LayeredAllowlist,
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    deadline: Option<&Deadline>,
+    project_path: Option<&Path>,
+    shell_dialect: ShellDialect,
+    nested_command_depth: usize,
+    nested_context: Option<&NestedCommandEvaluationContext<'_, '_>>,
+    inherited_automated_stdin: bool,
+) -> EvaluationResult {
+    // Already attributed to a heredoc AST/incomplete-analysis rule: keep as-is.
+    if denial.pattern_info.as_ref().is_some_and(|info| {
+        info.pack_id
+            .as_deref()
+            .is_some_and(|pack| pack.starts_with("heredoc."))
+    }) {
+        return denial;
+    }
+    // Check whether the command has a quoted Python/JS interpreter stdin body
+    // (the inert-interpreter mask is a fast structural Bash AST pass with no
+    // Python/JS parse). If the denial span intersects a masked interpreter body
+    // (or has no span and the command contains a quoted interpreter heredoc),
+    // verify the exterior shell command first so an in-body pack hit can never
+    // mask an exterior destructive command (e.g. `rm -rf / && python3 - <<'EOF'...`).
+    let masked_bodies = crate::heredoc::mask_inert_interpreter_stdin(command);
+    if masked_bodies.as_ref() == command || masked_bodies.len() != command.len() {
+        return denial;
+    }
+    let span_intersects_masked_body = denial
+        .pattern_info
+        .as_ref()
+        .and_then(|info| info.matched_span)
+        .is_none_or(|span| {
+            let start = span.start.min(command.len());
+            let end = span.end.min(command.len());
+            start < end
+                && command.as_bytes()[start..end]
+                    .iter()
+                    .zip(&masked_bodies.as_bytes()[start..end])
+                    .any(|(orig, masked)| orig != masked)
+        });
+    if !span_intersects_masked_body {
+        return denial;
+    }
+
+    // Re-evaluate packs on the exterior command with quoted interpreter bodies
+    // blanked out. If an exterior command itself triggers a pack rule (even in a
+    // pack ordered after the one that matched inside the unproved body), return
+    // that concrete exterior denial immediately.
+    let exterior_raw = masked_bodies.as_ref();
+    let exterior_sanitized = sanitize_for_pattern_matching(exterior_raw);
+    let exterior_dialect_norm =
+        crate::normalize::normalize_command_in_dialect(exterior_sanitized.as_ref(), shell_dialect);
+    let exterior_normalized = crate::normalize::normalize_command(exterior_dialect_norm.as_ref());
+    let exterior = {
+        let _allow_once_scope = AllowOnceSuppressionScope::enter();
+        evaluate_packs_with_allowlists_at_depth(
+            exterior_normalized.as_ref(),
+            exterior_normalized.as_ref(),
+            exterior_sanitized.as_ref(),
+            exterior_sanitized.as_ref(),
+            exterior_raw,
+            exterior_raw,
+            ordered_packs,
+            allowlists,
+            keyword_index,
+            deadline,
+            project_path,
+            shell_dialect,
+            nested_command_depth,
+            nested_context,
+            inherited_automated_stdin,
+        )
+    };
+    if exterior.decision == EvaluationDecision::Deny {
+        return exterior;
+    }
+
+    let incomplete = EvaluationResult::denied_by_incomplete_analysis(
+        "Interpreter source documentation proof did not complete within budget; conservative fallback blocked the command",
+    );
+    // Only honor an allowlist grant on `heredoc.shell:incomplete-analysis` when
+    // the exterior command was affirmatively proved clean (not indeterminate).
+    if exterior.decision == EvaluationDecision::Allow {
+        let (pack_id, pattern_name) = split_ast_rule_id(INCOMPLETE_ANALYSIS_RULE);
+        if let Some(hit) = allowlists.match_rule_at_path(&pack_id, &pattern_name, project_path) {
+            if let Some(info) = incomplete.pattern_info {
+                return EvaluationResult::allowed_by_allowlist(
+                    info,
+                    hit.layer,
+                    hit.entry.reason.clone(),
+                );
+            }
+        }
+    }
+    incomplete
+}
+
+enum DocumentationMaskOutcome<'a> {
+    Complete(Cow<'a, str>),
+    Incomplete(&'a str),
 }
 
 #[cfg(test)]
 thread_local! {
     // Documentation-mask analyses actually launched on this thread (#555).
     static DOCUMENTATION_MASK_ANALYSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Deterministic test hook to simulate documentation-mask budget exhaustion (bd-oxtg).
+    static DOCUMENTATION_MASK_BUDGET_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// A derived command can lose its enclosing pipeline, bindings, or generated
@@ -19804,6 +20753,16 @@ fn interpreter_data_has_complete_context(command: &str) -> bool {
 /// source remains input to interpreter, execution, pipeline, and protected-write
 /// checks; an opaque program never receives a mask.
 fn mask_proven_interpreter_documentation(command: &str) -> Cow<'_, str> {
+    match mask_proven_interpreter_documentation_with_outcome(command, None) {
+        DocumentationMaskOutcome::Complete(view) => view,
+        DocumentationMaskOutcome::Incomplete(view) => Cow::Borrowed(view),
+    }
+}
+
+fn mask_proven_interpreter_documentation_with_outcome<'a>(
+    command: &'a str,
+    deadline: Option<&Deadline>,
+) -> DocumentationMaskOutcome<'a> {
     // Capture provenance on the evaluating thread before entering the worker.
     let complete_context = interpreter_data_has_complete_context(command);
     // Only a Python or Node receiver can earn a mask, and both names are
@@ -19820,7 +20779,7 @@ fn mask_proven_interpreter_documentation(command: &str) -> Cow<'_, str> {
         || !(names_interpreter(b"python") || names_interpreter(b"node"))
         || check_triggers(command) == TriggerResult::NoTrigger
     {
-        return Cow::Borrowed(command);
+        return DocumentationMaskOutcome::Complete(Cow::Borrowed(command));
     }
     // The deadline covers extraction and both the Bash receiver proof and
     // the Python/JavaScript parse. Node/byte limits alone do not bound the
@@ -19843,29 +20802,58 @@ fn mask_proven_interpreter_documentation(command: &str) -> Cow<'_, str> {
         > = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     }
     const COMPLETED_CAPACITY: usize = 4;
-    let cached = COMPLETED.with(|completed| {
-        completed
-            .borrow()
-            .iter()
-            .find(|(source, complete, _)| source == command && *complete == complete_context)
-            .map(|(_, _, mask)| mask.clone())
-    });
-    let completed = cached.or_else(|| {
-        #[cfg(test)]
-        DOCUMENTATION_MASK_ANALYSES.with(|count| count.set(count.get() + 1));
-        let source = command.to_string();
-        let mask = run_documentation_mask_worker(
-            ACTIVE.with(std::sync::Arc::clone),
-            crate::ast_matcher::protected_scan_budget(),
-            move || {
-                Some(
-                    match mask_proven_interpreter_documentation_inner(&source, complete_context) {
-                        Cow::Owned(masked) => Some(masked),
-                        Cow::Borrowed(_) => None,
-                    },
-                )
-            },
-        )?;
+    #[cfg(test)]
+    let budget_override = DOCUMENTATION_MASK_BUDGET_OVERRIDE.with(std::cell::Cell::get);
+
+    #[cfg(test)]
+    let skip_cache = budget_override.is_some();
+    #[cfg(not(test))]
+    let skip_cache = false;
+
+    let cached = if skip_cache {
+        None
+    } else {
+        COMPLETED.with(|completed| {
+            completed
+                .borrow()
+                .iter()
+                .find(|(source, complete, _)| source == command && *complete == complete_context)
+                .map(|(_, _, mask)| mask.clone())
+        })
+    };
+    if let Some(mask) = cached {
+        return DocumentationMaskOutcome::Complete(mask.map_or(Cow::Borrowed(command), Cow::Owned));
+    }
+
+    #[cfg(test)]
+    DOCUMENTATION_MASK_ANALYSES.with(|count| count.set(count.get() + 1));
+
+    #[cfg(test)]
+    let mut budget = budget_override
+        .unwrap_or_else(|| crate::ast_matcher::protected_scan_budget_for(command.len()));
+    #[cfg(not(test))]
+    let mut budget = crate::ast_matcher::protected_scan_budget_for(command.len());
+    if let Some(deadline) = deadline {
+        let Some(remaining) = deadline.remaining() else {
+            return DocumentationMaskOutcome::Incomplete(command);
+        };
+        budget = budget.min(remaining);
+    }
+
+    let source = command.to_string();
+    let worker_result =
+        run_documentation_mask_worker(ACTIVE.with(std::sync::Arc::clone), budget, move || {
+            Some(
+                match mask_proven_interpreter_documentation_inner(&source, complete_context) {
+                    Cow::Owned(masked) => Some(masked),
+                    Cow::Borrowed(_) => None,
+                },
+            )
+        });
+    let Some(mask) = worker_result else {
+        return DocumentationMaskOutcome::Incomplete(command);
+    };
+    if !skip_cache {
         COMPLETED.with(|completed| {
             let mut completed = completed.borrow_mut();
             if completed.len() == COMPLETED_CAPACITY {
@@ -19873,11 +20861,8 @@ fn mask_proven_interpreter_documentation(command: &str) -> Cow<'_, str> {
             }
             completed.push_back((command.to_string(), complete_context, mask.clone()));
         });
-        Some(mask)
-    });
-    completed
-        .flatten()
-        .map_or(Cow::Borrowed(command), Cow::Owned)
+    }
+    DocumentationMaskOutcome::Complete(mask.map_or(Cow::Borrowed(command), Cow::Owned))
 }
 
 /// At most one parser per slot may outlive its optional documentation proof.
@@ -35688,7 +36673,13 @@ fn evaluate_core_filesystem_pack(
     let dialect_source = if shell_dialect != ShellDialect::Unknown && normalized_offset == Some(0) {
         if shell_dialect == ShellDialect::Posix {
             if interpreter_data_has_complete_context(original_command) {
-                preserve_source_heredoc_data_mask(original_command, original_command, shell_dialect)
+                preserve_source_heredoc_data_mask_with_status(
+                    original_command,
+                    original_command,
+                    shell_dialect,
+                    deadline,
+                )
+                .0
             } else {
                 crate::heredoc::mask_non_expanding_data_heredocs(original_command)
             }
@@ -47578,6 +48569,11 @@ mod tests {
             (
                 ShellDialect::Posix,
                 "export EXE=snow; \"$EXE\" sql -q 'DROP DATABASE analytics_prod'",
+                "drop-database",
+            ),
+            (
+                ShellDialect::Posix,
+                "export EXE=snow; eval 'true'; \"$EXE\" sql -q 'DROP DATABASE analytics_prod'",
                 "stdin-unverified",
             ),
             (
@@ -67946,6 +68942,13 @@ mod windows_redirection_free_view_tests {
             (r#"echo "re%x%g delete HKLM\Foo""#, None),
             (r"%LOGGER% rmmod nvidia", None),
             (r"%DIR%\ foo", None),
+            // Forward-slash Windows paths: wholly-dynamic basename must stay None (FE4),
+            // while partially-literal basename still elides.
+            ("C:/Windows/System32/%TOOL% rmmod nvidia", None),
+            (
+                "C:/Windows/System32/vssad%x%min.exe delete shadows /all",
+                Some("C:/Windows/System32/vssadmin.exe delete shadows /all"),
+            ),
         ] {
             assert_eq!(
                 cmd_elided_argv0_view(command).as_deref(),
@@ -67953,5 +68956,141 @@ mod windows_redirection_free_view_tests {
                 "{command:?}"
             );
         }
+    }
+
+    #[test]
+    fn bd_oxtg_degraded_documentation_mask_reports_incomplete_analysis() {
+        struct BudgetResetGuard;
+        impl Drop for BudgetResetGuard {
+            fn drop(&mut self) {
+                DOCUMENTATION_MASK_BUDGET_OVERRIDE.with(|cell| cell.set(None));
+            }
+        }
+
+        let heredoc_data = "python3 - <<'EOF'\nprint('x|git reset --hard')\nEOF";
+        let exterior_destructive =
+            "rm -rf / && python3 - <<'EOF'\nprint('x|git reset --hard')\nEOF";
+        let heredoc_settings = crate::config::HeredocSettings::default();
+        let allowlists = LayeredAllowlist::default();
+        let overrides = crate::config::CompiledOverrides::default();
+        let enabled_packs: HashSet<String> =
+            ["core.git".to_string(), "core.filesystem".to_string()]
+                .into_iter()
+                .collect();
+        let ordered_packs = crate::packs::REGISTRY.expand_enabled_ordered(&enabled_packs);
+        let enabled_keywords = crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+
+        // Normal budget: quoted Python heredoc data string is allowed.
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let ok = evaluate_command_with_pack_order_deadline_at_path_inner(
+                heredoc_data,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &overrides,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                dialect,
+                0,
+                false,
+            );
+            assert!(
+                ok.is_allowed(),
+                "normal budget must allow quoted Python data heredoc ({dialect:?}): {ok:?}"
+            );
+        }
+
+        // Simulated budget exhaustion on the documentation-mask proof:
+        // must deny under `heredoc.shell:incomplete-analysis` (never misattributed
+        // to `core.git:reset-hard`), while exterior destructive commands keep
+        // their real pack rule.
+        let _guard = BudgetResetGuard;
+        DOCUMENTATION_MASK_BUDGET_OVERRIDE.with(|cell| cell.set(Some(std::time::Duration::ZERO)));
+
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let degraded = evaluate_command_with_pack_order_deadline_at_path_inner(
+                heredoc_data,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &overrides,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                dialect,
+                0,
+                false,
+            );
+            assert_eq!(
+                degraded.decision,
+                EvaluationDecision::Deny,
+                "degraded documentation mask must fail closed ({dialect:?}): {degraded:?}"
+            );
+            let info = degraded.pattern_info.as_ref().expect("pattern info");
+            assert_eq!(
+                (info.pack_id.as_deref(), info.pattern_name.as_deref()),
+                (Some("heredoc.shell"), Some("incomplete-analysis")),
+                "degraded fallback must report heredoc.shell:incomplete-analysis, not literal pack rule ({dialect:?}): {info:?}"
+            );
+
+            // Exterior command must retain its concrete pack rule!
+            let exterior = evaluate_command_with_pack_order_deadline_at_path_inner(
+                exterior_destructive,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &overrides,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                dialect,
+                0,
+                false,
+            );
+            assert_eq!(exterior.decision, EvaluationDecision::Deny);
+            let ext_info = exterior
+                .pattern_info
+                .as_ref()
+                .expect("exterior pattern info");
+            assert_eq!(
+                ext_info.pack_id.as_deref(),
+                Some("core.filesystem"),
+                "exterior destructive command must retain concrete pack rule ({dialect:?}): {ext_info:?}"
+            );
+        }
+
+        // Granting `heredoc.shell:incomplete-analysis` in the allowlist must be honored.
+        let waived = LayeredAllowlist::default().with_rule_grants(
+            &[("heredoc.shell", "incomplete-analysis")],
+            "test waive incomplete analysis",
+            "test",
+        );
+        let waived_res = evaluate_command_with_pack_order_deadline_at_path_inner(
+            heredoc_data,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &overrides,
+            &waived,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            ShellDialect::Posix,
+            0,
+            false,
+        );
+        assert!(
+            waived_res.is_allowed(),
+            "allowlist grant for heredoc.shell:incomplete-analysis must be honored: {waived_res:?}"
+        );
     }
 }

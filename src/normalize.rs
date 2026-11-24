@@ -169,7 +169,10 @@ pub fn strip_wrapper_prefixes(command: &str) -> NormalizedCommand<'_> {
         {
             modprobe_env.posixly_correct = true;
         }
-        if (modprobe_env.modprobe_options.is_some() || modprobe_env.posixly_correct)
+        if (modprobe_env.modprobe_options.is_some()
+            || modprobe_env.pre_sudo_modprobe_options.is_some()
+            || modprobe_env.posixly_correct
+            || modprobe_env.pre_sudo_posixly_correct)
             && let Some(folded) = fold_modprobe_env_into_command(&current, &modprobe_env)
         {
             current = folded;
@@ -201,8 +204,19 @@ pub fn strip_wrapper_prefixes(command: &str) -> NormalizedCommand<'_> {
 ///   module name rather than a dry-run flag.
 #[derive(Default)]
 struct ModprobeEnvState {
+    /// `MODPROBE_OPTIONS` unconditionally visible to `modprobe` (either set
+    /// without crossing a non-preserving `sudo`, or preserved across `sudo`
+    /// via `-E` / `--preserve-env`).
     modprobe_options: Option<String>,
+    /// `MODPROBE_OPTIONS` set before a `sudo` that does NOT explicitly
+    /// preserve it: dropped under default `env_reset`, kept under `env_keep`
+    /// / `!env_reset`. Evaluated deny-wins over `{env_reset, env_keep}`.
+    pre_sudo_modprobe_options: Option<String>,
+    /// `POSIXLY_CORRECT` unconditionally visible to `modprobe`.
     posixly_correct: bool,
+    /// `POSIXLY_CORRECT` set before a `sudo` that does NOT explicitly preserve
+    /// it. Evaluated deny-wins over `{env_reset, env_keep}`.
+    pre_sudo_posixly_correct: bool,
 }
 
 fn record_modprobe_assignment(state: &mut ModprobeEnvState, raw: &str) {
@@ -214,8 +228,17 @@ fn record_modprobe_assignment(state: &mut ModprobeEnvState, raw: &str) {
         return;
     };
     match name {
-        "MODPROBE_OPTIONS" => state.modprobe_options = Some(value.to_string()),
-        "POSIXLY_CORRECT" => state.posixly_correct = true,
+        "MODPROBE_OPTIONS" => {
+            state.modprobe_options = Some(value.to_string());
+            // An assignment after `sudo` overrides any pre-sudo value in both
+            // `env_reset` and `env_keep` worlds (or sudo rejects SETENV and
+            // does not run modprobe at all).
+            state.pre_sudo_modprobe_options = None;
+        }
+        "POSIXLY_CORRECT" => {
+            state.posixly_correct = true;
+            state.pre_sudo_posixly_correct = false;
+        }
         _ => {}
     }
 }
@@ -226,16 +249,118 @@ fn unset_modprobe_env_name(state: &mut ModprobeEnvState, raw_name: &str) {
         .decode(raw_name.trim(), ShellTokenRole::Syntax)
         .unwrap_or_else(|| Cow::Borrowed(raw_name.trim()));
     match decoded.as_ref() {
-        "MODPROBE_OPTIONS" => state.modprobe_options = None,
-        "POSIXLY_CORRECT" => state.posixly_correct = false,
+        "MODPROBE_OPTIONS" => {
+            state.modprobe_options = None;
+            state.pre_sudo_modprobe_options = None;
+        }
+        "POSIXLY_CORRECT" => {
+            state.posixly_correct = false;
+            state.pre_sudo_posixly_correct = false;
+        }
         _ => {}
     }
+}
+
+/// Whether a stripped `sudo ...` prefix explicitly preserves `var_name`
+/// (via `-E`, `--preserve-env`, or `--preserve-env=...,VAR,...`).
+fn sudo_preserves_env_var(stripped_sudo: &str, var_name: &str) -> bool {
+    const ARG_FLAGS: &[char] = &['u', 'g', 'h', 'p', 'C', 'r', 'U', 'D', 't', 'a', 'T'];
+    const ARG_LONG_OPTIONS: &[&str] = &[
+        "--user",
+        "--group",
+        "--host",
+        "--prompt",
+        "--close-from",
+        "--role",
+        "--other-user",
+        "--chdir",
+        "--type",
+        "--command-timeout",
+    ];
+    let tokens = tokenize_for_normalization(stripped_sudo);
+    let words: Vec<&str> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(stripped_sudo))
+        .collect();
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+    let mut index = 1usize; // skip leading `sudo`
+    while index < words.len() {
+        let word = words[index];
+        if word == "--" {
+            break;
+        }
+        if !word.starts_with('-') || word.len() == 1 {
+            break;
+        }
+        if word.starts_with("--") {
+            let (name, value_opt) = word
+                .find('=')
+                .map_or((word, None), |eq| (&word[..eq], Some(&word[eq + 1..])));
+            if name == "--preserve-env" {
+                match value_opt {
+                    None => return true,
+                    Some(raw_list) => {
+                        let decoded = decoder
+                            .decode(raw_list, ShellTokenRole::Syntax)
+                            .unwrap_or(Cow::Borrowed(raw_list));
+                        if decoded.split(',').any(|entry| entry.trim() == var_name) {
+                            return true;
+                        }
+                    }
+                }
+                index += 1;
+                continue;
+            }
+            if ARG_LONG_OPTIONS.contains(&name) {
+                index += if value_opt.is_some() { 1 } else { 2 };
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        let mut advance = 1usize;
+        let mut chars = word[1..].chars().peekable();
+        while let Some(flag) = chars.next() {
+            if flag == 'E' {
+                return true;
+            }
+            if ARG_FLAGS.contains(&flag) {
+                if chars.peek().is_none() {
+                    advance = 2;
+                }
+                break;
+            }
+        }
+        index += advance;
+    }
+    false
 }
 
 fn record_modprobe_env_wrapper(state: &mut ModprobeEnvState, wrapper: &StrippedWrapper) {
     match wrapper.wrapper_type {
         "assignment" => record_modprobe_assignment(state, &wrapper.stripped_text),
         "env" => record_modprobe_env_prefix(state, &wrapper.stripped_text),
+        "sudo" => {
+            // Under default Linux `sudo` (`Defaults env_reset`), environment
+            // variables set before `sudo` are dropped unless `-E` or
+            // `--preserve-env` preserves them; under `Defaults env_keep` they
+            // survive. Move unpreserved `MODPROBE_OPTIONS` into
+            // `pre_sudo_modprobe_options` so folding enforces deny-wins over
+            // both worlds (never carrying dry-run `-n` across a resetting sudo,
+            // while still denying `MODPROBE_OPTIONS=-r sudo modprobe nvidia`).
+            if !sudo_preserves_env_var(&wrapper.stripped_text, "MODPROBE_OPTIONS")
+                && let Some(opts) = state.modprobe_options.take()
+            {
+                state.pre_sudo_modprobe_options = Some(opts);
+            }
+            if !sudo_preserves_env_var(&wrapper.stripped_text, "POSIXLY_CORRECT")
+                && state.posixly_correct
+            {
+                state.posixly_correct = false;
+                state.pre_sudo_posixly_correct = true;
+            }
+        }
         "exec" => {
             let tokens = tokenize_for_normalization(&wrapper.stripped_text);
             let mut cleared = false;
@@ -471,7 +596,7 @@ fn modprobe_posixly_correct_end_of_options(args: &[ModprobeFoldArg]) -> Option<u
 /// `strip_posix_assignment_prefix` leaves in place because of `$(...)`).
 /// In glibc `getopt_long`, ANY value — even empty — enables `POSIXLY_CORRECT`.
 fn leading_unstripped_posixly_correct_before_modprobe(command: &str) -> bool {
-    if !command.contains("POSIXLY_CORRECT=") || !command.contains("modprobe") {
+    if !command.contains("POSIXLY_CORRECT=") {
         return false;
     }
     let tokens = tokenize_for_normalization(command);
@@ -509,6 +634,119 @@ fn leading_unstripped_posixly_correct_before_modprobe(command: &str) -> bool {
         return saw_posixly && basename.eq_ignore_ascii_case("modprobe");
     }
     false
+}
+
+/// Split `MODPROBE_OPTIONS` on C `isspace()` bytes (`' '`, `'\t'`, `'\n'`,
+/// `'\x0b'`, `'\x0c'`, `'\r'`), matching kmod's parser.
+fn split_modprobe_options(opts: &str) -> Vec<&str> {
+    opts.split(|ch: char| ch.is_ascii_whitespace() || ch == '\x0b')
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// Whether a `modprobe` argument sequence requests module removal (`-r` /
+/// `--remove*`) without an effective dry-run flag (`-n` / `--dry-run` /
+/// `--show`), respecting option-value arity, `--`, and `POSIXLY_CORRECT`.
+///
+/// Used solely to arbitrate deny-wins over `{env_reset, env_keep}` when
+/// `MODPROBE_OPTIONS` was set before a non-preserving `sudo`.
+fn modprobe_args_remove_without_dry_run(args: &[ModprobeFoldArg], posixly_correct: bool) -> bool {
+    let mut index = 0usize;
+    let mut has_remove = false;
+    let mut has_dry_run = false;
+    let mut dry_run_certain = true;
+    while index < args.len() {
+        if args[index].is_redirection {
+            index += 1;
+            continue;
+        }
+        let tok = args[index].decoded.as_str();
+        if tok == "--" {
+            break;
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            if posixly_correct {
+                break;
+            }
+            if tok.contains(['*', '?', '[']) {
+                dry_run_certain = false;
+            }
+            index += 1;
+            continue;
+        }
+        if tok.starts_with("--") {
+            let (name, value_opt) = tok
+                .find('=')
+                .map_or((tok, None), |eq| (&tok[..eq], Some(&tok[eq + 1..])));
+            if name.starts_with("--rem") {
+                has_remove = true;
+                index += 1;
+                continue;
+            }
+            if matches!(name, "--dry-run" | "--show") && value_opt.is_none() {
+                if dry_run_certain {
+                    has_dry_run = true;
+                }
+                index += 1;
+                continue;
+            }
+            let takes_separate_value = value_opt.is_none()
+                && (("--config".starts_with(name) && name.len() >= 3)
+                    || ("--dirname".starts_with(name) && name.len() >= 4)
+                    || ("--set-version".starts_with(name) && name.len() >= 4)
+                    || ("--wait".starts_with(name) && name.len() >= 3));
+            index += 1;
+            if takes_separate_value {
+                while index < args.len() && args[index].is_redirection {
+                    index += 1;
+                }
+                if index < args.len() {
+                    index += 1;
+                }
+            } else if value_opt.is_none()
+                && !matches!(
+                    name,
+                    "--verbose"
+                        | "--quiet"
+                        | "--all"
+                        | "--first-time"
+                        | "--force"
+                        | "--ignore-install"
+                        | "--ignore-remove"
+                        | "--use-blacklist"
+                        | "--syslog"
+                )
+            {
+                // Unrecognized/ambiguous long option (e.g. `--c`): do not
+                // certify a later `-n` as dry-run.
+                dry_run_certain = false;
+            }
+            continue;
+        }
+        let bytes = tok.as_bytes();
+        let mut takes_separate_value = false;
+        for (pos, &byte) in bytes[1..].iter().enumerate() {
+            if matches!(byte, b'C' | b'd' | b'S' | b'w') {
+                takes_separate_value = pos + 1 == bytes[1..].len();
+                break;
+            }
+            if byte == b'r' {
+                has_remove = true;
+            } else if byte == b'n' && dry_run_certain {
+                has_dry_run = true;
+            }
+        }
+        index += 1;
+        if takes_separate_value {
+            while index < args.len() && args[index].is_redirection {
+                index += 1;
+            }
+            if index < args.len() {
+                index += 1;
+            }
+        }
+    }
+    has_remove && !has_dry_run
 }
 
 fn fold_modprobe_env_into_command(command: &str, env: &ModprobeEnvState) -> Option<String> {
@@ -556,26 +794,13 @@ fn fold_modprobe_env_into_command(command: &str, env: &ModprobeEnvState) -> Opti
         return None;
     }
 
-    let env_tokens: Vec<&str> = env
-        .modprobe_options
-        .as_deref()
-        .map(|opts| opts.split_ascii_whitespace().collect())
-        .unwrap_or_default();
-
-    let mut args: Vec<ModprobeFoldArg> =
-        Vec::with_capacity(env_tokens.len() + stmt_tokens.len().saturating_sub(argv0_index + 1));
-    for token in &env_tokens {
-        args.push(ModprobeFoldArg {
-            display: sanitize_modprobe_env_option_token(token),
-            decoded: (*token).to_string(),
-            is_redirection: false,
-        });
-    }
+    let mut cli_args: Vec<ModprobeFoldArg> =
+        Vec::with_capacity(stmt_tokens.len().saturating_sub(argv0_index + 1));
     next_is_redirect_target = false;
     for token in &stmt_tokens[argv0_index + 1..] {
         let raw = token.text(command)?;
         if next_is_redirect_target {
-            args.push(ModprobeFoldArg {
+            cli_args.push(ModprobeFoldArg {
                 display: raw.to_string(),
                 decoded: raw.to_string(),
                 is_redirection: true,
@@ -584,7 +809,7 @@ fn fold_modprobe_env_into_command(command: &str, env: &ModprobeEnvState) -> Opti
             continue;
         }
         if let Some(needs_target) = posix_redirect_needs_target(raw) {
-            args.push(ModprobeFoldArg {
+            cli_args.push(ModprobeFoldArg {
                 display: raw.to_string(),
                 decoded: raw.to_string(),
                 is_redirection: true,
@@ -595,14 +820,73 @@ fn fold_modprobe_env_into_command(command: &str, env: &ModprobeEnvState) -> Opti
         let decoded = decoder
             .decode(raw, ShellTokenRole::Syntax)
             .map_or_else(|| raw.to_string(), Cow::into_owned);
-        args.push(ModprobeFoldArg {
+        cli_args.push(ModprobeFoldArg {
             display: raw.to_string(),
             decoded,
             is_redirection: false,
         });
     }
 
-    let insert_dd_at = if env.posixly_correct {
+    // kmod parses `MODPROBE_OPTIONS` with C `isspace()`, which includes `'\x0b'`
+    // (vertical tab) in addition to Rust's `char::is_ascii_whitespace()`.
+    //
+    // When `MODPROBE_OPTIONS` or `POSIXLY_CORRECT` crossed a `sudo` without
+    // explicit `-E` / `--preserve-env`, evaluate deny-wins across all
+    // `{env_reset, env_keep}` combinations: if ANY world removes a module
+    // without an effective dry-run flag, emit that world's folded command.
+    let reset_opts = env.modprobe_options.as_deref();
+    let keep_opts = env
+        .modprobe_options
+        .as_deref()
+        .or(env.pre_sudo_modprobe_options.as_deref());
+    let reset_posix = env.posixly_correct;
+    let keep_posix = env.posixly_correct || env.pre_sudo_posixly_correct;
+
+    fn build_world_args<'a>(
+        opts_opt: Option<&'a str>,
+        cli_args: &[ModprobeFoldArg],
+    ) -> (Vec<&'a str>, Vec<ModprobeFoldArg>) {
+        let env_toks = opts_opt.map(split_modprobe_options).unwrap_or_default();
+        let mut combined = Vec::with_capacity(env_toks.len() + cli_args.len());
+        for token in &env_toks {
+            combined.push(ModprobeFoldArg {
+                display: sanitize_modprobe_env_option_token(token),
+                decoded: (*token).to_string(),
+                is_redirection: false,
+            });
+        }
+        combined.extend(cli_args.iter().map(|arg| ModprobeFoldArg {
+            display: arg.display.clone(),
+            decoded: arg.decoded.clone(),
+            is_redirection: arg.is_redirection,
+        }));
+        (env_toks, combined)
+    }
+
+    let (chosen_opts, chosen_posix) =
+        if env.pre_sudo_modprobe_options.is_none() && !env.pre_sudo_posixly_correct {
+            (reset_opts, reset_posix)
+        } else {
+            let candidates = [
+                (reset_opts, reset_posix),
+                (keep_opts, reset_posix),
+                (reset_opts, keep_posix),
+                (keep_opts, keep_posix),
+            ];
+            let mut selected = (reset_opts, reset_posix);
+            for (cand_opts, cand_posix) in candidates {
+                let (_, cand_args) = build_world_args(cand_opts, &cli_args);
+                if modprobe_args_remove_without_dry_run(&cand_args, cand_posix) {
+                    selected = (cand_opts, cand_posix);
+                    break;
+                }
+            }
+            selected
+        };
+
+    let (env_tokens, args) = build_world_args(chosen_opts, &cli_args);
+
+    let insert_dd_at = if chosen_posix {
         modprobe_posixly_correct_end_of_options(&args)
     } else {
         None
@@ -814,7 +1098,71 @@ fn strip_sudo(command: &str) -> Option<(String, StrippedWrapper)> {
         }
 
         if word.starts_with("--") {
-            // Unknown long option - not safe to strip
+            // Known safe sudo long options. Unknown long options (such as
+            // `--list`, `--edit`, `--validate`) still refuse stripping.
+            const SIMPLE_LONG_OPTIONS: &[&str] = &[
+                "--preserve-env",
+                "--set-home",
+                "--non-interactive",
+                "--reset-timestamp",
+                "--remove-timestamp",
+                "--stdin",
+                "--shell",
+                "--background",
+                "--login",
+                "--preserve-groups",
+                "--askpass",
+                "--bell",
+            ];
+            const ARG_LONG_OPTIONS: &[&str] = &[
+                "--user",
+                "--group",
+                "--host",
+                "--prompt",
+                "--close-from",
+                "--role",
+                "--other-user",
+                "--chdir",
+                "--type",
+                "--command-timeout",
+            ];
+            let (opt_name, value_opt) = word
+                .find('=')
+                .map_or((word, None), |eq| (&word[..eq], Some(&word[eq + 1..])));
+            if opt_name == "--preserve-env" {
+                if let Some(val) = value_opt
+                    && token_has_shell_effect(val.as_bytes())
+                {
+                    return None;
+                }
+                idx = word_end;
+                continue;
+            }
+            if value_opt.is_none() && SIMPLE_LONG_OPTIONS.contains(&opt_name) {
+                idx = word_end;
+                continue;
+            }
+            if ARG_LONG_OPTIONS.contains(&opt_name) {
+                idx = word_end;
+                if let Some(val) = value_opt {
+                    if token_has_shell_effect(val.as_bytes()) {
+                        return None;
+                    }
+                    continue;
+                }
+                while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+                    idx += 1;
+                }
+                if idx >= bytes.len() {
+                    return None;
+                }
+                let arg_start = idx;
+                idx = consume_word_token(bytes, idx, bytes.len());
+                if token_has_shell_effect(&bytes[arg_start..idx]) {
+                    return None;
+                }
+                continue;
+            }
             return None;
         }
 
@@ -3732,17 +4080,60 @@ pub(crate) fn cmd_expansion_end(bytes: &[u8], start: usize) -> Option<usize> {
     .then_some(start + 2)
 }
 
+/// Paired `%NAME%` or `!NAME!` expansion whose variable name contains no
+/// command/redirection/quote metacharacters, so keeping spaces inside the
+/// variable name in a single Cmd token cannot swallow a later separator or
+/// redirection (e.g. `echo 50% off & rd /s /q C:\ & echo 20%`).
+fn cmd_safe_paired_expansion_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let delimiter = *bytes.get(start)?;
+    if !matches!(delimiter, b'%' | b'!') {
+        return None;
+    }
+    let end = cmd_expansion_end(bytes, start)?;
+    // Require a paired closing delimiter (`%NAME%` / `!NAME!`), not `%1`/`%*`.
+    if end < start + 3 || bytes.get(end - 1) != Some(&delimiter) {
+        return None;
+    }
+    let interior = &bytes[start + 1..end - 1];
+    if interior.iter().any(|b| {
+        matches!(
+            *b,
+            b'&' | b'|'
+                | b'<'
+                | b'>'
+                | b';'
+                | b'('
+                | b')'
+                | b'{'
+                | b'}'
+                | b'$'
+                | b'"'
+                | b'\r'
+                | b'\n'
+        )
+    }) {
+        return None;
+    }
+    Some(end)
+}
+
 fn consume_cmd_word(bytes: &[u8], mut i: usize, len: usize, expansion_names: bool) -> usize {
     let mut in_double_quotes = false;
 
     while i < len {
         let byte = bytes[i];
-        if expansion_names
-            && byte == b'%'
-            && let Some(end) = cmd_expansion_end(bytes, i)
-        {
-            i = end;
-            continue;
+        if matches!(byte, b'%' | b'!') {
+            let end = if expansion_names {
+                cmd_expansion_end(bytes, i)
+            } else if !in_double_quotes {
+                cmd_safe_paired_expansion_end(bytes, i)
+            } else {
+                None
+            };
+            if let Some(end) = end {
+                i = end;
+                continue;
+            }
         }
         if !in_double_quotes {
             if byte.is_ascii_whitespace() || cmd_separator_end(bytes, i, len).is_some() {
@@ -3750,12 +4141,15 @@ fn consume_cmd_word(bytes: &[u8], mut i: usize, len: usize, expansion_names: boo
             }
             match byte {
                 b'^' => {
-                    // Percent expansion precedes caret removal. In
-                    // `vssad^%name with spaces%min` the caret does not expose
-                    // the variable name's spaces as argument boundaries.
-                    i = if expansion_names && bytes.get(i + 1) == Some(&b'%') {
-                        cmd_expansion_end(bytes, i + 1)
-                            .unwrap_or_else(|| consume_shell_escape(bytes, i, len))
+                    // Percent expansion precedes caret removal (`^%a b%` still
+                    // expands `%a b%`), whereas unquoted `^!` escapes `!`.
+                    i = if bytes.get(i + 1) == Some(&b'%') {
+                        let exp_end = if expansion_names {
+                            cmd_expansion_end(bytes, i + 1)
+                        } else {
+                            cmd_safe_paired_expansion_end(bytes, i + 1)
+                        };
+                        exp_end.unwrap_or_else(|| consume_shell_escape(bytes, i, len))
                     } else {
                         consume_shell_escape(bytes, i, len)
                     };
@@ -7678,4 +8072,138 @@ fn strip_wrapper_prefixes_folds_modprobe_env_options_and_posixly_correct() {
         strip_wrapper_prefixes("MODPROBE_OPTIONS=-r modprobe nvidia; echo done").normalized,
         "modprobe -r nvidia ; echo done"
     );
+}
+
+#[cfg(test)]
+#[test]
+fn modprobe_sudo_env_reset_and_preserve_env_deny_wins() {
+    // Under default Linux `sudo` (`env_reset`), pre-sudo `-n` is dropped, so
+    // `modprobe -r nvidia` unloads the module; folding MUST NOT carry `-n`.
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-n sudo modprobe -r nvidia").normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes(r#"MODPROBE_OPTIONS="-n -r" sudo modprobe -r nvidia"#).normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-n sudo --preserve-env=PATH modprobe -r nvidia")
+            .normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-C sudo modprobe -C -n -r nvidia").normalized,
+        "modprobe -C -n -r nvidia"
+    );
+    // Under `env_keep`, pre-sudo `-r` survives, so folding keeps `-r` (deny-wins).
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-r sudo modprobe nvidia").normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-r sudo --preserve-env modprobe nvidia")
+            .normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes(
+            "MODPROBE_OPTIONS=-r sudo --preserve-env=MODPROBE_OPTIONS modprobe nvidia"
+        )
+        .normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("sudo -u root MODPROBE_OPTIONS=-r modprobe nvidia").normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("sudo --user=root modprobe -r nvidia").normalized,
+        "modprobe -r nvidia"
+    );
+    // Benign negatives: explicit `-E` / `--preserve-env` covering MODPROBE_OPTIONS.
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-n sudo -E modprobe -r nvidia").normalized,
+        "modprobe -n -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-n sudo --preserve-env modprobe -r nvidia")
+            .normalized,
+        "modprobe -n -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes(
+            "MODPROBE_OPTIONS=-n sudo --preserve-env=MODPROBE_OPTIONS modprobe -r nvidia"
+        )
+        .normalized,
+        "modprobe -n -r nvidia"
+    );
+    // POSIXLY_CORRECT across sudo: deny-wins over {env_reset, env_keep}.
+    assert_eq!(
+        strip_wrapper_prefixes("POSIXLY_CORRECT=1 sudo modprobe nvidia -r").normalized,
+        "modprobe nvidia -r"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("POSIXLY_CORRECT=1 sudo modprobe -r nvidia -n").normalized,
+        "modprobe -r -- nvidia -n"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("POSIXLY_CORRECT=1 sudo -E modprobe nvidia -r").normalized,
+        "modprobe -- nvidia -r"
+    );
+    // Unlisted sudo long options (e.g. `--list`) must not be stripped.
+    assert_eq!(
+        strip_wrapper_prefixes("sudo --list rm -rf /").normalized,
+        "sudo --list rm -rf /"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn modprobe_quoted_argv0_unstripped_posixly_correct_and_vtab() {
+    // Quoted/escaped argv0 after unstripped POSIXLY_CORRECT=$(...) must fold `--`.
+    assert_eq!(
+        strip_wrapper_prefixes("POSIXLY_CORRECT=$(echo 1) 'mod'probe -r nvidia -n").normalized,
+        "POSIXLY_CORRECT=$(echo 1) modprobe -r -- nvidia -n"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes(r"POSIXLY_CORRECT=$(echo 1) m\odprobe -r nvidia -n").normalized,
+        "POSIXLY_CORRECT=$(echo 1) modprobe -r -- nvidia -n"
+    );
+    // C isspace() includes vertical tab (`\x0b`).
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=\"-r\" modprobe nvidia").normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=$'\\x0b-r' modprobe nvidia").normalized,
+        "modprobe -r nvidia"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn cmd_expansion_tokens_with_spaces_preserve_separators() {
+    let cmd1 = "git %a b%reset --hard";
+    let words1: Vec<&str> = tokenize_for_shell_dialect(cmd1, ShellDialect::Cmd)
+        .into_iter()
+        .filter(|t| t.kind == NormalizeTokenKind::Word)
+        .filter_map(|t| t.text(cmd1))
+        .collect();
+    assert_eq!(words1, vec!["git", "%a b%reset", "--hard"]);
+
+    let cmd2 = "g!a b!it reset --hard";
+    let words2: Vec<&str> = tokenize_for_shell_dialect(cmd2, ShellDialect::Cmd)
+        .into_iter()
+        .filter(|t| t.kind == NormalizeTokenKind::Word)
+        .filter_map(|t| t.text(cmd2))
+        .collect();
+    assert_eq!(words2, vec!["g!a b!it", "reset", "--hard"]);
+
+    let cmd3 = r"echo 50% off & rd /s /q C:\ & echo 20%";
+    let seps = tokenize_for_shell_dialect(cmd3, ShellDialect::Cmd)
+        .into_iter()
+        .filter(|t| t.kind == NormalizeTokenKind::Separator)
+        .count();
+    assert_eq!(seps, 2, "unpaired percent signs must never swallow `&`");
 }

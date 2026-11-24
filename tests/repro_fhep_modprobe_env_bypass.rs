@@ -248,3 +248,68 @@ fn modprobe_env_option_bypasses_are_denied_in_cli_and_hook() {
         );
     }
 }
+
+#[test]
+fn modprobe_sudo_env_reset_quoted_argv0_and_vtab_regressions() {
+    // FE1: sudo env_reset vs env_keep deny-wins, FE2: quoted/escaped argv0 after
+    // POSIXLY_CORRECT=$(...), FE3: C isspace() vertical tab (`\x0b`) in MODPROBE_OPTIONS.
+    let must_deny = [
+        "MODPROBE_OPTIONS=-n sudo modprobe -r nvidia",
+        r#"MODPROBE_OPTIONS="-n -r" sudo modprobe -r nvidia"#,
+        "MODPROBE_OPTIONS=-r sudo modprobe nvidia",
+        "MODPROBE_OPTIONS=-r sudo --preserve-env modprobe nvidia",
+        "MODPROBE_OPTIONS=-r sudo --preserve-env=MODPROBE_OPTIONS modprobe nvidia",
+        "MODPROBE_OPTIONS=-n sudo --preserve-env=PATH modprobe -r nvidia",
+        "MODPROBE_OPTIONS=-C sudo modprobe -C -n -r nvidia",
+        "sudo -u root MODPROBE_OPTIONS=-r modprobe nvidia",
+        "sudo --user=root modprobe -r nvidia",
+        "POSIXLY_CORRECT=1 sudo modprobe nvidia -r",
+        "POSIXLY_CORRECT=1 sudo modprobe -r nvidia -n",
+        "echo ok && MODPROBE_OPTIONS=-n sudo modprobe -r nvidia",
+        "POSIXLY_CORRECT=$(echo 1) 'mod'probe -r nvidia -n",
+        r"POSIXLY_CORRECT=$(echo 1) m\odprobe -r nvidia -n",
+        "MODPROBE_OPTIONS=\"\x0b-r\" modprobe nvidia",
+        "MODPROBE_OPTIONS=$'\\x0b-r' modprobe nvidia",
+    ];
+    for command in must_deny {
+        for dialect in ["posix", "unknown"] {
+            let verdict = dcg_test_verdict(command, dialect, true);
+            assert_eq!(
+                verdict["decision"].as_str(),
+                Some("deny"),
+                "{command:?} {dialect}: {verdict}"
+            );
+            assert_eq!(
+                verdict["rule_id"].as_str(),
+                Some("system.services:modprobe-remove"),
+                "{command:?} {dialect}: {verdict}"
+            );
+        }
+        let (denied, stdout) = hook_denies_bash(command);
+        assert!(denied, "hook must deny {command:?}, got stdout={stdout}");
+    }
+
+    // Benign negative controls: explicit `-E` / `--preserve-env` covering the var
+    // or dry-run via vertical-tab-separated `-n`.
+    let must_allow = [
+        "MODPROBE_OPTIONS=-n sudo -E modprobe -r nvidia",
+        "MODPROBE_OPTIONS=-n sudo --preserve-env modprobe -r nvidia",
+        "MODPROBE_OPTIONS=-n sudo --preserve-env=MODPROBE_OPTIONS modprobe -r nvidia",
+        "MODPROBE_OPTIONS=\"\x0b-n\" modprobe -r nvidia",
+    ];
+    for command in must_allow {
+        for dialect in ["posix", "unknown"] {
+            let verdict = dcg_test_verdict(command, dialect, true);
+            assert_eq!(
+                verdict["decision"].as_str(),
+                Some("allow"),
+                "benign control must allow {command:?} {dialect}: {verdict}"
+            );
+        }
+        let (denied, stdout) = hook_denies_bash(command);
+        assert!(
+            !denied,
+            "hook must allow benign {command:?}, got stdout={stdout}"
+        );
+    }
+}

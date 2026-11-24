@@ -279,3 +279,61 @@ fn cmd_benign_corpus_has_zero_false_positives() {
         );
     }
 }
+
+#[test]
+fn cmd_forward_slash_path_caret_percent_and_spaced_var_regressions() {
+    // FE4 benign negative: forward-slash path with wholly-dynamic basename must allow.
+    for dialect in ["cmd", "unknown"] {
+        let verdict = dcg_test_verdict("C:/Windows/System32/%TOOL% rmmod nvidia", dialect);
+        assert_eq!(
+            verdict["decision"].as_str(),
+            Some("allow"),
+            "wholly-dynamic forward-slash argv0 must allow ({dialect}): {verdict}"
+        );
+    }
+    let (denied, stdout) = hook_denies("C:/Windows/System32/%TOOL% rmmod nvidia", "cmd");
+    assert!(
+        !denied,
+        "cmd hook must allow wholly-dynamic forward-slash path: {stdout}"
+    );
+
+    // FE4 + ewf3-b + ewf3-d positive observables: must deny in cmd/unknown CLI + hook.
+    for command in [
+        "C:/Windows/System32/vssad%x%min.exe delete shadows /all",
+        "rm^%x% -rf /",
+        "r^m%x% -rf /",
+        "g^i%x%t reset --hard",
+        "git %a b%reset --hard",
+        "git reset %a b%--hard",
+        "rm %a b%-rf /",
+        "rm %x%-rf /",
+        "g!a b!it reset --hard",
+        "r!a b!m -rf /",
+    ] {
+        for dialect in ["cmd", "unknown"] {
+            let verdict = dcg_test_verdict(command, dialect);
+            assert_eq!(
+                verdict["decision"].as_str(),
+                Some("deny"),
+                "{command:?} {dialect}: {verdict}"
+            );
+        }
+        let (denied, stdout) = hook_denies(command, "cmd");
+        assert!(
+            denied,
+            "cmd hook must deny {command:?}, got stdout={stdout}"
+        );
+    }
+
+    // Benign negatives for spaced expansion names and unpaired percents.
+    for command in [r#"dir "%a b%""#, "echo %a b%", "echo 50% off & echo 20%"] {
+        for dialect in ["cmd", "unknown"] {
+            let verdict = dcg_test_verdict(command, dialect);
+            assert_eq!(
+                verdict["decision"].as_str(),
+                Some("allow"),
+                "{command:?} {dialect}: {verdict}"
+            );
+        }
+    }
+}

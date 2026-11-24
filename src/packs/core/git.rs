@@ -1683,16 +1683,76 @@ fn git_dynamic_fragments(decoded: &str, dialect: ShellDialect) -> Vec<String> {
     let chars: Vec<char> = decoded.chars().collect();
     let mut index = 0usize;
     let mut dynamic = false;
+    let mut posix_single = false;
+    let mut posix_double = false;
     while index < chars.len() {
+        if matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+            let ch = chars[index];
+            if posix_single {
+                if ch == '\'' {
+                    posix_single = false;
+                } else {
+                    fragments.last_mut().expect("seeded").push(ch);
+                }
+                index += 1;
+                continue;
+            }
+            if posix_double {
+                match ch {
+                    '"' => {
+                        posix_double = false;
+                        index += 1;
+                        continue;
+                    }
+                    '\\' => {
+                        if let Some(&next) = chars.get(index + 1) {
+                            if matches!(next, '$' | '`' | '"' | '\\') {
+                                fragments.last_mut().expect("seeded").push(next);
+                            } else if next != '\n' {
+                                fragments.last_mut().expect("seeded").push('\\');
+                                fragments.last_mut().expect("seeded").push(next);
+                            }
+                            index += 2;
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                match ch {
+                    '\'' => {
+                        posix_single = true;
+                        index += 1;
+                        continue;
+                    }
+                    '"' => {
+                        posix_double = true;
+                        index += 1;
+                        continue;
+                    }
+                    '\\' => {
+                        if let Some(&next) = chars.get(index + 1) {
+                            if next != '\n' {
+                                fragments.last_mut().expect("seeded").push(next);
+                            }
+                            index += 2;
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         let starts_dynamic = match dialect {
             ShellDialect::Posix | ShellDialect::Unknown => match chars[index] {
-                '$' | '`' | '*' | '?' => true,
+                '$' | '`' => true,
+                '*' | '?' if !posix_double => true,
                 // A `[`/`{` with no later closing delimiter in the word is
                 // literal (the test builtin / brace reserved word) and must
                 // contribute a literal fragment rather than a wildcard. Brace
                 // groups additionally need a `,`/`..` inside to expand.
-                '[' => chars[index + 1..].contains(&']'),
-                '{' => {
+                '[' if !posix_double => chars[index + 1..].contains(&']'),
+                '{' if !posix_double => {
                     let remainder = &chars[index + 1..];
                     remainder
                         .iter()
@@ -1969,7 +2029,11 @@ fn powershell_call_expression(command: &str) -> bool {
     command
         .trim_start()
         .strip_prefix('&')
-        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+        .filter(|rest| {
+            rest.chars()
+                .next()
+                .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '(' | '$' | '@'))
+        })
         .map(str::trim_start)
         .is_some_and(|rest| {
             rest.starts_with('(') || rest.starts_with("$(") || rest.starts_with("@(")
@@ -1999,7 +2063,11 @@ fn powershell_dynamic_call_operator(command: &str) -> bool {
     command
         .trim_start()
         .strip_prefix('&')
-        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+        .filter(|rest| {
+            rest.chars()
+                .next()
+                .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '(' | '$' | '@'))
+        })
         .map(str::trim_start)
         .is_some_and(|rest| {
             rest.starts_with('$') || rest.starts_with("@(") || rest.starts_with('(')
@@ -2289,7 +2357,11 @@ fn powershell_call_expression_parts(command: &str) -> Option<(&str, &str)> {
     let rest = command
         .trim_start()
         .strip_prefix('&')
-        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))?
+        .filter(|rest| {
+            rest.chars()
+                .next()
+                .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '(' | '$' | '@'))
+        })?
         .trim_start();
     let open = if rest.starts_with("$(") || rest.starts_with("@(") {
         1
@@ -5345,6 +5417,18 @@ pub(crate) fn syntax_view_for_pattern_matching(
     // returned the sanitized view above — so each reading is a faithful
     // spelling of what that candidate would run.
     let executable_unbounded = git_semantic_executable_is_unbounded(executable, dialect);
+    // When the executable is an unbounded dynamic word (e.g. `"$FLOWCTL"`, `"$VAR"`)
+    // and the sanitized view already synthesized plain `git …`, return it directly
+    // instead of rebuilding from the unmasked `command` and reintroducing inert
+    // data arguments (such as `flowctl gate check --command '…'`, #538).
+    if executable_unbounded
+        && sanitized_command != command
+        && sanitized_view
+            .as_deref()
+            .is_some_and(|view| view == "git" || view.starts_with("git "))
+    {
+        return sanitized_view;
+    }
     let mut args = String::new();
     for word in decoded.words.iter().skip(executable_index + 1) {
         args.push(' ');
@@ -5415,11 +5499,12 @@ pub(crate) fn branch_command_decision_in_dialect(
 
     if dialect == ShellDialect::Unknown {
         let trimmed = command.trim_start();
-        if trimmed
-            .strip_prefix('&')
-            .as_ref()
-            .is_some_and(|remainder| remainder.chars().next().is_some_and(char::is_whitespace))
-        {
+        if trimmed.strip_prefix('&').as_ref().is_some_and(|remainder| {
+            remainder
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '(' | '$' | '@' | '\'' | '"'))
+        }) {
             // A leading call operator is unambiguously PowerShell syntax; in
             // POSIX shells `&` terminates the preceding command instead of
             // introducing an executable. Preserve quoted Windows paths and
