@@ -1640,12 +1640,42 @@ fn command_may_rebind_inert_head(command: &str, dialect: ShellDialect) -> bool {
             || contains_ascii_word_ci(command, "iex")
             || contains_ascii_word_ci(command, "ipmo")
     };
+    let contains_empty_parens = |s: &str| {
+        let b = s.as_bytes();
+        let mut i = 0usize;
+        while i < b.len() {
+            if b[i] == b'(' {
+                let mut j = i + 1;
+                while j < b.len() && matches!(b[j], b' ' | b'\t') {
+                    j += 1;
+                }
+                if j < b.len() && b[j] == b')' {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
+    };
+    let contains_posix_dot_source = |s: &str| {
+        let b = s.as_bytes();
+        let mut i = 0usize;
+        while i < b.len() {
+            if b[i] == b'.' && b.get(i + 1).is_some_and(|c| matches!(*c, b' ' | b'\t')) {
+                let mut k = i;
+                while k > 0 && matches!(b[k - 1], b' ' | b'\t') {
+                    k -= 1;
+                }
+                if k == 0 || matches!(b[k - 1], b';' | b'\n' | b'&' | b'|' | b'(' | b'{') {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
+    };
     let posix_rebind = || {
-        // Any `()` catches `echo  () { ... }`, `echo\t() { ... }`, `'echo'()`,
-        // and arbitrary shell function definitions without relying on exact
-        // spacing. `eval`, `source`, `enable`, `shopt`, and dot-sourcing can
-        // likewise define functions/aliases or override builtins.
-        command.contains("()")
+        contains_empty_parens(command)
             || command.contains("PATH=")
             || contains_ascii_word_ci(command, "alias")
             || contains_ascii_word_ci(command, "function")
@@ -1653,14 +1683,7 @@ fn command_may_rebind_inert_head(command: &str, dialect: ShellDialect) -> bool {
             || contains_ascii_word_ci(command, "source")
             || contains_ascii_word_ci(command, "enable")
             || contains_ascii_word_ci(command, "shopt")
-            || command.starts_with(". ")
-            || command.starts_with(".\t")
-            || command.contains("; . ")
-            || command.contains("; .\t")
-            || command.contains("\n. ")
-            || command.contains("\n.\t")
-            || command.contains("&& . ")
-            || command.contains("|| . ")
+            || contains_posix_dot_source(command)
     };
     match dialect {
         ShellDialect::Cmd => cmd_rebind(),
@@ -1672,7 +1695,8 @@ fn command_may_rebind_inert_head(command: &str, dialect: ShellDialect) -> bool {
 
 /// Whether splitting an oversized command across multiple scan windows could
 /// sever a variable assignment in an earlier window from an expansion in a
-/// later window (e.g., `d=mkfs.ext4\n# <70 KiB>\n$d /dev/sda`).
+/// later window (including = assignments as well as printf -v, read, mapfile,
+/// readarray, Set-Variable, and New-Variable).
 fn oversized_windows_may_sever_binding(windows: &[String]) -> bool {
     if windows.len() <= 1 {
         return false;
@@ -1682,7 +1706,14 @@ fn oversized_windows_may_sever_binding(windows: &[String]) -> bool {
         if saw_assignment_in_earlier_window && window.contains(['$', '%', '!']) {
             return true;
         }
-        if window.contains('=') {
+        if window.contains('=')
+            || contains_ascii_word_ci(window, "printf")
+            || contains_ascii_word_ci(window, "read")
+            || contains_ascii_word_ci(window, "mapfile")
+            || contains_ascii_word_ci(window, "readarray")
+            || contains_ascii_word_ci(window, "set-variable")
+            || contains_ascii_word_ci(window, "new-variable")
+        {
             saw_assignment_in_earlier_window = true;
         }
     }
@@ -5815,6 +5846,36 @@ mod tests {
                     destructive_command_guard::normalize::ShellDialect::Posix,
                 ),
                 "cross-window assignment + expansion must not claim complete coverage"
+            );
+
+            // Whitespace inside function parens must fail closed.
+            let spaced_fn = format!("echo ( ) {{ eval \"$1\"; }}; echo '{pad}'");
+            assert!(
+                !oversized_command_windows_complete(
+                    &spaced_fn,
+                    destructive_command_guard::normalize::ShellDialect::Posix,
+                ),
+                "POSIX function rebind with spaces inside parens must fail closed"
+            );
+
+            // Unspaced separator before POSIX dot-source must fail closed.
+            let tight_dot = format!("true;. /tmp/helper; echo '{pad}'");
+            assert!(
+                !oversized_command_windows_complete(
+                    &tight_dot,
+                    destructive_command_guard::normalize::ShellDialect::Posix,
+                ),
+                "POSIX dot-source without space after separator must fail closed"
+            );
+
+            // Cross-window equals-free binding (printf -v) + later expansion must fail closed.
+            let printf_binding = format!("printf -v d mkfs.ext4\n{comment_pad}\n$d /dev/sda");
+            assert!(
+                !oversized_command_windows_complete(
+                    &printf_binding,
+                    destructive_command_guard::normalize::ShellDialect::Posix,
+                ),
+                "cross-window printf -v binding + expansion must fail closed"
             );
 
             // Benign negative: oversized metacharacter-free literal echo keeps complete coverage.

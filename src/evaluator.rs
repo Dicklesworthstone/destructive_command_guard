@@ -12805,17 +12805,31 @@ fn powershell_pipeline_consumer_mode(
     // Windows Python launcher (`py` / `py.exe`), optionally preceded by a
     // `-3` / `-3.12` / `-2` version selector argument before Python's argv.
     if executable == "py" {
-        let forwarded = match args.first().map(String::as_str) {
-            Some(first)
-                if first.starts_with('-')
-                    && first.len() >= 2
-                    && first[1..]
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || b == b'.' || b == b'-')
-                    && first.as_bytes()[1].is_ascii_digit() =>
-            {
-                &args[1..]
+        let is_py_version_selector = |arg: &str| -> bool {
+            if let Some(spec) = arg.strip_prefix("-V:") {
+                return !spec.is_empty();
             }
+            let Some(rest) = arg.strip_prefix('-') else {
+                return false;
+            };
+            if !rest.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+                return false;
+            }
+            let (ver, arch_opt) = rest
+                .split_once('-')
+                .map_or((rest, None), |(v, a)| (v, Some(a)));
+            let ver_ok = !ver.is_empty()
+                && ver.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                && !ver.ends_with('.');
+            let arch_ok = arch_opt.is_none_or(|arch| {
+                arch.eq_ignore_ascii_case("32")
+                    || arch.eq_ignore_ascii_case("64")
+                    || arch.eq_ignore_ascii_case("arm64")
+            });
+            ver_ok && arch_ok
+        };
+        let forwarded = match args.first().map(String::as_str) {
+            Some(first) if is_py_version_selector(first) => &args[1..],
             _ => args,
         };
         let mode =
@@ -13913,6 +13927,52 @@ fn powershell_call_operator_statements(
         let starts_statement = preceding.is_empty() || after_newline || after_separator;
         if starts_statement {
             statements.push((operator_text.len(), end));
+        }
+    }
+    // Also recover intact top-level PowerShell call statements (including
+    // & (...) / & ($var) after comments, here-strings, ;, &&, ||, |, or $x = & ...),
+    // because tokenize_powershell_raw splits on &, (, ) and does not skip comments.
+    if command.contains('&')
+        && let Ok(top_level) = split_top_level_powershell_statements(command)
+    {
+        let base_ptr = command.as_ptr() as usize;
+        for stmt in top_level {
+            let stmt_start = stmt.as_ptr() as usize - base_ptr;
+            let stmt_end = stmt_start + stmt.len();
+            fn strip_leading_ps_comments(mut s: &str) -> &str {
+                loop {
+                    let trimmed = s.trim_start();
+                    if trimmed.len() != s.len() {
+                        s = trimmed;
+                        continue;
+                    }
+                    if let Some(rest) = s.strip_prefix("<#") {
+                        if let Some(rel) = rest.find("#>") {
+                            s = &rest[rel + 2..];
+                            continue;
+                        }
+                        return "";
+                    }
+                    if s.starts_with('#') {
+                        s = s.find(['\n', '\r']).map_or("", |nl| &s[nl + 1..]);
+                        continue;
+                    }
+                    return s;
+                }
+            }
+            let eff = strip_leading_ps_comments(stmt);
+            let candidate = crate::normalize::powershell_assignment_rhs(eff).unwrap_or(eff);
+            let candidate = strip_leading_ps_comments(candidate);
+            if candidate.starts_with('&')
+                && !candidate.starts_with("&&")
+                && !candidate.starts_with("&>")
+            {
+                let cand_start = candidate.as_ptr() as usize - base_ptr;
+                let range = (cand_start, stmt_end);
+                if range.0 < range.1 && !statements.contains(&range) {
+                    statements.push(range);
+                }
+            }
         }
     }
     statements
@@ -16384,7 +16444,18 @@ impl ModeledPosixBindings {
                 continue;
             };
             match (self.entries.get(name).cloned(), other_binding) {
-                (None, binding) => self.insert(name.clone(), binding.clone()),
+                (None, binding) => {
+                    if self.is_overflowed(name) {
+                        self.insert(
+                            name.clone(),
+                            ModeledPosixBinding::Unverified(
+                                "the executable variable exceeded the bounded binding limit before a branch",
+                            ),
+                        );
+                    } else {
+                        self.insert(name.clone(), binding.clone());
+                    }
+                }
                 (Some(ModeledPosixBinding::Unverified(reason)), _)
                 | (_, &ModeledPosixBinding::Unverified(reason)) => {
                     self.insert(name.clone(), ModeledPosixBinding::Unverified(reason));
@@ -16514,17 +16585,26 @@ fn posix_declaration_assignment_parts(segment: &str) -> Option<Vec<(&str, &str)>
             index += 1;
             break;
         }
-        if !word.starts_with('-') || word.len() == 1 {
+        let prefix = word.as_bytes()[0];
+        if !matches!(prefix, b'-' | b'+') || word.len() == 1 {
             break;
         }
-        // Only accept non-transforming scalar attribute flags; reject `-i`
-        // (arithmetic), `-l`/`-u` (case-fold), `-n` (nameref), `-a`/`-A`
-        // (arrays), `-f`/`-F` (functions), and `-p` (print).
-        let allowed = match decl {
-            "export" => word == "-n",
-            "readonly" => false,
-            "declare" | "typeset" => word[1..].bytes().all(|b| matches!(b, b'x' | b'r' | b'g')),
-            "local" => word[1..].bytes().all(|b| matches!(b, b'x' | b'r')),
+        // Only accept non-transforming scalar attribute flags; reject -i
+        // (arithmetic), -l/-u (case-fold), -n (nameref), -a/-A (arrays),
+        // -f/-F (functions), and -p (print). Attribute-removal flags (+x, +r,
+        // +g, +i, +l, +u) leave literal values intact.
+        let flags = &word.as_bytes()[1..];
+        let allowed = match (decl, prefix) {
+            ("export", b'-') => flags.iter().all(|b| *b == b'n'),
+            ("readonly", _) => false,
+            ("declare" | "typeset", b'-') => flags.iter().all(|b| matches!(b, b'x' | b'r' | b'g')),
+            ("declare" | "typeset", b'+') => flags
+                .iter()
+                .all(|b| matches!(b, b'x' | b'r' | b'g' | b'i' | b'l' | b'u')),
+            ("local", b'-') => flags.iter().all(|b| matches!(b, b'x' | b'r')),
+            ("local", b'+') => flags
+                .iter()
+                .all(|b| matches!(b, b'x' | b'r' | b'i' | b'l' | b'u')),
             _ => false,
         };
         if !allowed {
@@ -16567,6 +16647,83 @@ const POSIX_BINDING_BOUNDARY_COMMANDS: &[&str] = &[
 /// `!` or temporary literal `K=V` env assignments such as `X=1 true`) named by
 /// a plain literal word or neutral builtin (`:`, `[`, `[[`, `test`, `true`,
 /// `echo`, ...) that cannot assign in this shell.
+/// Whether a non-argv0 segment rejected by posix_segment_keeps_bindings can
+/// mutate parent-shell bindings (e.g. [[ -v arr[d=1] ]], [[ -R ref ]], or
+/// POSIX special builtin K=V :), so tracked bindings must be invalidated
+/// rather than silently terminating modeling before a later variable use.
+/// Whether POSIX argument text can mutate shell bindings during expansion
+/// (command substitution, arithmetic expansion, or braced parameter expansion
+/// such as assign-default), while treating plain simple-variable reads as
+/// non-mutating.
+fn posix_args_may_mutate_via_expansion(args: &str) -> bool {
+    let bytes = args.as_bytes();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\\' && !in_single && index + 1 < bytes.len() {
+            index += 2;
+            continue;
+        }
+        if byte == b'\'' && !in_double {
+            in_single = !in_single;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' && !in_single {
+            in_double = !in_double;
+            index += 1;
+            continue;
+        }
+        if !in_single {
+            if byte == b'`' {
+                return true;
+            }
+            if byte == b'$' && matches!(bytes.get(index + 1), Some(b'(' | b'{' | b'[')) {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    in_single || in_double
+}
+
+fn posix_bracket_cond_may_mutate(words: &[&str]) -> bool {
+    words.iter().any(|w| {
+        matches!(
+            *w,
+            "=~" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "-v" | "-R"
+        ) || w.contains(['(', ')', '['])
+    })
+}
+
+fn posix_segment_mutates_bindings(segment: &str) -> bool {
+    let trimmed = segment.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let tokens = crate::normalize::tokenize_for_normalization(trimmed);
+    let words: Vec<(&str, std::ops::Range<usize>)> = tokens
+        .iter()
+        .filter(|token| token.kind == crate::normalize::NormalizeTokenKind::Word)
+        .filter_map(|token| Some((token.text(trimmed)?, token.byte_range.clone())))
+        .collect();
+    let Some(&(first, ref range)) = words.first() else {
+        return false;
+    };
+    if first == "[[" {
+        let rest_words: Vec<&str> = words[1..].iter().map(|(w, _)| *w).collect();
+        return posix_bracket_cond_may_mutate(&rest_words)
+            || posix_args_may_mutate_via_expansion(&trimmed[range.end..]);
+    }
+    let mut idx = 0usize;
+    while idx < words.len() && posix_assignment_word_parts(words[idx].0).is_some() {
+        idx += 1;
+    }
+    idx > 0 && words.get(idx).map(|(w, _)| *w) == Some(":")
+}
+
 fn posix_segment_keeps_bindings(segment: &str) -> bool {
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
     if tokens
@@ -16584,8 +16741,9 @@ fn posix_segment_keeps_bindings(segment: &str) -> bool {
     if words.get(index).is_some_and(|(w, _)| *w == "!") {
         index += 1;
     }
-    // Step over temporary per-command literal env assignments (e.g. `X=1 true`,
-    // `FOO=bar echo hi`), which do not persist into the parent shell.
+    // Step over temporary per-command literal env assignments, which do not
+    // persist into the parent shell for non-special builtins.
+    let prefix_start = index;
     while let Some((raw, _)) = words.get(index) {
         if let Some((_, raw_val)) = posix_assignment_word_parts(raw) {
             if literal_posix_executable_value(raw_val).is_none() {
@@ -16596,33 +16754,29 @@ fn posix_segment_keeps_bindings(segment: &str) -> bool {
         }
         break;
     }
+    let had_prefix_assignment = index > prefix_start;
     let Some((name, range)) = words.get(index) else {
         return false;
     };
     if matches!(*name, "[" | "[[") {
-        // `[` and `[[` are bracket-named test builtins; checking the whole
-        // segment with `contains_dynamic_shell_output` would falsely flag the
-        // leading `[` as a glob bracket. Inspect only the arguments after the
-        // command word, and for Bash `[[ ... ]]` also reject `=~` (which sets
-        // `BASH_REMATCH`) and arithmetic comparison operators (which evaluate
-        // arithmetic assignments like `[[ a++ -eq 0 ]]`).
+        // Inspect only the arguments after the bracket command word, and for
+        // Bash [[ ... ]] reject =~ (sets BASH_REMATCH), -v/-R and [ (evaluate
+        // array subscripts in arithmetic context), and arithmetic comparators.
         let args = &segment[range.end..];
-        if contains_dynamic_shell_output(args) {
+        if posix_args_may_mutate_via_expansion(args) {
             return false;
         }
         if *name == "[[" {
-            let has_mutating_cond = words[index + 1..].iter().any(|(w, _)| {
-                matches!(*w, "=~" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge")
-                    || w.contains(['(', ')'])
-            });
-            if has_mutating_cond {
+            let rest_words: Vec<&str> = words[index + 1..].iter().map(|(w, _)| *w).collect();
+            if posix_bracket_cond_may_mutate(&rest_words) {
                 return false;
             }
         }
         return true;
     }
     let rest_segment = &segment[range.start..];
-    let neutral_builtin = *name == ":";
+    // POSIX special builtin : persists preceding K=V assignments in sh/dash.
+    let neutral_builtin = *name == ":" && !had_prefix_assignment;
     let plain_name = !name.starts_with('-')
         && name.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b'+')
@@ -16703,13 +16857,90 @@ fn literal_posix_executable_value(raw: &str) -> Option<String> {
 /// `command`, `nohup`, `nice`, `!`, and leading literal `K=V` env assignments)
 /// to locate the wrapped command word index in `words`
 /// (bd-binding-model-variants-fd5q). Returns `(target_index, wrapped)`.
+fn env_split_string_is_literal_option_prefix(raw_payload: &str) -> bool {
+    if contains_dynamic_shell_output(raw_payload) {
+        return false;
+    }
+    let mut decoder = crate::normalize::ShellTokenDecoder::new(ShellDialect::Posix);
+    let Some(decoded) = decoder.decode(raw_payload, crate::normalize::ShellTokenRole::Syntax)
+    else {
+        return false;
+    };
+    let parts: Vec<&str> = decoded.split_ascii_whitespace().collect();
+    if parts.is_empty() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < parts.len() {
+        let tok = parts[i];
+        if tok == "--" {
+            return i + 1 == parts.len();
+        }
+        if tok == "-" {
+            i += 1;
+            continue;
+        }
+        if tok.starts_with("--") {
+            let (name, val_opt) = tok
+                .find('=')
+                .map_or((tok, None), |eq| (&tok[..eq], Some(&tok[eq + 1..])));
+            if matches!(
+                name,
+                "--ignore-environment"
+                    | "--null"
+                    | "--debug"
+                    | "--list-signal-handling"
+                    | "--ignore-signal"
+                    | "--default-signal"
+                    | "--block-signal"
+            ) {
+                i += 1;
+                continue;
+            }
+            if matches!(name, "--unset" | "--chdir" | "--file" | "--argv0") {
+                if val_opt.is_none() && i + 1 >= parts.len() {
+                    return false;
+                }
+                i += if val_opt.is_some() { 1 } else { 2 };
+                continue;
+            }
+            return false;
+        }
+        if tok.starts_with('-') && tok.len() > 1 {
+            let mut takes_next = false;
+            let mut chars = tok[1..].chars().peekable();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    'i' | '0' | 'v' => {}
+                    'u' | 'C' | 'f' | 'a' | 'P' => {
+                        takes_next = chars.peek().is_none();
+                        break;
+                    }
+                    _ => return false,
+                }
+            }
+            if takes_next && i + 1 >= parts.len() {
+                return false;
+            }
+            i += if takes_next { 2 } else { 1 };
+            continue;
+        }
+        if posix_assignment_word_parts(tok).is_some() {
+            i += 1;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+#[allow(clippy::too_many_lines)]
 fn skip_posix_use_site_wrappers(words: &[(&str, std::ops::Range<usize>)]) -> (usize, bool) {
     let mut index = 0usize;
     let mut wrapped = false;
-    for _ in 0..8 {
-        let Some(&(raw, _)) = words.get(index) else {
-            break;
-        };
+    let mut decoder = crate::normalize::ShellTokenDecoder::new(ShellDialect::Posix);
+    while index < words.len() {
+        let (raw, _) = words[index];
         if raw == "!" {
             index += 1;
             wrapped = true;
@@ -16720,7 +16951,14 @@ fn skip_posix_use_site_wrappers(words: &[(&str, std::ops::Range<usize>)]) -> (us
             wrapped = true;
             continue;
         }
-        let base = raw.rsplit('/').next().unwrap_or(raw);
+        let decoded_word = if raw.contains(['\'', '"', '\\']) {
+            decoder
+                .decode(raw, crate::normalize::ShellTokenRole::Syntax)
+                .unwrap_or(Cow::Borrowed(raw))
+        } else {
+            Cow::Borrowed(raw)
+        };
+        let base = decoded_word.rsplit('/').next().unwrap_or(&decoded_word);
         match base {
             "sudo" => {
                 let mut next = index + 1;
@@ -16733,8 +16971,26 @@ fn skip_posix_use_site_wrappers(words: &[(&str, std::ops::Range<usize>)]) -> (us
                         break;
                     }
                     if opt.starts_with("--") {
-                        let takes_val = matches!(
-                            opt,
+                        let (opt_name, value_opt) = opt
+                            .find('=')
+                            .map_or((opt, None), |eq| (&opt[..eq], Some(&opt[eq + 1..])));
+                        if matches!(
+                            opt_name,
+                            "--list"
+                                | "--edit"
+                                | "--validate"
+                                | "--remove-timestamp"
+                                | "--version"
+                                | "--help"
+                        ) {
+                            return (index, wrapped);
+                        }
+                        if opt_name == "--preserve-env" {
+                            next += 1;
+                            continue;
+                        }
+                        if matches!(
+                            opt_name,
                             "--user"
                                 | "--group"
                                 | "--host"
@@ -16743,24 +16999,48 @@ fn skip_posix_use_site_wrappers(words: &[(&str, std::ops::Range<usize>)]) -> (us
                                 | "--role"
                                 | "--other-user"
                                 | "--chdir"
+                                | "--chroot"
                                 | "--type"
                                 | "--command-timeout"
-                        );
-                        next += if takes_val { 2 } else { 1 };
-                    } else {
-                        let mut takes_next = false;
-                        let mut chars = opt[1..].chars().peekable();
-                        while let Some(ch) = chars.next() {
-                            if matches!(
-                                ch,
-                                'u' | 'g' | 'h' | 'p' | 'C' | 'r' | 'U' | 'D' | 't' | 'a' | 'T'
-                            ) {
+                        ) {
+                            next += if value_opt.is_some() { 1 } else { 2 };
+                            continue;
+                        }
+                        if value_opt.is_none()
+                            && matches!(
+                                opt_name,
+                                "--set-home"
+                                    | "--non-interactive"
+                                    | "--reset-timestamp"
+                                    | "--stdin"
+                                    | "--shell"
+                                    | "--background"
+                                    | "--login"
+                                    | "--preserve-groups"
+                                    | "--askpass"
+                                    | "--bell"
+                            )
+                        {
+                            next += 1;
+                            continue;
+                        }
+                        return (index, wrapped);
+                    }
+                    let mut takes_next = false;
+                    let mut chars = opt[1..].chars().peekable();
+                    while let Some(ch) = chars.next() {
+                        match ch {
+                            'l' | 'e' | 'v' | 'K' | 'V' => return (index, wrapped),
+                            'E' | 'H' | 'n' | 'k' | 'S' | 's' | 'b' | 'i' | 'P' | 'A' | 'B' => {}
+                            'u' | 'g' | 'h' | 'p' | 'C' | 'r' | 'U' | 'D' | 'R' | 't' | 'a'
+                            | 'T' => {
                                 takes_next = chars.peek().is_none();
                                 break;
                             }
+                            _ => return (index, wrapped),
                         }
-                        next += if takes_next { 2 } else { 1 };
                     }
+                    next += if takes_next { 2 } else { 1 };
                 }
                 if next < words.len() {
                     index = next;
@@ -16782,22 +17062,72 @@ fn skip_posix_use_site_wrappers(words: &[(&str, std::ops::Range<usize>)]) -> (us
                     }
                     if opt.starts_with('-') && opt.len() > 1 {
                         if opt.starts_with("--") {
-                            let takes_val = matches!(
-                                opt,
-                                "--unset" | "--chdir" | "--file" | "--argv0" | "--ignore-signal"
-                            );
-                            next += if takes_val { 2 } else { 1 };
-                        } else {
-                            let mut takes_next = false;
-                            let mut chars = opt[1..].chars().peekable();
-                            while let Some(ch) = chars.next() {
-                                if matches!(ch, 'u' | 'C' | 'f' | 'a' | 'P') {
+                            let (opt_name, value_opt) = opt
+                                .find('=')
+                                .map_or((opt, None), |eq| (&opt[..eq], Some(&opt[eq + 1..])));
+                            if matches!(opt_name, "--help" | "--version") {
+                                return (index, wrapped);
+                            }
+                            if opt_name == "--split-string" {
+                                let payload = if let Some(val) = value_opt {
+                                    Some(val)
+                                } else {
+                                    words.get(next + 1).map(|(w, _)| *w)
+                                };
+                                if payload.is_some_and(env_split_string_is_literal_option_prefix) {
+                                    next += if value_opt.is_some() { 1 } else { 2 };
+                                    continue;
+                                }
+                                return (index, wrapped);
+                            }
+                            if matches!(
+                                opt_name,
+                                "--ignore-environment"
+                                    | "--null"
+                                    | "--debug"
+                                    | "--list-signal-handling"
+                                    | "--ignore-signal"
+                                    | "--default-signal"
+                                    | "--block-signal"
+                            ) {
+                                next += 1;
+                                continue;
+                            }
+                            if matches!(opt_name, "--unset" | "--chdir" | "--file" | "--argv0") {
+                                next += if value_opt.is_some() { 1 } else { 2 };
+                                continue;
+                            }
+                            return (index, wrapped);
+                        }
+                        let mut takes_next = false;
+                        let mut chars = opt[1..].char_indices().peekable();
+                        while let Some((rel_pos, ch)) = chars.next() {
+                            match ch {
+                                'h' | 'V' => return (index, wrapped),
+                                'i' | '0' | 'v' => {}
+                                'S' => {
+                                    let inline_rest = &opt[1 + rel_pos + ch.len_utf8()..];
+                                    let (payload, step) = if inline_rest.is_empty() {
+                                        (words.get(next + 1).map(|(w, _)| *w), 2usize)
+                                    } else {
+                                        (Some(inline_rest), 1usize)
+                                    };
+                                    if payload
+                                        .is_some_and(env_split_string_is_literal_option_prefix)
+                                    {
+                                        takes_next = step == 2;
+                                        break;
+                                    }
+                                    return (index, wrapped);
+                                }
+                                'u' | 'C' | 'f' | 'a' | 'P' => {
                                     takes_next = chars.peek().is_none();
                                     break;
                                 }
+                                _ => return (index, wrapped),
                             }
-                            next += if takes_next { 2 } else { 1 };
                         }
+                        next += if takes_next { 2 } else { 1 };
                         continue;
                     }
                     if posix_assignment_word_parts(opt).is_some() {
@@ -16820,7 +17150,37 @@ fn skip_posix_use_site_wrappers(words: &[(&str, std::ops::Range<usize>)]) -> (us
                         next += 1;
                         break;
                     }
-                    if opt == "-p" {
+                    if matches!(opt, "-h" | "--help" | "-V" | "--version") {
+                        return (index, wrapped);
+                    }
+                    if matches!(
+                        opt,
+                        "-a" | "--append"
+                            | "-p"
+                            | "--portability"
+                            | "-q"
+                            | "--quiet"
+                            | "-v"
+                            | "--verbose"
+                    ) {
+                        next += 1;
+                        continue;
+                    }
+                    if matches!(opt, "-f" | "--format" | "-o" | "--output") {
+                        next += 2;
+                        continue;
+                    }
+                    if opt.starts_with("--format=")
+                        || opt.starts_with("--output=")
+                        || (opt.len() > 2
+                            && opt.starts_with('-')
+                            && matches!(opt.as_bytes()[1], b'f' | b'o'))
+                        || (opt.starts_with('-')
+                            && opt.len() > 1
+                            && opt[1..]
+                                .bytes()
+                                .all(|b| matches!(b, b'a' | b'p' | b'q' | b'v')))
+                    {
                         next += 1;
                         continue;
                     }
@@ -16840,15 +17200,29 @@ fn skip_posix_use_site_wrappers(words: &[(&str, std::ops::Range<usize>)]) -> (us
                         next += 1;
                         break;
                     }
-                    if opt == "-a" {
-                        next += 2;
-                        continue;
+                    if !opt.starts_with('-') || opt.len() == 1 || opt.starts_with("--") {
+                        break;
                     }
-                    if opt.starts_with('-') && opt.len() > 1 {
-                        next += 1;
-                        continue;
+                    let mut takes_next = false;
+                    let mut valid = true;
+                    let mut chars = opt[1..].chars().peekable();
+                    while let Some(ch) = chars.next() {
+                        match ch {
+                            'c' | 'l' => {}
+                            'a' => {
+                                takes_next = chars.peek().is_none();
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
                     }
-                    break;
+                    if !valid {
+                        return (index, wrapped);
+                    }
+                    next += if takes_next { 2 } else { 1 };
                 }
                 if next < words.len() {
                     index = next;
@@ -16864,11 +17238,11 @@ fn skip_posix_use_site_wrappers(words: &[(&str, std::ops::Range<usize>)]) -> (us
                         next += 1;
                         break;
                     }
-                    if opt == "-p" {
+                    if opt.starts_with('-') && opt.len() > 1 && opt[1..].bytes().all(|b| b == b'p')
+                    {
                         next += 1;
                         continue;
                     }
-                    // `-v`/`-V` only inspect, do not execute.
                     if opt.starts_with('-') {
                         return (index, wrapped);
                     }
@@ -16881,9 +17255,17 @@ fn skip_posix_use_site_wrappers(words: &[(&str, std::ops::Range<usize>)]) -> (us
                 }
                 break;
             }
-            "nohup" => {
-                if index + 1 < words.len() {
-                    index += 1;
+            "builtin" | "nohup" => {
+                let mut next = index + 1;
+                if let Some(&(opt, _)) = words.get(next) {
+                    if opt == "--" {
+                        next += 1;
+                    } else if opt.starts_with('-') {
+                        return (index, wrapped);
+                    }
+                }
+                if next < words.len() {
+                    index = next;
                     wrapped = true;
                     continue;
                 }
@@ -16896,13 +17278,21 @@ fn skip_posix_use_site_wrappers(words: &[(&str, std::ops::Range<usize>)]) -> (us
                         next += 1;
                         break;
                     }
+                    if matches!(opt, "--help" | "--version") {
+                        return (index, wrapped);
+                    }
                     if opt == "-n" || opt == "--adjustment" {
                         next += 2;
                         continue;
                     }
-                    if opt.starts_with('-') && opt.len() > 1 {
+                    if opt.starts_with("--adjustment=")
+                        || (opt.starts_with('-') && opt.len() > 1 && !opt.starts_with("--"))
+                    {
                         next += 1;
                         continue;
+                    }
+                    if opt.starts_with('-') {
+                        return (index, wrapped);
                     }
                     break;
                 }
@@ -17205,6 +17595,18 @@ fn model_literal_posix_executable_assignments(
                 PosixListSeparator::Other => break,
             }
         }
+        // A segment feeding a pipeline or background job runs in a subshell in
+        // POSIX sh/bash, so assignments inside it do not overwrite parent-shell
+        // bindings. Snapshot confirmed_before_branch before processing it.
+        if matches!(
+            separators.get(segment_index),
+            Some(PosixListSeparator::Pipe | PosixListSeparator::Background)
+        ) {
+            deny_only = true;
+            if confirmed_before_branch.is_none() {
+                confirmed_before_branch = Some(bindings.clone());
+            }
+        }
         let Some(segment) = command.get(start..end) else {
             return model;
         };
@@ -17279,6 +17681,11 @@ fn model_literal_posix_executable_assignments(
         let Some((name, argv0_range, quoted, wrapped)) = posix_variable_argv0(segment) else {
             if posix_segment_keeps_bindings(segment) {
                 deny_only = true;
+                continue;
+            }
+            if posix_segment_mutates_bindings(segment) {
+                deny_only = true;
+                invalidate_modeled_posix_bindings(&mut bindings, &mut ifs);
                 continue;
             }
             break;
@@ -18081,87 +18488,245 @@ fn powershell_invocation_reaches_pack_keyword(
     }
 }
 
+fn skip_powershell_inline_trivia(mut s: &str) -> &str {
+    loop {
+        let bytes = s.as_bytes();
+        if let Some(&b) = bytes.first()
+            && matches!(b, b' ' | b'\t')
+        {
+            s = &s[1..];
+            continue;
+        }
+        if bytes.starts_with(b"<#") {
+            let rest = &bytes[2..];
+            if let Some(rel) = rest.windows(2).position(|w| w == b"#>") {
+                s = &s[2 + rel + 2..];
+                continue;
+            }
+            return "";
+        }
+        if bytes.starts_with(b"`\n") {
+            s = &s[2..];
+            continue;
+        }
+        if bytes.starts_with(b"`\r\n") {
+            s = &s[3..];
+            continue;
+        }
+        return s;
+    }
+}
+
+fn powershell_here_string_open(bytes: &[u8], start: usize) -> Option<(usize, u8)> {
+    if bytes.get(start) != Some(&b'@') {
+        return None;
+    }
+    let quote = *bytes.get(start + 1)?;
+    if !matches!(quote, b'\'' | b'"') {
+        return None;
+    }
+    let mut pos = start + 2;
+    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t') {
+        pos += 1;
+    }
+    if bytes.get(pos) == Some(&b'\r') && bytes.get(pos + 1) == Some(&b'\n') {
+        Some((pos + 2, quote))
+    } else if bytes.get(pos) == Some(&b'\n') {
+        Some((pos + 1, quote))
+    } else {
+        None
+    }
+}
+
+fn powershell_call_expr_here_string_end(
+    bytes: &[u8],
+    body_start: usize,
+    quote: u8,
+) -> (usize, usize) {
+    let mut pos = body_start;
+    while pos < bytes.len() {
+        if bytes[pos] == quote && bytes.get(pos + 1) == Some(&b'@') {
+            return (pos, pos + 2);
+        }
+        match bytes[pos..].iter().position(|&b| b == b'\n') {
+            Some(rel) => pos += rel + 1,
+            None => return (bytes.len(), bytes.len()),
+        }
+    }
+    (bytes.len(), bytes.len())
+}
+
 /// Whether `command` contains a statement-leading PowerShell call/dot-source
 /// expression (`& (...)`, `&(...)`, `& $(...)`, `& @(...)`, `& $var`,
 /// `. (...)`) whose target is computed or dynamic (bd-ps-cross-dialect-gaps-ewf3).
 ///
 /// Only statement-leading `&` counts (start of command or after `;`, `\n`,
-/// `|`, `=`, `{`, `(`) so a POSIX backgrounded command (`echo a & (echo b)`)
+/// `|`, `&&`, `=`, `{`, `(`) so a POSIX backgrounded command (`echo a & (echo b)`)
 /// never triggers a PowerShell replay.
-fn powershell_has_dynamic_call_expression(command: &str) -> bool {
-    if !command.contains(['&', '.']) {
+pub(crate) fn powershell_has_dynamic_call_expression(command: &str) -> bool {
+    powershell_has_dynamic_call_expression_depth(command, 0)
+}
+
+#[allow(clippy::too_many_lines)]
+fn powershell_has_dynamic_call_expression_depth(command: &str, depth: usize) -> bool {
+    if depth > 4 || !command.contains(['&', '.']) {
         return false;
     }
     let bytes = command.as_bytes();
     let mut index = 0usize;
     let mut at_statement_start = true;
+    let mut at_token_start = true;
     let mut in_single = false;
     let mut in_double = false;
     while index < bytes.len() {
         let byte = bytes[index];
         if in_single {
             if byte == b'\'' {
+                if bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                    continue;
+                }
                 in_single = false;
             }
             index += 1;
             continue;
         }
         if in_double {
-            // PowerShell escapes inside double quotes with backtick, never backslash.
             if byte == b'`' {
                 index = (index + 2).min(bytes.len());
                 continue;
             }
             if byte == b'"' {
+                if bytes.get(index + 1) == Some(&b'"') {
+                    index += 2;
+                    continue;
+                }
                 in_double = false;
             }
             index += 1;
             continue;
         }
+        // PowerShell block comments preserve at_statement_start.
+        if byte == b'<' && bytes.get(index + 1) == Some(&b'#') {
+            let rest = &bytes[index + 2..];
+            index = match rest.windows(2).position(|w| w == b"#>") {
+                Some(rel) => index + 2 + rel + 2,
+                None => bytes.len(),
+            };
+            at_token_start = true;
+            continue;
+        }
+        // PowerShell line comments run until CR/LF (leaving line terminator to reset statement start).
+        if byte == b'#' && at_token_start {
+            index = match bytes[index + 1..]
+                .iter()
+                .position(|&b| matches!(b, b'\n' | b'\r'))
+            {
+                Some(rel) => index + 1 + rel,
+                None => bytes.len(),
+            };
+            continue;
+        }
+        // PowerShell here-strings so embedded quotes cannot flip quote parity.
+        if byte == b'@'
+            && let Some((body_start, quote)) = powershell_here_string_open(bytes, index)
+        {
+            let (body_end, end) = powershell_call_expr_here_string_end(bytes, body_start, quote);
+            if quote == b'"'
+                && let Some(body) = command.get(body_start..body_end)
+                && body.contains("$(")
+            {
+                let mut scan = 0usize;
+                while let Some(rel) = body[scan..].find("$(") {
+                    let sub_start = scan + rel + 2;
+                    if powershell_has_dynamic_call_expression_depth(&body[sub_start..], depth + 1) {
+                        return true;
+                    }
+                    scan = sub_start;
+                }
+            }
+            index = end;
+            at_statement_start = false;
+            at_token_start = false;
+            continue;
+        }
         match byte {
-            b' ' | b'\t' | b'\r' => {
+            b' ' | b'\t' => {
+                at_token_start = true;
                 index += 1;
             }
-            b'\n' | b';' | b'|' | b'=' | b'{' | b'(' => {
+            b'\n' | b'\r' | b';' | b'|' | b'=' | b'{' | b'(' => {
                 at_statement_start = true;
+                at_token_start = true;
                 index += 1;
+            }
+            b')' | b'}' => {
+                at_statement_start = false;
+                at_token_start = true;
+                index += 1;
+            }
+            b'`' => {
+                if bytes.get(index + 1) == Some(&b'\n') {
+                    at_token_start = true;
+                    index += 2;
+                } else if bytes.get(index + 1) == Some(&b'\r')
+                    && bytes.get(index + 2) == Some(&b'\n')
+                {
+                    at_token_start = true;
+                    index += 3;
+                } else {
+                    at_statement_start = false;
+                    at_token_start = false;
+                    index = (index + 2).min(bytes.len());
+                }
             }
             b'\'' => {
                 at_statement_start = false;
+                at_token_start = false;
                 in_single = true;
                 index += 1;
             }
             b'"' => {
                 at_statement_start = false;
+                at_token_start = false;
                 in_double = true;
                 index += 1;
             }
-            b'&' if at_statement_start => {
-                // Ignore `&&` and redirections (`&>`).
-                if matches!(bytes.get(index + 1), Some(b'&' | b'>')) {
-                    at_statement_start = bytes.get(index + 1) == Some(&b'&');
+            b'&' => {
+                if bytes.get(index + 1) == Some(&b'&') {
+                    at_statement_start = true;
+                    at_token_start = true;
                     index += 2;
                     continue;
                 }
-                let rest = command[index + 1..].trim_start();
-                if rest.starts_with('(')
-                    || rest.starts_with("$(")
-                    || rest.starts_with("@(")
-                    || rest.starts_with('$')
-                {
-                    return true;
+                if bytes.get(index + 1) == Some(&b'>') {
+                    at_statement_start = false;
+                    at_token_start = true;
+                    index += 2;
+                    continue;
+                }
+                if at_statement_start {
+                    let rest = skip_powershell_inline_trivia(&command[index + 1..]);
+                    if rest.starts_with('(')
+                        || rest.starts_with("$(")
+                        || rest.starts_with("@(")
+                        || rest.starts_with('$')
+                    {
+                        return true;
+                    }
                 }
                 at_statement_start = false;
+                at_token_start = true;
                 index += 1;
             }
             b'.' if at_statement_start => {
-                let rest = &command[index + 1..];
-                if rest
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| ch.is_whitespace() || ch == '(')
-                {
-                    let trimmed = rest.trim_start();
+                let raw_rest = &command[index + 1..];
+                let valid_sep = raw_rest.starts_with([' ', '\t', '('])
+                    || raw_rest.starts_with("<#")
+                    || raw_rest.starts_with("`\n")
+                    || raw_rest.starts_with("`\r\n");
+                if valid_sep {
+                    let trimmed = skip_powershell_inline_trivia(raw_rest);
                     if trimmed.starts_with('(')
                         || trimmed.starts_with("$(")
                         || trimmed.starts_with("@(")
@@ -18170,10 +18735,12 @@ fn powershell_has_dynamic_call_expression(command: &str) -> bool {
                     }
                 }
                 at_statement_start = false;
+                at_token_start = false;
                 index += 1;
             }
             _ => {
                 at_statement_start = false;
+                at_token_start = false;
                 index += 1;
             }
         }
@@ -18454,8 +19021,11 @@ fn elide_cmd_argv0_word(raw: &str) -> Option<String> {
         copied_from = span.end;
     }
     out.push_str(&raw[copied_from..]);
-    if !double && out.ends_with('^') && !out.ends_with("^^") {
-        out.pop();
+    if !double {
+        let trailing_carets = out.bytes().rev().take_while(|&b| b == b'^').count();
+        if trailing_carets % 2 == 1 {
+            out.pop();
+        }
     }
     Some(out)
 }
@@ -20646,7 +21216,7 @@ fn attribute_incomplete_interpreter_documentation_denial(
     // (or has no span and the command contains a quoted interpreter heredoc),
     // verify the exterior shell command first so an in-body pack hit can never
     // mask an exterior destructive command (e.g. `rm -rf / && python3 - <<'EOF'...`).
-    let masked_bodies = crate::heredoc::mask_inert_interpreter_stdin(command);
+    let masked_bodies = crate::heredoc::mask_python_js_interpreter_stdin(command);
     if masked_bodies.as_ref() == command || masked_bodies.len() != command.len() {
         return denial;
     }
@@ -20667,22 +21237,42 @@ fn attribute_incomplete_interpreter_documentation_denial(
         return denial;
     }
 
-    // Re-evaluate packs on the exterior command with quoted interpreter bodies
-    // blanked out. If an exterior command itself triggers a pack rule (even in a
-    // pack ordered after the one that matched inside the unproved body), return
-    // that concrete exterior denial immediately.
+    // Re-evaluate packs on the exterior command with quoted Python/JS bodies
+    // blanked out, preserving non-expanding data heredocs and checking both
+    // primary and redirection-free argv views.
     let exterior_raw = masked_bodies.as_ref();
     let exterior_sanitized = sanitize_for_pattern_matching(exterior_raw);
+    let exterior_data = crate::heredoc::mask_non_expanding_data_heredocs(exterior_raw);
+    let exterior_for_match = if exterior_data.as_ref() == exterior_raw
+        || exterior_data.len() != exterior_raw.len()
+        || exterior_sanitized.len() != exterior_raw.len()
+    {
+        exterior_sanitized
+    } else {
+        let mut merged = exterior_sanitized.as_bytes().to_vec();
+        for ((orig, masked), out) in exterior_raw
+            .bytes()
+            .zip(exterior_data.bytes())
+            .zip(merged.iter_mut())
+        {
+            if orig != masked {
+                *out = masked;
+            }
+        }
+        String::from_utf8(merged).map_or(exterior_sanitized, Cow::Owned)
+    };
     let exterior_dialect_norm =
-        crate::normalize::normalize_command_in_dialect(exterior_sanitized.as_ref(), shell_dialect);
+        crate::normalize::normalize_command_in_dialect(exterior_for_match.as_ref(), shell_dialect);
     let exterior_normalized = crate::normalize::normalize_command(exterior_dialect_norm.as_ref());
-    let exterior = {
+    let exterior_for_packs =
+        crate::heredoc::mask_non_executing_heredocs(exterior_normalized.as_ref());
+    let mut exterior = {
         let _allow_once_scope = AllowOnceSuppressionScope::enter();
         evaluate_packs_with_allowlists_at_depth(
+            exterior_for_packs.as_ref(),
             exterior_normalized.as_ref(),
-            exterior_normalized.as_ref(),
-            exterior_sanitized.as_ref(),
-            exterior_sanitized.as_ref(),
+            exterior_for_match.as_ref(),
+            exterior_for_match.as_ref(),
             exterior_raw,
             exterior_raw,
             ordered_packs,
@@ -20696,6 +21286,37 @@ fn attribute_incomplete_interpreter_documentation_denial(
             inherited_automated_stdin,
         )
     };
+    if exterior.decision == EvaluationDecision::Allow
+        && let Some(views) =
+            redirection_free_pack_views(exterior_raw, exterior_for_match.as_ref(), shell_dialect)
+    {
+        let argv_exterior = {
+            let _allow_once_scope = AllowOnceSuppressionScope::enter();
+            evaluate_packs_with_allowlists_at_depth(
+                &views.for_packs,
+                &views.normalized,
+                &views.for_match,
+                &views.for_match,
+                &views.command,
+                exterior_raw,
+                ordered_packs,
+                allowlists,
+                keyword_index,
+                deadline,
+                project_path,
+                shell_dialect,
+                nested_command_depth,
+                nested_context,
+                inherited_automated_stdin,
+            )
+        };
+        if matches!(
+            argv_exterior.decision,
+            EvaluationDecision::Deny | EvaluationDecision::Indeterminate
+        ) {
+            exterior = argv_exterior;
+        }
+    }
     if exterior.decision == EvaluationDecision::Deny {
         return exterior;
     }
@@ -69091,6 +69712,214 @@ mod windows_redirection_free_view_tests {
         assert!(
             waived_res.is_allowed(),
             "allowlist grant for heredoc.shell:incomplete-analysis must be honored: {waived_res:?}"
+        );
+    }
+
+    #[test]
+    fn powershell_dynamic_call_expression_handles_comments_here_strings_and_chains() {
+        for cmd in [
+            "# \"\n& ('gi'+'t') reset --hard",
+            "<# \"\n#> & ('gi'+'t') reset --hard",
+            "echo ok && & ('gi'+'t') reset --hard",
+            "@\"\n\"\n\"@\n& ('gi'+'t') reset --hard",
+            "@\"\n$(& ('gi'+'t') reset --hard)\n\"@",
+            "@\"\n$(& ('gi'+'t') reset --hard)",
+            "& <# c #> ('gi'+'t') reset --hard",
+            "echo 'it''s' ; & ('gi'+'t') reset --hard",
+            "echo \"# not a comment\"; & ('gi'+'t') reset --hard",
+            "# c\r& ('gi'+'t') reset --hard",
+        ] {
+            assert!(
+                powershell_has_dynamic_call_expression(cmd),
+                "expected dynamic call expression detection for: {cmd:?}"
+            );
+        }
+
+        for benign in [
+            "# & ('gi'+'t') reset --hard\necho ok",
+            "<# & ('gi'+'t') reset --hard #>\necho ok",
+            "<# unclosed & ('gi'+'t') reset --hard",
+            "@'\n& ('gi'+'t') reset --hard\n'@\necho ok",
+            "echo a & (echo b)",
+        ] {
+            assert!(
+                !powershell_has_dynamic_call_expression(benign),
+                "benign command must not trigger dynamic call replay: {benign:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn elide_cmd_argv0_word_handles_odd_and_even_trailing_carets() {
+        assert_eq!(elide_cmd_argv0_word("g^%x%it").as_deref(), Some("g^it"));
+        assert_eq!(elide_cmd_argv0_word("g^^%x%it").as_deref(), Some("g^^it"));
+        assert_eq!(elide_cmd_argv0_word("g^^^%x%it").as_deref(), Some("g^^^it"));
+        assert_eq!(elide_cmd_argv0_word("rm^%x%").as_deref(), Some("rm"));
+        assert_eq!(elide_cmd_argv0_word("rm^^%x%").as_deref(), Some("rm^^"));
+        assert_eq!(elide_cmd_argv0_word("rm^^^%x%").as_deref(), Some("rm^^"));
+    }
+
+    #[test]
+    fn incomplete_documentation_mask_hardening_preserves_exterior_and_non_pyjs_denials() {
+        struct BudgetResetGuard;
+        impl Drop for BudgetResetGuard {
+            fn drop(&mut self) {
+                DOCUMENTATION_MASK_BUDGET_OVERRIDE.with(|cell| cell.set(None));
+            }
+        }
+
+        let heredoc_settings = crate::config::HeredocSettings::default();
+        let allowlists = LayeredAllowlist::default();
+        let waived = LayeredAllowlist::default().with_rule_grants(
+            &[("heredoc.shell", "incomplete-analysis")],
+            "test waive incomplete analysis",
+            "test",
+        );
+        let overrides = crate::config::CompiledOverrides::default();
+        let enabled_packs: HashSet<String> =
+            ["core.git".to_string(), "core.filesystem".to_string()]
+                .into_iter()
+                .collect();
+        let ordered_packs = crate::packs::REGISTRY.expand_enabled_ordered(&enabled_packs);
+        let enabled_keywords = crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+
+        let _guard = BudgetResetGuard;
+        DOCUMENTATION_MASK_BUDGET_OVERRIDE.with(|cell| cell.set(Some(std::time::Duration::ZERO)));
+
+        let redir_exterior =
+            "rm </dev/null -rf / && python3 - <<'EOF'\nprint('x|git reset --hard')\nEOF";
+        for al in [&allowlists, &waived] {
+            let res = evaluate_command_with_pack_order_deadline_at_path_inner(
+                redir_exterior,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &overrides,
+                al,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                ShellDialect::Posix,
+                0,
+                false,
+            );
+            assert_eq!(res.decision, EvaluationDecision::Deny, "must deny: {res:?}");
+            let info = res.pattern_info.as_ref().expect("pattern info");
+            assert_eq!(
+                info.pack_id.as_deref(),
+                Some("core.filesystem"),
+                "redirection exterior must keep core.filesystem even under allowlist: {info:?}"
+            );
+        }
+
+        let perl_and_py = "perl - <<'PL'\nsystem(\"rm -rf /\")\nPL\npython3 - <<'PY'\nprint('x|git reset --hard')\nPY";
+        let perl_res = evaluate_command_with_pack_order_deadline_at_path_inner(
+            perl_and_py,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &overrides,
+            &waived,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            ShellDialect::Posix,
+            0,
+            false,
+        );
+        assert_eq!(
+            perl_res.decision,
+            EvaluationDecision::Deny,
+            "perl heredoc must remain denied even when incomplete-analysis is waived: {perl_res:?}"
+        );
+        assert_ne!(
+            perl_res
+                .pattern_info
+                .as_ref()
+                .and_then(|p| p.pack_id.as_deref()),
+            Some("heredoc.shell"),
+            "perl heredoc must not be attributed to heredoc.shell:incomplete-analysis: {perl_res:?}"
+        );
+
+        let bash_and_py =
+            "bash <<'SH'\nrm -rf /\nSH\npython3 - <<'PY'\nprint('x|git reset --hard')\nPY";
+        let bash_res = evaluate_command_with_pack_order_deadline_at_path_inner(
+            bash_and_py,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &overrides,
+            &waived,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            ShellDialect::Posix,
+            0,
+            false,
+        );
+        assert_eq!(
+            bash_res.decision,
+            EvaluationDecision::Deny,
+            "shell heredoc must stay denied even when incomplete-analysis is waived: {bash_res:?}"
+        );
+        assert_ne!(
+            bash_res
+                .pattern_info
+                .as_ref()
+                .and_then(|p| p.pack_id.as_deref()),
+            Some("heredoc.shell"),
+            "shell heredoc must not be attributed to heredoc.shell:incomplete-analysis: {bash_res:?}"
+        );
+
+        let cat_and_py =
+            "cat <<'DOC'\nrm -rf /\nDOC\npython3 - <<'EOF'\nprint('x|git reset --hard')\nEOF";
+        let cat_degraded = evaluate_command_with_pack_order_deadline_at_path_inner(
+            cat_and_py,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &overrides,
+            &allowlists,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            ShellDialect::Posix,
+            0,
+            false,
+        );
+        assert_eq!(cat_degraded.decision, EvaluationDecision::Deny);
+        let cat_info = cat_degraded.pattern_info.as_ref().expect("pattern info");
+        assert_eq!(
+            (
+                cat_info.pack_id.as_deref(),
+                cat_info.pattern_name.as_deref()
+            ),
+            (Some("heredoc.shell"), Some("incomplete-analysis")),
+            "benign cat data heredoc must not steal attribution from incomplete-analysis: {cat_info:?}"
+        );
+        let cat_waived = evaluate_command_with_pack_order_deadline_at_path_inner(
+            cat_and_py,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &overrides,
+            &waived,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            ShellDialect::Posix,
+            0,
+            false,
+        );
+        assert!(
+            cat_waived.is_allowed(),
+            "waiving incomplete-analysis must allow benign cat data heredoc + python heredoc: {cat_waived:?}"
         );
     }
 }
