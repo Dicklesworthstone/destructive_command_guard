@@ -95,6 +95,7 @@ pub fn strip_wrapper_prefixes(command: &str) -> NormalizedCommand<'_> {
 
     let mut current = trimmed.to_string();
     let mut stripped_wrappers = Vec::new();
+    let mut modprobe_env = ModprobeEnvState::default();
 
     // Iteratively strip wrappers until no more are found
     // Limit iterations to prevent DoS from maliciously crafted commands
@@ -114,36 +115,42 @@ pub fn strip_wrapper_prefixes(command: &str) -> NormalizedCommand<'_> {
 
         // Try stripping each wrapper type in order
         if let Some((remaining, wrapper)) = strip_sudo(&current) {
+            record_modprobe_env_wrapper(&mut modprobe_env, &wrapper);
             stripped_wrappers.push(wrapper);
             current = remaining;
             continue;
         }
 
         if let Some((remaining, wrapper)) = strip_env(&current) {
+            record_modprobe_env_wrapper(&mut modprobe_env, &wrapper);
             stripped_wrappers.push(wrapper);
             current = remaining;
             continue;
         }
 
         if let Some((remaining, wrapper)) = strip_command_wrapper(&current) {
+            record_modprobe_env_wrapper(&mut modprobe_env, &wrapper);
             stripped_wrappers.push(wrapper);
             current = remaining;
             continue;
         }
 
         if let Some((remaining, wrapper)) = strip_posix_assignment_prefix(&current) {
+            record_modprobe_env_wrapper(&mut modprobe_env, &wrapper);
             stripped_wrappers.push(wrapper);
             current = remaining;
             continue;
         }
 
         if let Some((remaining, wrapper)) = strip_execution_wrapper(&current) {
+            record_modprobe_env_wrapper(&mut modprobe_env, &wrapper);
             stripped_wrappers.push(wrapper);
             current = remaining;
             continue;
         }
 
         if let Some((remaining, wrapper)) = strip_leading_backslash(&current) {
+            record_modprobe_env_wrapper(&mut modprobe_env, &wrapper);
             stripped_wrappers.push(wrapper);
             current = remaining;
             continue;
@@ -155,7 +162,22 @@ pub fn strip_wrapper_prefixes(command: &str) -> NormalizedCommand<'_> {
         }
     }
 
-    if stripped_wrappers.is_empty() {
+    let mut modprobe_env_folded = false;
+    if !limit_reached {
+        if !modprobe_env.posixly_correct
+            && leading_unstripped_posixly_correct_before_modprobe(&current)
+        {
+            modprobe_env.posixly_correct = true;
+        }
+        if (modprobe_env.modprobe_options.is_some() || modprobe_env.posixly_correct)
+            && let Some(folded) = fold_modprobe_env_into_command(&current, &modprobe_env)
+        {
+            current = folded;
+            modprobe_env_folded = true;
+        }
+    }
+
+    if stripped_wrappers.is_empty() && !modprobe_env_folded {
         NormalizedCommand::unchanged(command)
     } else {
         NormalizedCommand {
@@ -165,6 +187,453 @@ pub fn strip_wrapper_prefixes(command: &str) -> NormalizedCommand<'_> {
             wrapper_limit_reached: limit_reached,
         }
     }
+}
+
+/// Environment variables stripped before `modprobe` that change how kmod
+/// parses its command line (bd-modprobe-env-option-bypass-fhep).
+///
+/// - `MODPROBE_OPTIONS`: kmod splits this on ASCII whitespace and prepends the
+///   resulting tokens before `argv[1..]`, so `MODPROBE_OPTIONS=-r modprobe x`
+///   unloads `x`.
+/// - `POSIXLY_CORRECT`: glibc `getopt_long` stops permuting options at the
+///   first non-option operand whenever this variable is present (even empty),
+///   so `POSIXLY_CORRECT=1 modprobe -r nvidia -n` treats `-n` as another
+///   module name rather than a dry-run flag.
+#[derive(Default)]
+struct ModprobeEnvState {
+    modprobe_options: Option<String>,
+    posixly_correct: bool,
+}
+
+fn record_modprobe_assignment(state: &mut ModprobeEnvState, raw: &str) {
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+    let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) else {
+        return;
+    };
+    let Some((name, value)) = decoded.split_once('=') else {
+        return;
+    };
+    match name {
+        "MODPROBE_OPTIONS" => state.modprobe_options = Some(value.to_string()),
+        "POSIXLY_CORRECT" => state.posixly_correct = true,
+        _ => {}
+    }
+}
+
+fn unset_modprobe_env_name(state: &mut ModprobeEnvState, raw_name: &str) {
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+    let decoded = decoder
+        .decode(raw_name.trim(), ShellTokenRole::Syntax)
+        .unwrap_or_else(|| Cow::Borrowed(raw_name.trim()));
+    match decoded.as_ref() {
+        "MODPROBE_OPTIONS" => state.modprobe_options = None,
+        "POSIXLY_CORRECT" => state.posixly_correct = false,
+        _ => {}
+    }
+}
+
+fn record_modprobe_env_wrapper(state: &mut ModprobeEnvState, wrapper: &StrippedWrapper) {
+    match wrapper.wrapper_type {
+        "assignment" => record_modprobe_assignment(state, &wrapper.stripped_text),
+        "env" => record_modprobe_env_prefix(state, &wrapper.stripped_text),
+        "exec" => {
+            let tokens = tokenize_for_normalization(&wrapper.stripped_text);
+            let mut cleared = false;
+            let _ = exec_wrapper_command_index(&wrapper.stripped_text, &tokens, &mut cleared);
+            if cleared {
+                *state = ModprobeEnvState::default();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn record_modprobe_env_prefix(state: &mut ModprobeEnvState, stripped_env: &str) {
+    let tokens = tokenize_for_normalization(stripped_env);
+    let words: Vec<&str> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(stripped_env))
+        .collect();
+    // Skip the leading `env` / `/usr/bin/env` word.
+    let mut index = 1usize;
+    while index < words.len() {
+        let word = words[index];
+        if word == "--" {
+            index += 1;
+            break;
+        }
+        if word == "-" {
+            *state = ModprobeEnvState::default();
+            index += 1;
+            continue;
+        }
+        if !word.starts_with('-') || word.len() == 1 {
+            break;
+        }
+        if word.starts_with("--") {
+            let (name, value_opt) = word.find('=').map_or((word, None), |eq_pos| {
+                (&word[..eq_pos], Some(&word[eq_pos + 1..]))
+            });
+            match name {
+                "--ignore-environment" => {
+                    *state = ModprobeEnvState::default();
+                    index += 1;
+                }
+                "--null" | "--debug" => {
+                    index += 1;
+                }
+                "--unset" => {
+                    if let Some(value) = value_opt {
+                        unset_modprobe_env_name(state, value);
+                        index += 1;
+                    } else if let Some(next) = words.get(index + 1) {
+                        unset_modprobe_env_name(state, next);
+                        index += 2;
+                    } else {
+                        return;
+                    }
+                }
+                "--chdir" | "--file" | "--argv0" | "--ignore-signal" => {
+                    index += if value_opt.is_some() { 1 } else { 2 };
+                }
+                "--split-string" => {
+                    // `-S` emitted the split command back into the wrapper
+                    // loop; any assignments inside it are processed next.
+                    return;
+                }
+                _ => return,
+            }
+            continue;
+        }
+        let bytes = word.as_bytes();
+        let mut pos = 1usize;
+        let mut advance = 1usize;
+        while pos < bytes.len() {
+            match bytes[pos] {
+                b'i' => {
+                    *state = ModprobeEnvState::default();
+                    pos += 1;
+                }
+                b'0' | b'v' => pos += 1,
+                b'S' => return,
+                b'u' => {
+                    if pos + 1 < bytes.len() {
+                        unset_modprobe_env_name(state, &word[pos + 1..]);
+                    } else if let Some(next) = words.get(index + 1) {
+                        unset_modprobe_env_name(state, next);
+                        advance = 2;
+                    } else {
+                        return;
+                    }
+                    break;
+                }
+                b'P' | b'C' | b'f' | b'a' => {
+                    if pos + 1 >= bytes.len() {
+                        advance = 2;
+                    }
+                    break;
+                }
+                _ => return,
+            }
+        }
+        index += advance;
+    }
+    while index < words.len() {
+        record_modprobe_assignment(state, words[index]);
+        index += 1;
+    }
+}
+
+fn posix_redirect_needs_target(word: &str) -> Option<bool> {
+    let bytes = word.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    if bytes.starts_with(b"&>") {
+        let mut idx = 2usize;
+        if bytes.get(idx) == Some(&b'>') {
+            idx += 1;
+        }
+        return Some(idx == bytes.len());
+    }
+    let mut idx = bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    let op = *bytes.get(idx)?;
+    if !matches!(op, b'<' | b'>') {
+        return None;
+    }
+    idx += 1;
+    if bytes.get(idx).is_some_and(|next| {
+        matches!(
+            (op, *next),
+            (b'>', b'>') | (b'>', b'|') | (b'>', b'&') | (b'<', b'<') | (b'<', b'>') | (b'<', b'&')
+        )
+    }) {
+        idx += 1;
+        if op == b'<' && bytes.get(idx - 1) == Some(&b'<') && bytes.get(idx) == Some(&b'<') {
+            idx += 1;
+        }
+    }
+    Some(idx == bytes.len())
+}
+
+fn sanitize_modprobe_env_option_token(token: &str) -> String {
+    if !token.contains([';', '&', '|', '\n', '\r', '#', '\'', '"']) {
+        return token.to_string();
+    }
+    if token.starts_with('-') {
+        token
+            .chars()
+            .map(|ch| {
+                if matches!(ch, ';' | '&' | '|' | '\n' | '\r' | '#' | '\'' | '"') {
+                    'X'
+                } else {
+                    ch
+                }
+            })
+            .collect()
+    } else {
+        "__dcg_env_arg__".to_string()
+    }
+}
+
+struct ModprobeFoldArg {
+    display: String,
+    decoded: String,
+    is_redirection: bool,
+}
+
+fn modprobe_posixly_correct_end_of_options(args: &[ModprobeFoldArg]) -> Option<usize> {
+    let mut index = 0usize;
+    while index < args.len() {
+        if args[index].is_redirection {
+            index += 1;
+            continue;
+        }
+        let tok = args[index].decoded.as_str();
+        if tok == "--" {
+            return None;
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            return Some(index);
+        }
+        if tok.starts_with("--") {
+            if tok.contains('=') {
+                index += 1;
+                continue;
+            }
+            // Unambiguous prefixes of kmod `modprobe`'s four value-taking long
+            // options (`--config`, `--dirname`, `--set-version`, `--wait`).
+            let takes_separate_value = ("--config".starts_with(tok) && tok.len() >= 3)
+                || ("--dirname".starts_with(tok) && tok.len() >= 4)
+                || ("--set-version".starts_with(tok) && tok.len() >= 4)
+                || ("--wait".starts_with(tok) && tok.len() >= 3);
+            index += 1;
+            if takes_separate_value {
+                while index < args.len() && args[index].is_redirection {
+                    index += 1;
+                }
+                if index < args.len() {
+                    index += 1;
+                }
+            }
+            // Never insert `--` before an option token (`--rem`, `--remove-d`,
+            // etc.): doing so would push the option past `--` and hide it from
+            // `modprobe-remove`.
+            continue;
+        }
+        let bytes = tok.as_bytes();
+        let mut takes_separate_value = false;
+        for (pos, &byte) in bytes[1..].iter().enumerate() {
+            if matches!(byte, b'C' | b'd' | b'S' | b'w') {
+                takes_separate_value = pos + 1 == bytes[1..].len();
+                break;
+            }
+        }
+        index += 1;
+        if takes_separate_value {
+            while index < args.len() && args[index].is_redirection {
+                index += 1;
+            }
+            if index < args.len() {
+                index += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Whether `command` still begins with an unstripped `POSIXLY_CORRECT=...`
+/// assignment (for example `POSIXLY_CORRECT=$(echo 1) modprobe -r x -n`, which
+/// `strip_posix_assignment_prefix` leaves in place because of `$(...)`).
+/// In glibc `getopt_long`, ANY value — even empty — enables `POSIXLY_CORRECT`.
+fn leading_unstripped_posixly_correct_before_modprobe(command: &str) -> bool {
+    if !command.contains("POSIXLY_CORRECT=") || !command.contains("modprobe") {
+        return false;
+    }
+    let tokens = tokenize_for_normalization(command);
+    let mut saw_posixly = false;
+    let mut next_is_redirect_target = false;
+    for token in &tokens {
+        if token.kind == NormalizeTokenKind::Separator {
+            break;
+        }
+        let Some(raw) = token.text(command) else {
+            return false;
+        };
+        if next_is_redirect_target {
+            next_is_redirect_target = false;
+            continue;
+        }
+        if let Some(needs_target) = posix_redirect_needs_target(raw) {
+            next_is_redirect_target = needs_target;
+            continue;
+        }
+        if is_env_assignment(raw) {
+            if raw.starts_with("POSIXLY_CORRECT=") {
+                saw_posixly = true;
+            }
+            continue;
+        }
+        let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+        let decoded = decoder
+            .decode(raw, ShellTokenRole::Syntax)
+            .unwrap_or(Cow::Borrowed(raw));
+        let basename = decoded
+            .rsplit('/')
+            .next()
+            .unwrap_or_else(|| decoded.as_ref());
+        return saw_posixly && basename.eq_ignore_ascii_case("modprobe");
+    }
+    false
+}
+
+fn fold_modprobe_env_into_command(command: &str, env: &ModprobeEnvState) -> Option<String> {
+    let tokens = tokenize_for_normalization(command);
+    let stmt_token_end = tokens
+        .iter()
+        .position(|token| token.kind == NormalizeTokenKind::Separator)
+        .unwrap_or(tokens.len());
+    let stmt_tokens = &tokens[..stmt_token_end];
+    let tail = tokens
+        .get(stmt_token_end)
+        .map_or("", |sep| &command[sep.byte_range.start..]);
+
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+    let mut leading_prefix: Vec<&str> = Vec::new();
+    let mut next_is_redirect_target = false;
+    let mut argv0_index = None;
+    for (idx, token) in stmt_tokens.iter().enumerate() {
+        let raw = token.text(command)?;
+        if next_is_redirect_target {
+            leading_prefix.push(raw);
+            next_is_redirect_target = false;
+            continue;
+        }
+        if let Some(needs_target) = posix_redirect_needs_target(raw) {
+            leading_prefix.push(raw);
+            next_is_redirect_target = needs_target;
+            continue;
+        }
+        if is_env_assignment(raw) {
+            leading_prefix.push(raw);
+            continue;
+        }
+        argv0_index = Some(idx);
+        break;
+    }
+    let argv0_index = argv0_index?;
+    let argv0_raw = stmt_tokens[argv0_index].text(command)?;
+    let decoded_argv0 = decoder.decode(argv0_raw, ShellTokenRole::Syntax)?;
+    let basename = decoded_argv0
+        .rsplit('/')
+        .next()
+        .unwrap_or_else(|| decoded_argv0.as_ref());
+    if !basename.eq_ignore_ascii_case("modprobe") {
+        return None;
+    }
+
+    let env_tokens: Vec<&str> = env
+        .modprobe_options
+        .as_deref()
+        .map(|opts| opts.split_ascii_whitespace().collect())
+        .unwrap_or_default();
+
+    let mut args: Vec<ModprobeFoldArg> =
+        Vec::with_capacity(env_tokens.len() + stmt_tokens.len().saturating_sub(argv0_index + 1));
+    for token in &env_tokens {
+        args.push(ModprobeFoldArg {
+            display: sanitize_modprobe_env_option_token(token),
+            decoded: (*token).to_string(),
+            is_redirection: false,
+        });
+    }
+    next_is_redirect_target = false;
+    for token in &stmt_tokens[argv0_index + 1..] {
+        let raw = token.text(command)?;
+        if next_is_redirect_target {
+            args.push(ModprobeFoldArg {
+                display: raw.to_string(),
+                decoded: raw.to_string(),
+                is_redirection: true,
+            });
+            next_is_redirect_target = false;
+            continue;
+        }
+        if let Some(needs_target) = posix_redirect_needs_target(raw) {
+            args.push(ModprobeFoldArg {
+                display: raw.to_string(),
+                decoded: raw.to_string(),
+                is_redirection: true,
+            });
+            next_is_redirect_target = needs_target;
+            continue;
+        }
+        let decoded = decoder
+            .decode(raw, ShellTokenRole::Syntax)
+            .map_or_else(|| raw.to_string(), Cow::into_owned);
+        args.push(ModprobeFoldArg {
+            display: raw.to_string(),
+            decoded,
+            is_redirection: false,
+        });
+    }
+
+    let insert_dd_at = if env.posixly_correct {
+        modprobe_posixly_correct_end_of_options(&args)
+    } else {
+        None
+    };
+
+    if env_tokens.is_empty() && insert_dd_at.is_none() {
+        return None;
+    }
+
+    let mut out = String::with_capacity(command.len() + 32);
+    for prefix in leading_prefix {
+        out.push_str(prefix);
+        out.push(' ');
+    }
+    if argv0_raw.contains(['\'', '"', '\\']) {
+        out.push_str(decoded_argv0.as_ref());
+    } else {
+        out.push_str(argv0_raw);
+    }
+    for (idx, arg) in args.iter().enumerate() {
+        if insert_dd_at == Some(idx) {
+            out.push_str(" --");
+        }
+        out.push(' ');
+        out.push_str(&arg.display);
+    }
+    if !tail.is_empty() {
+        out.push(' ');
+        out.push_str(tail);
+    }
+    Some(out)
 }
 
 /// Whether a recognized wrapper invalidates evidence from the caller's cwd or
@@ -7106,4 +7575,107 @@ fn test_attached_redirection_normalization_strips_exe_suffix() {
 #[test]
 fn test_numeric_fd_redirection_is_not_rewritten() {
     assert_eq!(normalize_command_word_token("2>/dev/null"), None);
+}
+
+#[test]
+fn strip_wrapper_prefixes_folds_modprobe_env_options_and_posixly_correct() {
+    // MODPROBE_OPTIONS prepends tokens before modprobe's argv.
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-r modprobe nvidia").normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes(r#"MODPROBE_OPTIONS="--remove-dependencies" modprobe nvidia"#)
+            .normalized,
+        "modprobe --remove-dependencies nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes(r#"MODPROBE_OPTIONS="-r -n" modprobe nvidia"#).normalized,
+        "modprobe -r -n nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes(r#"MODPROBE_OPTIONS="--config=/etc/m.conf -r" modprobe nvidia"#)
+            .normalized,
+        "modprobe --config=/etc/m.conf -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("env MODPROBE_OPTIONS=-r modprobe nvidia").normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("sudo env MODPROBE_OPTIONS=-r modprobe nvidia").normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-r sudo -E modprobe nvidia").normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-n MODPROBE_OPTIONS=-r modprobe nvidia")
+            .normalized,
+        "modprobe -r nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-r MODPROBE_OPTIONS=-n modprobe nvidia")
+            .normalized,
+        "modprobe -n nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-r env -u MODPROBE_OPTIONS modprobe nvidia")
+            .normalized,
+        "modprobe nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-r env -i modprobe nvidia").normalized,
+        "modprobe nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-r /usr/sbin/modprobe nvidia").normalized,
+        "/usr/sbin/modprobe -r nvidia"
+    );
+    // POSIXLY_CORRECT stops getopt permutation at the first non-option operand.
+    assert_eq!(
+        strip_wrapper_prefixes("POSIXLY_CORRECT=1 modprobe -r nvidia -n").normalized,
+        "modprobe -r -- nvidia -n"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("POSIXLY_CORRECT= modprobe -r nvidia -n").normalized,
+        "modprobe -r -- nvidia -n"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("POSIXLY_CORRECT=1 modprobe -n -r nvidia").normalized,
+        "modprobe -n -r -- nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("POSIXLY_CORRECT=1 modprobe -C /etc/m.conf -n -r nvidia").normalized,
+        "modprobe -C /etc/m.conf -n -r -- nvidia"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("POSIXLY_CORRECT=1 MODPROBE_OPTIONS=-r modprobe nvidia -n")
+            .normalized,
+        "modprobe -r -- nvidia -n"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("POSIXLY_CORRECT=1 modprobe --rem nvidia -n").normalized,
+        "modprobe --rem -- nvidia -n"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("POSIXLY_CORRECT=1 modprobe --conf /etc/m.conf -r nvidia -n")
+            .normalized,
+        "modprobe --conf /etc/m.conf -r -- nvidia -n"
+    );
+    // Non-modprobe commands are unaffected.
+    assert_eq!(
+        strip_wrapper_prefixes("POSIXLY_CORRECT=1 ls -la /tmp").normalized,
+        "ls -la /tmp"
+    );
+    assert_eq!(
+        strip_wrapper_prefixes("FOO=bar modprobe nvidia").normalized,
+        "modprobe nvidia"
+    );
+    // Compound tail is preserved verbatim.
+    assert_eq!(
+        strip_wrapper_prefixes("MODPROBE_OPTIONS=-r modprobe nvidia; echo done").normalized,
+        "modprobe -r nvidia ; echo done"
+    );
 }

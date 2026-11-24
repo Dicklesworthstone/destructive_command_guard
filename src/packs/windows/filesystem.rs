@@ -849,6 +849,170 @@ fn cmd_drive_target(decoded: &str) -> bool {
 /// word only when its prefix is exactly a protected internal command, and a
 /// switch word only when every piece is a one-letter switch or `/?`, so a
 /// path or a `/fs:NTFS`-style valued switch is never taken apart.
+fn split_cmd_packed_dynamic_switches(word: &str) -> Option<Vec<String>> {
+    if !word.starts_with('/') || !word.contains(['%', '!', '^']) {
+        return None;
+    }
+    let bytes = word.as_bytes();
+    let mut slash_positions = vec![0usize];
+    let mut index = 1usize;
+    let mut double = false;
+    while index < bytes.len() {
+        if let Some(end) = crate::normalize::cmd_expansion_end(bytes, index) {
+            index = end;
+            continue;
+        }
+        match bytes[index] {
+            b'"' => {
+                double = !double;
+                index += 1;
+            }
+            b'^' if !double => {
+                if bytes.get(index + 1) == Some(&b'%')
+                    && let Some(end) = crate::normalize::cmd_expansion_end(bytes, index + 1)
+                {
+                    index = end;
+                } else {
+                    index = index.saturating_add(2).min(bytes.len());
+                }
+            }
+            b'/' if !double => {
+                slash_positions.push(index);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    if slash_positions.len() < 2 {
+        return None;
+    }
+    let mut pieces = Vec::with_capacity(slash_positions.len());
+    for (idx, &start) in slash_positions.iter().enumerate() {
+        let end = slash_positions.get(idx + 1).copied().unwrap_or(word.len());
+        let piece = &word[start..end];
+        let is_plain_switch =
+            piece == "/?" || (piece.len() == 2 && piece.as_bytes()[1].is_ascii_alphabetic());
+        let is_dynamic_switch = piece.len() > 1 && piece.contains(['%', '!', '^']);
+        if !(is_plain_switch || is_dynamic_switch) {
+            return None;
+        }
+        pieces.push(piece.to_string());
+    }
+    Some(pieces)
+}
+
+fn cmd_first_glued_switch_slash(word: &str) -> Option<usize> {
+    let bytes = word.as_bytes();
+    let mut index = 0usize;
+    let mut double = false;
+    while index < bytes.len() {
+        if let Some(end) = crate::normalize::cmd_expansion_end(bytes, index) {
+            index = end;
+            continue;
+        }
+        match bytes[index] {
+            b'"' => {
+                double = !double;
+                index += 1;
+            }
+            b'^' if !double => {
+                if bytes.get(index + 1) == Some(&b'%')
+                    && let Some(end) = crate::normalize::cmd_expansion_end(bytes, index + 1)
+                {
+                    index = end;
+                } else {
+                    index = index.saturating_add(2).min(bytes.len());
+                }
+            }
+            b'/' if !double => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn symbolic_cmd_executable_may_split_into(word: &WindowsFilesystemWord, candidate: &str) -> bool {
+    if !word.dynamic || !word.may_split {
+        return false;
+    }
+    // An unquoted `%VAR%`/`!VAR!` in argv0 expands before whitespace
+    // splitting in cmd.exe: `set "x=d "` turns `r%x%md /s /q C:\` into
+    // `rd md /s /q C:\`. When a non-empty literal prefix before the first
+    // unquoted expansion prefixes a protected deletion command, the runtime
+    // argv0 can resolve to that command while pushing the remaining suffix
+    // into argv[1].
+    let Some(fragments) = word.cmd_fragments.as_ref() else {
+        return false;
+    };
+    let Some(first) = fragments.first() else {
+        return false;
+    };
+    if first.is_empty() {
+        return false;
+    }
+    let first_lower = first.to_ascii_lowercase();
+    candidate.to_ascii_lowercase().starts_with(&first_lower)
+}
+
+fn cmd_word_is_or_elides_to_call(word: &str) -> bool {
+    if word.contains('"') {
+        return false;
+    }
+    if !word.contains(['%', '!']) {
+        return word.trim_start_matches('@').eq_ignore_ascii_case("call");
+    }
+    let bytes = word.as_bytes();
+    let mut out = String::with_capacity(word.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if matches!(byte, b'%' | b'!')
+            && let Some(end) = crate::normalize::cmd_expansion_end(bytes, index)
+        {
+            index = end;
+            continue;
+        }
+        if byte == b'^' {
+            if bytes.get(index + 1) == Some(&b'%')
+                && let Some(end) = crate::normalize::cmd_expansion_end(bytes, index + 1)
+            {
+                index = end;
+                continue;
+            }
+            if let Some(&next) = bytes.get(index + 1) {
+                out.push(next as char);
+                index += 2;
+                continue;
+            }
+        }
+        out.push(byte as char);
+        index += 1;
+    }
+    out.trim_start_matches('@').eq_ignore_ascii_case("call")
+}
+
+fn cmd_leading_redirect_needs_target(word: &str) -> Option<bool> {
+    let bytes = word.as_bytes();
+    let mut index = bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    let redirect = *bytes.get(index)?;
+    if !matches!(redirect, b'<' | b'>') {
+        return None;
+    }
+    index += 1;
+    if bytes.get(index).is_some_and(|next| {
+        matches!(
+            (redirect, *next),
+            (b'>', b'>') | (b'>', b'&') | (b'<', b'<') | (b'<', b'>') | (b'<', b'&')
+        )
+    }) {
+        index += 1;
+    }
+    Some(index == bytes.len())
+}
+
 fn cmd_expand_glued_switches(words: Vec<&str>) -> Vec<String> {
     fn plain(word: &str) -> bool {
         !word.contains(['^', '%', '!', '"'])
@@ -863,30 +1027,68 @@ fn cmd_expand_glued_switches(words: Vec<&str>) -> Vec<String> {
             .then_some(pieces)
     }
     let mut out = Vec::with_capacity(words.len());
-    for (index, word) in words.into_iter().enumerate() {
-        if plain(word) {
-            if index == 0 {
-                if let Some((name, rest)) = word.split_once('/') {
-                    let is_internal = matches!(
-                        name.to_ascii_lowercase().as_str(),
-                        "del" | "erase" | "rd" | "rmdir" | "format"
-                    );
-                    if is_internal {
-                        if let Some(pieces) = switch_pieces(rest) {
-                            out.push(name.to_string());
-                            out.extend(pieces);
-                            continue;
-                        }
-                    }
-                }
-            } else if let Some(rest) = word.strip_prefix('/') {
-                if rest.contains('/') {
-                    if let Some(pieces) = switch_pieces(rest) {
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Cmd);
+    let mut at_executable = true;
+    let mut next_is_redirect_target = false;
+    for word in words {
+        if at_executable {
+            if next_is_redirect_target {
+                next_is_redirect_target = false;
+                out.push(word.to_string());
+                continue;
+            }
+            if let Some(needs_target) = cmd_leading_redirect_needs_target(word) {
+                next_is_redirect_target = needs_target;
+                out.push(word.to_string());
+                continue;
+            }
+            if cmd_word_is_or_elides_to_call(word) {
+                out.push(word.to_string());
+                continue;
+            }
+            at_executable = false;
+            if let Some(slash) = cmd_first_glued_switch_slash(word)
+                && slash > 0
+            {
+                let name = &word[..slash];
+                let rest = &word[slash + 1..];
+                if let Some(pieces) = switch_pieces(rest)
+                    && let Some(decoded) = decode_cmd_symbolic_word(&mut decoder, name)
+                {
+                    let exe = executable_word(decoded, ShellDialect::Cmd);
+                    let may_be_protected = CMD_PROTECTED_EXECUTABLES.iter().any(|candidate| {
+                        symbolic_word_may_equal(&exe, ShellDialect::Cmd, candidate)
+                    }) || [
+                        "del",
+                        "del.exe",
+                        "erase",
+                        "erase.exe",
+                        "rd",
+                        "rd.exe",
+                        "rmdir",
+                        "rmdir.exe",
+                    ]
+                    .iter()
+                    .any(|candidate| symbolic_cmd_executable_may_split_into(&exe, candidate));
+                    if may_be_protected {
+                        out.push(name.to_string());
                         out.extend(pieces);
                         continue;
                     }
                 }
             }
+        } else if plain(word)
+            && let Some(rest) = word.strip_prefix('/')
+            && rest.contains('/')
+            && let Some(pieces) = switch_pieces(rest)
+        {
+            out.extend(pieces);
+            continue;
+        } else if word.starts_with('/')
+            && let Some(pieces) = split_cmd_packed_dynamic_switches(word)
+        {
+            out.extend(pieces);
+            continue;
         }
         out.push(word.to_string());
     }
@@ -895,6 +1097,13 @@ fn cmd_expand_glued_switches(words: Vec<&str>) -> Vec<String> {
 
 fn cmd_segment_semantic_decision(segment: &str) -> WindowsFilesystemSemanticDecision {
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Cmd);
+    cmd_statement_tokens_semantic_decision(segment, &tokens)
+}
+
+fn cmd_statement_tokens_semantic_decision(
+    source: &str,
+    tokens: &[NormalizeToken],
+) -> WindowsFilesystemSemanticDecision {
     let word_count = tokens
         .iter()
         .filter(|token| token.kind == NormalizeTokenKind::Word)
@@ -907,34 +1116,59 @@ fn cmd_segment_semantic_decision(segment: &str) -> WindowsFilesystemSemanticDeci
         tokens
             .iter()
             .filter(|token| token.kind == NormalizeTokenKind::Word)
-            .filter_map(|token| token.text(segment))
+            .filter_map(|token| token.text(source))
             .collect(),
     );
     let mut raw_words = expanded_words.iter().map(String::as_str);
-    let Some(mut raw_executable) = raw_words.next() else {
+    let mut next_is_redirect_target = false;
+    let mut raw_executable = None;
+    for word in raw_words.by_ref() {
+        if next_is_redirect_target {
+            next_is_redirect_target = false;
+            continue;
+        }
+        if let Some(needs_target) = cmd_leading_redirect_needs_target(word) {
+            next_is_redirect_target = needs_target;
+            continue;
+        }
+        raw_executable = Some(word);
+        break;
+    }
+    let Some(mut raw_executable) = raw_executable else {
         return WindowsFilesystemSemanticDecision::NoMatch;
     };
     let mut decoder = ShellTokenDecoder::new(ShellDialect::Cmd);
-    let Some(mut executable) = decode_syntax_word(&mut decoder, raw_executable, ShellDialect::Cmd)
-    else {
+    let Some(mut executable) = decode_cmd_symbolic_word(&mut decoder, raw_executable) else {
         return WindowsFilesystemSemanticDecision::Unverified;
     };
     executable = executable_word(executable, ShellDialect::Cmd);
-    if !executable.dynamic && executable.decoded.eq_ignore_ascii_case("call") {
+    if cmd_word_is_or_elides_to_call(raw_executable) {
         let Some(next) = raw_words.next() else {
             return WindowsFilesystemSemanticDecision::NoMatch;
         };
         raw_executable = next;
-        let Some(decoded) = decode_syntax_word(&mut decoder, raw_executable, ShellDialect::Cmd)
-        else {
+        let Some(decoded) = decode_cmd_symbolic_word(&mut decoder, raw_executable) else {
             return WindowsFilesystemSemanticDecision::Unverified;
         };
         executable = executable_word(decoded, ShellDialect::Cmd);
     }
 
-    let might_be_protected = CMD_PROTECTED_EXECUTABLES
+    let possible_del = ["del", "del.exe", "erase", "erase.exe"]
+        .iter()
+        .any(|candidate| {
+            symbolic_word_may_equal(&executable, ShellDialect::Cmd, candidate)
+                || symbolic_cmd_executable_may_split_into(&executable, candidate)
+        });
+    let possible_rd = ["rd", "rd.exe", "rmdir", "rmdir.exe"]
+        .iter()
+        .any(|candidate| {
+            symbolic_word_may_equal(&executable, ShellDialect::Cmd, candidate)
+                || symbolic_cmd_executable_may_split_into(&executable, candidate)
+        });
+    let possible_format = ["format", "format.com", "format.exe"]
         .iter()
         .any(|candidate| symbolic_word_may_equal(&executable, ShellDialect::Cmd, candidate));
+    let might_be_protected = possible_del || possible_rd || possible_format;
     if !might_be_protected {
         return WindowsFilesystemSemanticDecision::NoMatch;
     }
@@ -964,7 +1198,7 @@ fn cmd_segment_semantic_decision(segment: &str) -> WindowsFilesystemSemanticDeci
     let mut literal_temp_targets = 0usize;
     let mut non_temp_target = false;
     for raw in raw_words {
-        let Some(decoded) = decode_syntax_word(&mut decoder, raw, ShellDialect::Cmd) else {
+        let Some(decoded) = decode_cmd_symbolic_word(&mut decoder, raw) else {
             return WindowsFilesystemSemanticDecision::Unverified;
         };
         if decoded.decoded.starts_with('/') || decoded.dynamic {
@@ -1015,15 +1249,6 @@ fn cmd_segment_semantic_decision(segment: &str) -> WindowsFilesystemSemanticDeci
         return WindowsFilesystemSemanticDecision::Destructive("format-drive");
     }
 
-    let possible_del = ["del", "del.exe", "erase", "erase.exe"]
-        .iter()
-        .any(|candidate| symbolic_word_may_equal(&executable, ShellDialect::Cmd, candidate));
-    let possible_rd = ["rd", "rd.exe", "rmdir", "rmdir.exe"]
-        .iter()
-        .any(|candidate| symbolic_word_may_equal(&executable, ShellDialect::Cmd, candidate));
-    let possible_format = ["format", "format.com", "format.exe"]
-        .iter()
-        .any(|candidate| symbolic_word_may_equal(&executable, ShellDialect::Cmd, candidate));
     if executable.dynamic && (possible_del || possible_rd) && recursive.possible
         || (exact_del || exact_rd) && recursive.possible && !recursive.exact
         || possible_format && drive_target.possible && (executable.dynamic || !drive_target.exact)
@@ -2285,6 +2510,39 @@ pub(crate) fn windows_filesystem_semantic_decision_in_dialect(
             WindowsFilesystemSemanticDecision::Incomplete => saw_incomplete = true,
             WindowsFilesystemSemanticDecision::Safe => saw_safe = true,
             WindowsFilesystemSemanticDecision::NoMatch => {}
+        }
+    }
+    // Percent variable names in cmd.exe may contain spaces, `&`, or `|`
+    // (`r%PATH:~0, 0%mdir /s /q C:\`, `r%NAME&WITH|PUNCT%mdir /s /q C:\`).
+    // Inspect the expansion-preserving token view too so those variable names
+    // cannot split argv0 across segments.
+    if dialect == ShellDialect::Cmd && command.contains('%') {
+        let expansion_tokens = crate::normalize::tokenize_cmd_expansion_view(command);
+        let mut start = 0usize;
+        let mut statements = 0usize;
+        for end in 0..=expansion_tokens.len() {
+            if end < expansion_tokens.len()
+                && expansion_tokens[end].kind != NormalizeTokenKind::Separator
+            {
+                continue;
+            }
+            let statement = &expansion_tokens[start..end];
+            start = end + 1;
+            if statement.is_empty() {
+                continue;
+            }
+            statements += 1;
+            if statements > MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS {
+                saw_incomplete = true;
+                break;
+            }
+            match cmd_statement_tokens_semantic_decision(command, statement) {
+                decision @ WindowsFilesystemSemanticDecision::Destructive(_) => return decision,
+                WindowsFilesystemSemanticDecision::Unverified => saw_unverified = true,
+                WindowsFilesystemSemanticDecision::Incomplete => saw_incomplete = true,
+                WindowsFilesystemSemanticDecision::Safe => saw_safe = true,
+                WindowsFilesystemSemanticDecision::NoMatch => {}
+            }
         }
     }
     if saw_unverified {
@@ -4348,5 +4606,60 @@ mod tests {
             ),
             WindowsFilesystemSemanticDecision::Destructive("rd-recursive")
         );
+    }
+
+    #[test]
+    fn cmd_dynamic_argv0_glued_switches_and_split_prefixes_fail_closed_j70t() {
+        for command in [
+            r"r%x%md /s /q C:\",
+            r"r%PATH:~0,0%md /s /q C:\",
+            r"r%x%mdir /s /q C:\",
+            r"r%PATH:~0, 0%mdir /s /q C:\",
+            r"r%NAME\WITH\SEP%mdir /s /q C:\",
+            r"r%NAME&WITH|PUNCT%mdir /s /q C:\",
+            r"r%x%mdir/s/q C:\",
+            r"r%x%d/s/q C:\",
+            r"d%x%el/s/q C:\",
+            r"call r%x%mdir/s/q C:\",
+            r"ca%x%ll r%x%md /s /q C:\",
+            r"ca%x%ll r%x%mdir/s/q C:\",
+            r"C:\Windows\System32\r%x%md /s /q C:\",
+            r"form%x%at/q C:",
+        ] {
+            for dialect in [ShellDialect::Cmd, ShellDialect::Unknown] {
+                assert_eq!(
+                    windows_filesystem_semantic_decision_in_dialect(command, dialect),
+                    WindowsFilesystemSemanticDecision::Unverified,
+                    "{dialect:?}: {command}"
+                );
+                assert!(
+                    windows_filesystem_semantic_scan_required(command, dialect),
+                    "{dialect:?}: {command}"
+                );
+            }
+        }
+
+        for benign in [
+            r"echo %PATH%",
+            r"dir %USERPROFILE%",
+            r"dir /s %USERPROFILE%",
+            r"r%x%md C:\empty_dir",
+            r#""r%x%md" /s /q C:\"#,
+            r"run_%ENV%.exe /s",
+            r"deploy_%ENV%.cmd /s",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(benign, ShellDialect::Cmd),
+                WindowsFilesystemSemanticDecision::NoMatch,
+                "benign cmd must not trigger windows.filesystem: {benign}"
+            );
+        }
+        for help in [r"rd /?", r"r%x%mdir /?", r"r%x%md /?"] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(help, ShellDialect::Cmd),
+                WindowsFilesystemSemanticDecision::Safe,
+                "help invocation must stay safe: {help}"
+            );
+        }
     }
 }

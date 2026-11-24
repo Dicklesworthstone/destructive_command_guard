@@ -60,10 +60,10 @@ macro_rules! modprobe_dry_run_ahead {
 /// abbreviation of it, or a short-flag cluster holding `r` such as `-rf`),
 /// unless they ask for a dry run.
 ///
-/// `MODPROBE_OPTIONS=-r`/`POSIXLY_CORRECT` prefixes cannot be matched here:
-/// the evaluator strips a leading environment assignment as a wrapper before
-/// any pack sees the command, so the variable is gone by match time. That
-/// env-layer bypass is bd-modprobe-env-option-bypass-fhep.
+/// `MODPROBE_OPTIONS` and `POSIXLY_CORRECT` leading assignments (bare or via
+/// `env`/`sudo`) are folded into the `modprobe` command by
+/// `normalize::strip_wrapper_prefixes` before this rule runs
+/// (bd-modprobe-env-option-bypass-fhep).
 macro_rules! modprobe_removal {
     () => {
         concat!(

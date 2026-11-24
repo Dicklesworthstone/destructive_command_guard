@@ -17580,12 +17580,16 @@ fn view_decode_exposes_pack_keyword(
         return view_escape_present || elided.is_some();
     };
     // The elided view is measured against cmd's own view, so it answers only
-    // for what the expansions hid.
+    // for what the expansions hid. An argv0 whose elided spelling names an
+    // enabled keyword also requires a Cmd replay even if that same keyword
+    // already appeared elsewhere in the command (e.g., in an earlier segment
+    // or a registry path such as `re%x%g delete HKLM\Software\reg\Foo`).
     (view_escape_present
         && index.exposes_keyword_absent_from(view_normalized.as_ref(), posix_normalized.as_ref()))
         || elided.is_some_and(|elided| {
             index.exposes_keyword_absent_from(&elided, view_normalized.as_ref())
         })
+        || (view == ShellDialect::Cmd && cmd_elided_argv0_matches_keyword(command, index))
 }
 
 /// The byte ranges of cmd.exe `%NAME%`, delayed `!NAME!` and batch-parameter
@@ -17687,6 +17691,190 @@ fn elide_cmd_percent_expansions(command: &str) -> Option<String> {
         elided.push_str(&command[copied_from..]);
         elided
     })
+}
+
+fn cmd_elided_argv0_has_nonempty_basename(elided: &str) -> bool {
+    let unquoted: String = elided.chars().filter(|&ch| ch != '"').collect();
+    let trimmed = unquoted.trim_start_matches('@');
+    let after_backslash = trimmed.rsplit('\\').next().unwrap_or(trimmed).trim();
+    !after_backslash.is_empty() && after_backslash.chars().any(char::is_alphanumeric)
+}
+
+/// Elide active `%NAME%` and `!NAME!` expansions from one Cmd argv0 word.
+///
+/// Matches cmd.exe's two-phase expansion precedence: `%NAME%` expands before
+/// caret removal (so `^%x%` still expands), whereas unquoted `^!` escapes `!`
+/// into a literal exclamation mark (so `vssad^!LITERAL^!%EMPTY%min` elides
+/// only `%EMPTY%` and does not collapse into `vssadmin`).
+fn elide_cmd_argv0_word(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut spans = Vec::new();
+    let mut index = 0usize;
+    let mut double = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%'
+            && let Some(end) = crate::normalize::cmd_expansion_end(bytes, index)
+        {
+            spans.push(index..end);
+            index = end;
+            continue;
+        }
+        if byte == b'!'
+            && let Some(end) = crate::normalize::cmd_expansion_end(bytes, index)
+        {
+            spans.push(index..end);
+            index = end;
+            continue;
+        }
+        match byte {
+            b'"' => {
+                double = !double;
+                index += 1;
+            }
+            b'^' if !double => {
+                if bytes.get(index + 1) == Some(&b'%')
+                    && let Some(end) = crate::normalize::cmd_expansion_end(bytes, index + 1)
+                {
+                    spans.push(index + 1..end);
+                    index = end;
+                } else {
+                    // Caret escapes the next byte (including `^!`).
+                    index = index.saturating_add(2).min(bytes.len());
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    if spans.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut copied_from = 0usize;
+    for span in spans {
+        out.push_str(&raw[copied_from..span.start]);
+        copied_from = span.end;
+    }
+    out.push_str(&raw[copied_from..]);
+    Some(out)
+}
+
+fn cmd_elided_argv0_edits_for_tokens(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut edits = Vec::new();
+    let mut start = 0usize;
+    for end in 0..=tokens.len() {
+        if end < tokens.len() && tokens[end].kind != NormalizeTokenKind::Separator {
+            continue;
+        }
+        let statement = &tokens[start..end];
+        start = end + 1;
+        let mut next_is_redirect_target = false;
+        for token in statement {
+            let Some(raw) = token.text(command) else {
+                break;
+            };
+            if next_is_redirect_target {
+                next_is_redirect_target = false;
+                continue;
+            }
+            if let Some(needs_target) = cmd_leading_redirect_needs_target(raw) {
+                next_is_redirect_target = needs_target;
+                continue;
+            }
+            if !raw.contains(['"', '%', '!'])
+                && raw.trim_start_matches('@').eq_ignore_ascii_case("call")
+            {
+                continue;
+            }
+            if raw.contains(['%', '!'])
+                && let Some(elided_word) = elide_cmd_argv0_word(raw)
+                && cmd_elided_argv0_has_nonempty_basename(&elided_word)
+            {
+                let is_obfuscated_call = !raw.contains('"')
+                    && elided_word
+                        .trim_start_matches('@')
+                        .eq_ignore_ascii_case("call");
+                edits.push((token.byte_range.clone(), elided_word));
+                if is_obfuscated_call {
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+    edits
+}
+
+/// Collect `(byte_range, elided_word)` edits for Cmd executable-position words
+/// that contain `%NAME%`/`!NAME!` expansions while leaving a non-empty
+/// executable basename (bd-cmd-dynamic-argv0-windows-rules-j70t).
+///
+/// Inspects both the expansion-preserving token view (so spaces/`&`/`|` inside
+/// a `%NAME%` variable name stay inside argv0) and the standard Cmd token view
+/// (so an earlier undefined `%undefined` token cannot swallow a later `& argv0`
+/// boundary). Argument words and wholly dynamic executables like `%TOOL%` are
+/// left untouched.
+fn cmd_elided_argv0_edits(command: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    if !command.contains(['%', '!']) {
+        return Vec::new();
+    }
+    let mut edits = if command.contains('%') {
+        let expansion_tokens = crate::normalize::tokenize_cmd_expansion_view(command);
+        cmd_elided_argv0_edits_for_tokens(command, &expansion_tokens)
+    } else {
+        Vec::new()
+    };
+    let native_tokens = tokenize_for_shell_dialect(command, ShellDialect::Cmd);
+    for edit in cmd_elided_argv0_edits_for_tokens(command, &native_tokens) {
+        let overlaps = edits
+            .iter()
+            .any(|(existing, _)| edit.0.start < existing.end && existing.start < edit.0.end);
+        if !overlaps {
+            edits.push(edit);
+        }
+    }
+    edits.sort_unstable_by_key(|(range, _)| range.start);
+    edits
+}
+
+/// `command` with `%NAME%`/`!NAME!` expansions elided ONLY in Cmd executable
+/// (argv0) positions, or `None` when no argv0 had such an expansion.
+fn cmd_elided_argv0_view(command: &str) -> Option<String> {
+    let edits = cmd_elided_argv0_edits(command);
+    if edits.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(command.len());
+    let mut copied_from = 0usize;
+    for (range, replacement) in edits {
+        if range.start > copied_from {
+            out.push_str(&command[copied_from..range.start]);
+        }
+        out.push_str(&replacement);
+        copied_from = range.end;
+    }
+    if copied_from < command.len() {
+        out.push_str(&command[copied_from..]);
+    }
+    Some(out)
+}
+
+/// Whether eliding `%NAME%`/`!NAME!` in any Cmd executable word produces an
+/// executable token containing a keyword tracked by `index`.
+fn cmd_elided_argv0_matches_keyword(
+    command: &str,
+    index: &crate::packs::EnabledKeywordIndex,
+) -> bool {
+    cmd_elided_argv0_edits(command)
+        .into_iter()
+        .any(|(_, elided_word)| {
+            let normalized =
+                crate::normalize::normalize_command_in_dialect(&elided_word, ShellDialect::Cmd);
+            index.has_any_keyword(normalized.as_ref())
+        })
 }
 
 /// Whether `view`'s parse of `command` exposes command segments the POSIX parse
@@ -17989,6 +18177,81 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                         info.matched_span = None;
                     }
                 }
+            }
+        }
+    }
+    // In cmd.exe, `%VAR%` (e.g. `%PATH:~0,0%` which is always empty) and
+    // delayed `!VAR!` expand before command lookup, so `re%x%g delete ...` or
+    // `wba%x%dmin delete catalog` runs the real Windows program while regex
+    // rules see the unexpanded spelling (bd-cmd-dynamic-argv0-windows-rules-j70t).
+    // Re-evaluate with expansions elided in executable (argv0) positions only,
+    // deny-wins, preserving explicit as-written allowances and AllowOnce.
+    if shell_dialect == ShellDialect::Cmd
+        && result.decision == EvaluationDecision::Allow
+        && result.bypass_method != Some(BypassMethod::AllowOnce)
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+        && let Some(elided) = cmd_elided_argv0_view(command)
+    {
+        let mut alternate = if deadline_exceeded(deadline) {
+            EvaluationResult::indeterminate_due_to_budget()
+        } else {
+            evaluate_command_in_dialect_union(
+                &elided,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path,
+                deadline,
+                ShellDialect::Cmd,
+                nested_command_depth,
+                inherited_automated_stdin,
+            )
+        };
+        if alternate.decision == EvaluationDecision::Allow
+            && let Some(folded) =
+                crate::normalize::fold_program_name_case(&elided, enabled_keywords)
+        {
+            let folded_alt = if deadline_exceeded(deadline) {
+                EvaluationResult::indeterminate_due_to_budget()
+            } else {
+                evaluate_command_in_dialect_union(
+                    &folded,
+                    enabled_keywords,
+                    ordered_packs,
+                    keyword_index,
+                    compiled_overrides,
+                    allowlists,
+                    heredoc_settings,
+                    None,
+                    project_path,
+                    deadline,
+                    ShellDialect::Cmd,
+                    nested_command_depth,
+                    inherited_automated_stdin,
+                )
+            };
+            if matches!(
+                folded_alt.decision,
+                EvaluationDecision::Deny | EvaluationDecision::Indeterminate
+            ) || (alternate.effective_mode.is_none() && folded_alt.effective_mode.is_some())
+            {
+                alternate = folded_alt;
+            }
+        }
+        let adopt = match alternate.decision {
+            EvaluationDecision::Deny | EvaluationDecision::Indeterminate => true,
+            EvaluationDecision::Allow => {
+                result.effective_mode.is_none() && alternate.effective_mode.is_some()
+            }
+        };
+        if adopt {
+            result = alternate;
+            if let Some(info) = result.pattern_info.as_mut() {
+                info.matched_span = None;
             }
         }
     }
@@ -29634,9 +29897,27 @@ fn evaluate_packs_with_allowlists_at_depth(
                 }
                 let sanitized_segment = sanitize_for_pattern_matching(segment);
                 let segment_for_match = sanitized_segment.as_ref();
+                // Compound commands only ran `strip_wrapper_prefixes` at the
+                // start of the whole line. For `system.services`, normalize
+                // later segments too so `echo ok && MODPROBE_OPTIONS=-r modprobe x`
+                // and `echo ok && POSIXLY_CORRECT=1 modprobe -r x -n` fold their
+                // env vars just like single-segment commands
+                // (bd-modprobe-env-option-bypass-fhep).
+                let services_stripped = (pack_id == "system.services"
+                    && matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown))
+                .then(|| crate::normalize::strip_wrapper_prefixes(segment_for_match))
+                .filter(|stripped| stripped.normalized.as_ref() != segment_for_match);
+                let effective_segment = services_stripped
+                    .as_ref()
+                    .map_or(segment_for_match, |stripped| stripped.normalized.as_ref());
+                let effective_offset = if services_stripped.is_some() {
+                    None
+                } else {
+                    normalized_offset
+                };
                 if safe_inputs.matches(
                     pack,
-                    segment_for_match,
+                    effective_segment,
                     Some((segment_start, segment_end)),
                     deadline,
                 ) {
@@ -29656,11 +29937,11 @@ fn evaluate_packs_with_allowlists_at_depth(
                 if let Some(result) = evaluate_pack_destructive_patterns(
                     pack_id,
                     pack,
-                    segment_for_match,
+                    effective_segment,
                     shell_dialect,
                     segment_start,
                     original_command,
-                    normalized_offset,
+                    effective_offset,
                     original_len,
                     allowlists,
                     project_path,
@@ -29689,6 +29970,18 @@ fn evaluate_packs_with_allowlists_at_depth(
                 // segment. Re-running this regex across the whole compound
                 // command would recreate cross-boundary and nested-data false
                 // positives.
+                continue;
+            }
+            if has_compound_segments
+                && pack_id == "system.services"
+                && pattern.name == Some("modprobe-remove")
+                && matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+            {
+                // `modprobe-remove` is executable-scoped to one `modprobe`
+                // segment and was already evaluated per-segment with
+                // `MODPROBE_OPTIONS` / `POSIXLY_CORRECT` env folding applied.
+                // Re-running on the raw whole command would undo an env-folded
+                // dry run like `echo ok && MODPROBE_OPTIONS=-n modprobe -r x`.
                 continue;
             }
 
@@ -67620,6 +67913,44 @@ mod windows_redirection_free_view_tests {
                 windows_redirection_free_view(command, dialect),
                 None,
                 "{dialect:?} {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_elided_argv0_view_elides_only_executable_words_j70t() {
+        for (command, expected) in [
+            (
+                r"re%x%g delete HKLM\Software\Foo /f",
+                Some(r"reg delete HKLM\Software\Foo /f"),
+            ),
+            (
+                r"C:\Windows\System32\vssad%PATH:~0,0%min.exe delete shadows /all",
+                Some(r"C:\Windows\System32\vssadmin.exe delete shadows /all"),
+            ),
+            (
+                r"call re%x%g delete HKLM\Foo & ws%x%l --unregister Ubuntu",
+                Some(r"call reg delete HKLM\Foo & wsl --unregister Ubuntu"),
+            ),
+            (
+                r"2>nul re!x!g delete HKLM\Foo /f",
+                Some(r"2>nul reg delete HKLM\Foo /f"),
+            ),
+            (
+                r"ca%x%ll re%x%g delete HKLM\Foo /f",
+                Some(r"call reg delete HKLM\Foo /f"),
+            ),
+            // Arguments and wholly-dynamic argv0 stay untouched.
+            (r"echo %PATH%", None),
+            (r"dir %USERPROFILE%", None),
+            (r#"echo "re%x%g delete HKLM\Foo""#, None),
+            (r"%LOGGER% rmmod nvidia", None),
+            (r"%DIR%\ foo", None),
+        ] {
+            assert_eq!(
+                cmd_elided_argv0_view(command).as_deref(),
+                expected,
+                "{command:?}"
             );
         }
     }
