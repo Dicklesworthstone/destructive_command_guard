@@ -37,6 +37,21 @@ which read as "allow when analysis fails". The settings choose bounded fallback
 scanning, and the JSON now uses the names you write in `[heredoc]`. Scripts that
 parse this output need the new key names.
 
+**A quoted `for` loop word that the loop only prints no longer trips
+`containers.docker` (#666).** `for c in 'git status' 'docker rm -f web'; do
+printf '%s\n' "$c"; done` was denied as `containers.docker:rm-force` although
+nothing ran the text. The docker rules now stand down for that shape only: the
+docker text is one quoted word of a `for` or `select` list whose variable name
+is lowercase (and not zsh's `prompt`), every other statement is `do`, `done`,
+`printf` (with a literal format and no options), `echo`, `:`, `true`, `break`
+or `continue`, and the command has no pipe, redirection, substitution,
+assignment, function definition or `$` other than a plain `"$name"` with no
+`[` after it. A loop body or later statement that runs the word (`$c`,
+`eval "$c"`, `sh -c "$c"`, `hyperfine "$c"`), a pipe or redirect of the printed
+text, a loop variable such as `PAGER` that another program runs, and a `printf`
+the command rebinds all still deny. Quoted docker text outside a loop keeps its
+previous verdict.
+
 ---
 
 ## [v0.17.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.17.1) -- 2026-11-23 [Release]

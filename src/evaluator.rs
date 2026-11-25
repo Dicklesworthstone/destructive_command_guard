@@ -38097,7 +38097,12 @@ fn command_pattern_match_is_inert_quoted_data(
             .is_some_and(|word| {
                 word.eq_ignore_ascii_case("dcg") || word.eq_ignore_ascii_case("dcg.exe")
             });
-    if (!matches!(pack_id, "core.git" | "core.filesystem") && !guardrail_dcg_invocation)
+    // The docker rules take this reading too (#666), but only for the loop
+    // shape `docker_match_is_printed_loop_word` checks.
+    let docker_rule = pack_id == "containers.docker";
+    if (!matches!(pack_id, "core.git" | "core.filesystem")
+        && !guardrail_dcg_invocation
+        && !docker_rule)
         || is_core_filesystem_redirect_rule(pack_id, pattern_name)
     {
         return false;
@@ -38134,6 +38139,25 @@ fn command_pattern_match_is_inert_quoted_data(
     else {
         return false;
     };
+    // The loop check reads the whole command: a view of one segment would
+    // not show the body that runs the loop variable.
+    if docker_rule {
+        let (whole, base) = source_context.unwrap_or((command, 0));
+        let is_slice_of_whole = base
+            .checked_add(command.len())
+            .and_then(|end| whole.get(base..end))
+            .is_some_and(|slice| slice == command);
+        if !is_slice_of_whole
+            || !docker_match_is_printed_loop_word(
+                whole,
+                base.saturating_add(keyword_offset),
+                base.saturating_add(span.end),
+                shell_dialect,
+            )
+        {
+            return false;
+        }
+    }
 
     // The quote reading below is POSIX. PowerShell does not escape with a
     // backslash, so POSIX reads `echo "x\"; git reset --hard; \"y"` as one
@@ -38186,6 +38210,184 @@ fn command_pattern_match_is_inert_quoted_data(
                 source_base..source_base.saturating_add(command.len()),
             ))
     })
+}
+
+/// Whether a `containers.docker` match is a word of a `for`/`select` list
+/// that the loop only prints (#666).
+///
+/// The quoted-data reading above was built for the core git rules. Quoted
+/// text reaches a shell through many more programs than dcg models: anything
+/// that runs a command string it is handed (`watchexec '…'`, `hyperfine '…'`,
+/// `sg group '…'`, `man -P '…'`, `rsync -e '…'`), a `PAGER` or `EDITOR`
+/// value that another program runs, or a file the command writes and then
+/// executes. So the docker rules take that reading only for the loop shape,
+/// checked against a small grammar instead of a list of dangerous programs:
+///
+/// * the match lies inside one quoted part of a word in the list of a
+///   `for NAME in …` or `select NAME in …` header, and NAME is lowercase, so
+///   it is not an exported setting such as `PAGER` that some program runs,
+///   and does not contain `prompt` (zsh's `prompt` is `PS1`, which
+///   `PROMPT_SUBST` expands);
+/// * every other statement is `do`, `done`, or an unquoted `printf`, `echo`,
+///   `true`, `:`, `break` or `continue`; `printf` takes no option and its
+///   format is not an expansion (`printf -v NAME` assigns, and
+///   `printf "$opt"` can be `-v`);
+/// * statements are separated only by `;` or newlines; outside quotes there
+///   is no pipe, `&`, redirection, parenthesis, brace, `#`, `!` or `=`; and
+///   outside single quotes there is no backslash, backquote or `$`, except
+///   `"$name"` inside double quotes when no `[` follows it (zsh reads
+///   `$name[…]` as a subscript and evaluates it).
+///
+/// Anything else keeps the verdict the docker rules gave before. Only the
+/// POSIX dialect takes this reading.
+fn docker_match_is_printed_loop_word(
+    command: &str,
+    keyword_offset: usize,
+    match_end: usize,
+    dialect: ShellDialect,
+) -> bool {
+    /// One shell word: its text without quotes, and the byte ranges of its
+    /// quoted parts (inside the quotes), and whether it expands a variable.
+    #[derive(Default)]
+    struct Word {
+        text: String,
+        quoted: Vec<std::ops::Range<usize>>,
+        expands: bool,
+    }
+
+    if dialect != ShellDialect::Posix {
+        return false;
+    }
+    let Some(matched) = command.get(keyword_offset..match_end) else {
+        return false;
+    };
+    // The patterns may take an optional closing quote after their last word
+    // (`-f'`); that byte belongs to the string, not to the words.
+    let words_len = matched.trim_end_matches(['\'', '"']).len();
+    let Some(last_word_byte) = keyword_offset
+        .checked_add(words_len)
+        .and_then(|end| end.checked_sub(1))
+    else {
+        return false;
+    };
+
+    let bytes = command.as_bytes();
+    let mut statements: Vec<Vec<Word>> = vec![Vec::new()];
+    let mut word: Option<Word> = None;
+    let mut index = 0usize;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b' ' | b'\t' | b';' | b'\n' => {
+                if let (Some(finished), Some(statement)) = (word.take(), statements.last_mut()) {
+                    statement.push(finished);
+                }
+                if matches!(byte, b';' | b'\n') {
+                    statements.push(Vec::new());
+                }
+                index += 1;
+            }
+            b'\'' => {
+                let start = index + 1;
+                let Some(len) = command[start..].find('\'') else {
+                    return false;
+                };
+                let current = word.get_or_insert_with(Word::default);
+                current.text.push_str(&command[start..start + len]);
+                current.quoted.push(start..start + len);
+                index = start + len + 1;
+            }
+            b'"' => {
+                let start = index + 1;
+                let mut end = start;
+                let mut expands = false;
+                loop {
+                    match bytes.get(end) {
+                        Some(b'"') => break,
+                        // Only a plain `$name` expands here.
+                        Some(b'$') => {
+                            let name = &bytes[end + 1..];
+                            let len = name
+                                .iter()
+                                .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+                                .count();
+                            if len == 0 || name[0].is_ascii_digit() || name.get(len) == Some(&b'[')
+                            {
+                                return false;
+                            }
+                            expands = true;
+                            end += 1 + len;
+                        }
+                        Some(b'`' | b'\\') | None => return false,
+                        Some(_) => end += 1,
+                    }
+                }
+                let current = word.get_or_insert_with(Word::default);
+                current.text.push_str(&command[start..end]);
+                current.quoted.push(start..end);
+                current.expands |= expands;
+                index = end + 1;
+            }
+            b'|' | b'&' | b'<' | b'>' | b'(' | b')' | b'{' | b'}' | b'\\' | b'#' | b'!' | b'='
+            | b'`' | b'$' | b'\r' => return false,
+            _ => {
+                let Some(ch) = command[index..].chars().next() else {
+                    return false;
+                };
+                word.get_or_insert_with(Word::default).text.push(ch);
+                index += ch.len_utf8();
+            }
+        }
+    }
+    if let (Some(finished), Some(statement)) = (word.take(), statements.last_mut()) {
+        statement.push(finished);
+    }
+
+    let mut in_loop_list = false;
+    for statement in &statements {
+        let words = match statement.as_slice() {
+            [first, rest @ ..] if first.quoted.is_empty() && first.text == "do" => rest,
+            words => words,
+        };
+        let Some((first, rest)) = words.split_first() else {
+            continue;
+        };
+        if !first.quoted.is_empty() {
+            return false;
+        }
+        match first.text.as_str() {
+            "for" | "select" => {
+                let [name, keyword_in, list @ ..] = rest else {
+                    return false;
+                };
+                let lowercase_name = name.quoted.is_empty()
+                    && name
+                        .text
+                        .bytes()
+                        .next()
+                        .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+                    && name
+                        .text
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                    && !name.text.contains("prompt");
+                if !lowercase_name || !keyword_in.quoted.is_empty() || keyword_in.text != "in" {
+                    return false;
+                }
+                in_loop_list |= list.iter().any(|item| {
+                    item.quoted.iter().any(|part| {
+                        part.contains(&keyword_offset) && part.contains(&last_word_byte)
+                    })
+                });
+            }
+            "done" if rest.is_empty() => {}
+            "printf"
+                if rest.first().is_none_or(|format| !format.expands)
+                    && rest.iter().all(|arg| !arg.text.starts_with('-')) => {}
+            "echo" | "true" | ":" | "break" | "continue" => {}
+            _ => return false,
+        }
+    }
+    in_loop_list
 }
 
 /// True when the command contains at least one dynamic-path marker
