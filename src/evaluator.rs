@@ -38234,7 +38234,10 @@ fn command_pattern_match_is_inert_quoted_data(
 /// * every other statement is `do`, `done`, or an unquoted `printf`, `echo`,
 ///   `true`, `:`, `break` or `continue`; `printf` takes no option and its
 ///   format is not an expansion (`printf -v NAME` assigns, and
-///   `printf "$opt"` can be `-v`);
+///   `printf "$opt"` can be `-v`) and converts only as text (`%s`, `%b`,
+///   `%q`, `%%`; see `printf_format_only_prints_text`), and `break` and
+///   `continue` take at most a literal count, since a numeric conversion and
+///   a loop count read their argument as a number, not as text;
 /// * statements are separated only by `;` or newlines; outside quotes there
 ///   is no pipe, `&`, redirection, parenthesis, brace, `#`, `!` or `=`; and
 ///   outside single quotes there is no backslash, backquote or `$`, except
@@ -38386,13 +38389,62 @@ fn docker_match_is_printed_loop_word(
             }
             "done" if rest.is_empty() => {}
             "printf"
-                if rest.first().is_none_or(|format| !format.expands)
-                    && rest.iter().all(|arg| !arg.text.starts_with('-')) => {}
-            "echo" | "true" | ":" | "break" | "continue" => {}
+                if rest.first().is_none_or(|format| {
+                    !format.expands && printf_format_only_prints_text(&format.text)
+                }) && rest.iter().all(|arg| !arg.text.starts_with('-')) => {}
+            "echo" | "true" | ":" => {}
+            "break" | "continue"
+                if rest.iter().all(|count| {
+                    count.quoted.is_empty()
+                        && !count.text.is_empty()
+                        && count.text.bytes().all(|b| b.is_ascii_digit())
+                }) => {}
             _ => return false,
         }
     }
     in_loop_list
+}
+
+/// Whether a literal `printf` format, read by the #666 loop check, converts
+/// its arguments only as text: each conversion is `%s`, `%b`, `%q` or `%%`,
+/// with optional flags, width and precision digits. The numeric conversions,
+/// `%n`, `*` widths and `%N$` positions read their argument as a number or a
+/// name rather than as text. Escapes are limited to the character escapes,
+/// so none can spell a `%`, and a glob character, which could turn the word
+/// into file names, keeps the format out.
+fn printf_format_only_prints_text(format: &str) -> bool {
+    let bytes = format.as_bytes();
+    let mut index = 0usize;
+    while let Some(&byte) = bytes.get(index) {
+        index += 1;
+        match byte {
+            b'*' | b'?' | b'[' | b']' | b'~' => return false,
+            b'\\' => {
+                if !matches!(
+                    bytes.get(index),
+                    Some(
+                        b'n' | b't' | b'r' | b'a' | b'b' | b'f' | b'v' | b'e' | b'E' | b'c' | b'\\'
+                    )
+                ) {
+                    return false;
+                }
+                index += 1;
+            }
+            b'%' => {
+                while bytes.get(index).is_some_and(|b| {
+                    matches!(b, b'-' | b'+' | b' ' | b'#' | b'.') || b.is_ascii_digit()
+                }) {
+                    index += 1;
+                }
+                if !matches!(bytes.get(index), Some(b's' | b'b' | b'q' | b'%')) {
+                    return false;
+                }
+                index += 1;
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// True when the command contains at least one dynamic-path marker

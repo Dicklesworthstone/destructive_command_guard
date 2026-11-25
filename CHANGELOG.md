@@ -44,8 +44,9 @@ nothing ran the text. The docker rules now stand down for that shape only: the
 docker text is one quoted word of a `for` or `select` list whose variable name
 is lowercase (and not zsh's `prompt`, `mailpath` or a search path such as
 `path`), every other statement is `do`, `done`,
-`printf` (with a literal format and no options), `echo`, `:`, `true`, `break`
-or `continue`, and the command has no pipe, redirection, substitution,
+`printf` (with no options and a literal format whose conversions are `%s`,
+`%b`, `%q` or `%%`), `echo`, `:`, `true`, or `break` or `continue` with at most a
+literal count, and the command has no pipe, redirection, substitution,
 assignment, function definition or `$` other than a plain `"$name"` with no
 `[` after it. A loop body or later statement that runs the word (`$c`,
 `eval "$c"`, `sh -c "$c"`, `hyperfine "$c"`), a pipe or redirect of the printed

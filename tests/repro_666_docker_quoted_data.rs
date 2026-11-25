@@ -3,8 +3,9 @@
 //! body only prints it. The docker rules now stand down for that shape: the
 //! text is one quoted word of a `for`/`select` list with a lowercase loop
 //! variable (not zsh's `prompt`, `mailpath` or a search path), and every
-//! other statement only prints (`printf` with a literal format and no
-//! options, `echo`, `:`, `true`, `break`, `continue`), with no pipe,
+//! other statement only prints (`printf` with a literal format of text
+//! conversions and no options, `echo`, `:`, `true`, and `break` or `continue`
+//! with at most a literal count), with no pipe,
 //! redirection, substitution, assignment or function definition anywhere.
 //! Every other way the loop text could reach a shell still denies.
 //!
@@ -126,6 +127,13 @@ fn quoted_docker_loop_words_that_are_only_printed_are_allowed_issue_666() {
         "for cmd in 'docker system prune -af' 'docker rm -f web'; do echo \"$cmd\"; done; true",
         "select c in 'docker rm -f web'; do echo \"$c\"; break; done",
         "for c in 'git status' 'docker rm -f web'\ndo\n  printf '%s\\n' \"$c\"\ndone",
+        // Text conversions with flags and widths, a format with no
+        // conversion, and literal loop counts.
+        "for c in 'docker rm -f web'; do printf '%-20s|%5.3s|%q|%b%%\\t\\n' \"$c\" \"$c\" \"$c\" \"$c\"; done",
+        "for c in 'docker rm -f web'; do printf \"%s \" \"$c\"; done",
+        "for c in 'docker rm -f web'; do printf 'item\\n'; done",
+        "for i in 1; do for c in 'docker rm -f web'; do echo \"$c\"; break 2; done; done",
+        "for c in 'docker rm -f web'; do echo \"$c\"; continue 1; done",
     ];
     assert_all(&commands, "allow");
 }
@@ -181,6 +189,27 @@ fn loop_words_that_can_reach_a_shell_still_deny_issue_666() {
         "for c in 'docker rm -f web'; do PAGER=$c git log; done",
         "for c in 'docker rm -f web'; do export PAGER=\"$c\"; man ls; done",
         "for c in 'docker rm -f web'; do printf -v PAGER '%s' \"$c\"; export PAGER; man ls; done",
+        // Only text conversions and literal loop counts take the reading: a
+        // numeric conversion, `%n`, a `*` width, a `%N$` position, an escape
+        // other than a character escape, a glob in the format, or a loop
+        // count that is not a literal number keeps the docker verdict.
+        "for c in 'docker rm -f web'; do printf '%d\\n' \"$c\"; done",
+        "for c in 'docker rm -f web'; do printf '%s %i\\n' x \"$c\"; done",
+        "for c in 'docker rm -f web'; do printf \"%x\" \"$c\"; done",
+        "for c in 'docker rm -f web'; do printf %f \"$c\"; done",
+        "for c in 'docker rm -f web'; do printf '%c' \"$c\"; done",
+        "for c in 'docker rm -f web'; do printf '%n' \"$c\"; done",
+        "for c in 'docker rm -f web'; do printf '%*s' \"$c\" x; done",
+        "for c in 'docker rm -f web'; do printf '%.*s' \"$c\" x; done",
+        "for c in 'docker rm -f web'; do printf '%1$s' \"$c\"; done",
+        "for c in 'docker rm -f web'; do printf '%s%' \"$c\"; done",
+        "for c in 'docker rm -f web'; do printf '\\045d' \"$c\"; done",
+        "for c in 'docker rm -f web'; do printf * \"$c\"; done",
+        "for c in 'docker rm -f web'; do printf [%]d \"$c\"; done",
+        "for c in 'docker rm -f web'; do break \"$c\"; done",
+        "for c in 'docker rm -f web'; do continue \"$c\"; done",
+        "for c in 'docker rm -f web'; do echo \"$c\"; break -1; done",
+        "select c in 'docker rm -f web'; do echo \"$c\"; break \"$c\"; done",
         // `printf -v` spelled through a variable, so no word starts with `-`.
         "for o in -v; do for c in 'docker rm -f web'; do printf \"$o\" PAGER '%s' \"$c\"; done; done",
         // zsh: `prompt` is PS1, expanded with PROMPT_SUBST at the next prompt.
