@@ -11213,10 +11213,14 @@ destructive_patterns:
         tool: &str,
         rule: Option<&str>,
     ) {
+        // Claude Code sends a `toolu_` tool-use id with every call. Without
+        // one, a `PowerShell` payload is a Codex payload, which is answered
+        // in Codex's minimal shape: a deny with no `ruleId` to compare.
         let payload = serde_json::json!({
             "hook_event_name": "PreToolUse",
             "tool_name": tool,
             "tool_input": {"command": candidate},
+            "tool_use_id": "toolu_dcg_issue_671",
         });
         let mut child = fixture
             .command()
@@ -11859,8 +11863,17 @@ destructive_patterns:
         ] {
             fixture.assert_explain(candidate, "deny", Some("core.git:reset-hard"));
         }
+        // A case-insensitive shell finds `GIT`, but Git's own subcommand
+        // lookup is case-sensitive: `RESET` is not the `reset` builtin, so it
+        // can only run as an alias or helper that dcg cannot see.
         fixture.assert_explain_in_dialects(
             "GIT RESET --HARD",
+            "deny",
+            Some("core.git:git-alias-semantic-unverified"),
+            &["powershell", "unknown"],
+        );
+        fixture.assert_explain_in_dialects(
+            "GIT reset --hard",
             "deny",
             Some("core.git:reset-hard"),
             &["powershell", "unknown"],
