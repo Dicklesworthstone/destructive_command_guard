@@ -20,6 +20,42 @@ fn dcg_binary() -> PathBuf {
 const PACKS: &str =
     "core.git,core.filesystem,windows.filesystem,careful_company_running_windows.guardrails";
 
+/// Commands whose POSIX reading has a backquote substitution that does not
+/// parse: a backquote left open, or a quote left open inside one. PowerShell
+/// reads each backquote as an escape. The `unknown` view is the fail-closed
+/// union of every dialect, and its POSIX reading denies the substitution as
+/// unverifiable (`heredoc.posix:substitution-unverified`) before any
+/// guardrail rule is reached. So under `unknown` these commands are blocked
+/// by that rule, whatever the PowerShell reading says.
+const POSIX_UNPARSEABLE_SUBSTITUTION: &[&str] = &[
+    "dcg --a`gent=codex --robot uninstall",
+    "dcg --a`gent codex --r`obot un`install",
+    "dcg allowl`ist --a`gent='dcg uninstall' a`dd core.git:reset-hard --reason reviewed",
+    "dcg --a`gent='allowlist add' allowlist list",
+    "dcg --a`gent='dcg --robot uninstall' doctor",
+    "dcg --a`gent='two words' doctor",
+    "dcg --a`gent='two 'words doctor",
+    "dcg --a`gent 'two 'words doctor",
+    "dcg --a`gent='co`dex; dcg uninstall' doctor",
+    "dcg --r`obot al`lowlist li`st",
+    "dcg al`lowlist --a`gent=add li`st",
+    "dcg --r`obot test 'dcg --robot uninstall'",
+    "dcg --agent=two` words uninstall",
+    "dcg --agent two` words uninstall",
+];
+
+/// Assert the `unknown` view blocks `command` as an unparseable POSIX
+/// substitution. See [`POSIX_UNPARSEABLE_SUBSTITUTION`].
+fn assert_unknown_view_denies_unparseable_substitution(command: &str) {
+    let (result, full) = dcg_test_in_dialect(command, "unknown");
+    assert!(
+        result.starts_with("Result: BLOCKED")
+            && full.contains("Pack: heredoc.posix")
+            && full.contains("Pattern: substitution-unverified"),
+        "[unknown] {command:?}: {full}"
+    );
+}
+
 /// `dcg test <command>` under a hermetic config; returns the `Result:` line
 /// plus the full output for diagnostics.
 fn dcg_test(command: &str) -> (String, String) {
@@ -235,7 +271,6 @@ fn global_options_preserve_inspection_and_argument_data() {
         "dcg --agent uninstall doctor",
         "dcg --agent='allowlist add' doctor",
         "dcg --agent='dcg --robot uninstall' doctor",
-        "dcg --agent='dcg --robot allow-once abc --yes' allowlist list",
         "dcg --robot allowlist remove core.git:reset-hard",
         "dcg --robot test 'dcg --robot uninstall'",
         "dcg --no-color explain 'dcg --robot allow-once abc123 --yes'",
@@ -244,6 +279,25 @@ fn global_options_preserve_inspection_and_argument_data() {
         "echo 'dcg --robot allowlist add core.git:reset-hard --reason reviewed'",
     ] {
         assert_allowed(command);
+    }
+
+    // Single quotes quote in POSIX and PowerShell, so the agent value is one
+    // word there. cmd.exe does not treat them as quotes: its argv is
+    // `--agent='dcg`, `--robot`, `allow-once`, `abc`, ..., which is an
+    // allow-once invocation. The cmd view, and the `unknown` union that
+    // includes it, stay blocked.
+    let command = "dcg --agent='dcg --robot allow-once abc --yes' allowlist list";
+    for dialect in ["posix", "powershell"] {
+        let (result, full) = dcg_test_in_dialect(command, dialect);
+        assert_eq!(result, "Result: ALLOWED", "[{dialect}] {command:?}: {full}");
+    }
+    for dialect in ["cmd", "unknown"] {
+        let (result, full) = dcg_test_in_dialect(command, dialect);
+        assert!(
+            result.starts_with("Result: BLOCKED")
+                && full.contains("Pattern: dcg-policy-self-weakening"),
+            "[{dialect}] {command:?}: {full}"
+        );
     }
 }
 
@@ -310,6 +364,10 @@ fn escaped_dcg_syntax_cannot_hide_guardrail_changes() {
                 "dcg-policy-self-weakening",
             ),
         ] {
+            if dialect == "unknown" && POSIX_UNPARSEABLE_SUBSTITUTION.contains(&command) {
+                assert_unknown_view_denies_unparseable_substitution(command);
+                continue;
+            }
             let (result, full) = dcg_test_in_dialect(command, dialect);
             assert!(
                 result.starts_with("Result: BLOCKED"),
@@ -340,6 +398,10 @@ fn escaped_dcg_options_keep_agent_values_and_inspection_arguments_as_data() {
             "dcg --r`obot test 'dcg --robot uninstall'",
             "dcg --agent='--robot uninstall' explain 'dcg allow-once abc123 --yes'",
         ] {
+            if dialect == "unknown" && POSIX_UNPARSEABLE_SUBSTITUTION.contains(&command) {
+                assert_unknown_view_denies_unparseable_substitution(command);
+                continue;
+            }
             let (result, full) = dcg_test_in_dialect(command, dialect);
             assert_eq!(result, "Result: ALLOWED", "[{dialect}] {command:?}: {full}");
         }
@@ -352,6 +414,11 @@ fn native_agent_argument_boundaries_are_dialect_specific() {
         for separator in ["=", " "] {
             let dangerous = format!("dcg --agent{separator}{escaped_space} uninstall");
             for view in [dialect, "unknown"] {
+                if view == "unknown" && POSIX_UNPARSEABLE_SUBSTITUTION.contains(&dangerous.as_str())
+                {
+                    assert_unknown_view_denies_unparseable_substitution(&dangerous);
+                    continue;
+                }
                 let (result, full) = dcg_test_in_dialect(&dangerous, view);
                 assert!(
                     result.starts_with("Result: BLOCKED"),
