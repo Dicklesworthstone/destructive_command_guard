@@ -15431,6 +15431,113 @@ fn restore_powershell_here_string_substitution_text<'a>(
     })
 }
 
+/// Environment settings whose value other programs run as a command or as a
+/// program: pagers, editors, a browser, the login shell, ssh transports and
+/// password helpers.
+const PROGRAM_RUN_SETTINGS: &[&str] = &[
+    "PAGER",
+    "MANPAGER",
+    "GIT_PAGER",
+    "SYSTEMD_PAGER",
+    "EDITOR",
+    "VISUAL",
+    "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR",
+    "SUDO_EDITOR",
+    "FCEDIT",
+    "BROWSER",
+    "SHELL",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "RSYNC_RSH",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "SUDO_ASKPASS",
+];
+
+/// Commands whose `NAME=value` operands set the environment of what runs
+/// after them.
+const SETTING_BINDING_COMMANDS: &[&str] = &[
+    "export", "declare", "typeset", "local", "readonly", "env", "sudo", "doas",
+];
+
+/// Judge each static value a command gives a [`PROGRAM_RUN_SETTINGS`] name
+/// as shell source, the way an `sh -c` payload is judged: something the
+/// command runs next may execute it. The value comes from an assignment word
+/// before the command word or among the operands of a
+/// [`SETTING_BINDING_COMMANDS`] entry, or from the word list of a
+/// `for`/`select` loop over the name. An ordinary pager, editor or shell path
+/// judges as an ordinary command and stays allowed. A value with an
+/// expansion is left to the other passes.
+fn collect_posix_program_setting_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
+    if !PROGRAM_RUN_SETTINGS
+        .iter()
+        .any(|name| command.contains(name))
+    {
+        return;
+    }
+    for segment in crate::packs::split_command_segments_in_dialect(command, ShellDialect::Posix) {
+        let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+        let words: Vec<&str> = tokens
+            .iter()
+            .filter(|token| token.kind == NormalizeTokenKind::Word)
+            .filter_map(|token| token.text(segment))
+            .collect();
+        let start = words
+            .iter()
+            .position(|word| !matches!(*word, "do" | "then" | "else" | "elif" | "{" | "(" | "!"))
+            .unwrap_or(words.len());
+        let words = &words[start..];
+        let mut values: Vec<&str> = Vec::new();
+        if let [keyword, name, keyword_in, list @ ..] = words
+            && matches!(*keyword, "for" | "select")
+            && *keyword_in == "in"
+            && PROGRAM_RUN_SETTINGS.contains(name)
+        {
+            values.extend(list.iter().copied());
+        } else {
+            for word in words {
+                if crate::normalize::is_env_assignment(word) {
+                    if let Some((name, value)) = word.split_once('=')
+                        && PROGRAM_RUN_SETTINGS.contains(&name.strip_suffix('+').unwrap_or(name))
+                    {
+                        values.push(value);
+                    }
+                    continue;
+                }
+                if word.starts_with('-') || SETTING_BINDING_COMMANDS.contains(word) {
+                    continue;
+                }
+                break;
+            }
+        }
+        for raw in values {
+            let Some(value) = crate::normalize::decode_posix_literal_word(raw) else {
+                continue;
+            };
+            if value.trim().is_empty() {
+                continue;
+            }
+            if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
+                sinks.push(ExecutableTextSink::Unverified {
+                    rule: SINK_ANALYSIS_BOUNDS_RULE,
+                    reason: "command contains too many executable text sinks for bounded analysis",
+                });
+                return;
+            }
+            let sink = ExecutableTextSink::Payload {
+                source: value.into_owned(),
+                dialect: ShellDialect::Posix,
+                context: "a program runs this environment setting's value as a command",
+                nonlocal_filesystem: false,
+            };
+            if !sinks.contains(&sink) {
+                sinks.push(sink);
+            }
+        }
+    }
+}
+
 fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<ExecutableTextSink> {
     let mut sinks = Vec::new();
     if matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
@@ -15466,6 +15573,10 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
         let process_view = crate::heredoc::mask_inert_interpreter_stdin(command);
         collect_posix_process_substitution_sinks(process_view.as_ref(), &mut sinks);
         collect_data_heredoc_output_sinks(command, &interpreter_heredocs, &mut sinks);
+        // A quoted data body or an interpreter's own body binds no setting in
+        // this shell, so this reads the view with both masked.
+        let setting_view = crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
+        collect_posix_program_setting_sinks(setting_view.as_ref(), &mut sinks);
     }
     if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown) {
         collect_powershell_iex_sinks(command, &mut sinks);
@@ -55464,6 +55575,109 @@ mod tests {
                 "a real source flag still makes each record source: {command:?}: {:?}",
                 result.pattern_info
             );
+        }
+    }
+
+    /// A static value given to a setting that programs run is judged as the
+    /// command it names, wherever the command gives it. An ordinary program
+    /// value, a name that is not such a setting, and printed text stay
+    /// allowed.
+    #[test]
+    fn program_run_setting_values_are_judged_as_commands() {
+        let packs = ["containers.docker", "core.filesystem", "core.git"];
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for (command, pack) in [
+                (
+                    "for PAGER in 'docker rm -f web'; do man ls; done",
+                    "containers.docker",
+                ),
+                (
+                    "for EDITOR in 'docker rm -f web'; do crontab -e; done",
+                    "containers.docker",
+                ),
+                (
+                    "for VISUAL in \"docker rm -f web\"; do crontab -e; done",
+                    "containers.docker",
+                ),
+                (
+                    "for MANPAGER in 'docker rm -f web'; do man ls; done",
+                    "containers.docker",
+                ),
+                (
+                    "for GIT_EDITOR in 'docker rm -f web'; do git commit; done",
+                    "containers.docker",
+                ),
+                (
+                    "for BROWSER in 'docker rm -f web'; do xdg-open https://example.com; done",
+                    "containers.docker",
+                ),
+                (
+                    "for SHELL in 'docker rm -f web'; do script -q /dev/null; done",
+                    "containers.docker",
+                ),
+                (
+                    "select PAGER in 'docker rm -f web'; do man ls; done",
+                    "containers.docker",
+                ),
+                (
+                    "for PAGER in less 'docker rm -f web'; do man ls; done",
+                    "containers.docker",
+                ),
+                (
+                    "if true; then for PAGER in 'docker rm -f web'; do man ls; done; fi",
+                    "containers.docker",
+                ),
+                ("PAGER='docker rm -f web' man ls", "containers.docker"),
+                ("PAGER='docker rm -f web'; man ls", "containers.docker"),
+                (
+                    "export PAGER='docker rm -f web'; man ls",
+                    "containers.docker",
+                ),
+                ("env PAGER='docker rm -f web' man ls", "containers.docker"),
+                (
+                    "declare -x EDITOR='docker rm -f web'; crontab -e",
+                    "containers.docker",
+                ),
+                (
+                    "GIT_PAGER='rm -rf /home/example/data' git log",
+                    "core.filesystem",
+                ),
+                ("EDITOR='git reset --hard' crontab -e", "core.git"),
+            ] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(
+                    result.is_denied(),
+                    "[{dialect:?}] the setting's value runs: {command:?}: {:?}",
+                    result.pattern_info
+                );
+                assert_eq!(
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pack_id.as_deref()),
+                    Some(pack),
+                    "[{dialect:?}] {command:?}: {:?}",
+                    result.pattern_info
+                );
+            }
+            for command in [
+                "for PAGER in less more; do man ls; done",
+                "for EDITOR in vim nano 'code --wait'; do crontab -e; done",
+                "PAGER=less man ls",
+                "GIT_PAGER=cat git log",
+                "export EDITOR='code --wait'; crontab -e",
+                "SHELL=/bin/zsh script -q /dev/null",
+                "for pager in 'docker rm -f web'; do man ls; done",
+                "for PAGERS in 'docker rm -f web'; do man ls; done",
+                "echo PAGER='docker rm -f web'",
+            ] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(
+                    result.is_allowed(),
+                    "[{dialect:?}] {command:?}: {:?}",
+                    result.pattern_info
+                );
+            }
         }
     }
 
