@@ -11,7 +11,14 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## Unreleased
+## [v0.17.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.17.2) -- 2026-11-25 [Release]
+
+This patch release adds the opt-in `system.processes` pack, analyzes more
+wrapped and obfuscated command forms the way the shell runs them, judges a
+literal value given to a pager, editor, browser or similar setting as the
+command it runs, removes several false blocks (printed `for` loop words, large
+quoted data heredocs, script operands in `xargs` pipelines), renames two keys
+in `dcg config --format json` (#555), and updates dependencies.
 
 **Opt-in `system.processes` pack (`bd-wx2x`).** Enable it with
 `enabled = ["system.processes"]` on machines shared by several agents. It denies
@@ -53,6 +60,51 @@ assignment, function definition or `$` other than a plain `"$name"` with no
 text, a loop variable such as `PAGER` that another program runs, and a `printf`
 the command rebinds all still deny. Quoted docker text outside a loop keeps its
 previous verdict.
+
+**More command forms are analyzed the way the shell runs them.** Windows `cmd`
+commands that build their program name or switches from variable expansions,
+`modprobe` options supplied through the environment (directly or through `env`,
+`exec` or `sudo`), PowerShell call expressions that follow comments, and more
+wrapper, declaration and variable-binding forms are now normalized before the
+packs run, so the existing `windows.*`, `system.services` and core rules apply
+to them. Benign `cmd` commands, read-only operations and `modprobe` dry runs
+keep their verdicts. Known false positive: a program named by a quoted variable
+that is given `-D` or `-d` and a word, such as `"$CC" main.c -D NDEBUG`, is
+judged like the unquoted spelling and can be denied as
+`core.git:branch-dynamic-token`. Name the program literally, or allow the exact
+command once it is reviewed.
+
+**A literal value given to a pager, editor, browser or similar setting is
+judged as the command it runs.** Settings such as `PAGER`, `EDITOR`, `VISUAL`,
+`BROWSER` and `SHELL` name a program that other programs run, so their value is
+program text, not data. Ordinary values such as `less`, `cat`, `vim`,
+`code --wait` and `/bin/zsh` stay allowed. The extra check runs only for
+commands that name one of these settings.
+
+**Large quoted data heredocs no longer trip the oversized-command scan.** When a
+command is too large for full analysis, heredoc bodies proven to be inert quoted
+data are masked before the fallback scan, `<<` operators inside those bodies
+(shift operators in a large source file, for example) no longer use up the
+operator budget, and the scan splits the command at statement boundaries for
+POSIX shells, PowerShell and `cmd` instead of at fixed strides. When a split
+could separate a variable assignment from its later use, the scan fails closed.
+
+**Script operands are no longer mistaken for interpreter source flags.** In
+`xargs` and `parallel` pipelines whose consumer is an interpreter running a
+script file, a script path that happened to contain the letter of the
+interpreter's source flag was read as that flag, so every record was judged as
+source text. Only an argument that starts with `-` is now treated as a flag;
+explicit source flags still mark each record as source.
+
+**Clearer attribution for degraded heredoc analysis.** When analysis of a quoted
+Python or JavaScript heredoc body is degraded, the resulting denial is reported
+as `heredoc.shell:incomplete-analysis`. A concrete pack match in the surrounding
+command is still reported under that pack's rule.
+
+**Dependencies.** `nix` 0.32.0, and a `Cargo.lock` refresh within the existing
+version requirements: `clap` 4.6.10, `rich_rust` 0.2.4 (which drops a duplicate
+`fancy-regex`), `hyper` 1.13.0, `h2` 0.4.21, `globset` 0.4.22, `ignore` 0.4.35,
+`crc32fast` 1.5.6 and `zlib-rs` 0.6.9.
 
 ---
 

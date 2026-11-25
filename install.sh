@@ -5,7 +5,7 @@
 # Authenticate a pinned release installer before running this script:
 #   https://github.com/Dicklesworthstone/destructive_command_guard#quick-install-verified-release
 # After verifying the signature and pinned digest, run the local file:
-#   bash ./install.sh --version v0.17.1 --require-minisign
+#   bash ./install.sh --version v0.17.2 --require-minisign
 #
 # Options:
 #   --version vX.Y.Z   Install specific version (default: latest)
@@ -31,7 +31,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
   printf '%s\n' \
     'dcg installer: this script needs bash. Authenticate the release installer first:' \
     '  https://github.com/Dicklesworthstone/destructive_command_guard#quick-install-verified-release' \
-    'Then run the verified local file with bash ./install.sh --version v0.17.1 --require-minisign' >&2
+    'Then run the verified local file with bash ./install.sh --version v0.17.2 --require-minisign' >&2
   exit 1
 fi
 # bash run as `sh` starts in POSIX mode, which rejects the process
