@@ -170,7 +170,9 @@ fn executing_receivers_and_expanding_bodies_stay_denied() {
         "sh <<'EOF'\ngit reset --hard HEAD~3\nEOF",
         "cat <<'EOF' | bash\ngit restore .\nEOF",
         "cat > f <<EOF\n$(git restore .)\nEOF",
-        "git commit -F - <<EOF\n$(rm -rf /tmp/x)\nEOF",
+        // Not `rm -rf /tmp/x`: that is allowed when run directly, so its
+        // substitution is allowed too.
+        "git commit -F - <<EOF\n$(rm -rf /home/user)\nEOF",
         "git commit -F - <<EOF; echo done\n$(git restore .)\nEOF",
     ] {
         assert_denied(command);

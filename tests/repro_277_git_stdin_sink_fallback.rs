@@ -145,12 +145,17 @@ fn bash_heredoc_stays_denied_when_extraction_size_limit_is_exceeded() {
     );
 }
 
-/// Planted negative (pinned current behavior): an UNQUOTED delimiter lets the
-/// outer shell expand `$(...)` before git ever reads the message, so a
-/// command substitution in the body must stay denied.
+/// Planted negative: an UNQUOTED delimiter lets the outer shell expand
+/// `$(...)` before git ever reads the message, so a destructive command
+/// substitution in the body must stay denied.
+///
+/// The substitution is judged as the command it runs. This control used to
+/// substitute `rm -rf /tmp/x`, which is allowed when run directly (a literal
+/// temp path), so it is allowed inside the substitution as well and could
+/// not serve as a true positive.
 #[test]
 fn unquoted_delimiter_with_command_substitution_stays_denied() {
-    let command = "git commit -F - <<EOF\n$(rm -rf /tmp/x)\nEOF";
+    let command = "git commit -F - <<EOF\n$(rm -rf /home/user)\nEOF";
     for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
         let result = evaluate(command, dialect);
         assert!(
@@ -158,6 +163,67 @@ fn unquoted_delimiter_with_command_substitution_stays_denied() {
             "{command:?} must stay denied under {dialect:?}, got {result:?}"
         );
     }
+}
+
+/// Planted negatives, metamorphic form: the outer shell runs every `$(...)`
+/// and backquote in an unquoted body before the receiver reads it, so the
+/// heredoc must never weaken the verdict of the command it substitutes.
+/// Every command below is denied when run directly, and must stay denied in
+/// every wrapper, in both dialects.
+///
+/// `rm -rf /tmp/x` is deliberately absent: it is allowed when run directly,
+/// so allowing its substitution is consistent, not a bypass.
+#[test]
+fn unquoted_body_substitution_is_never_weaker_than_the_command_it_runs() {
+    const DESTRUCTIVE: [&str; 8] = [
+        "rm -rf /home/user",
+        "rm -rf ./build",
+        "rm -rf /tmp/../home/x",
+        "git reset --hard HEAD~3",
+        "git restore .",
+        "git clean -fdx",
+        "git push --force origin main",
+        "find . -delete",
+    ];
+    // `@CMD@` is replaced by each command above.
+    const WRAPPERS: [&str; 6] = [
+        "git commit -F - <<EOF\n$(@CMD@)\nEOF",
+        "git commit -F - <<EOF\nsubject $(@CMD@) tail\nEOF",
+        "git commit -F - <<EOF\n`@CMD@`\nEOF",
+        "git commit -F - <<EOF; echo done\n$(@CMD@)\nEOF",
+        "git merge -F - <<EOF\n$(@CMD@)\nEOF",
+        "cat > f <<EOF\n$(@CMD@)\nEOF",
+    ];
+
+    let mut failures = Vec::new();
+    for inner in DESTRUCTIVE {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            // The control itself must be a true positive, or the wrapped
+            // rows below would prove nothing.
+            let direct = evaluate(inner, dialect);
+            if !direct.is_denied() {
+                failures.push(format!(
+                    "control {inner:?} is not denied when run directly under {dialect:?}: {direct:?}"
+                ));
+                continue;
+            }
+            for wrapper in WRAPPERS {
+                let command = wrapper.replace("@CMD@", inner);
+                let result = evaluate(&command, dialect);
+                if !result.is_denied() {
+                    failures.push(format!(
+                        "{command:?} is allowed under {dialect:?} although {inner:?} is denied when run directly: {result:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} wrapped substitution(s) weaker than the command itself:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 /// Planted negative (#136 revert, accepted behavior per #278): interpreter

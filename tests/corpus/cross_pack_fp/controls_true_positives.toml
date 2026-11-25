@@ -94,8 +94,10 @@ issue = 279
 dialects = ["posix"]
 
 [[case]]
+# The substitution is judged as the command it runs. `rm -rf /tmp/x` is
+# allowed when run directly, so it cannot be the target of this control.
 description = "unquoted heredoc delimiter expands the substitution"
-command = "git commit -F - <<EOF\n$(rm -rf /tmp/x)\nEOF"
+command = "git commit -F - <<EOF\n$(rm -rf /home/user)\nEOF"
 expected = "deny"
 issue = 277
 dialects = ["posix", "unknown"]
