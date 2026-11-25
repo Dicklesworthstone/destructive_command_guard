@@ -90,13 +90,25 @@ impl Sandbox {
     }
 
     fn run_at(&self, args: &[&str], directory: &Path) -> Output {
-        let mut command = Command::new(&self.binary);
-        self.configure(&mut command);
-        command
-            .args(args)
-            .current_dir(directory)
-            .output()
-            .expect("run the DCG binary")
+        // A test that runs a fresh copy of the binary (the metacharacter-path
+        // test) can hit ETXTBSY on Linux: another test thread may fork while
+        // the copy's write descriptor is still open, and that child holds it
+        // until it execs. Retry only ExecutableFileBusy, for at most ~1 s.
+        let mut attempts = 0usize;
+        loop {
+            let mut command = Command::new(&self.binary);
+            self.configure(&mut command);
+            match command.args(args).current_dir(directory).output() {
+                Ok(output) => return output,
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(err) => panic!("run the DCG binary: {err:?}"),
+            }
+        }
     }
 
     fn install(&self) -> Value {
