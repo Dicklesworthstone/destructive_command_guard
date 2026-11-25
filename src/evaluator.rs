@@ -15574,9 +15574,17 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
         collect_posix_process_substitution_sinks(process_view.as_ref(), &mut sinks);
         collect_data_heredoc_output_sinks(command, &interpreter_heredocs, &mut sinks);
         // A quoted data body or an interpreter's own body binds no setting in
-        // this shell, so this reads the view with both masked.
-        let setting_view = crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
-        collect_posix_program_setting_sinks(setting_view.as_ref(), &mut sinks);
+        // this shell, so this reads the view with both masked. Masking only
+        // blanks bytes, so a view names a setting only if the command does:
+        // checking the command first skips the extra mask pass for commands
+        // that name none, with the same result.
+        if PROGRAM_RUN_SETTINGS
+            .iter()
+            .any(|name| command.contains(name))
+        {
+            let setting_view = crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
+            collect_posix_program_setting_sinks(setting_view.as_ref(), &mut sinks);
+        }
     }
     if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown) {
         collect_powershell_iex_sinks(command, &mut sinks);
