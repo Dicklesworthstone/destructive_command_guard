@@ -55367,6 +55367,11 @@ mod tests {
     /// letter (`c` for shells and Python, `e` for Ruby, Perl and Node) is a
     /// file, not a bundled `-c`/`-e`: the records are its arguments. The
     /// real source flags, bundled or long, still make each record source.
+    ///
+    /// The interpreter controls use `-0` so each program reaches the flag as
+    /// one record. Without it xargs splits the input into quote-processed
+    /// words, and no single word of these programs is a program of its own:
+    /// `node --eval` would get `const`, then `fs`, then `=`, ...
     #[test]
     fn xargs_script_operands_containing_the_flag_letter_are_not_source_flags() {
         for command in [
@@ -55393,8 +55398,9 @@ mod tests {
             "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 bash -c",
             "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 bash -xc",
             "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 sh -ec",
-            r#"printf '%s\n' 'import shutil; shutil.rmtree("/home/example/data")' | xargs python3 -c"#,
-            r#"printf '%s\n' 'const fs = require("fs"); fs.rmSync("/home/example/data", { recursive: true, force: true })' | xargs node --eval"#,
+            r#"printf '%s\0' 'import shutil; shutil.rmtree("/home/example/data")' | xargs -0 python3 -c"#,
+            r#"printf '%s\0' 'const fs = require("fs"); fs.rmSync("/home/example/data", { recursive: true, force: true })' | xargs -0 node --eval"#,
+            r#"printf '%s\0' 'const fs = require("fs"); fs.rmSync("/home/example/data", { recursive: true, force: true })' | xargs -0 node -e"#,
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,
