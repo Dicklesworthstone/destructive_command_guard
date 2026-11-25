@@ -74,6 +74,11 @@ fn decision(command: &str) -> String {
         // Verdicts, not scheduling: heredoc extraction's own 50 ms clock
         // answered incomplete-analysis on a loaded host (bd-e1xl).
         .env("DCG_HEREDOC_TIMEOUT_MS", "5000")
+        // The optional data proofs (#543's literal transfer reading among
+        // them) run on the AST clock, whose release floor is 20 ms. An expired
+        // proof supplies no waiver, so a loaded host turned an allow row here
+        // into the conservative deny.
+        .env("DCG_AST_TIMEOUT_MS", "5000")
         .current_dir(temp.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

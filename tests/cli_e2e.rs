@@ -45,6 +45,12 @@ fn run_dcg(args: &[&str]) -> std::process::Output {
         .env("TMP", home.path().join("tmp"))
         .env("XDG_CONFIG_HOME", home.path().join(".config"))
         .env("DCG_NO_SELF_HEAL", "1")
+        // Verdicts, not scheduling. The optional data proofs run on the AST
+        // clock (release floor 20 ms) and heredoc extraction on its own 50 ms
+        // clock; on a loaded host either can expire and hand back the
+        // conservative verdict instead of the completed one.
+        .env("DCG_AST_TIMEOUT_MS", "5000")
+        .env("DCG_HEREDOC_TIMEOUT_MS", "5000")
         .env("NO_COLOR", "1")
         .env("CLICOLOR", "0")
         .env("TERM", "dumb")
@@ -281,6 +287,10 @@ fn run_dcg_hook_with_env(command: &str, extra_env: &[(&str, &std::ffi::OsStr)]) 
         // may still override this when a test intentionally exercises deadline
         // behavior.
         .env("DCG_HOOK_TIMEOUT_MS", "5000")
+        // The same holds for the AST clock (optional data proofs, release
+        // floor 20 ms) and heredoc extraction's 50 ms clock.
+        .env("DCG_AST_TIMEOUT_MS", "5000")
+        .env("DCG_HEREDOC_TIMEOUT_MS", "5000")
         .env("DCG_PACKS", "core.git,core.filesystem")
         .current_dir(temp.path())
         .stdin(Stdio::piped())
@@ -8554,6 +8564,8 @@ mod hook_mode_tests {
             // Match the top-level hook helper: these are semantic E2E tests,
             // while deadline behavior has deterministic unit coverage.
             .env("DCG_HOOK_TIMEOUT_MS", "5000")
+            .env("DCG_AST_TIMEOUT_MS", "5000")
+            .env("DCG_HEREDOC_TIMEOUT_MS", "5000")
             .env("DCG_PACKS", "core.git,core.filesystem")
             .current_dir(cwd)
             .stdin(Stdio::piped())
