@@ -156,7 +156,10 @@ fn unquoted_redirect_substitution_pidfile_is_still_denied() {
             "{command:?}: {verdict}"
         );
     }
-    for command in ["kill \"$(< /tmp/job.pid)\"", "kill -9 \"$(<job.pid)\" 2>/dev/null"] {
+    for command in [
+        "kill \"$(< /tmp/job.pid)\"",
+        "kill -9 \"$(<job.pid)\" 2>/dev/null",
+    ] {
         let verdict = verdict(command, "system.processes", true);
         assert_eq!(
             verdict["decision"].as_str(),
