@@ -42,7 +42,8 @@ parse this output need the new key names.
 printf '%s\n' "$c"; done` was denied as `containers.docker:rm-force` although
 nothing ran the text. The docker rules now stand down for that shape only: the
 docker text is one quoted word of a `for` or `select` list whose variable name
-is lowercase (and not zsh's `prompt`), every other statement is `do`, `done`,
+is lowercase (and not zsh's `prompt`, `mailpath` or a search path such as
+`path`), every other statement is `do`, `done`,
 `printf` (with a literal format and no options), `echo`, `:`, `true`, `break`
 or `continue`, and the command has no pipe, redirection, substitution,
 assignment, function definition or `$` other than a plain `"$name"` with no

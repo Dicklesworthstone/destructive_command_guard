@@ -2,11 +2,11 @@
 //! `docker rm -f` was denied as `containers.docker:rm-force` although the loop
 //! body only prints it. The docker rules now stand down for that shape: the
 //! text is one quoted word of a `for`/`select` list with a lowercase loop
-//! variable (not zsh's `prompt`), and every other statement only prints
-//! (`printf` with a literal format and no options, `echo`, `:`, `true`,
-//! `break`, `continue`), with no pipe, redirection, substitution, assignment
-//! or function definition anywhere. Every other way the loop text could
-//! reach a shell still denies.
+//! variable (not zsh's `prompt`, `mailpath` or a search path), and every
+//! other statement only prints (`printf` with a literal format and no
+//! options, `echo`, `:`, `true`, `break`, `continue`), with no pipe,
+//! redirection, substitution, assignment or function definition anywhere.
+//! Every other way the loop text could reach a shell still denies.
 //!
 //! Every command is classifier input only, sent to the real binary through
 //! `dcg hook --batch` with an empty HOME. Nothing is executed.
@@ -185,6 +185,10 @@ fn loop_words_that_can_reach_a_shell_still_deny_issue_666() {
         "for o in -v; do for c in 'docker rm -f web'; do printf \"$o\" PAGER '%s' \"$c\"; done; done",
         // zsh: `prompt` is PS1, expanded with PROMPT_SUBST at the next prompt.
         "for prompt in '$(docker rm -f web)'; do echo \"$prompt\"; done",
+        // zsh: a `mailpath` message goes through command substitution at the
+        // next mail check; `path` is PATH.
+        "for mailpath in '/tmp/inbox?$(docker rm -f web)'; do echo \"$mailpath\"; done",
+        "for path in 'docker rm -f web'; do echo \"$path\"; done",
         // zsh: `$v[i]` evaluates the subscript `i` as arithmetic, and `i`
         // holds a substitution.
         "for i in 'x[$(docker rm -f web)]'; do echo \"$v[i]\"; done",

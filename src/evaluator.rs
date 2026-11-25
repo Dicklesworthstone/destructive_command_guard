@@ -38226,8 +38226,11 @@ fn command_pattern_match_is_inert_quoted_data(
 /// * the match lies inside one quoted part of a word in the list of a
 ///   `for NAME in …` or `select NAME in …` header, and NAME is lowercase, so
 ///   it is not an exported setting such as `PAGER` that some program runs,
-///   and does not contain `prompt` (zsh's `prompt` is `PS1`, which
-///   `PROMPT_SUBST` expands);
+///   and contains none of `prompt`, `mail` or `path`, which cover zsh's
+///   lowercase settings: `prompt` is `PS1`, which `PROMPT_SUBST` expands;
+///   a `mailpath` message goes through command substitution at the next
+///   mail check; and `path`, `cdpath`, `fpath`, `manpath` and
+///   `module_path` are the search paths;
 /// * every other statement is `do`, `done`, or an unquoted `printf`, `echo`,
 ///   `true`, `:`, `break` or `continue`; `printf` takes no option and its
 ///   format is not an expansion (`printf -v NAME` assigns, and
@@ -38369,7 +38372,9 @@ fn docker_match_is_printed_loop_word(
                         .text
                         .bytes()
                         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-                    && !name.text.contains("prompt");
+                    && !["prompt", "mail", "path"]
+                        .iter()
+                        .any(|setting| name.text.contains(setting));
                 if !lowercase_name || !keyword_in.quoted.is_empty() || keyword_in.text != "in" {
                     return false;
                 }
