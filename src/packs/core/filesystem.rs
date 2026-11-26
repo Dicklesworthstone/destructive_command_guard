@@ -380,16 +380,18 @@ fn may_name_trash(command: &str) -> bool {
     // A Bash ANSI-C quote can encode the entire command name. Other quoted
     // or escaped spellings preserve its letters in order. Scan without
     // copying the command, including when the input exceeds the AST budget.
-    static QUOTED_NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        let names = ["trash", "rimraf", "Trash"].map(|name| {
-            name.chars()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join(r#"['"\\\r\n]*"#)
-        });
-        regex::Regex::new(&names.join("|")).expect("constant trash command names")
-    });
-    command.contains("$'") || QUOTED_NAME.is_match(command)
+    let bytes = command.as_bytes();
+    command.contains("$'")
+        || ["trash", "rimraf", "Trash"].iter().any(|name| {
+            memchr::memchr_iter(name.as_bytes()[0], bytes).any(|start| {
+                bytes[start..]
+                    .iter()
+                    .copied()
+                    .filter(|byte| !matches!(byte, b'\'' | b'"' | b'\\' | b'\r' | b'\n'))
+                    .take(name.len())
+                    .eq(name.bytes())
+            })
+        })
 }
 
 /// Inspect original shell syntax. The Bash grammar gives us the executable
