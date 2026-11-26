@@ -1879,13 +1879,26 @@ fn compose_policy_matches(
     matches: Result<Vec<PatternMatch>, MatchError>,
     protected: Result<Vec<PatternMatch>, MatchError>,
 ) -> Result<Vec<PatternMatch>, MatchError> {
-    let mut matches = matches?;
-    match protected {
-        Ok(protected) => matches.extend(protected),
-        // A new classifier's limit must not suppress a deletion/exec
-        // denial the existing engine has already established.
-        Err(_) if matches.iter().any(|hit| hit.severity.blocks_by_default()) => {}
-        Err(error) => return Err(error),
+    let (mut matches, error) = match (matches, protected) {
+        (Ok(mut matches), Ok(protected)) => {
+            matches.extend(protected);
+            (matches, None)
+        }
+        (Ok(matches), Err(error))
+        | (Err(error @ MatchError::AnalysisIncomplete { .. }), Ok(matches)) => {
+            (matches, Some(error))
+        }
+        (Err(error), _) => return Err(error),
+    };
+    if let Some(error) = error {
+        if !matches.iter().any(|hit| hit.severity.blocks_by_default()) {
+            return Err(error);
+        }
+        // Keep the other classifier's proven denial. If policy waives it,
+        // the unfinished scan still cannot establish a clean verdict.
+        if let MatchError::AnalysisIncomplete { stage, .. } = &error {
+            crate::packs::regex_engine::record_incomplete_analysis(stage, &error);
+        }
     }
     matches.sort_by_key(|hit| hit.start);
     Ok(matches)
@@ -1947,9 +1960,10 @@ fn protected_matches(
     if !credential_files::source_scan_required(code, language) {
         return Ok(Vec::new());
     }
-    if code.len() > 256 * 1024 {
-        return Err(MatchError::ParseError {
+    if code.len() > credential_files::MAX_PROTECTED_SOURCE_BYTES {
+        return Err(MatchError::AnalysisIncomplete {
             language,
+            stage: "protected_write_analysis",
             detail: "protected-write source exceeds the byte limit".into(),
         });
     }
@@ -1976,9 +1990,18 @@ fn protected_matches(
             detail: format!("could not start protected-write analysis: {error}"),
         })?;
     let hits = match receiver.recv_timeout(budget) {
-        Ok(result) => result.map_err(|detail| MatchError::ParseError {
-            language,
-            detail: detail.to_string(),
+        Ok(result) => result.map_err(|error| match error {
+            credential_files::SourceScanError::Syntax(detail) => MatchError::ParseError {
+                language,
+                detail: detail.to_owned(),
+            },
+            credential_files::SourceScanError::Incomplete(detail) => {
+                MatchError::AnalysisIncomplete {
+                    language,
+                    stage: "protected_write_analysis",
+                    detail: detail.to_owned(),
+                }
+            }
         })?,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             return Err(MatchError::Timeout {
@@ -3479,11 +3502,44 @@ mod tests {
 
     #[test]
     fn protected_write_limits_report_incomplete_analysis() {
-        let oversized = format!("# open\n{}", " ".repeat(256 * 1024));
+        let oversized = format!(
+            "# open\n{}",
+            " ".repeat(credential_files::MAX_PROTECTED_SOURCE_BYTES)
+        );
         assert!(matches!(
             DEFAULT_MATCHER.find_matches(&oversized, ScriptLanguage::Python),
-            Err(MatchError::ParseError { .. })
+            Err(MatchError::AnalysisIncomplete {
+                stage: "protected_write_analysis",
+                ..
+            })
         ));
+    }
+
+    #[test]
+    fn a_known_finding_and_an_incomplete_scan_both_survive_composition() {
+        let language = ScriptLanguage::Python;
+        let hits = protected_matches("open('.git/config', 'w')", language, Duration::from_secs(5))
+            .expect("a literal destination is decidable");
+        assert!(hits.iter().any(|hit| hit.severity.blocks_by_default()));
+        for (protected_failed, stage) in [
+            (true, "protected_write_analysis"),
+            (false, "python_deletion_bindings"),
+        ] {
+            let scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
+            let incomplete = Err(MatchError::AnalysisIncomplete {
+                language,
+                stage,
+                detail: "traversal limit".into(),
+            });
+            let known = Ok(hits.clone());
+            let combined = if protected_failed {
+                compose_policy_matches(known, incomplete)
+            } else {
+                compose_policy_matches(incomplete, known)
+            };
+            assert_eq!(combined.expect("independent finding"), hits);
+            assert_eq!(scope.incomplete_stage(), Some(stage));
+        }
     }
 
     mod interpreter_literal_budget_regressions_560 {

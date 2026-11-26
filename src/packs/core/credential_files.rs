@@ -8,7 +8,9 @@ mod embedded;
 mod shell;
 mod word_splitting;
 
-pub(crate) use embedded::{scan_extracted, source_scan_required};
+pub(crate) use embedded::{
+    MAX_BYTES as MAX_PROTECTED_SOURCE_BYTES, SourceScanError, scan_extracted, source_scan_required,
+};
 // Rule NAMES are deliberately not re-exported: every hit carries the
 // rule it denies under, so the evaluator reads `hit.rule` instead of choosing
 // one. That is what keeps `.git/` writes allowlistable separately from

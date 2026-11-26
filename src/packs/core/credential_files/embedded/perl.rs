@@ -6,9 +6,10 @@
 
 use super::{
     Access, Bindings, CredentialFileWrite, MAX_BYTES, MAX_DEPTH, MAX_NODES, MAX_STATIC_PATH_BYTES,
-    OpenFlags, ResolvedPath, Value, combine_open_flags, concatenate_text, record_write,
-    resolved_path,
+    OpenFlags, ResolvedPath, SourceScanError, Value, combine_open_flags, concatenate_text,
+    record_write, resolved_path,
 };
+use SourceScanError::{Incomplete, Syntax};
 use regex::Regex;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -51,18 +52,20 @@ struct State {
 /// Bound total token visits as well as source size and nesting. Otherwise
 /// overlapping argument scans could keep a quadratic worker alive after the
 /// caller's wall-clock deadline has expired.
-fn charge(work: &Cell<usize>) -> Result<(), &'static str> {
+fn charge(work: &Cell<usize>) -> Result<(), SourceScanError> {
     let left = work
         .get()
         .checked_sub(1)
-        .ok_or("protected-write Perl exceeds the work limit")?;
+        .ok_or(Incomplete("protected-write Perl exceeds the work limit"))?;
     work.set(left);
     Ok(())
 }
 
-pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str> {
+pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, SourceScanError> {
     if code.len() > MAX_BYTES {
-        return Err("protected-write Perl source exceeds the byte limit");
+        return Err(Incomplete(
+            "protected-write Perl source exceeds the byte limit",
+        ));
     }
     let tokens = lex(code)?;
     let mut state = State {
@@ -94,7 +97,9 @@ pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str>
             }
         }
         if state.values.len() + state.handles.len() > 1024 || pending.len() > MAX_DEPTH {
-            return Err("protected-write Perl source exceeds the binding limit");
+            return Err(Incomplete(
+                "protected-write Perl source exceeds the binding limit",
+            ));
         }
         let token = &tokens[index];
         if matches!(token.text, "use" | "require")
@@ -284,13 +289,15 @@ fn handle_name<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
     matches!(token.kind, Kind::Variable | Kind::Word).then_some(token.text)
 }
 
-fn lex(code: &str) -> Result<Vec<Token<'_>>, &'static str> {
+fn lex(code: &str) -> Result<Vec<Token<'_>>, SourceScanError> {
     let mut tokens: Vec<Token<'_>> = Vec::new();
     let mut heredocs = Vec::new();
     let mut offset = 0;
     while offset < code.len() {
         if tokens.len() >= MAX_NODES {
-            return Err("protected-write Perl source exceeds the token limit");
+            return Err(Incomplete(
+                "protected-write Perl source exceeds the token limit",
+            ));
         }
         let rest = &code[offset..];
         let line_start = offset == 0 || code.as_bytes()[offset - 1] == b'\n';
@@ -317,7 +324,7 @@ fn lex(code: &str) -> Result<Vec<Token<'_>>, &'static str> {
             && crate::heredoc::is_literal_perl_print_heredoc(code, offset..end)
         {
             if heredocs.len() == MAX_DEPTH {
-                return Err("protected-write Perl exceeds the heredoc limit");
+                return Err(Incomplete("protected-write Perl exceeds the heredoc limit"));
             }
             heredocs.push((label, indented));
             tokens.push(Token {
@@ -330,7 +337,7 @@ fn lex(code: &str) -> Result<Vec<Token<'_>>, &'static str> {
         }
         let found = TOKEN
             .find(rest)
-            .ok_or("protected-write Perl tokenization failed")?;
+            .ok_or(Syntax("protected-write Perl tokenization failed"))?;
         let raw = found.as_str();
         let start = offset;
         offset += raw.len();
@@ -360,7 +367,7 @@ fn lex(code: &str) -> Result<Vec<Token<'_>>, &'static str> {
         let mut text = raw;
         if matches!(kind, Kind::Quoted(_)) {
             if raw.len() < 2 {
-                return Err("protected-write Perl has an unterminated quote");
+                return Err(Syntax("protected-write Perl has an unterminated quote"));
             }
             text = &raw[1..raw.len() - 1];
         } else if matches!(
@@ -403,7 +410,7 @@ fn lex(code: &str) -> Result<Vec<Token<'_>>, &'static str> {
             kind = Kind::Opaque;
         }
         if matches!(raw, "'" | "\"") {
-            return Err("protected-write Perl has an unterminated quote");
+            return Err(Syntax("protected-write Perl has an unterminated quote"));
         }
         tokens.push(Token {
             text,
@@ -412,7 +419,7 @@ fn lex(code: &str) -> Result<Vec<Token<'_>>, &'static str> {
         });
     }
     if !heredocs.is_empty() {
-        return Err("protected-write Perl has an unterminated heredoc");
+        return Err(Syntax("protected-write Perl has an unterminated heredoc"));
     }
     Ok(tokens)
 }
@@ -420,7 +427,10 @@ fn lex(code: &str) -> Result<Vec<Token<'_>>, &'static str> {
 /// Locate a Perl heredoc header. The caller skips its body ONLY for a proven
 /// literal print statement; eval-fed and interpolating bodies remain visible
 /// to the conservative fallback just as they were before data skipping.
-fn heredoc_header(code: &str, start: usize) -> Result<Option<(&str, bool, usize)>, &'static str> {
+fn heredoc_header(
+    code: &str,
+    start: usize,
+) -> Result<Option<(&str, bool, usize)>, SourceScanError> {
     let Some(rest) = code[start..].strip_prefix("<<") else {
         return Ok(None);
     };
@@ -437,7 +447,9 @@ fn heredoc_header(code: &str, start: usize) -> Result<Option<(&str, bool, usize)
         let (body, end) = quoted_span(code, position)?;
         let label = &code[body];
         if label.contains(['\n', '\r', '\\']) {
-            return Err("protected-write Perl has an unsupported heredoc delimiter");
+            return Err(Incomplete(
+                "protected-write Perl has an unsupported heredoc delimiter",
+            ));
         }
         return Ok(Some((label, indented, end)));
     }
@@ -465,7 +477,7 @@ fn heredoc_end(
     mut offset: usize,
     label: &str,
     indented: bool,
-) -> Result<usize, &'static str> {
+) -> Result<usize, SourceScanError> {
     while offset < code.len() {
         let rest = &code[offset..];
         let length = rest.find('\n').unwrap_or(rest.len());
@@ -480,14 +492,14 @@ fn heredoc_end(
             return Ok(offset);
         }
     }
-    Err("protected-write Perl has an unterminated heredoc")
+    Err(Syntax("protected-write Perl has an unterminated heredoc"))
 }
 
-fn quoted_span(code: &str, start: usize) -> Result<(Range<usize>, usize), &'static str> {
+fn quoted_span(code: &str, start: usize) -> Result<(Range<usize>, usize), SourceScanError> {
     let open = code[start..]
         .chars()
         .next()
-        .ok_or("missing Perl quote delimiter")?;
+        .ok_or(Syntax("missing Perl quote delimiter"))?;
     let close = match open {
         '(' => ')',
         '[' => ']',
@@ -515,18 +527,20 @@ fn quoted_span(code: &str, start: usize) -> Result<(Range<usize>, usize), &'stat
         } else if open != close && ch == open {
             depth += 1;
             if depth > MAX_DEPTH {
-                return Err("protected-write Perl quote exceeds the nesting limit");
+                return Err(Incomplete(
+                    "protected-write Perl quote exceeds the nesting limit",
+                ));
             }
         }
     }
-    Err("protected-write Perl has an unterminated quote")
+    Err(Syntax("protected-write Perl has an unterminated quote"))
 }
 
 fn matching_end(
     tokens: &[Token<'_>],
     start: usize,
     work: &Cell<usize>,
-) -> Result<usize, &'static str> {
+) -> Result<usize, SourceScanError> {
     let mut stack = Vec::new();
     for (index, token) in tokens.iter().enumerate().skip(start) {
         charge(work)?;
@@ -539,7 +553,7 @@ fn matching_end(
             "{" => stack.push("}"),
             ")" | "]" | "}" => {
                 if stack.pop() != Some(token.text) {
-                    return Err("protected-write Perl has mismatched delimiters");
+                    return Err(Syntax("protected-write Perl has mismatched delimiters"));
                 }
                 if stack.is_empty() {
                     return Ok(index);
@@ -548,17 +562,19 @@ fn matching_end(
             _ => {}
         }
         if stack.len() > MAX_DEPTH {
-            return Err("protected-write Perl exceeds the nesting limit");
+            return Err(Incomplete("protected-write Perl exceeds the nesting limit"));
         }
     }
-    Err("protected-write Perl has an unterminated argument list")
+    Err(Syntax(
+        "protected-write Perl has an unterminated argument list",
+    ))
 }
 
 fn statement_end(
     tokens: &[Token<'_>],
     start: usize,
     work: &Cell<usize>,
-) -> Result<usize, &'static str> {
+) -> Result<usize, SourceScanError> {
     let mut index = start;
     while let Some(token) = tokens.get(index) {
         charge(work)?;
@@ -579,7 +595,7 @@ fn call_arguments<'a, 's>(
     tokens: &'a [Token<'s>],
     start: usize,
     work: &Cell<usize>,
-) -> Result<(Vec<&'a [Token<'s>]>, usize), &'static str> {
+) -> Result<(Vec<&'a [Token<'s>]>, usize), SourceScanError> {
     let parenthesized = tokens
         .get(start)
         .is_some_and(|token| token.text == "(" && token.kind == Kind::Punctuation);
@@ -927,7 +943,16 @@ mod tests {
         }
         denied("print <<'DATA';\nopen(FH, '>', '/tmp/out');\nDATA\nopen(FH, '>', '/etc/shadow');");
         denied("__DATA__suffix(); open(FH, '>', '/etc/shadow');");
-        assert!(scan("print <<'DATA';\nunterminated\n").is_err());
+        assert!(matches!(
+            scan("print <<'DATA';\nunterminated\n"),
+            Err(Syntax("protected-write Perl has an unterminated heredoc"))
+        ));
+        assert!(matches!(
+            scan("print <<'DOC\\TEXT';\nnotes\nDOC\\TEXT\n"),
+            Err(Incomplete(
+                "protected-write Perl has an unsupported heredoc delimiter"
+            ))
+        ));
     }
 
     #[test]
@@ -957,10 +982,10 @@ mod tests {
     #[test]
     fn perl_overlapping_scans_have_an_aggregate_work_budget() {
         let code = format!("{}FH, '>', '/etc/shadow';", "open ".repeat(1000));
-        assert_eq!(
-            scan(&code).unwrap_err(),
-            "protected-write Perl exceeds the work limit"
-        );
+        assert!(matches!(
+            scan(&code),
+            Err(Incomplete("protected-write Perl exceeds the work limit"))
+        ));
     }
 
     #[test]
@@ -981,14 +1006,20 @@ mod tests {
             scan("open(FH, '>', '/home/u/.bashrc'); open(GIT, '>', '.git/config');").unwrap();
         assert_eq!(hits.len(), 2);
         assert_ne!(hits[0].rule, hits[1].rule);
-        assert!(scan(&" ".repeat(MAX_BYTES + 1)).is_err());
-        assert!(scan("open(FH, '>', '/etc/shadow'").is_err());
-        assert!(scan("print 'unterminated").is_err());
+        assert!(matches!(
+            scan(&" ".repeat(MAX_BYTES + 1)),
+            Err(Incomplete(_))
+        ));
+        assert!(matches!(
+            scan("open(FH, '>', '/etc/shadow'"),
+            Err(Syntax(_))
+        ));
+        assert!(matches!(scan("print 'unterminated"), Err(Syntax(_))));
         let code = format!(
             "open(FH, '>', {}'/etc/shadow'{});",
             "(".repeat(MAX_DEPTH + 1),
             ")".repeat(MAX_DEPTH + 1)
         );
-        assert!(scan(&code).is_err());
+        assert!(matches!(scan(&code), Err(Incomplete(_))));
     }
 }

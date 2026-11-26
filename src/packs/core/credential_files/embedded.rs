@@ -25,13 +25,21 @@ type Syntax<'a> = Node<'a, StrDoc<SupportLang>>;
 
 // Bound direct library calls as well as the hook. An exhausted source walk
 // must report incomplete analysis, not a successful empty match set.
-const MAX_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_BYTES: usize = 256 * 1024;
 const MAX_DEPTH: usize = 128;
 const MAX_NODES: usize = 40_000;
 // A small source can repeatedly double a bound string. Bound folded values
 // separately from input bytes so path construction cannot amplify it without
 // limit. This is an analysis bound, not a query of the host filesystem.
 const MAX_STATIC_PATH_BYTES: usize = 4096;
+
+/// A grammar error can use parse-error fallback. A valid program whose
+/// writes we could not inspect must remain unverified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourceScanError {
+    Syntax(&'static str),
+    Incomplete(&'static str),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Language {
@@ -111,7 +119,7 @@ fn source_has_sink_name(code: &str) -> bool {
 pub(crate) fn scan_extracted(
     code: &str,
     language: ScriptLanguage,
-) -> Result<Vec<CredentialFileWrite>, &'static str> {
+) -> Result<Vec<CredentialFileWrite>, SourceScanError> {
     if !source_scan_required(code, language) {
         return Ok(Vec::new());
     }
@@ -649,9 +657,11 @@ fn scan_source(
     code: &str,
     language: Language,
     grammar: SupportLang,
-) -> Result<Vec<CredentialFileWrite>, &'static str> {
+) -> Result<Vec<CredentialFileWrite>, SourceScanError> {
     if code.len() > MAX_BYTES {
-        return Err("protected-write source exceeds the byte limit");
+        return Err(SourceScanError::Incomplete(
+            "protected-write source exceeds the byte limit",
+        ));
     }
     let ast = AstGrep::new(code, grammar);
     let mut bindings = Bindings::new();
@@ -698,14 +708,18 @@ fn visit(
     depth: usize,
     remaining_nodes: &mut usize,
     hits: &mut Vec<CredentialFileWrite>,
-) -> Result<(), &'static str> {
+) -> Result<(), SourceScanError> {
     if depth > MAX_DEPTH || *remaining_nodes == 0 {
-        return Err("protected-write source exceeds the AST traversal limit");
+        return Err(SourceScanError::Incomplete(
+            "protected-write source exceeds the AST traversal limit",
+        ));
     }
     *remaining_nodes -= 1;
     let kind = node.kind();
     if kind == "ERROR" {
-        return Err("protected-write source contains a syntax error");
+        return Err(SourceScanError::Syntax(
+            "protected-write source contains a syntax error",
+        ));
     }
     if matches!(
         kind.as_ref(),

@@ -12,7 +12,7 @@ fn rule(body: &str) -> Option<String> {
     let source = format!(
         "package main\n\nimport (\n\t\"os\"\n\t\"path/filepath\"\n)\n\nfunc main() {{\n{body}\n}}\n"
     );
-    let hits = scan(&source).unwrap_or_else(|error| panic!("{body} should scan: {error}"));
+    let hits = scan(&source).unwrap_or_else(|error| panic!("{body} should scan: {error:?}"));
     hits.first().map(|hit| hit.rule.to_string())
 }
 
@@ -25,6 +25,24 @@ fn denies(body: &str) {
 
 fn allows(body: &str) {
     assert_eq!(rule(body), None, "expected no hit for:\n{body}");
+}
+
+#[test]
+fn distinguishes_go_scan_limits_from_syntax_errors() {
+    allows("println(1)");
+    let nested = format!(
+        "package main\nfunc main() {{ println({}1{}) }}",
+        "(".repeat(MAX_DEPTH),
+        ")".repeat(MAX_DEPTH)
+    );
+    let oversized = format!("package main\n//{}", "x".repeat(MAX_BYTES));
+    for source in [nested, oversized] {
+        assert!(matches!(scan(&source), Err(SourceScanError::Incomplete(_))));
+    }
+    assert!(matches!(
+        scan("package main\n???"),
+        Err(SourceScanError::Syntax(_))
+    ));
 }
 
 /// The four operations from the report's cross-language table, which were

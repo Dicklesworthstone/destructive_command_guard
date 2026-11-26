@@ -5,7 +5,7 @@
 
 use super::{
     Access, AstGrep, CredentialFileWrite, MAX_BYTES, MAX_DEPTH, MAX_NODES, MAX_STATIC_PATH_BYTES,
-    ResolvedPath, SupportLang, Syntax, record_write,
+    ResolvedPath, SourceScanError, SupportLang, Syntax, record_write,
 };
 use std::collections::HashMap;
 
@@ -62,9 +62,11 @@ pub(super) fn has_sink_name(code: &str) -> bool {
     })
 }
 
-pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str> {
+pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, SourceScanError> {
     if code.len() > MAX_BYTES {
-        return Err("protected-write PHP source exceeds the byte limit");
+        return Err(SourceScanError::Incomplete(
+            "protected-write PHP source exceeds the byte limit",
+        ));
     }
     // -r has no opening tag; stdin programs normally do. Keep findings in
     // original-source coordinates rather than exposing the synthetic prefix.
@@ -97,14 +99,18 @@ fn visit(
     depth: usize,
     remaining: &mut usize,
     hits: &mut Vec<CredentialFileWrite>,
-) -> Result<(), &'static str> {
+) -> Result<(), SourceScanError> {
     if depth > MAX_DEPTH || *remaining == 0 || state.values.len() > 1024 {
-        return Err("protected-write PHP source exceeds the traversal limit");
+        return Err(SourceScanError::Incomplete(
+            "protected-write PHP source exceeds the traversal limit",
+        ));
     }
     *remaining -= 1;
     let kind = node.kind();
     if kind == "ERROR" {
-        return Err("protected-write PHP source contains a syntax error");
+        return Err(SourceScanError::Syntax(
+            "protected-write PHP source contains a syntax error",
+        ));
     }
     if kind == "namespace_definition" {
         if let Some(body) = node.field("body") {
@@ -536,6 +542,17 @@ mod tests {
 
     fn allowed(code: &str) {
         assert!(scan(code).expect(code).is_empty(), "{code}");
+    }
+
+    #[test]
+    fn distinguishes_php_scan_limits_from_syntax_errors() {
+        allowed("echo 1;");
+        let nested = format!("echo {}1{};", "(".repeat(MAX_DEPTH), ")".repeat(MAX_DEPTH));
+        let oversized = format!("//{}", "x".repeat(MAX_BYTES));
+        for source in [nested, oversized] {
+            assert!(matches!(scan(&source), Err(SourceScanError::Incomplete(_))));
+        }
+        assert!(matches!(scan("echo ];"), Err(SourceScanError::Syntax(_))));
     }
 
     #[test]

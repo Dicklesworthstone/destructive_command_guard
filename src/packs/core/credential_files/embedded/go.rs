@@ -16,7 +16,7 @@
 
 use super::{
     Access, AstGrep, CredentialFileWrite, MAX_BYTES, MAX_DEPTH, MAX_NODES, MAX_STATIC_PATH_BYTES,
-    ResolvedPath, SupportLang, Syntax, record_write,
+    ResolvedPath, SourceScanError, SupportLang, Syntax, record_write,
 };
 use std::collections::HashMap;
 
@@ -84,9 +84,11 @@ pub(super) fn has_sink_name(code: &str) -> bool {
     .any(|word| code.contains(word))
 }
 
-pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str> {
+pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, SourceScanError> {
     if code.len() > MAX_BYTES {
-        return Err("protected-write Go source exceeds the byte limit");
+        return Err(SourceScanError::Incomplete(
+            "protected-write Go source exceeds the byte limit",
+        ));
     }
     let ast = AstGrep::new(code, SupportLang::Go);
     let mut hits = Vec::new();
@@ -101,14 +103,18 @@ fn visit(
     depth: usize,
     remaining: &mut usize,
     hits: &mut Vec<CredentialFileWrite>,
-) -> Result<(), &'static str> {
+) -> Result<(), SourceScanError> {
     if depth > MAX_DEPTH || *remaining == 0 || state.values.len() > 1024 {
-        return Err("protected-write Go source exceeds the traversal limit");
+        return Err(SourceScanError::Incomplete(
+            "protected-write Go source exceeds the traversal limit",
+        ));
     }
     *remaining -= 1;
     let kind = node.kind();
     if kind == "ERROR" {
-        return Err("protected-write Go source contains a syntax error");
+        return Err(SourceScanError::Syntax(
+            "protected-write Go source contains a syntax error",
+        ));
     }
 
     if kind == "import_spec" {
@@ -194,7 +200,7 @@ fn assign(
     depth: usize,
     remaining: &mut usize,
     hits: &mut Vec<CredentialFileWrite>,
-) -> Result<(), &'static str> {
+) -> Result<(), SourceScanError> {
     let names: Vec<String> = node
         .field("left")
         .or_else(|| node.field("name"))

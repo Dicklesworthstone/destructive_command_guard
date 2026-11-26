@@ -344,14 +344,23 @@ fn python_local_call_results_reach_the_hook_without_spurious_deadlines_673() {
 }
 
 #[test]
-fn python_deletion_binding_traversal_limit_keeps_a_valid_body_unverified() {
-    // Both programs only add integers. The deeper expression exceeds the
-    // deletion-binding walk's structural limit even with time left to run.
-    for (terms, complete) in [(4, true), (160, false)] {
+fn python_traversal_limits_keep_a_valid_body_unverified() {
+    // The deeper sum exceeds the selected walk's structural limit even
+    // with time left on the clock. The shallow sum can be checked in full.
+    let deletion_docs = "import shutil\n# See the rmtree documentation.";
+    let file_read = "text = open('notes.txt').read()";
+    for (preamble, terms, incomplete) in [
+        (deletion_docs, 4, None),
+        (
+            deletion_docs,
+            160,
+            Some("incomplete: python_deletion_bindings"),
+        ),
+        (file_read, 4, None),
+        (file_read, 160, Some("incomplete: protected_write_analysis")),
+    ] {
         let sum = vec!["1"; terms].join("+");
-        let command = format!(
-            "python3 - <<'PY'\nimport shutil\n# See the rmtree documentation.\nvalue = {sum}\nPY"
-        );
+        let command = format!("python3 - <<'PY'\n{preamble}\nvalue = {sum}\nPY");
         let output = run_hook_with_env(
             &payload(&command),
             None,
@@ -363,19 +372,16 @@ fn python_deletion_binding_traversal_limit_keeps_a_valid_body_unverified() {
             ],
         );
         assert!(output.status.success(), "{output:?}");
-        if complete {
-            assert!(output.stdout.is_empty(), "{output:?}");
-        } else {
+        if let Some(incomplete) = incomplete {
             let wire: serde_json::Value =
                 serde_json::from_slice(&output.stdout).expect("incomplete hook verdict");
             let result = &wire["hookSpecificOutput"];
             assert_eq!(result["permissionDecision"], "ask", "{wire}");
             let reason = result["permissionDecisionReason"].as_str().unwrap();
-            assert!(
-                reason.contains("incomplete: python_deletion_bindings"),
-                "{reason}"
-            );
+            assert!(reason.contains(incomplete), "{reason}");
             assert!(!reason.contains("hook_timeout_ms"), "{reason}");
+        } else {
+            assert!(output.stdout.is_empty(), "{output:?}");
         }
     }
 }
