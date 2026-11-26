@@ -10,3 +10,4 @@
 pub(crate) mod credential_files;
 pub mod filesystem;
 pub mod git;
+mod trash_target;

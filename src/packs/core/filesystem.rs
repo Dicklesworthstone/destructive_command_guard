@@ -40,18 +40,18 @@ const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
         "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
     ),
     PatternSuggestion::with_platform(
-        "trash-put {path}",
-        "Move to trash instead of permanent deletion (requires trash-cli)",
+        "trash-put /tmp/task/out",
+        "Replace the example with the reviewed literal path (requires trash-cli)",
         Platform::Linux,
     ),
     PatternSuggestion::with_platform(
-        "gio trash {path}",
-        "Move to trash via GNOME (requires gio)",
+        "gio trash /tmp/task/out",
+        "Replace the example with the reviewed literal path (requires gio)",
         Platform::Linux,
     ),
     PatternSuggestion::with_platform(
-        "mv {path} ~/.Trash/",
-        "Move to the Finder trash instead of deleting (macOS has no ~/.local/share/Trash)",
+        "mv /tmp/task/out ~/.Trash/",
+        "Move the reviewed literal path to the Finder trash",
         Platform::MacOS,
     ),
     PatternSuggestion::new(
@@ -141,8 +141,8 @@ const UNLINK_SUGGESTIONS: &[PatternSuggestion] = &[
         "Safe temp-directory unlink (allowed without confirmation)",
     ),
     PatternSuggestion::with_platform(
-        "trash-put {path}",
-        "Move to trash instead of permanent unlink (requires trash-cli)",
+        "trash-put /tmp/task/out",
+        "Move the reviewed file to trash using its literal path (requires trash-cli)",
         Platform::Linux,
     ),
 ];
@@ -364,6 +364,174 @@ use crate::normalize::{
     tokenize_for_normalization, tokenize_for_shell_dialect,
 };
 use std::ops::Range;
+use std::path::Path;
+
+pub(crate) const TRASH_TARGET_RULE: &str = "trash-unsafe-target";
+
+/// A candidate gate only. Removing quotes here can select inert text; the
+/// command parser below must prove the executable and each operand's role.
+fn may_name_trash(command: &str) -> bool {
+    if command.contains("trash") || command.contains("rimraf") || command.contains("Trash") {
+        return true;
+    }
+    if !command.contains(['\'', '"', '\\']) {
+        return false;
+    }
+    // A Bash ANSI-C quote can encode the entire command name. Other quoted
+    // or escaped spellings preserve its letters in order. Scan without
+    // copying the command, including when the input exceeds the AST budget.
+    static QUOTED_NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        let names = ["trash", "rimraf", "Trash"].map(|name| {
+            name.chars()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(r#"['"\\\r\n]*"#)
+        });
+        regex::Regex::new(&names.join("|")).expect("constant trash command names")
+    });
+    command.contains("$'") || QUOTED_NAME.is_match(command)
+}
+
+/// Inspect original shell syntax. The Bash grammar gives us the executable
+/// and its raw argument fields, including empty quoted words and substitutions.
+/// Comments, redirection targets and quoted command examples are not argv.
+pub(crate) fn unsafe_trash_span(
+    command: &str,
+    cwd: Option<&Path>,
+) -> Result<Option<Range<usize>>, ()> {
+    use ast_grep_core::AstGrep;
+    use ast_grep_language::SupportLang;
+
+    if !may_name_trash(command) {
+        return Ok(None);
+    }
+    if command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
+        return Err(());
+    }
+    let source = crate::context::shell_parse_source(command);
+    let ast = AstGrep::try_new(source.as_ref(), SupportLang::Bash).map_err(|_| ())?;
+    let root = ast.root();
+    for (index, invocation) in root.dfs().enumerate() {
+        if index >= 40_000 {
+            return Err(());
+        }
+        if invocation.kind() != "command" {
+            continue;
+        }
+        let Some(name) = invocation.field("name") else {
+            continue;
+        };
+        let raw_name = source.get(name.range()).ok_or(())?;
+        let args = invocation.field_children("argument");
+        let words: Vec<&str> = std::iter::once(raw_name)
+            .chain(args.filter_map(|arg| source.get(arg.range())))
+            .collect();
+        if unsafe_trash_argv(&words, cwd) {
+            return Ok(Some(invocation.range()));
+        }
+    }
+    Ok(None)
+}
+
+fn unsafe_trash_argv(words: &[&str], cwd: Option<&Path>) -> bool {
+    use super::trash_target::{unsafe_rimraf_glob_operand, unsafe_trash_operand};
+    use crate::normalize::decode_posix_literal_word;
+
+    let Some((&name, args)) = words.split_first() else {
+        return false;
+    };
+    let Some(name) = decode_posix_literal_word(name) else {
+        return false;
+    };
+    match name.rsplit('/').next() {
+        Some("trash" | "trash-put") => args.iter().any(|word| unsafe_trash_operand(word, cwd)),
+        Some("rimraf") => {
+            let glob = args
+                .iter()
+                .map(|word| decode_posix_literal_word(word))
+                .take_while(|word| word.as_deref() != Some("--"))
+                .any(|word| matches!(word.as_deref(), Some("--glob" | "-g")));
+            args.iter().any(|word| {
+                if glob {
+                    unsafe_rimraf_glob_operand(word, cwd)
+                } else {
+                    unsafe_trash_operand(word, cwd)
+                }
+            })
+        }
+        Some("gio") => args.split_first().is_some_and(|(operation, operands)| {
+            decode_posix_literal_word(operation).as_deref() == Some("trash")
+                && operands.iter().any(|word| unsafe_trash_operand(word, cwd))
+        }),
+        Some("mv") => unsafe_trash_move(args, cwd),
+        _ => {
+            // Ask the existing wrapper parser which argument is executed.
+            // Only a suffix of the same raw words can supply a child argv.
+            if !args.iter().any(|arg| {
+                decode_posix_literal_word(arg).is_some_and(|word| {
+                    matches!(
+                        word.rsplit('/').next(),
+                        Some("trash" | "trash-put" | "rimraf" | "gio" | "mv")
+                    )
+                })
+            }) {
+                return false;
+            }
+            let invocation = words.join(" ");
+            let stripped = crate::normalize::strip_wrapper_prefixes(&invocation);
+            if !stripped.was_normalized() || stripped.wrapper_limit_reached {
+                return false;
+            }
+            let child = stripped.normalized.as_ref();
+            let tokens = tokenize_for_normalization(child);
+            let child_words: Vec<_> = tokens.iter().filter_map(|word| word.text(child)).collect();
+            child_words.len() < words.len() && unsafe_trash_argv(&child_words, cwd)
+        }
+    }
+}
+
+fn unsafe_trash_move(args: &[&str], cwd: Option<&Path>) -> bool {
+    use super::trash_target::{is_trash_destination, unsafe_trash_operand};
+    use crate::normalize::decode_posix_syntax_token;
+
+    let mut options = true;
+    let mut sources = Vec::new();
+    let mut target_directory_is_trash = None;
+    let mut args = args.iter().copied();
+    while let Some(arg) = args.next() {
+        if options {
+            let word = decode_posix_syntax_token(arg);
+            if word == "--" {
+                options = false;
+                continue;
+            }
+            if word == "--target-directory" {
+                target_directory_is_trash = args.next().map(is_trash_destination);
+                continue;
+            }
+            if let Some(dest) = word.strip_prefix("--target-directory=") {
+                target_directory_is_trash = Some(is_trash_destination(dest));
+                continue;
+            }
+            if word.starts_with('-') && word != "-" {
+                // GNU mv accepts -t DIR, -tDIR, and -ft DIR.
+                if !word.starts_with("--")
+                    && let Some((_, dest)) = word.split_once('t')
+                {
+                    target_directory_is_trash = if dest.is_empty() {
+                        args.next().map(is_trash_destination)
+                    } else {
+                        Some(is_trash_destination(dest))
+                    };
+                }
+                continue;
+            }
+        }
+        sources.push(arg);
+    }
+    target_directory_is_trash.unwrap_or_else(|| sources.pop().is_some_and(is_trash_destination))
+        && sources.iter().any(|word| unsafe_trash_operand(word, cwd))
+}
 
 const RM_RF_ROOT_HOME_NAME: &str = "rm-rf-root-home";
 const RM_RF_ROOT_HOME_REASON: &str = "rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed.";
@@ -421,13 +589,13 @@ const RM_RECURSIVE_SUGGESTIONS: &[PatternSuggestion] = &[
         "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
     ),
     PatternSuggestion::with_platform(
-        "trash-put {path}",
-        "Move to trash instead of permanent deletion (requires trash-cli)",
+        "trash-put /tmp/task/out",
+        "Replace the example with the reviewed literal path (requires trash-cli)",
         Platform::Linux,
     ),
     PatternSuggestion::with_platform(
-        "mv {path} ~/.Trash/",
-        "Move to the Finder trash instead of deleting (macOS has no ~/.local/share/Trash)",
+        "mv /tmp/task/out ~/.Trash/",
+        "Move the reviewed literal path to the Finder trash",
         Platform::MacOS,
     ),
     PatternSuggestion::new(
@@ -1915,8 +2083,10 @@ fn segment_names_semantic_writer(segment: &str) -> bool {
             let executable = rm_frontend_basename(decoded.as_ref());
             // An obfuscated writer spelling (`t''ee`, `\tee`) carries no
             // keyword; `credential-file-write` still has to see it.
-            matches!(executable, "rm" | "unlink")
-                || super::credential_files::is_credential_writer(executable)
+            matches!(
+                executable,
+                "rm" | "unlink" | "trash" | "trash-put" | "rimraf" | "gio" | "mv"
+            ) || super::credential_files::is_credential_writer(executable)
         })
 }
 
@@ -2072,6 +2242,10 @@ pub(crate) fn filesystem_keyword_candidate(command: &str) -> bool {
         "rm",
         "find",
         "unlink",
+        "trash",
+        "trash-put",
+        "rimraf",
+        "gio",
         "truncate",
         "shred",
         "tar",
@@ -4374,7 +4548,7 @@ fn path_is_root_home(path: &PathToken<'_>) -> bool {
 /// Top-level directories whose subtrees are the operating system, another
 /// user's data, or a whole mounted volume. A recursive delete anywhere under
 /// one of these keeps the Critical root/home severity at any depth.
-const CRITICAL_TOP_LEVEL_DIRS: &[&str] = &[
+pub(super) const CRITICAL_TOP_LEVEL_DIRS: &[&str] = &[
     "Applications",
     "Library",
     "Program Files",
@@ -4408,7 +4582,7 @@ const CRITICAL_TOP_LEVEL_DIRS: &[&str] = &[
 ];
 
 /// Directories whose direct children are user home directories.
-const HOME_PARENT_DIRS: &[&str] = &["home", "Users"];
+pub(super) const HOME_PARENT_DIRS: &[&str] = &["home", "Users"];
 
 /// Whether a recursive delete of `text` earns the Critical root/home rule.
 ///
@@ -4542,6 +4716,10 @@ pub fn create_pack() -> Pack {
             "rm",
             "find",
             "unlink",
+            "trash",
+            "trash-put",
+            "rimraf",
+            "gio",
             "truncate",
             "shred",
             "tar",
@@ -5920,6 +6098,19 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use an explicit literal `/tmp/<subdir>` or `/var/tmp/<subdir>` path.\n\
              - Use `dcg allow-once` only after verifying the resolved source and destination.",
             MV_DYNAMIC_SUGGESTIONS
+        ),
+        // The argv classifier owns this rule. Text in an echo, a comment,
+        // or an option's data cannot prove an executed disposal command.
+        destructive_pattern!(
+            "trash-unsafe-target",
+            r"(?!)",
+            "This disposal command could remove a worktree or a protected directory. Name a specific literal path, e.g. `trash /tmp/my-task/out`.",
+            High,
+            "An unset variable or empty argument can select the working directory. A broad operand can move an entire worktree or home to the Trash, or permanently delete it with rimraf. Verify the exact paths and list them explicitly.",
+            &[PatternSuggestion::new(
+                "trash /tmp/my-task/out",
+                "After verifying the intended target, name its literal path",
+            )]
         ),
         // ----- credential / login-file writes (Critical, semantic) -----
         //
@@ -8874,6 +9065,35 @@ mod tests {
                 ),
                 "Remove-Item outside the literal temp carve-out must stay denied: {cmd}"
             );
+        }
+    }
+
+    #[test]
+    fn trash_arguments_retain_shell_roles() {
+        let pack = create_pack();
+        for command in [
+            "/usr/bin/env trash -- '/tmp'",
+            "command tr'a'sh .",
+            "mv '-t' ~/.Trash ./",
+            "mv -ft ~/.Trash ./",
+            "rimraf --glob '*'",
+            "trash .>/dev/null",
+        ] {
+            assert_eq!(
+                pack.check(command).and_then(|m| m.name),
+                Some(TRASH_TARGET_RULE),
+                "{command}"
+            );
+        }
+        for command in [
+            "env echo trash .",
+            "command -v trash",
+            "echo trash > /dev/null",
+            "trash ./build # . and /tmp",
+            "trash ./build 2>/dev/null",
+            "rimraf --glob '*.log'",
+        ] {
+            assert_eq!(unsafe_trash_span(command, None), Ok(None), "{command}");
         }
     }
 

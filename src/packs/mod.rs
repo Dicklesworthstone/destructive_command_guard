@@ -724,6 +724,11 @@ impl Pack {
                 .map(|_| false)
             }
             "core.filesystem" => {
+                // The mv-to-Trash regex exemptions only apply after checking
+                // every source. In particular "." must never earn a rescue.
+                if cmd.contains("Trash") && !matches!(core::filesystem::unsafe_trash_span(cmd, None), Ok(None)) {
+                    return Some(false);
+                }
                 // This proof owns unlink's exemptions, including rejected
                 // literal-path boundaries that a legacy temp regex may match.
                 crate::packs::core::filesystem::unlink_command_for_pattern_matching(
@@ -847,6 +852,11 @@ impl Pack {
     /// Returns the matched pattern's reason, name, severity, and explanation if found.
     #[must_use]
     pub fn matches_destructive(&self, cmd: &str) -> Option<DestructiveMatch> {
+        if self.id == "core.filesystem"
+            && !matches!(core::filesystem::unsafe_trash_span(cmd, None), Ok(None))
+        {
+            return self.destructive_match_by_name(core::filesystem::TRASH_TARGET_RULE, cmd);
+        }
         if self.id == "careful_company_running_windows.guardrails"
             && crate::packs::careful_company_running_windows::guardrails::authorization_store_write_span(
                 cmd,
@@ -1751,6 +1761,14 @@ static PACK_ENTRIES: [PackEntry; 104] = [
             "/find",
             "unlink",
             "/unlink",
+            "trash",
+            "/trash",
+            "trash-put",
+            "/trash-put",
+            "rimraf",
+            "/rimraf",
+            "gio",
+            "/gio",
             "truncate",
             "/truncate",
             "shred",

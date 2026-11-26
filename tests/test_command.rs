@@ -125,6 +125,105 @@ fn test_basic_allowed_command_exits_zero() {
     assert_eq!(json["decision"], "allow");
 }
 
+/// #675: the documented trash alternatives must protect the worktree in the
+/// diagnostic CLI and in a real PreToolUse call. Candidates are passed as
+/// arguments or JSON data to DCG. No shell executes them.
+#[test]
+fn trash_operand_decisions_agree_with_the_hook() {
+    for (command, expected) in [
+        (r#"trash "$OUT""#, "deny"),
+        (r#"trash """#, "deny"),
+        ("trash .", "deny"),
+        ("trash-put ./build ''", "deny"),
+        ("gio trash -- ./build ${OUT}", "deny"),
+        (r#"rimraf "build/$(pwd)""#, "deny"),
+        ("trash-put -- `pwd`", "deny"),
+        ("env trash-put .", "deny"),
+        ("for f in a b; do trash \"$f\"; done", "deny"),
+        ("rimraf ./build .//", "deny"),
+        ("gio trash work/..", "deny"),
+        ("trash /tmp/task/.", "deny"),
+        ("trash-put //", "deny"),
+        ("rimraf **", "deny"),
+        ("rimraf --glob './**'", "deny"),
+        ("trash /home/user/", "deny"),
+        ("trash-put /Users", "deny"),
+        ("gio trash ./build /tmp", "deny"),
+        ("rimraf /System", "deny"),
+        ("mv . ~/.Trash/", "deny"),
+        ("mv ./ ~/.Trash/", "deny"),
+        ("mv ./build './.' ~/.local/share/Trash/", "deny"),
+        ("mv .* ~/.Trash/", "deny"),
+        ("mv -t ~/.Trash/ ./build .", "deny"),
+        ("trash /tmp/pr-prov/render", "allow"),
+        ("trash-put ./build .env ../sibling/build", "allow"),
+        ("gio trash -- 'build outputs'", "allow"),
+        ("rimraf a b", "allow"),
+        ("mv ./build ~/.Trash/", "allow"),
+        ("gio info .", "allow"),
+        ("trash-put '$OUT'", "allow"),
+        ("echo trash .", "allow"),
+        ("printf '%s' 'gio trash .'", "allow"),
+    ] {
+        assert_trash_decision(command, expected, None);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn trash_absolute_target_uses_the_reported_working_directory() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let workspace = temp.path().canonicalize().expect("workspace path");
+    let cwd = workspace.join("first/project");
+    let other = workspace.join("second/project");
+    for (target, expected) in [(&cwd, "deny"), (&other, "allow")] {
+        std::fs::create_dir_all(target).expect("create project");
+        let command = format!("trash '{}'", target.display());
+        assert_trash_decision(&command, expected, Some(&cwd));
+    }
+}
+
+#[track_caller]
+fn assert_trash_decision(command: &str, expected: &str, cwd: Option<&Path>) {
+    let test = run_dcg_isolated(
+        &["test", "--dialect", "posix", "--format", "json", command],
+        cwd,
+    );
+    let verdict = parse_json(&test);
+    assert_eq!(
+        verdict["decision"], expected,
+        "dcg test: {command}: {verdict}"
+    );
+
+    let mut payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+    });
+    if let Some(cwd) = cwd {
+        payload["cwd"] = serde_json::json!(cwd);
+    }
+    let hook = run_dcg_isolated_with_stdin(&["--agent", "claude-code"], &payload.to_string());
+    assert!(hook.status.success(), "hook: {command}: {hook:?}");
+    if expected == "deny" {
+        assert_eq!(
+            verdict["pack_id"], "core.filesystem",
+            "{command}: {verdict}"
+        );
+        let response = parse_json(&hook);
+        let result = &response["hookSpecificOutput"];
+        assert_eq!(result["permissionDecision"], "deny", "{command}: {result}");
+        let pattern = verdict["pattern_name"].as_str().expect("CLI rule name");
+        assert_eq!(
+            result["ruleId"],
+            format!("core.filesystem:{pattern}"),
+            "{command}"
+        );
+    } else {
+        assert!(hook.stdout.is_empty(), "hook: {command}: {hook:?}");
+    }
+}
+
 #[test]
 fn python_local_call_failure_names_the_step_in_test_and_classify_673() {
     let command =

@@ -832,7 +832,7 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         .with_command("rm -ri path"),
         Suggestion::new(
             SuggestionKind::WorkflowFix,
-            "Move to trash with `trash-put path` on Linux (trash-cli), or `mv path ~/.Trash/` on macOS",
+            "Use the reviewed literal path, for example `trash-put /tmp/task/out` on Linux (trash-cli) or `mv /tmp/task/out ~/.Trash/` on macOS",
         ),
     ];
     for &rule_id in GENERAL_RECURSIVE_RM_SUGGESTION_RULES {
@@ -978,7 +978,7 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         .with_command("cp -p path path.bak"),
         Suggestion::new(
             SuggestionKind::WorkflowFix,
-            "Move a disposable file with `trash-put path` on Linux (trash-cli), or `mv path ~/.Trash/` on macOS",
+            "Use the disposable file's literal path, for example `trash-put /tmp/task/out` on Linux (trash-cli) or `mv /tmp/task/out ~/.Trash/` on macOS",
         ),
     ];
     for &rule_id in SINGLE_FILE_SUGGESTION_RULES {
@@ -1004,6 +1004,21 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
     for &rule_id in MOVED_PATH_SUGGESTION_RULES {
         m.insert(rule_id, moved_path_suggestions.clone());
     }
+
+    m.insert(
+        "core.filesystem:trash-unsafe-target",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Check the literal path of the item you intend to remove",
+            )
+            .with_command("ls -ld /tmp/task/out"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Pass each reviewed item by its literal path, for example `trash /tmp/task/out`",
+            ),
+        ],
+    );
 
     // The command word is assembled at runtime. Do not guess a platform or
     // repeat the unverified delete; make the executable and target reviewable.
@@ -2404,6 +2419,7 @@ mod tests {
             "core.filesystem:powershell-remove-item-recursive",
             "core.filesystem:rm-bare-glob",
             "core.filesystem:rm-bare-glob-root",
+            "core.filesystem:trash-unsafe-target",
             "core.filesystem:find-delete-root-home",
             "core.filesystem:find-delete-general",
             "core.filesystem:unlink-root-home",

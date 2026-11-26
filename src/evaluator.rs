@@ -31222,6 +31222,34 @@ fn evaluate_packs_with_allowlists_at_depth(
         // This prevents compound command bypass where one pack's safe pattern
         // would whitelist destructive commands from other packs.
         if pack_id == "core.filesystem" {
+            // Read the original argv: substitution masking can erase an
+            // operand, and the mv-to-Trash exemption must see every source.
+            if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+                match crate::packs::core::filesystem::unsafe_trash_span(
+                    original_command,
+                    project_path,
+                ) {
+                    Ok(Some(span)) => {
+                        if let Some(result) = evaluate_named_pack_rule_with_span(
+                            pack_id,
+                            pack,
+                            crate::packs::core::filesystem::TRASH_TARGET_RULE,
+                            allowlists,
+                            project_path,
+                            &mut first_allowlist_hit,
+                            original_command,
+                            Some(MatchSpan {
+                                start: span.start,
+                                end: span.end,
+                            }),
+                        ) {
+                            return result;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(()) => native_semantic_analysis_incomplete = true,
+                }
+            }
             if let Some(result) = evaluate_core_filesystem_pack(
                 pack_id,
                 pack,
