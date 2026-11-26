@@ -83,17 +83,84 @@ pub(crate) fn inert_documentation_literal_ranges_with_data_inspection(
     let root = ast.root();
     let mut proof = DocumentationProof::new(language, 128, 16_384);
     proof.allow_data_inspection = allow_data_inspection;
-    if proof.expression(&root, 0).is_some() {
+    if proof.proves_program(&root) {
         if proof.may_write_files {
             proof.literals
         } else {
             proof.data_literals
         }
+    } else if allow_data_inspection
+        && language == ScriptLanguage::Python
+        && let Some(ranges) = pathlib_document_write_payloads(&root)
+    {
+        ranges
     } else if has_substitution_text {
         inert_named_exec_literal_ranges(&root, code, language)
     } else {
         Vec::new()
     }
+}
+
+/// An isolated Python program whose only operations are importing the standard
+/// Path constructor and writing literal text to ordinary documentation files.
+/// Return just the payloads. The destination and original source remain visible
+/// to protected-write checks. A second consumer, rebinding or opaque call in
+/// the program withdraws the proof for every write.
+fn pathlib_document_write_payloads<D: ast_grep_core::Doc>(
+    root: &ast_grep_core::Node<'_, D>,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let mut statements = root
+        .children()
+        .filter(|child| child.is_named() && child.kind().as_ref() != "comment");
+    let import = statements.next()?;
+    let constructor = match (import.kind().as_ref(), import.text().as_ref()) {
+        ("import_statement", "import pathlib") => "pathlib.Path",
+        ("import_from_statement", "from pathlib import Path") => "Path",
+        _ => return None,
+    };
+    let mut ranges = Vec::new();
+    for statement in statements {
+        let call = literal_statement(statement)?;
+        let method = call.field("function")?;
+        let receiver = method.field("object")?;
+        if call.kind().as_ref() != "call"
+            || method.kind().as_ref() != "attribute"
+            || method.field("attribute")?.text() != "write_text"
+            || receiver.kind().as_ref() != "call"
+            || receiver.field("function")?.text() != constructor
+        {
+            return None;
+        }
+        let destination = single_python_string_argument(&receiver)?;
+        let filename = static_interpreter_literal(&destination, ScriptLanguage::Python, 0)?;
+        // A general file can be an executable, startup file, or configuration.
+        // A documentation suffix on a path in a hooks/config directory does not
+        // establish this data role. Accept ordinary relative basenames only.
+        let (stem, extension) = filename.rsplit_once('.')?;
+        if !matches!(extension, "md" | "markdown" | "rst")
+            || !stem.starts_with(|c: char| c.is_ascii_alphanumeric())
+            || !stem
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b' '))
+        {
+            return None;
+        }
+        let payload = single_python_string_argument(&call)?;
+        static_interpreter_literal(&payload, ScriptLanguage::Python, 0)?;
+        ranges.push(payload.range());
+    }
+    (!ranges.is_empty()).then_some(ranges)
+}
+
+fn single_python_string_argument<'a, D: ast_grep_core::Doc>(
+    call: &ast_grep_core::Node<'a, D>,
+) -> Option<ast_grep_core::Node<'a, D>> {
+    let arguments = call.field("arguments")?;
+    let mut args = arguments
+        .children()
+        .filter(|child| child.is_named() && child.kind().as_ref() != "comment");
+    let only = args.next()?;
+    (only.kind().as_ref() == "string" && args.next().is_none()).then_some(only)
 }
 
 /// The parse the documentation proof starts from: Python or JavaScript of at
@@ -147,6 +214,9 @@ struct DocumentationProof {
     /// later executes it. The established proof treats every open this way;
     /// the inspection extension can prove a Python file is read-only.
     may_write_files: bool,
+    /// A text append is an inspection operation only when the complete
+    /// program keeps the result away from an unproved file destination.
+    uses_text_append: bool,
     remaining_steps: usize,
 }
 
@@ -160,6 +230,7 @@ impl DocumentationProof {
             literals: Vec::new(),
             data_literals: Vec::new(),
             may_write_files: false,
+            uses_text_append: false,
             remaining_steps,
         }
     }
@@ -169,6 +240,10 @@ impl DocumentationProof {
             self.literals.push(range.clone());
         }
         self.data_literals.push(range);
+    }
+
+    fn proves_program<D: ast_grep_core::Doc>(&mut self, root: &ast_grep_core::Node<'_, D>) -> bool {
+        self.expression(root, 0).is_some() && !(self.uses_text_append && self.may_write_files)
     }
 
     fn expression<D: ast_grep_core::Doc>(
@@ -213,6 +288,22 @@ impl DocumentationProof {
                 let value = self.expression(&right, depth + 1)?;
                 self.values.insert(name, value);
                 Some(value)
+            }
+            "augmented_assignment"
+                if self.allow_data_inspection && self.language == ScriptLanguage::Python =>
+            {
+                // Only an existing name bound to built-in text can retain its
+                // type across +=. Other targets and operands can run user code.
+                let left = node.field("left")?;
+                if left.kind() != "identifier"
+                    || node.field("operator")?.text() != "+="
+                    || self.values.get(left.text().as_ref()) != Some(&Text)
+                    || self.expression(&node.field("right")?, depth + 1)? != Text
+                {
+                    return None;
+                }
+                self.uses_text_append = true;
+                Some(Text)
             }
             "identifier" => self.values.get(node.text().as_ref()).copied(),
             "integer" | "float" | "number" | "true" | "false" | "none" | "null" => Some(Scalar),
@@ -1356,7 +1447,11 @@ pub(super) fn interpreter_literal_shell_commands_inner_with_execution_evidence(
         // New data operations require the caller's complete source context.
         // Unquoted heredocs retain live shell expansion even for pure data.
         proof.allow_data_inspection = allow_data_inspection && screen_execution_evidence;
-        if proof.expression(&root, 0).is_some() {
+        if proof.proves_program(&root)
+            || (proof.allow_data_inspection
+                && language == ScriptLanguage::Python
+                && pathlib_document_write_payloads(&root).is_some())
+        {
             return Ok(Vec::new());
         }
     }
@@ -2813,6 +2908,42 @@ mod tests {
     }
 
     #[test]
+    fn pathlib_document_writes_only_mask_the_literal_payload_664() {
+        let language = ScriptLanguage::Python;
+        for (import, constructor, filename) in [
+            ("import pathlib", "pathlib.Path", "NOTES.md"),
+            ("from pathlib import Path", "Path", "release-notes.rst"),
+        ] {
+            let payload = r#""`git checkout -- <path>` is blocked""#;
+            let source = format!("{import}\n{constructor}('{filename}').write_text({payload})");
+            let ranges = inert_documentation_literal_ranges(&source, language);
+            assert_eq!(ranges.len(), 1, "{source}");
+            assert_eq!(&source[ranges[0].clone()], payload);
+            assert!(
+                inert_documentation_literal_ranges_with_data_inspection(&source, language, false)
+                    .is_empty(),
+                "a nested source may have an unknown consumer"
+            );
+        }
+        for statement in [
+            "pathlib.Path(dest).write_text('git checkout -- <path>')",
+            "pathlib.Path('job.sh').write_text('git checkout -- <path>')",
+            "pathlib.Path('.git/hooks/notes.md').write_text('git checkout -- <path>')",
+            "pathlib.Path('NOTES.md').write_text('git checkout -- <path>', encoding=codec)",
+            "pathlib = other\npathlib.Path('NOTES.md').write_text('git checkout -- <path>')",
+            "pathlib.Path('NOTES.md').write_text(f'git checkout -- {make_text()}')",
+            "pathlib.Path('NOTES.md').write_text('git checkout -- <path>')\nconsume('NOTES.md')",
+            "other.write_text('git checkout -- <path>')",
+        ] {
+            let source = format!("import pathlib\n{statement}");
+            assert!(
+                inert_documentation_literal_ranges(&source, language).is_empty(),
+                "unproven use: {source}"
+            );
+        }
+    }
+
+    #[test]
     fn documentation_literal_proof_masks_every_literal_only_without_writes_586() {
         // A proved program that only reads and prints cannot run or store
         // its text, so a literal spelling a shell command is data whether
@@ -2913,6 +3044,39 @@ mod tests {
                     .get(range.clone())
                     .is_some_and(|literal| literal.contains("rm -rf /"))),
                 "a known data expression must retain its literal role: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_text_append_requires_a_known_text_binding_and_an_isolated_consumer_664() {
+        let source = "s = ''; extra = '`docs`'; s += extra; s += ' text'; print(s)";
+        let python = ScriptLanguage::Python;
+        let ranges = inert_documentation_literal_ranges(source, python);
+        assert!(
+            ranges
+                .iter()
+                .any(|range| &source[range.clone()] == "'`docs`'"),
+            "a print-only program appends built-in text"
+        );
+        assert!(
+            inert_documentation_literal_ranges_with_data_inspection(source, python, false)
+                .is_empty()
+        );
+
+        for source in [
+            "s += '`docs`'; print(s)",
+            "s = []; s += '`docs`'; print(s)",
+            "s = ''; s += ['`docs`']; print(s)",
+            "s = {}; s['key'] += '`docs`'; print(s)",
+            "s = ''; s %= '`docs`'; print(s)",
+            "s = ''; s += format_note('`docs`'); print(s)",
+            "s = ''; s += '`docs`'; open('output', 'w').write(s)",
+            "out = open('output', 'w'); s = ''; s += '`docs`'; out.write(s)",
+        ] {
+            assert!(
+                inert_documentation_literal_ranges(source, python).is_empty(),
+                "unsupported append or output must keep the original source: {source}"
             );
         }
     }

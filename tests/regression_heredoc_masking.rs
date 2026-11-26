@@ -1301,6 +1301,32 @@ EOF";
     }
 
     #[test]
+    fn issue_664_pathlib_document_payload_requires_an_isolated_write() {
+        for (path, prose) in [
+            ("NOTES.md", "git checkout -- <path> is blocked"),
+            ("NOTES.md", "`git checkout -- <path>` is blocked"),
+            ("RUNBOOK.rst", "`git reset --hard` is blocked"),
+            ("NOTES.md", "`rm -rf ~/projects` is blocked"),
+        ] {
+            let command = format!(
+                "python3 - <<'PY'\nimport pathlib\npathlib.Path('{path}').write_text('{prose}')\nPY"
+            );
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(decision, "allow", "{command}: {rule}");
+        }
+        let write = "python3 - <<'PY'\nfrom pathlib import Path\nPath('NOTES.md').write_text('git reset --hard')\nPY";
+        let (decision, rule) = hook_decision(&format!("{write}\nsh NOTES.md"));
+        assert_eq!(decision, "deny");
+        assert!(rule.contains("reset-hard"), "{rule}");
+
+        let (decision, rule) = hook_decision(
+            "python3 - <<'PY'\nimport pathlib\npathlib.Path('.git/config').write_text('text')\nPY",
+        );
+        assert_eq!(decision, "deny");
+        assert!(rule.contains("git-internals-write"), "{rule}");
+    }
+
+    #[test]
     fn issue_544_document_edits_keep_the_same_command_text_inert() {
         for (program, body) in [
             (

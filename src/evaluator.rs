@@ -48295,6 +48295,21 @@ mod tests {
     }
 
     #[test]
+    fn python_text_append_reaches_print_or_a_shell_consumer_664() {
+        let body = "s = ''\ns += \"`git checkout -- <path>` is blocked\"\nprint(s)";
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for (output, decision) in [
+                ("", EvaluationDecision::Allow),
+                (" | sh", EvaluationDecision::Deny),
+            ] {
+                let command = format!("python3 - <<'PY'{output}\n{body}\nPY");
+                let result = evaluate_with_pack_ids_in_dialect(&command, &["core.git"], dialect);
+                assert_eq!(result.decision, decision, "{command}: {result:?}");
+            }
+        }
+    }
+
+    #[test]
     fn careful_windows_preset_enforces_cmd_parity_across_policy_channels() {
         let preset = ["careful_company_running_windows"];
         let blocked = [
