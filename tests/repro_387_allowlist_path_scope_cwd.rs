@@ -140,6 +140,49 @@ fn allowed(output: &std::process::Output) -> bool {
 }
 
 #[test]
+fn corpus_uses_scoped_allowlists_only_when_requested() {
+    let env = TestEnv::new();
+    env.write_allowlist(Some(&env.scope_in_patterns()));
+    // The fixture lives outside the granted directory in all three runs.
+    let category = env.elsewhere.join("false_positives");
+    fs::create_dir(&category).unwrap();
+    fs::write(
+        category.join("policy.toml"),
+        format!(
+            "[[case]]\ndescription = 'scoped grant'\ncommand = '{PROBE}'\nexpected = 'allow'\n"
+        ),
+    )
+    .unwrap();
+
+    for (cwd, opt_in, expected) in [
+        (&env.scope_in, false, "deny"),
+        (&env.scope_in, true, "allow"),
+        (&env.scope_out, true, "deny"),
+    ] {
+        let mut command = Command::new(dcg_binary());
+        command
+            .args(["corpus", "--dir"])
+            .arg(&env.elsewhere)
+            .args(["--format", "json"])
+            .current_dir(cwd)
+            .env_clear()
+            .env("HOME", &env.home)
+            .env("USERPROFILE", &env.home)
+            .env("XDG_CONFIG_HOME", &env.xdg_config)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "");
+        if opt_in {
+            command.arg("--use-allowlist");
+        }
+        let output = command.output().expect("run dcg corpus");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stderr)));
+        assert_eq!(report["total_cases"], 1);
+        assert_eq!(report["cases"][0]["actual"], expected, "{report}");
+        assert_eq!(output.status.success(), expected == "allow", "{report}");
+    }
+}
+
+#[test]
 fn baseline_probe_is_denied_without_an_allowlist_entry() {
     let env = TestEnv::new();
     fs::write(

@@ -3,6 +3,11 @@
 This directory contains test cases for dcg's command evaluation. The corpus
 tests run automatically via `cargo test --test regression_corpus`.
 
+To test your project's allowlist, run `dcg corpus --use-allowlist --dir <corpus>`
+from the directory where the commands would run. DCG loads the current agent's
+allowlist once and uses the invocation directory for path-scoped entries.
+Omit `--use-allowlist` to run the corpus with an empty allowlist.
+
 ## Directory Structure
 
 ```

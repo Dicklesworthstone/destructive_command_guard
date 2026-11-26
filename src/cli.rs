@@ -12,7 +12,7 @@ use crate::agent::{DetectionMethod, detect_agent_with_details};
 use crate::config::{Config, ConfigFileLayer, ConfigFileStatus, ConfigSourceOutcome};
 use crate::evaluator::{
     DEFAULT_WINDOW_WIDTH, EvaluationDecision, EvaluationResult, MatchSource,
-    evaluate_command_with_pack_order, evaluate_command_with_pack_order_deadline_at_path,
+    evaluate_command_with_pack_order_at_path, evaluate_command_with_pack_order_deadline_at_path,
     evaluate_command_with_pack_order_deadline_at_path_in_dialect,
 };
 use crate::exit_codes::{EXIT_DENIED, EXIT_WARNING};
@@ -952,6 +952,10 @@ pub struct CorpusCommand {
     /// Filter to specific category (`true_positives`, `false_positives`, `bypass_attempts`, `edge_cases`)
     #[arg(long, short = 'c')]
     pub category: Option<String>,
+
+    /// Apply the current agent's effective allowlist, using the invocation directory for path scopes
+    #[arg(long)]
+    pub use_allowlist: bool,
 
     /// Show only failed tests
     #[arg(long)]
@@ -8860,7 +8864,19 @@ fn run_corpus(
     config: &Config,
     corpus_dir: &std::path::Path,
     category_filter: Option<&str>,
+    use_allowlist: bool,
 ) -> CorpusOutput {
+    let (allowlists, project_path) = if use_allowlist {
+        (
+            config.apply_agent_allowlist_profile(
+                &crate::agent::detect_agent(),
+                load_default_allowlists(),
+            ),
+            std::env::current_dir().ok(),
+        )
+    } else {
+        (crate::LayeredAllowlist::default(), None)
+    };
     let mut results = Vec::new();
     let mut summary = CorpusSummary {
         decision: std::collections::HashMap::new(),
@@ -8936,7 +8952,15 @@ fn run_corpus(
                 .to_string();
 
             for (idx, case) in corpus_file.cases.into_iter().enumerate() {
-                let result = run_single_corpus_test(config, &case, category, &file_name, idx);
+                let result = run_single_corpus_test(
+                    config,
+                    &allowlists,
+                    project_path.as_deref(),
+                    &case,
+                    category,
+                    &file_name,
+                    idx,
+                );
 
                 // Update summary stats
                 *summary.decision.entry(result.actual.clone()).or_default() += 1;
@@ -8982,6 +9006,8 @@ fn run_corpus(
 /// Run a single corpus test case through the evaluator.
 fn run_single_corpus_test(
     config: &Config,
+    allowlists: &crate::LayeredAllowlist,
+    project_path: Option<&std::path::Path>,
     case: &CorpusTestCase,
     category: CorpusCategory,
     file_name: &str,
@@ -9007,7 +9033,6 @@ fn run_single_corpus_test(
     let mut enabled_packs = effective_config.enabled_pack_ids();
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let compiled_overrides = effective_config.overrides.compile();
-    let allowlists = crate::LayeredAllowlist::default();
     let heredoc_settings = effective_config.heredoc_settings();
 
     // Load external packs from custom_paths (glob + tilde expansion).
@@ -9049,14 +9074,15 @@ fn run_single_corpus_test(
 
     // Time the evaluation
     let start = Instant::now();
-    let result = evaluate_command_with_pack_order(
+    let result = evaluate_command_with_pack_order_at_path(
         &case.command,
         &enabled_keywords,
         &ordered_packs,
         keyword_index.as_ref(),
         &compiled_overrides,
-        &allowlists,
+        allowlists,
         &heredoc_settings,
+        project_path,
     );
     let duration_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
 
@@ -9120,7 +9146,7 @@ fn handle_corpus_command(
     use colored::Colorize;
 
     // Run corpus tests
-    let mut output = run_corpus(config, &cmd.dir, cmd.category.as_deref());
+    let mut output = run_corpus(config, &cmd.dir, cmd.category.as_deref(), cmd.use_allowlist);
 
     // Handle baseline diffing BEFORE filtering/clearing (need full results for comparison)
     if let Some(ref baseline_path) = cmd.baseline {
