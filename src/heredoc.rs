@@ -10756,8 +10756,8 @@ fn mask_interpreter_stdin_bodies(command: &str, blank: impl Fn(&str) -> bool) ->
 /// command solely because the quoted interpreter body is not shell grammar,
 /// inspect the complete physical header, including words AFTER the delimiter.
 /// A valid AST that does not prove ownership must never fall back to a looser
-/// prefix proof. Recovery accepts only one literal program, an optional stdin
-/// marker and one delimiter on the first nonblank physical line; no wrappers,
+/// prefix proof. Recovery accepts only one literal program with proven stdin
+/// arguments and one delimiter on the first nonblank physical line; no wrappers,
 /// extra operands, redirects, substitutions, pipelines or continued commands.
 fn direct_interpreter_stdin_owner(command: &str, operator_start: usize) -> bool {
     let owner = plain_heredoc_command_at(command, operator_start).or_else(|| {
@@ -10821,8 +10821,8 @@ fn direct_interpreter_stdin_owner(command: &str, operator_start: usize) -> bool 
     // the operand rule. Keeping a narrower private language list here
     // silently withdrew the #357 exemption from deno/bun/go when #560 made
     // every exemption consumer require this proof. The operand rule admits
-    // Python's run-mode options (`python3 -I -`) and the program's own
-    // arguments after `-`, which leave stdin the program (#560).
+    // Python/Node run-mode options and the program's own arguments after `-`,
+    // which leave stdin the program (#560, #674).
     is_non_shell_interpreter_stdin_command(program)
         && interpreter_arguments_read_program_from_stdin(program, arguments)
 }
@@ -10951,17 +10951,38 @@ pub(crate) fn range_is_quoted_interpreter_source(
 /// value.
 const PYTHON_RUN_MODE_FLAGS: &[u8] = b"bBdEIOPqRsSuv";
 
+/// Node diagnostic options that neither select nor transform program source.
+/// Node accepts underscores in place of dashes in option names as well.
+fn node_warning_option(option: &str) -> bool {
+    matches!(
+        option,
+        "--no-warnings"
+            | "--no_warnings"
+            | "--trace-warnings"
+            | "--trace_warnings"
+            | "--no-deprecation"
+            | "--no_deprecation"
+            | "--trace-deprecation"
+            | "--trace_deprecation"
+    )
+}
+
 /// Whether an interpreter invoked with these arguments reads its program
 /// from standard input, leaving every later word as data for the program.
 ///
-/// Python's [`PYTHON_RUN_MODE_FLAGS`] may come first. After a `-` operand, Python
-/// and Node hand the remaining words to the program as `sys.argv` /
+/// Python's [`PYTHON_RUN_MODE_FLAGS`], or Node's warning options and explicit
+/// JavaScript input type, may come first. After a `-` operand, Python and Node
+/// hand the remaining words to the program as `sys.argv` /
 /// `process.argv`: they can no longer become options, a script file or a code
-/// string. Anything else (a script operand, `-c`, `-m`, `-r`, an unknown
-/// option) does not prove that stdin is the program.
+/// string. Node's `--` ends options, but still requires stdin rather than a
+/// script filename. Anything else (a script operand, inline code, a preload,
+/// a source-transforming or unknown option) does not prove that stdin is the
+/// ordinary program source.
 fn interpreter_arguments_read_program_from_stdin(program: &str, arguments: &[String]) -> bool {
     let name = program.rsplit('/').next().unwrap_or(program);
-    let python = ScriptLanguage::from_command(name) == ScriptLanguage::Python;
+    let language = ScriptLanguage::from_command(name);
+    let python = language == ScriptLanguage::Python;
+    let node = language == ScriptLanguage::JavaScript;
     let mut rest = arguments;
     if python {
         while let Some((option, tail)) = rest.split_first() {
@@ -10977,11 +10998,40 @@ fn interpreter_arguments_read_program_from_stdin(program: &str, arguments: &[Str
             }
             rest = tail;
         }
+    } else if node {
+        while let Some((option, tail)) = rest.split_first() {
+            if node_warning_option(option) {
+                rest = tail;
+                continue;
+            }
+            let (input_type, tail) = if matches!(option.as_str(), "--input-type" | "--input_type") {
+                let Some((value, tail)) = tail.split_first() else {
+                    return false;
+                };
+                (value.as_str(), tail)
+            } else if let Some(value) = option
+                .strip_prefix("--input-type=")
+                .or_else(|| option.strip_prefix("--input_type="))
+            {
+                (value, tail)
+            } else {
+                if option == "--" {
+                    rest = tail;
+                }
+                break;
+            };
+            // TypeScript modes need their own grammar/source proof. Invalid
+            // or missing values must not be mistaken for program arguments.
+            if !matches!(input_type, "module" | "commonjs") {
+                return false;
+            }
+            rest = tail;
+        }
     }
     match rest {
         [] => true,
         [stdin] => stdin == "-",
-        [stdin, ..] => stdin == "-" && (python || matches!(name, "node" | "nodejs")),
+        [stdin, ..] => stdin == "-" && (python || node),
     }
 }
 
@@ -12208,10 +12258,7 @@ fn literal_interpreter_script_operand(words: &[String]) -> Option<(&str, &str)> 
                         .bytes()
                         .all(|flag| PYTHON_RUN_MODE_FLAGS.contains(&flag))
             }),
-            ScriptLanguage::JavaScript => matches!(
-                argument.as_str(),
-                "--no-warnings" | "--trace-warnings" | "--no-deprecation" | "--trace-deprecation"
-            ),
+            ScriptLanguage::JavaScript => node_warning_option(argument),
             _ => false,
         };
         if !preserves_source {
@@ -26895,6 +26942,100 @@ mod issue_560_masking_tests {
         ] {
             let masked = mask_inert_interpreter_stdin(command);
             assert!(!masked.contains("it`s"), "{command}");
+        }
+    }
+
+    #[test]
+    fn issue_674_node_options_preserve_javascript_heredoc_ownership() {
+        let source = r#"x=/^cp .* (?:>|)\s*"([^"\n]+)\/(?:a|b)\/([^"\n]+)"/"#;
+        for receiver in [
+            "node",
+            "node -",
+            "node --input-type=module",
+            "node --input-type=commonjs",
+            "node --input-type module",
+            "node --input-type commonjs",
+            "node --no-warnings",
+            "node --trace-warnings",
+            "node --no-deprecation",
+            "node --trace-deprecation",
+            "node --no-warnings --input-type=module -",
+            "node --input-type commonjs --trace-warnings - arg --eval code",
+            "node --input-type=module --",
+            "node --input-type=module -- - arg",
+            "node --input_type=module --no_warnings",
+            "node --input_type commonjs --trace_warnings --no_deprecation --trace_deprecation",
+            "nodejs --input-type=commonjs -",
+            "node22 --no-warnings - arg",
+            "/usr/bin/node --input-type=module -",
+        ] {
+            let command = format!("{receiver} <<'JS'\n{source}\nJS");
+            let ExtractionResult::Extracted(contents) =
+                extract_content(&command, &ExtractionLimits::structural_scan())
+            else {
+                panic!("Node source must be completely extracted: {command:?}");
+            };
+            let [body] = contents.as_slice() else {
+                panic!("exactly one JavaScript program: {command:?}: {contents:?}");
+            };
+            assert_eq!(body.language, ScriptLanguage::JavaScript, "{command}");
+            assert_eq!(body.content, source, "{command}");
+            let range = body.content_range.as_ref().expect("heredoc source range");
+            assert!(
+                range_is_inert_interpreter_stdin(&command, range),
+                "{command}"
+            );
+            assert!(
+                range_is_quoted_interpreter_source(&command, range, ScriptLanguage::JavaScript),
+                "{command}"
+            );
+            let masked = mask_inert_interpreter_stdin(&command);
+            assert_eq!(masked.len(), command.len());
+            assert!(masked.starts_with(&format!("{receiver} <<'JS'\n")));
+            assert!(!masked.contains(source), "{command}");
+        }
+    }
+
+    #[test]
+    fn issue_674_node_source_changing_options_keep_stdin_visible() {
+        let source = r#"const text = "echo bad > $TARGET";"#;
+        for header in [
+            "node --input-type <<'JS'",
+            "node --input-type= <<'JS'",
+            "node --input-type=unknown <<'JS'",
+            "node --input-type module-typescript <<'JS'",
+            "node --input-type=commonjs-typescript <<'JS'",
+            "node --input-type=module script.js <<'JS'",
+            "node --no-warnings <<'JS' script.js",
+            "node --no-warnings -- script.js <<'JS'",
+            "node --no-warnings -- -e code <<'JS'",
+            "node --input-type=commonjs -e code <<'JS'",
+            "node --no-warnings --eval=code <<'JS'",
+            "node --no-warnings -p code <<'JS'",
+            "node --no-warnings --print=code <<'JS'",
+            "node --no-warnings -r setup.js <<'JS'",
+            "node --no-warnings --require=setup.js <<'JS'",
+            "node --input-type=module --import setup.mjs <<'JS'",
+            "node --input-type=module --loader=loader.mjs <<'JS'",
+            "node --no-warnings --env-file=settings.env <<'JS'",
+            "node --no-warnings --unknown-option <<'JS'",
+            "env node --no-warnings <<'JS'",
+            "NODE_OPTIONS=--require=setup.js node --no-warnings <<'JS'",
+            "node() { sh -s; }; node --no-warnings <<'JS'",
+            "node --no-warnings <<JS",
+        ] {
+            let command = format!("{header}\n{source}\nJS");
+            let start = command.find(source).expect("source in command");
+            let range = start..start + source.len();
+            assert_eq!(mask_inert_interpreter_stdin(&command).as_ref(), command);
+            assert!(
+                !range_is_inert_interpreter_stdin(&command, &range),
+                "{command}"
+            );
+            assert!(
+                !range_is_quoted_interpreter_source(&command, &range, ScriptLanguage::JavaScript),
+                "{command}"
+            );
         }
     }
 

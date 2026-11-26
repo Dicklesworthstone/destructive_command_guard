@@ -98,6 +98,14 @@ EOF";
     }
 
     fn hook_decision_with_allowlist(command: &str, allowed_rule: Option<&str>) -> (String, String) {
+        dcg_decision(command, allowed_rule, None)
+    }
+
+    fn dcg_decision(
+        command: &str,
+        allowed_rule: Option<&str>,
+        dialect: Option<&str>,
+    ) -> (String, String) {
         let temporary = tempfile::tempdir().expect("isolated hook directory");
         let home = temporary.path().join("home");
         std::fs::create_dir_all(&home).expect("isolated home");
@@ -114,13 +122,19 @@ EOF";
             )
             .expect("isolated user allowlist");
         }
-        let payload = serde_json::json!({
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
-            "tool_input": { "command": command },
-        })
-        .to_string();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_dcg"))
+        let mut process = Command::new(env!("CARGO_BIN_EXE_dcg"));
+        let payload = if let Some(dialect) = dialect {
+            process.args(["test", "--stdin", "--dialect", dialect, "--format", "json"]);
+            command.to_string()
+        } else {
+            serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": { "command": command },
+            })
+            .to_string()
+        };
+        let mut child = process
             .env_clear()
             .env("HOME", &home)
             .env("USERPROFILE", &home)
@@ -152,33 +166,182 @@ EOF";
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("start dcg hook");
+            .expect("start dcg, never the fixture");
         child
             .stdin
             .take()
-            .expect("hook stdin")
+            .expect("dcg stdin")
             .write_all(payload.as_bytes())
-            .expect("send hook payload");
-        let output = child.wait_with_output().expect("hook output");
-        assert_eq!(
-            output.status.code(),
-            Some(0),
-            "hook protocol failed for {command:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if output.stdout.is_empty() {
-            return ("allow".to_string(), String::new());
+            .expect("send dcg input");
+        let output = child.wait_with_output().expect("dcg output");
+        if dialect.is_none() {
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "hook protocol failed for {command:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if output.stdout.is_empty() {
+                return ("allow".to_string(), String::new());
+            }
         }
         let response: serde_json::Value =
-            serde_json::from_slice(&output.stdout).expect("valid hook JSON");
-        let result = &response["hookSpecificOutput"];
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "invalid dcg JSON for {command:?} ({dialect:?}): {error}; stdout={}; stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        let (decision, rule) = if dialect.is_some() {
+            (&response["decision"], &response["rule_id"])
+        } else {
+            let result = &response["hookSpecificOutput"];
+            (&result["permissionDecision"], &result["ruleId"])
+        };
+        let decision = decision.as_str().expect("dcg decision");
+        if dialect.is_some() {
+            let expected_exit = i32::from(matches!(decision, "deny" | "ask" | "indeterminate"));
+            assert_eq!(
+                output.status.code(),
+                Some(expected_exit),
+                "CLI exit must agree with its decision for {command:?} ({dialect:?}): {response}"
+            );
+        }
         (
-            result["permissionDecision"]
-                .as_str()
-                .expect("hook decision")
-                .to_string(),
-            result["ruleId"].as_str().unwrap_or_default().to_string(),
+            decision.to_string(),
+            rule.as_str().unwrap_or_default().to_string(),
         )
+    }
+
+    fn assert_issue_674_decision(command: &str, expected: &str, expected_rule: Option<&str>) {
+        for dialect in [None, Some("posix"), Some("unknown")] {
+            let (decision, rule) = dcg_decision(command, None, dialect);
+            assert_eq!(
+                decision,
+                expected,
+                "{}: {command:?}: {rule}",
+                dialect.unwrap_or("hook")
+            );
+            if let Some(expected_rule) = expected_rule {
+                assert_eq!(
+                    rule,
+                    expected_rule,
+                    "{}: {command:?}",
+                    dialect.unwrap_or("hook")
+                );
+            } else if expected == "deny" {
+                assert!(!rule.is_empty(), "denial must name its rule: {command:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn issue_674_node_heredoc_options_preserve_javascript_routing() {
+        // Both exact reported bodies contain shell-looking redirect/pipeline
+        // tokens inside JavaScript regex literals. Options do not turn that
+        // program into POSIX shell or PowerShell source.
+        for body in [
+            r#"x=/^cp .* (?:>|)\s*"([^"\n]+)\/(?:a|b)\/([^"\n]+)"/"#,
+            r#" const match=line.match(/^(?:cp |printf ).* (?:>|)\s*"([^"\n]+)\/(?:completed|pending)\/([^"\n]+)"\s*$/);"#,
+        ] {
+            for receiver in [
+                "node",
+                "node -",
+                "cat",
+                "node --input-type=module",
+                "node --input-type=commonjs",
+                "node --input-type module",
+                "node --input-type commonjs",
+                "node --no-warnings",
+                "node --input-type=module -",
+                "node --input-type=commonjs -",
+                "node --input-type module -",
+                "node --input-type commonjs -",
+                "node --no-warnings -",
+                "node --no-warnings --input-type=module -",
+                "node --input-type commonjs --trace-warnings --no-deprecation --trace-deprecation -",
+                "node --input-type=module --",
+                "node --input-type=module -- - argument --require",
+                "node --input-type=module - argument --require",
+                "nodejs --no-warnings",
+                "/usr/bin/node --input-type=module -",
+            ] {
+                let command = format!("{receiver} <<'JS'\n{body}\nJS");
+                assert_issue_674_decision(&command, "allow", None);
+            }
+        }
+    }
+
+    #[test]
+    fn issue_674_node_heredoc_options_preserve_executed_code() {
+        for (receiver, body, rule) in [
+            (
+                "node --input-type=module",
+                "import { execSync } from 'node:child_process'; execSync('git reset --hard');",
+                "heredoc.javascript:exec_sink.git_reset_hard",
+            ),
+            (
+                "node --input-type module -",
+                "import fs from 'node:fs'; fs.rmSync('/etc', {recursive: true, force: true});",
+                "heredoc.javascript:fs_rmsync.catastrophic",
+            ),
+            (
+                "node --input-type=commonjs",
+                "require('child_process').execSync('git reset --hard');",
+                "heredoc.javascript:require_execsync.git_reset_hard",
+            ),
+            (
+                "node --no-warnings -",
+                "require('fs').rmSync('/etc', {recursive: true, force: true});",
+                "heredoc.javascript:fs_rmsync.catastrophic",
+            ),
+            (
+                "node --input-type=module",
+                "eval(process.env.CODE);",
+                "heredoc.javascript:dynamic_source",
+            ),
+        ] {
+            let command = format!("{receiver} <<'JS'\n{body}\nJS");
+            assert_issue_674_decision(&command, "deny", Some(rule));
+        }
+        for command in [
+            "node --input-type=module <<'JS'\nconsole.log('safe');\nJS\ngit reset --hard",
+            "node --no-warnings <<JS\nconst text = '$(git reset --hard)';\nJS",
+            "sh <<'JS'\ngit reset --hard\nJS",
+        ] {
+            assert_issue_674_decision(command, "deny", Some("core.git:reset-hard"));
+        }
+        // An opaque producer or rebound interpreter may be rejected by a
+        // bounded-analysis guard before a concrete destructive rule runs.
+        for command in [
+            "node --input-type=module <<'JS' | sh\nconsole.log('git reset --hard');\nJS",
+            "node() { sh -s; }; node --no-warnings <<'JS'\ngit reset --hard\nJS",
+        ] {
+            assert_issue_674_decision(command, "deny", None);
+        }
+    }
+
+    #[test]
+    fn issue_674_source_changing_node_options_do_not_gain_data_proof() {
+        // Preloads can replace the ordinary JavaScript builtins, and a script
+        // file may execute stdin. Neither has the direct source contract that
+        // makes a normal console.log argument inert.
+        for receiver in [
+            "node --require ./bootstrap.js --no-warnings",
+            "node --require=./bootstrap.js --input-type=commonjs",
+            "node -r ./bootstrap.js --no-warnings",
+            "node --import ./bootstrap.mjs --input-type=module",
+            "node --loader ./loader.mjs --input-type=module",
+            "node --env-file .env --no-warnings",
+            "node --no-warnings script.js",
+        ] {
+            let command = format!("{receiver} <<'JS'\nconsole.log('git reset --hard');\nJS");
+            assert_issue_674_decision(&command, "deny", None);
+        }
+        // Eval reads a different program; an innocent heredoc cannot mask it.
+        let command = "node --input-type=commonjs -e \"require('child_process').execSync('git reset --hard')\" <<'JS'\nconsole.log('safe');\nJS";
+        assert_issue_674_decision(command, "deny", None);
     }
 
     #[test]
