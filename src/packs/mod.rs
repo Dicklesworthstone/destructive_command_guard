@@ -4979,6 +4979,28 @@ fn pack_aware_quick_reject_from_normalized_spans(
         }
     }
 
+    // Quoting fixes the argument's shell boundaries, but an unregistered
+    // option can still consume it as code. Use the matching view to keep
+    // registered data options inert while letting each pack see its own
+    // keywords in an opaque option value (#661).
+    if normalized.contains("--") {
+        let sanitized = std::cell::OnceCell::new();
+        for span in spans.spans() {
+            if matches!(
+                span.kind,
+                crate::context::SpanKind::Data | crate::context::SpanKind::Argument
+            ) && quoted_long_option_value(normalized, span.byte_range.start)
+                && span_matches_any_keyword(span.text(normalized), enabled_keywords)
+            {
+                let sanitized = sanitized
+                    .get_or_init(|| crate::context::sanitize_for_pattern_matching(normalized));
+                if span_matches_any_keyword(span.text(sanitized), enabled_keywords) {
+                    return false;
+                }
+            }
+        }
+    }
+
     if !saw_executable {
         if syntax_outside_executable_spans_matches_keyword(normalized, enabled_keywords) {
             return false;
@@ -4992,6 +5014,28 @@ fn pack_aware_quick_reject_from_normalized_spans(
     // an interpreter. Do not widen ordinary inert pipelines (`echo ... | cat`)
     // to a full scan: quoted documentation there remains data (#230).
     !syntax_outside_executable_spans_matches_keyword(normalized, enabled_keywords) // No keywords found in executable spans, safe to skip pack checking
+}
+
+fn quoted_long_option_value(command: &str, start: usize) -> bool {
+    let prefix = &command[..start];
+    let option = if let Some(prefix) = prefix.strip_suffix('=') {
+        prefix
+    } else if prefix.ends_with([' ', '\t']) {
+        prefix.trim_end_matches([' ', '\t'])
+    } else {
+        return false;
+    };
+    let Some(name) = option
+        .split_ascii_whitespace()
+        .next_back()
+        .and_then(|word| word.strip_prefix("--"))
+    else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 #[cfg(test)]

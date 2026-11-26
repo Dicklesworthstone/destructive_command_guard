@@ -117,6 +117,27 @@ fn assert_all(commands: &[&str], expected: &str) {
 }
 
 #[test]
+fn quoted_options_are_judged_by_the_same_rules_across_pack_sets_issue_661() {
+    let commands = [
+        "mytool update x-1 --append-notes 'Do not run docker rm -f web here.'",
+        "mytool update résumé --append-notes=\"記録: docker rm -f web here.\"",
+        "br update x-1 --append-notes 'Do not run docker rm -f web here.'",
+        "br update résumé --append-notes=\"記録: docker rm -f web here.\"",
+        "mytool update x-1 --append-notes 'Routine note.'",
+    ];
+    for packs in PACK_SETS {
+        let actual = verdicts(&commands, packs);
+        for (decision, rule) in &actual[..2] {
+            assert_eq!(decision, "deny", "{packs}: {actual:?}");
+            assert_eq!(rule, "containers.docker:rm-force", "{packs}: {actual:?}");
+        }
+        for (decision, _) in &actual[2..] {
+            assert_eq!(decision, "allow", "{packs}: {actual:?}");
+        }
+    }
+}
+
+#[test]
 fn quoted_docker_loop_words_that_are_only_printed_are_allowed_issue_666() {
     let commands = [
         // The report's row and its single-word variant.
