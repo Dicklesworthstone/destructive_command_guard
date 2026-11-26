@@ -28,6 +28,7 @@ enum DocumentationValue {
     Collection,
     ReadOnlyFile,
     File,
+    PythonSys,
     NodeFs,
     JavaScriptRegex,
 }
@@ -99,6 +100,18 @@ pub(crate) fn inert_documentation_literal_ranges_with_data_inspection(
     } else {
         Vec::new()
     }
+}
+
+/// Can this complete Python filter only consume data and produce data on stdout?
+/// A pipeline's producer still needs independent evaluation, and its data can
+/// never establish the identity of code the Python process might execute.
+pub(crate) fn python_filter_is_read_only(code: &str) -> bool {
+    let Some(ast) = documentation_ast(code, ScriptLanguage::Python) else {
+        return false;
+    };
+    let mut proof = DocumentationProof::new(ScriptLanguage::Python, 128, 16_384);
+    proof.allow_data_inspection = true;
+    proof.proves_program(&ast.root()) && !proof.may_write_files
 }
 
 /// An isolated Python program whose only operations are importing the standard
@@ -214,9 +227,9 @@ struct DocumentationProof {
     /// later executes it. The established proof treats every open this way;
     /// the inspection extension can prove a Python file is read-only.
     may_write_files: bool,
-    /// A text append is an inspection operation only when the complete
-    /// program keeps the result away from an unproved file destination.
-    uses_text_append: bool,
+    /// An inspection of piped stdin or a text append needs a complete
+    /// program that keeps its data away from an unproved file destination.
+    requires_read_only_program: bool,
     remaining_steps: usize,
 }
 
@@ -230,7 +243,7 @@ impl DocumentationProof {
             literals: Vec::new(),
             data_literals: Vec::new(),
             may_write_files: false,
-            uses_text_append: false,
+            requires_read_only_program: false,
             remaining_steps,
         }
     }
@@ -243,7 +256,8 @@ impl DocumentationProof {
     }
 
     fn proves_program<D: ast_grep_core::Doc>(&mut self, root: &ast_grep_core::Node<'_, D>) -> bool {
-        self.expression(root, 0).is_some() && !(self.uses_text_append && self.may_write_files)
+        self.expression(root, 0).is_some()
+            && !(self.requires_read_only_program && self.may_write_files)
     }
 
     fn expression<D: ast_grep_core::Doc>(
@@ -271,6 +285,26 @@ impl DocumentationProof {
                 [child] => self.expression(child, depth + 1),
                 _ => None,
             },
+            "import_statement"
+                if self.allow_data_inspection
+                    && self.language == ScriptLanguage::Python
+                    && node.text() == "import sys"
+                    && self.values.len() < self.max_values =>
+            {
+                self.requires_read_only_program = true;
+                self.values
+                    .insert("sys".to_string(), DocumentationValue::PythonSys);
+                Some(Scalar)
+            }
+            "attribute"
+                if self.allow_data_inspection
+                    && self.language == ScriptLanguage::Python
+                    && node.field("attribute")?.text() == "stdin"
+                    && self.expression(&node.field("object")?, depth + 1)?
+                        == DocumentationValue::PythonSys =>
+            {
+                Some(DocumentationValue::ReadOnlyFile)
+            }
             "assignment" | "variable_declarator" => {
                 // Additional named children include evaluated annotations.
                 if named.len() != 2 || self.values.len() >= self.max_values {
@@ -302,7 +336,7 @@ impl DocumentationProof {
                 {
                     return None;
                 }
-                self.uses_text_append = true;
+                self.requires_read_only_program = true;
                 Some(Text)
             }
             "identifier" => self.values.get(node.text().as_ref()).copied(),

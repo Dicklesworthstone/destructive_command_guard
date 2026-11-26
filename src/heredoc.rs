@@ -11802,33 +11802,13 @@ fn literal_inline_interpreter_arguments<'tree, N: ast_grep_core::source::SgNode<
 ///
 /// The caller runs both Bash parses under the interpreter worker's deadline.
 /// Source size, command operands and the payload's AST walk are bounded too.
-pub(crate) fn inline_interpreter_source_proof(
+#[cfg(test)]
+fn inline_interpreter_source_proof(
     command: &str,
     range: &Range<usize>,
     language: ScriptLanguage,
 ) -> Option<bool> {
-    if range.start >= range.end
-        || command.get(range.clone()).is_none()
-        || !matches!(
-            language,
-            ScriptLanguage::Python | ScriptLanguage::JavaScript
-        )
-        || command.len() > MAX_SUBSTITUTION_SOURCE_BYTES
-    {
-        return None;
-    }
-    if range_is_literal_inline_interpreter_source(command, range, language) {
-        return Some(true);
-    }
-
-    let quoted_range = range.start.checked_sub(1)?..range.end.checked_add(1)?;
-    inline_interpreter_word_source_proof(
-        command,
-        &quoted_range,
-        command.get(range.clone())?,
-        language,
-        false,
-    )
+    inline_interpreter_consumer_proof(command, range, None, language, false)
 }
 
 /// [`inline_interpreter_source_proof`] for a program whose complete shell
@@ -11844,30 +11824,62 @@ pub(crate) fn inline_interpreter_source_proof(
 /// those of the exact proof: `Some(true)` for an isolated `interpreter -c
 /// WORD` invocation, `Some(false)` for a complete program with other shell
 /// consumers, `None` for anything not provably that program.
-pub(crate) fn decoded_inline_interpreter_source_proof(
+#[cfg(test)]
+fn decoded_inline_interpreter_source_proof(
     command: &str,
     word: &Range<usize>,
     program: &str,
     language: ScriptLanguage,
 ) -> Option<bool> {
-    if word.start >= word.end
-        || program.is_empty()
-        || command.get(word.clone()).is_none()
+    inline_interpreter_consumer_proof(command, word, Some(program), language, false)
+}
+
+/// Establish the role of an inline source word in the complete shell request.
+/// A pipe into a read-only Python filter supplies data on stdin; the source
+/// still comes from argv. Only the final command of a top-level pipeline can
+/// use this proof, so its output cannot become another command's input.
+pub(crate) fn inline_interpreter_consumer_proof(
+    command: &str,
+    range: &Range<usize>,
+    decoded: Option<&str>,
+    language: ScriptLanguage,
+    complete_request: bool,
+) -> Option<bool> {
+    if range.start >= range.end
+        || command.len() > MAX_SUBSTITUTION_SOURCE_BYTES
         || !matches!(
             language,
             ScriptLanguage::Python | ScriptLanguage::JavaScript
         )
-        || command.len() > MAX_SUBSTITUTION_SOURCE_BYTES
     {
         return None;
     }
-    inline_interpreter_word_source_proof(command, word, program, language, true)
+    let raw = command.get(range.clone())?;
+    let (source, word) = if let Some(program) = decoded {
+        if program.is_empty() {
+            return None;
+        }
+        (program, range.clone())
+    } else {
+        if range_is_literal_inline_interpreter_source(command, range, language) {
+            return Some(true);
+        }
+        (raw, range.start.checked_sub(1)?..range.end.checked_add(1)?)
+    };
+    inline_interpreter_word_source_proof(
+        command,
+        &word,
+        source,
+        language,
+        decoded.is_some(),
+        complete_request,
+    )
 }
 
 /// Shared argv ownership proof for one inline program word. `decoded`
 /// selects how the word's value is read: POSIX quote removal for a decoded
 /// word, which also reports the isolated-invocation exemption from the same
-/// parse, or the exact quoted bytes for [`inline_interpreter_source_proof`],
+/// parse, or the exact quoted bytes for a contiguous source range,
 /// whose caller has already tried that exemption.
 fn inline_interpreter_word_source_proof(
     command: &str,
@@ -11875,6 +11887,7 @@ fn inline_interpreter_word_source_proof(
     source_text: &str,
     language: ScriptLanguage,
     decoded: bool,
+    complete_request: bool,
 ) -> Option<bool> {
     let ast = try_parse_shell_ast(command).ok()?;
     let root = ast.root();
@@ -11946,7 +11959,16 @@ fn inline_interpreter_word_source_proof(
     if !literal_inline_interpreter_payload_is_static(&payload) {
         return None;
     }
-    Some(decoded && inline_interpreter_invocation_is_isolated(&root, &payload))
+    Some(inline_interpreter_has_no_consumer(
+        &root,
+        &payload,
+        decoded,
+        || {
+            complete_request
+                && language == ScriptLanguage::Python
+                && crate::ast_matcher::python_filter_is_read_only(source_text)
+        },
+    ))
 }
 
 /// The structural half of [`range_is_literal_inline_interpreter_source`] for
@@ -11954,9 +11976,11 @@ fn inline_interpreter_word_source_proof(
 /// program: the whole input is that one simple command, with no environment
 /// assignment, redirect, extra argument, background operator or other
 /// statement that could change what the program's output or builtins mean.
-fn inline_interpreter_invocation_is_isolated<'tree, N: ast_grep_core::source::SgNode<'tree>>(
+fn inline_interpreter_has_no_consumer<'tree, N: ast_grep_core::source::SgNode<'tree>>(
     root: &N,
     payload: &N,
+    decoded: bool,
+    read_only_filter: impl FnOnce() -> bool,
 ) -> bool {
     if root.children().any(|child| child.kind().as_ref() == "&") {
         return false;
@@ -11967,11 +11991,21 @@ fn inline_interpreter_invocation_is_isolated<'tree, N: ast_grep_core::source::Sg
     let (Some(statement), None) = (statements.next(), statements.next()) else {
         return false;
     };
-    statement.kind().as_ref() == "command"
-        && statement.named_children().count() == 3
-        && payload
-            .parent()
-            .is_some_and(|parent| parent.node_id() == statement.node_id())
+    let Some(receiver) = payload.parent() else {
+        return false;
+    };
+    if receiver.kind().as_ref() != "command" || receiver.named_children().count() != 3 {
+        return false;
+    }
+    if receiver.node_id() == statement.node_id() {
+        return decoded;
+    }
+    statement.kind().as_ref() == "pipeline"
+        && statement
+            .named_children()
+            .last()
+            .is_some_and(|last| last.node_id() == receiver.node_id())
+        && read_only_filter()
 }
 
 /// The `>` bytes that JavaScript itself parses as arrow operators in a

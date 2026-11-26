@@ -1301,6 +1301,29 @@ EOF";
     }
 
     #[test]
+    fn issue_653_piped_python_filters_keep_their_source_language() {
+        for command in [
+            r#"printf x | python3 -c 'print("`")'"#,
+            r#"printf x | python3 -c 'import sys; print(sys.stdin.read() + "`")'"#,
+            r#"printf x | cat | python3 -c 'print("`")'"#,
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(decision, "allow", "{command:?}: {rule}");
+            let (decision, rule) = dcg_decision(command, None, Some("posix"));
+            assert_eq!(decision, "allow", "{command:?}: {rule}");
+        }
+        for command in [
+            r#"git reset --hard | python3 -c 'print("`")'"#,
+            r#"printf x | python3 -c 'print("git reset --hard")' | sh"#,
+            r#"printf x | python3 -c 'from pathlib import Path; Path(".git/config").write_text("x")'"#,
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(decision, "deny", "{command:?}: {rule}");
+            assert!(!rule.is_empty(), "{command:?}");
+        }
+    }
+
+    #[test]
     fn issue_664_pathlib_document_payload_requires_an_isolated_write() {
         for (path, prose) in [
             ("NOTES.md", "git checkout -- <path> is blocked"),

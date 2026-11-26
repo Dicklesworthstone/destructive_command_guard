@@ -21703,11 +21703,12 @@ fn mask_proven_interpreter_documentation_inner(
             let Some(word) = content.word_range.as_ref() else {
                 continue;
             };
-            if crate::heredoc::decoded_inline_interpreter_source_proof(
+            if crate::heredoc::inline_interpreter_consumer_proof(
                 command,
                 word,
-                &content.content,
+                Some(&content.content),
                 content.language,
+                complete_context,
             ) != Some(true)
             {
                 continue;
@@ -42188,24 +42189,19 @@ fn exec_sink_pack_verdict(
             .min((remaining / 2).max(crate::ast_matcher::protected_scan_budget()))
             .min(remaining);
     }
+    let complete_context = interpreter_data_has_complete_context(command);
     let proof = move || {
         let Some((source, range, decoded_program, language)) = source_identity else {
             return (!inline).then_some(false);
         };
-        if let Some(program) = decoded_program {
-            // The complete word, decoded by the extractor's own lexer.
-            // An unresolved (partial or dynamic) word carries no
-            // `word_range` and never reaches this proof.
-            crate::heredoc::decoded_inline_interpreter_source_proof(
-                &source, &range, &program, language,
+        if inline {
+            crate::heredoc::inline_interpreter_consumer_proof(
+                &source,
+                &range,
+                decoded_program.as_deref(),
+                language,
+                complete_context,
             )
-        } else if inline {
-            // The existing inline extractor can return a partial raw
-            // fragment when shell quotes are escaped. Only extend it
-            // when the extracted bytes are exactly the complete program.
-            // Other consumers revoke the documentation exemption without
-            // suppressing additive checks of that complete source.
-            crate::heredoc::inline_interpreter_source_proof(&source, &range, language)
         } else {
             Some(crate::heredoc::range_is_quoted_interpreter_source(
                 &source, &range, language,
@@ -42229,7 +42225,7 @@ fn exec_sink_pack_verdict(
             &content.content,
             content.language,
             proof,
-            interpreter_data_has_complete_context(command),
+            complete_context,
             budget,
         )
     };
