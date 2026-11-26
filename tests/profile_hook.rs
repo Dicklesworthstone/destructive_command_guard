@@ -304,3 +304,41 @@ fn interpreter_literal_failure_is_unverified_without_blame_or_source_disclosure(
         assert!(!report.to_string().contains("INTERPRETER_SOURCE_CANARY"));
     }
 }
+
+#[test]
+fn python_local_call_results_reach_the_hook_without_spurious_deadlines_673() {
+    let read_only = "def edit(p, pairs):\n    s=open(p).read()\n\nedit('x',[('a','b')])\nedit('y',[('a','remove')])";
+    let recursive = "def recurse(action):\n    return recurse(action)\nrecurse('remove')";
+    for body in [read_only, recursive] {
+        for command in [
+            format!("python3 - <<'EOF'\n{body}\nEOF"),
+            format!("python3 -c \"{body}\""),
+        ] {
+            let output = run_hook_with_env(
+                &payload(&command),
+                None,
+                false,
+                false,
+                &[
+                    ("DCG_AST_TIMEOUT_MS", "5000"),
+                    ("DCG_HEREDOC_TIMEOUT_MS", "5000"),
+                ],
+            );
+            assert!(output.status.success(), "{command}: {output:?}");
+            if body == read_only {
+                assert!(output.stdout.is_empty(), "{command}: {output:?}");
+            } else {
+                let wire: serde_json::Value = serde_json::from_slice(&output.stdout)
+                    .expect("recursive call needs manual review");
+                let result = &wire["hookSpecificOutput"];
+                assert_eq!(result["permissionDecision"], "ask", "{command}: {wire}");
+                let reason = result["permissionDecisionReason"].as_str().unwrap();
+                assert!(
+                    reason.contains("incomplete: python_local_call_analysis"),
+                    "{command}: {reason}"
+                );
+                assert!(!reason.contains("hook_timeout_ms"), "{command}: {reason}");
+            }
+        }
+    }
+}

@@ -33,6 +33,7 @@ fn mock_deny_result(
         skipped_due_to_budget: false,
         regex_evaluation_incomplete: false,
         regex_failure: None,
+        incomplete_stage: None,
         quick_rejected: false,
         branch_context: None,
         session_occurrence: None,

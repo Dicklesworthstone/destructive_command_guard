@@ -172,6 +172,14 @@ pub enum MatchError {
         language: ScriptLanguage,
         detail: String,
     },
+    /// The code parsed, but a semantic analysis could not resolve it within
+    /// its structural limits. Retrying with a longer timeout cannot help.
+    AnalysisIncomplete {
+        language: ScriptLanguage,
+        /// Stable operation name used in incomplete-analysis diagnostics.
+        stage: &'static str,
+        detail: String,
+    },
     /// Pattern matching exceeded timeout.
     Timeout { elapsed_ms: u64, budget_ms: u64 },
     /// Pattern compilation failed (should not happen with static patterns).
@@ -205,6 +213,11 @@ impl std::fmt::Display for MatchError {
             }
             Self::ParseError { language, detail } => {
                 write!(f, "AST parse error for {language:?}: {detail}")
+            }
+            Self::AnalysisIncomplete {
+                language, detail, ..
+            } => {
+                write!(f, "AST analysis incomplete for {language:?}: {detail}")
             }
             Self::Timeout {
                 elapsed_ms,
@@ -7498,6 +7511,14 @@ mod tests {
             .is_transient()
         );
         assert!(!MatchError::UnsupportedLanguage(ScriptLanguage::Unknown).is_transient());
+        assert!(
+            !MatchError::AnalysisIncomplete {
+                language: ScriptLanguage::Python,
+                stage: "python_local_call_analysis",
+                detail: "unresolved local callable".into()
+            }
+            .is_transient()
+        );
         assert!(
             !MatchError::PatternError {
                 pattern: "p".into(),

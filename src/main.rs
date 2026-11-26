@@ -294,7 +294,10 @@ impl IndeterminateDetail {
 
 /// Use the selected evaluation's provenance, not a prior diagnostic or policy
 /// probe on this thread. Keep deadline evidence independently of regex failure.
-fn take_evaluation_exhaustion(failure: Option<perf::RegexFailure>) -> perf::BudgetExhaustion {
+fn take_evaluation_exhaustion(
+    failure: Option<perf::RegexFailure>,
+    stage: Option<&'static str>,
+) -> perf::BudgetExhaustion {
     let mut exhaustion = perf::take_budget_exhaustion();
     if let Some(failure) = failure {
         let phase = match failure.operation {
@@ -302,9 +305,14 @@ fn take_evaluation_exhaustion(failure: Option<perf::RegexFailure>) -> perf::Budg
             _ => ProfilePhase::RegexMatch,
         };
         exhaustion.incomplete = Some((failure.operation.as_str(), Some(phase)));
-    } else if exhaustion.regex_failure.is_some() {
-        // An unrelated regex note cannot identify this result's failed step.
-        exhaustion.incomplete = None;
+    } else {
+        exhaustion.incomplete = stage.map(|stage| {
+            let phase = exhaustion
+                .incomplete
+                .filter(|(observed, _)| *observed == stage)
+                .and_then(|(_, phase)| phase);
+            (stage, phase)
+        });
     }
     exhaustion.regex_failure = failure;
     exhaustion
@@ -2812,7 +2820,7 @@ fn attempt_rebase_recovery(
     // This independent evaluation must not inherit a confidence probe's notes.
     let _ = perf::take_budget_exhaustion();
     if ctx.deadline.is_exceeded() {
-        return RecoveryAttempt::Indeterminate(Box::new(take_evaluation_exhaustion(None)));
+        return RecoveryAttempt::Indeterminate(Box::new(take_evaluation_exhaustion(None, None)));
     }
     let relaxed = rebase_recovery::relaxed_allowlist(ctx.allowlists);
     let residual = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
@@ -2857,6 +2865,7 @@ fn attempt_rebase_recovery(
     if residual.decision == EvaluationDecision::Indeterminate || residual.skipped_due_to_budget {
         return RecoveryAttempt::Indeterminate(Box::new(take_evaluation_exhaustion(
             residual.regex_failure,
+            residual.incomplete_stage,
         )));
     }
     if residual.decision == EvaluationDecision::Deny {
@@ -2991,7 +3000,10 @@ fn resolve_hook_command(
         return ResolvedCommandOutcome::DeadlineExhausted {
             command: command.to_string(),
             stage: "evaluation",
-            exhaustion: Box::new(take_evaluation_exhaustion(result.regex_failure)),
+            exhaustion: Box::new(take_evaluation_exhaustion(
+                result.regex_failure,
+                result.incomplete_stage,
+            )),
         };
     }
 
@@ -4979,7 +4991,7 @@ mod tests {
         };
         perf::note_regex_failure(prior);
         perf::note_deadline_exhausted();
-        let deadline = take_evaluation_exhaustion(None);
+        let deadline = take_evaluation_exhaustion(None, None);
         assert!(deadline.deadline.is_some());
         assert!(deadline.regex_failure.is_none());
         assert!(deadline.incomplete.is_none());
@@ -4991,7 +5003,7 @@ mod tests {
             operation: perf::RegexOperation::FindFrom,
             cause: perf::RegexFailureCause::BacktrackLimit { steps: 100_000 },
         };
-        let exhaustion = take_evaluation_exhaustion(Some(selected));
+        let exhaustion = take_evaluation_exhaustion(Some(selected), None);
         assert_eq!(exhaustion.regex_failure, Some(selected));
         assert_eq!(
             exhaustion.incomplete,
@@ -5000,12 +5012,19 @@ mod tests {
         assert!(exhaustion.deadline.is_none());
 
         perf::note_incomplete_analysis("interpreter_literal_recovery");
-        let generic = take_evaluation_exhaustion(None);
+        let generic = take_evaluation_exhaustion(None, Some("interpreter_literal_recovery"));
         assert_eq!(
             generic.incomplete.unwrap().0,
             "interpreter_literal_recovery"
         );
         assert!(generic.regex_failure.is_none());
+
+        perf::note_incomplete_analysis("interpreter_literal_recovery");
+        let local_call = take_evaluation_exhaustion(None, Some("python_local_call_analysis"));
+        assert_eq!(
+            local_call.incomplete,
+            Some(("python_local_call_analysis", None))
+        );
     }
 
     #[test]

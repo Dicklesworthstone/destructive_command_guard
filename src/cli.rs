@@ -1087,11 +1087,22 @@ const CLASSIFY_OUTPUT_SCHEMA_VERSION: u32 = 1;
 /// pattern has been proven, but execution is still blocked conservatively.
 const INDETERMINATE_REASON: &str = "Safety evaluation did not complete within the analysis budget";
 
+fn indeterminate_stage(result: &EvaluationResult) -> Option<&'static str> {
+    result
+        .incomplete_stage
+        .filter(|_| !result.skipped_due_to_budget)
+}
+
 /// Describe the failure attached to this evaluation, never a stale thread-local
 /// observation. A regex work limit is independent of the hook's wall clock;
 /// retain the deadline wording when the evaluator actually exhausted it, with
 /// the known regex failure as additional context.
 fn indeterminate_reason(result: &EvaluationResult) -> std::borrow::Cow<'static, str> {
+    if let Some(stage) = indeterminate_stage(result) {
+        return std::borrow::Cow::Owned(format!(
+            "Safety evaluation could not finish (incomplete: {stage}). The command was not verified."
+        ));
+    }
     if !result.skipped_due_to_budget
         && let Some(failure) = &result.regex_failure
     {
@@ -5625,7 +5636,14 @@ fn test_command(
                     "Execution is blocked because DCG could not complete safety analysis."
                         .to_string(),
                 ),
-                source: Some("analysis_budget".to_string()),
+                source: Some(
+                    if indeterminate_stage(&result).is_some() {
+                        "analysis_incomplete"
+                    } else {
+                        "analysis_budget"
+                    }
+                    .to_string(),
+                ),
                 matched_span: None,
                 severity: None,
                 allowlist: None,
@@ -6207,7 +6225,12 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
             "unknown".to_string(),
             1.0,
             vec![ClassifyReason {
-                rule_id: "dcg:analysis-budget".to_string(),
+                rule_id: if indeterminate_stage(&result).is_some() {
+                    "dcg:analysis-incomplete"
+                } else {
+                    "dcg:analysis-budget"
+                }
+                .to_string(),
                 severity: "unknown".to_string(),
                 explanation: indeterminate_reason(&result).into_owned(),
             }],

@@ -131,6 +131,7 @@ enum Symbol {
     TemporaryDirectory,
     Str,
     Print,
+    Open,
     Getattr,
     Builtins,
 }
@@ -389,6 +390,8 @@ enum Value {
     Delete(Delete),
     Join(Path),
     PathRead,
+    ReadOnlyFile,
+    FileRead,
     LocalFunction(Arc<LocalFunction>),
 }
 
@@ -882,8 +885,9 @@ impl<'a> Scan<'a> {
     fn check<D: Doc>(&mut self, node: &Node<'_, D>, depth: usize) -> Result<(), MatchError> {
         check_ast_timeout(self.started, self.timeout, self.budget_ms, self.cancel)?;
         if depth >= MAX_DEPTH || self.remaining == 0 {
-            return Err(MatchError::Unavailable {
+            return Err(MatchError::AnalysisIncomplete {
                 language: ScriptLanguage::Python,
+                stage: "python_path_bindings",
                 detail: "Python path-binding analysis exhausted its traversal limit".to_string(),
             });
         }
@@ -1018,6 +1022,7 @@ impl<'a> Scan<'a> {
         for (name, symbol) in [
             ("str", Symbol::Str),
             ("print", Symbol::Print),
+            ("open", Symbol::Open),
             ("getattr", Symbol::Getattr),
         ] {
             if !writes.contains(name) && !imported_names.contains(name) {
@@ -1033,7 +1038,7 @@ impl<'a> Scan<'a> {
         };
         env.values
             .insert("getattr".to_string(), Value::Symbol(Symbol::Getattr).lost());
-        for name in ["str", "print", "getattr"] {
+        for name in ["str", "print", "open", "getattr"] {
             if let Some(value) = self.immutable.get(name) {
                 env.values.insert(name.to_string(), value.clone());
             }
@@ -3288,8 +3293,9 @@ impl<'a> Scan<'a> {
                     if possible.direct & MAY_LOCAL != 0 {
                         return Err(local_call_error("exhausted local return-depth summary"));
                     }
-                    return Err(MatchError::Unavailable {
+                    return Err(MatchError::AnalysisIncomplete {
                         language: ScriptLanguage::Python,
+                        stage: "python_container_selector",
                         detail:
                             "Python container selector analysis exhausted its return-depth limit"
                                 .to_string(),
@@ -3387,6 +3393,15 @@ impl<'a> Scan<'a> {
                     Value::Directory(path)
                 }
             }
+            // Only the builtin with a proved path and plain read mode yields
+            // this receiver. A custom opener, codec, or path conversion can
+            // execute Python and must still invalidate the caller's bindings.
+            Value::Symbol(Symbol::Open)
+                if env.trusted && plain && read_only_open(&args.positional) =>
+            {
+                Value::ReadOnlyFile
+            }
+            Value::FileRead if env.trusted && plain && args.positional.is_empty() => Value::Unknown,
             Value::PathRead | Value::Symbol(Symbol::Print) => Value::Unknown,
             Value::LocalFunction(function) => {
                 self.local_call(node, &function, &args, env, depth + 1)?
@@ -3577,8 +3592,9 @@ fn bounded_container(container: Container) -> Value {
 }
 
 fn local_call_error(detail: &str) -> MatchError {
-    MatchError::Unavailable {
+    MatchError::AnalysisIncomplete {
         language: ScriptLanguage::Python,
+        stage: "python_local_call_analysis",
         detail: format!("Python local-call analysis incomplete: {detail}"),
     }
 }
@@ -3832,6 +3848,7 @@ fn attribute(object: Value, member: &str) -> Value {
             Value::Symbol(Symbol::TemporaryDirectory)
         }
         (Value::Directory(path), "name") => Value::Text(path.clone()),
+        (Value::ReadOnlyFile, "read") => Value::FileRead,
         (Value::Path(path), "joinpath") => Value::Join(path.clone()),
         (
             Value::Path(_),
@@ -3858,6 +3875,19 @@ fn fold_paths(values: &[Value]) -> Option<Path> {
         path = path.join(value.path()?)?;
     }
     Some(path)
+}
+
+fn read_only_open(positional: &[Value]) -> bool {
+    match positional {
+        [Value::Text(_) | Value::Path(_)] => true,
+        [
+            Value::Text(_) | Value::Path(_),
+            Value::Text(Path::Literal(mode)),
+        ] => {
+            matches!(mode.as_ref(), "r" | "rt" | "tr" | "rb" | "br")
+        }
+        _ => false,
+    }
 }
 
 fn factory_arguments(args: &Args) -> bool {
@@ -3953,6 +3983,45 @@ mod tests {
                     && hit.severity.blocks_by_default()),
             "canonical recursive-deletion finding disappeared: {matches:?}"
         );
+    }
+
+    #[test]
+    fn repeated_local_calls_keep_identity_across_builtin_file_reads() {
+        for read in ["open(p).read()", "open(p, 'rb').read()"] {
+            let source = format!(
+                "def edit(p, pairs):\n    s = {read}\nedit('x', [('a', 'b')])\nedit('y', [('a', 'remove')])"
+            );
+            assert_blocked(&source, false);
+        }
+        // The second call must still analyze the helper with its new callback.
+        assert_blocked(
+            "import os\ndef edit(p, pairs, callback):\n    s = open(p).read()\n    callback(p)\nedit('x', [('a', 'b')], print)\nedit('y', [('a', 'remove')], os.remove)",
+            true,
+        );
+    }
+
+    #[test]
+    fn opaque_file_operations_still_invalidate_local_call_identity() {
+        for (setup, read) in [
+            ("from helpers import open\n", "open(p).read()"),
+            ("", "open(unknown_path).read()"),
+            ("", "open(p, opener=custom).read()"),
+            ("", "open(p, encoding=codec).read()"),
+            ("", "open(p).read(size)"),
+            ("", "other.read()"),
+        ] {
+            let source = format!(
+                "{setup}def edit(p, pairs):\n    s = {read}\nedit('x', [('a', 'b')])\nedit('y', [('a', 'remove')])"
+            );
+            let error = crate::ast_matcher::DEFAULT_MATCHER
+                .find_matches(&source, ScriptLanguage::Python)
+                .expect_err("opaque code can change the helper before its second call");
+            assert!(
+                matches!(error, MatchError::AnalysisIncomplete { ref detail, .. }
+                    if detail.contains("local callable identity is unresolved")),
+                "{source}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -4061,8 +4130,11 @@ mod tests {
             assert!(
                 matches!(
                     error,
-                    MatchError::Unavailable { language: ScriptLanguage::Python, ref detail }
-                        if detail == &format!("Python local-call analysis incomplete: {reason}")
+                    MatchError::AnalysisIncomplete {
+                        language: ScriptLanguage::Python,
+                        stage: "python_local_call_analysis",
+                        ref detail,
+                    } if detail == &format!("Python local-call analysis incomplete: {reason}")
                 ),
                 "unexpected analysis error: {error}"
             );
@@ -4113,8 +4185,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                MatchError::Unavailable { language: ScriptLanguage::Python, ref detail }
-                    if detail == "Python local-call analysis incomplete: recursive or exhausted local invocation"
+                MatchError::AnalysisIncomplete {
+                    language: ScriptLanguage::Python,
+                    stage: "python_local_call_analysis",
+                    ref detail,
+                } if detail == "Python local-call analysis incomplete: recursive or exhausted local invocation"
             ),
             "unexpected analysis error: {error}"
         );
@@ -4191,8 +4266,10 @@ mod tests {
             if returns_callable {
                 let error = result
                     .expect_err("a returned local callable must retain its unresolved identity");
-                assert!(matches!(error, MatchError::Unavailable { ref detail, .. }
-                    if detail == "Python local-call analysis incomplete: local callable identity is unresolved"));
+                assert!(
+                    matches!(error, MatchError::AnalysisIncomplete { ref detail, .. }
+                    if detail == "Python local-call analysis incomplete: local callable identity is unresolved")
+                );
             } else {
                 result.expect(
                     "an opaque factory with no synchronous call or return capabilities completes",
@@ -4235,7 +4312,7 @@ mod tests {
         .run(ast.root())
         .expect_err("invocation cannot consume a truncated return summary");
         assert!(
-            matches!(error, MatchError::Unavailable { ref detail, .. }
+            matches!(error, MatchError::AnalysisIncomplete { ref detail, .. }
             if detail == "Python local-call analysis incomplete: exhausted local return-depth summary"),
             "unexpected analysis error: {error}"
         );
@@ -4405,7 +4482,7 @@ mod tests {
         let matcher = super::super::AstMatcher::with_patterns(super::super::default_patterns());
         assert!(matches!(
             matcher.find_matches(&source, ScriptLanguage::Python),
-            Err(MatchError::Unavailable { detail, .. })
+            Err(MatchError::AnalysisIncomplete { stage: "python_container_selector", detail, .. })
                 if detail.contains("selector") && detail.contains("return-depth")
         ));
     }
@@ -4492,10 +4569,14 @@ mod tests {
         );
         scan.remaining = 1;
         let error = scan.run(ast.root()).expect_err("proof cannot fit one node");
-        assert!(
-            error.is_transient(),
-            "exhaustion cannot authorize a deletion"
-        );
+        assert!(matches!(
+            error,
+            MatchError::AnalysisIncomplete {
+                language: ScriptLanguage::Python,
+                stage: "python_path_bindings",
+                ref detail,
+            } if detail.contains("traversal limit")
+        ));
     }
 
     #[test]
@@ -4514,7 +4595,7 @@ mod tests {
         )
         .run(ast.root())
         .expect_err("cancelled proof must not succeed");
-        assert!(error.is_transient());
+        assert!(matches!(error, MatchError::Timeout { .. }));
     }
 
     #[test]

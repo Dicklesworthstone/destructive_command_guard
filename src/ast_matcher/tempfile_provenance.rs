@@ -915,7 +915,9 @@ mod tests {
                 case.id
             );
             match result {
-                Err(super::super::MatchError::Unavailable { language, detail }) => {
+                Err(super::super::MatchError::AnalysisIncomplete {
+                    language, detail, ..
+                }) => {
                     assert_eq!(language, ScriptLanguage::Python, "{}", case.id);
                     assert_eq!(&detail, expected, "{}", case.id);
                 }

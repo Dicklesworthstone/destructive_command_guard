@@ -25,6 +25,8 @@ struct EvaluationFailureState {
     // None after a non-regex proof fails first. A later regex failure must
     // not be attributed as the cause of that earlier incomplete analysis.
     first_regex_failure: Option<RegexFailure>,
+    // Populated only when the first failure was an embedded-source proof.
+    incomplete_stage: Option<&'static str>,
 }
 
 /// Metadata attached to a rule, never to an ambient evaluation context.
@@ -75,6 +77,15 @@ impl RegexEvaluationScope {
                 .and_then(|state| state.first_regex_failure)
         })
     }
+
+    pub(crate) fn incomplete_stage(&self) -> Option<&'static str> {
+        EVALUATION_FAILURES.with(|stack| {
+            stack
+                .borrow()
+                .last()
+                .and_then(|state| state.incomplete_stage)
+        })
+    }
 }
 
 impl Drop for RegexEvaluationScope {
@@ -104,6 +115,9 @@ pub(crate) fn record_incomplete_analysis(
 ) -> bool {
     let recorded = EVALUATION_FAILURES.with(|stack| {
         stack.borrow_mut().last_mut().is_some_and(|state| {
+            if !state.failed {
+                state.incomplete_stage = Some(stage);
+            }
             state.failed = true;
             true
         })
@@ -1180,17 +1194,31 @@ mod tests {
             .with_rule_identity("test.later", Some("later-rule"));
         let input = format!("{}!", "a".repeat(80));
         let outer = RegexEvaluationScope::enter();
-        assert!(record_incomplete_analysis(
-            "interpreter_literal_recovery",
-            &"bounded proof stopped"
-        ));
+        {
+            let inner = RegexEvaluationScope::enter();
+            assert!(record_incomplete_analysis(
+                "interpreter_literal_recovery",
+                &"bounded proof stopped"
+            ));
+            assert!(record_incomplete_analysis("later_analysis", &"stopped"));
+            assert_eq!(
+                inner.incomplete_stage(),
+                Some("interpreter_literal_recovery")
+            );
+        }
         {
             let inner = RegexEvaluationScope::enter();
             assert!(!pattern.is_match(&input));
+            assert!(record_incomplete_analysis("later_analysis", &"stopped"));
             assert!(inner.failure().is_some());
+            assert!(inner.incomplete_stage().is_none());
         }
         assert!(outer.has_failed());
         assert!(outer.failure().is_none());
+        assert_eq!(
+            outer.incomplete_stage(),
+            Some("interpreter_literal_recovery")
+        );
         let note = crate::perf::take_budget_exhaustion();
         assert_eq!(note.incomplete.unwrap().0, "interpreter_literal_recovery");
         assert!(note.regex_failure.is_none());

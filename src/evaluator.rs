@@ -989,6 +989,9 @@ pub struct EvaluationResult {
     /// executed child. Contains bounded rule identifiers and engine limits,
     /// never command text, pattern source, or execution context.
     pub regex_failure: Option<crate::perf::RegexFailure>,
+    /// The analysis step that stopped first, when the failure was outside the
+    /// regex engine. Belongs to this request, including its executed children.
+    pub incomplete_stage: Option<&'static str>,
     /// Whether the evaluator proved that no enabled-pack keyword was present
     /// and returned through the bounded quick-reject fast path.
     pub quick_rejected: bool,
@@ -1030,6 +1033,7 @@ impl EvaluationResult {
             quick_rejected: false,
             regex_evaluation_incomplete: false,
             regex_failure: None,
+            incomplete_stage: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1061,6 +1065,7 @@ impl EvaluationResult {
             quick_rejected: true,
             regex_evaluation_incomplete: false,
             regex_failure: None,
+            incomplete_stage: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1085,6 +1090,7 @@ impl EvaluationResult {
             quick_rejected: false,
             regex_evaluation_incomplete: false,
             regex_failure: None,
+            incomplete_stage: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1115,6 +1121,7 @@ impl EvaluationResult {
             quick_rejected: false,
             regex_evaluation_incomplete: false,
             regex_failure: None,
+            incomplete_stage: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1145,6 +1152,7 @@ impl EvaluationResult {
             quick_rejected: false,
             regex_evaluation_incomplete: false,
             regex_failure: None,
+            incomplete_stage: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1186,6 +1194,7 @@ impl EvaluationResult {
             quick_rejected: false,
             regex_evaluation_incomplete: false,
             regex_failure: None,
+            incomplete_stage: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1247,6 +1256,7 @@ impl EvaluationResult {
             quick_rejected: false,
             regex_evaluation_incomplete: false,
             regex_failure: None,
+            incomplete_stage: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1315,6 +1325,7 @@ impl EvaluationResult {
             quick_rejected: false,
             regex_evaluation_incomplete: false,
             regex_failure: None,
+            incomplete_stage: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1346,6 +1357,7 @@ impl EvaluationResult {
             quick_rejected: false,
             regex_evaluation_incomplete: false,
             regex_failure: None,
+            incomplete_stage: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1376,6 +1388,7 @@ impl EvaluationResult {
             quick_rejected: false,
             regex_evaluation_incomplete: false,
             regex_failure: None,
+            incomplete_stage: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1413,6 +1426,7 @@ impl EvaluationResult {
             quick_rejected: false,
             regex_evaluation_incomplete: false,
             regex_failure: None,
+            incomplete_stage: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1450,6 +1464,7 @@ impl EvaluationResult {
             quick_rejected: false,
             regex_evaluation_incomplete: false,
             regex_failure: None,
+            incomplete_stage: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1490,6 +1505,7 @@ impl EvaluationResult {
             quick_rejected: false,
             regex_evaluation_incomplete: false,
             regex_failure: None,
+            incomplete_stage: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1518,6 +1534,7 @@ impl EvaluationResult {
             quick_rejected: false,
             regex_evaluation_incomplete: false,
             regex_failure: None,
+            incomplete_stage: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -19742,6 +19759,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         }
         result.regex_evaluation_incomplete = true;
         result.regex_failure = scope.failure();
+        result.incomplete_stage = scope.incomplete_stage();
     }
     // The early lookup predicate is a performance guard, not an authorization
     // boundary. A nested inspection it did not predict must not strand an
@@ -41114,6 +41132,8 @@ fn evaluate_heredoc(
     context: HeredocEvaluationContext<'_>,
     first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
 ) -> Option<EvaluationResult> {
+    use crate::ast_matcher::MatchError;
+
     if deadline_exceeded(context.deadline)
         || remaining_below(context.deadline, &crate::perf::FULL_HEREDOC_PIPELINE)
     {
@@ -41301,7 +41321,7 @@ fn evaluate_heredoc(
             });
         shell_view.into_iter().chain(std::iter::once(content))
     });
-    let mut ast_left_body_unanalysed = false;
+    let mut unscoped_ast_stage = None;
     for mut content in content_views {
         if deadline_exceeded(context.deadline) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
@@ -41383,6 +41403,7 @@ fn evaluate_heredoc(
                         quick_rejected: false,
                         regex_evaluation_incomplete: false,
                         regex_failure: None,
+                        incomplete_stage: None,
                         branch_context: None,
                         session_occurrence: None,
                         graduated_response: None,
@@ -41722,6 +41743,7 @@ fn evaluate_heredoc(
                             quick_rejected: false,
                             regex_evaluation_incomplete: false,
                             regex_failure: None,
+                            incomplete_stage: None,
                             branch_context: None,
                             session_occurrence: None,
                             graduated_response: None,
@@ -41751,20 +41773,33 @@ fn evaluate_heredoc(
                         ..EvaluationResult::allowed()
                     });
                 }
+                // Remember an unread body before any later finding can return.
+                // If policy waives that finding, the failed proof still stands.
+                let stage = match &err {
+                    MatchError::AnalysisIncomplete { stage, .. } => Some(*stage),
+                    MatchError::Timeout { .. } => Some("ast_match"),
+                    MatchError::Unavailable { .. } => Some("ast_worker"),
+                    MatchError::UnsupportedLanguage(_)
+                    | MatchError::ParseError { .. }
+                    | MatchError::PatternError { .. } => None,
+                };
+                if let Some(stage) = stage
+                    && !crate::packs::regex_engine::record_incomplete_analysis(stage, &err)
+                {
+                    unscoped_ast_stage.get_or_insert(stage);
+                }
                 if let Some(blocked) =
                     check_fallback_patterns(&content.content, context, first_allowlist_hit)
                 {
                     return Some(blocked);
                 }
 
-                // A timeout or a matcher that could not run is the host's
-                // failure, not the code's: the strict timeout policy governs
-                // it, and under the fallback policy the body stays unanalysed.
-                let is_timeout = err.is_transient();
-                ast_left_body_unanalysed |= is_timeout;
-                let strict_timeout = is_timeout && !context.heredoc_settings.fallback_on_timeout;
-                let strict_other = !is_timeout && !context.heredoc_settings.fallback_on_parse_error;
-                if strict_timeout || strict_other {
+                let fallback = if err.is_transient() {
+                    context.heredoc_settings.fallback_on_timeout
+                } else {
+                    context.heredoc_settings.fallback_on_parse_error
+                };
+                if !fallback {
                     let reason = format!(
                         "Embedded code blocked: AST matching error with strict fallback \
                          configuration ({err})"
@@ -41843,6 +41878,7 @@ fn evaluate_heredoc(
                 quick_rejected: false,
                 regex_evaluation_incomplete: false,
                 regex_failure: None,
+                incomplete_stage: None,
                 branch_context: None,
                 session_occurrence: None,
                 graduated_response: None,
@@ -41946,11 +41982,18 @@ fn evaluate_heredoc(
         return Some(undecided);
     }
 
-    // Every backstop has had its say and none proved a deny, but a body the
-    // AST matcher never finished reading is not a clean body: answering `None`
-    // here would let the caller's quick-reject allow it.
-    if ast_left_body_unanalysed {
+    if deadline_exceeded(context.deadline) {
         return Some(EvaluationResult::indeterminate_due_to_budget());
+    }
+    // Without an enclosing evaluation scope, return the incomplete verdict
+    // here, after the remaining bodies and backstops have been checked.
+    if let Some(stage) = unscoped_ast_stage {
+        crate::perf::note_incomplete_analysis(stage);
+        return Some(EvaluationResult {
+            decision: EvaluationDecision::Indeterminate,
+            incomplete_stage: Some(stage),
+            ..EvaluationResult::allowed()
+        });
     }
 
     None
@@ -42069,6 +42112,7 @@ fn exec_sink_backstop_verdict(
             quick_rejected: false,
             regex_evaluation_incomplete: false,
             regex_failure: None,
+            incomplete_stage: None,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -42563,6 +42607,7 @@ fn dynamic_source_finding_verdict(
         quick_rejected: false,
         regex_evaluation_incomplete: false,
         regex_failure: None,
+        incomplete_stage: None,
         branch_context: None,
         session_occurrence: None,
         graduated_response: None,
@@ -42958,6 +43003,7 @@ fn check_credential_write_fallback(
                 quick_rejected: false,
                 regex_evaluation_incomplete: false,
                 regex_failure: None,
+                incomplete_stage: None,
                 branch_context: None,
                 session_occurrence: None,
                 graduated_response: None,
@@ -64563,6 +64609,7 @@ mod tests {
                 quick_rejected: false,
                 regex_evaluation_incomplete: false,
                 regex_failure: None,
+                incomplete_stage: None,
                 branch_context: None,
                 session_occurrence: None,
                 graduated_response: None,
@@ -64753,6 +64800,7 @@ mod tests {
                 quick_rejected: false,
                 regex_evaluation_incomplete: false,
                 regex_failure: None,
+                incomplete_stage: None,
                 session_occurrence: None,
                 graduated_response: None,
                 bypass_method: None,
@@ -65346,6 +65394,16 @@ mod tests {
             assert!(matches!(
                 retry_transient_ast_failure(parse, &content, context),
                 Err(MatchError::ParseError { .. })
+            ));
+
+            let incomplete = MatchError::AnalysisIncomplete {
+                language: content.language,
+                stage: "python_local_call_analysis",
+                detail: "recursive local invocation".into(),
+            };
+            assert!(matches!(
+                retry_transient_ast_failure(incomplete, &content, context),
+                Err(MatchError::AnalysisIncomplete { .. })
             ));
 
             let mut strict = completed_extraction();

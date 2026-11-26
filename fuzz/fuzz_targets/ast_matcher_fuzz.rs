@@ -96,7 +96,9 @@ fn assert_expected_fail_open_error(error: MatchError) {
     match error {
         MatchError::UnsupportedLanguage(_)
         | MatchError::ParseError { .. }
+        | MatchError::AnalysisIncomplete { .. }
         | MatchError::Timeout { .. }
+        | MatchError::Unavailable { .. }
         | MatchError::PatternError { .. } => {}
     }
 }

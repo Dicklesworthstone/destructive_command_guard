@@ -126,6 +126,40 @@ fn test_basic_allowed_command_exits_zero() {
 }
 
 #[test]
+fn python_local_call_failure_names_the_step_in_test_and_classify_673() {
+    let command =
+        "python3 - <<'PY'\ndef recurse(action):\n    return recurse(action)\nrecurse('remove')\nPY";
+    let timeouts = [
+        ("DCG_AST_TIMEOUT_MS", Path::new("5000")),
+        ("DCG_HEREDOC_TIMEOUT_MS", Path::new("5000")),
+    ];
+    for subcommand in ["test", "classify"] {
+        let output =
+            run_dcg_isolated_with_env(&[subcommand, "--format", "json", command], None, &timeouts);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let json = parse_json(&output);
+        assert_eq!(json["decision"], "indeterminate", "{json}");
+        let reason = if subcommand == "test" {
+            assert_eq!(json["source"], "analysis_incomplete", "{json}");
+            &json["reason"]
+        } else {
+            assert_eq!(
+                json["reasons"][0]["rule_id"], "dcg:analysis-incomplete",
+                "{json}"
+            );
+            &json["reasons"][0]["explanation"]
+        };
+        assert!(
+            reason
+                .as_str()
+                .unwrap()
+                .contains("incomplete: python_local_call_analysis"),
+            "{json}"
+        );
+    }
+}
+
+#[test]
 fn test_stdin_keeps_blocked_command_off_the_cli_arguments() {
     let output = run_dcg_isolated_with_stdin(
         &[
