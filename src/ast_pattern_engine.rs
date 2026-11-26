@@ -172,8 +172,8 @@ pub enum MatchError {
         language: ScriptLanguage,
         detail: String,
     },
-    /// The code parsed, but a semantic analysis could not resolve it within
-    /// its structural limits. Retrying with a longer timeout cannot help.
+    /// A structural limit or unresolved value prevented a complete analysis.
+    /// Retrying with a longer timeout cannot help.
     AnalysisIncomplete {
         language: ScriptLanguage,
         /// Stable operation name used in incomplete-analysis diagnostics.
@@ -453,8 +453,15 @@ impl AstMatcher {
             return Ok(Vec::new());
         }
 
-        if timeout.is_zero() || code.len() > MAX_AST_INPUT_BYTES {
+        if timeout.is_zero() {
             return Err(timeout_error(start_time, budget_ms));
+        }
+        if code.len() > MAX_AST_INPUT_BYTES {
+            return Err(MatchError::AnalysisIncomplete {
+                language,
+                stage: "ast_input_size",
+                detail: format!("source exceeds the {MAX_AST_INPUT_BYTES}-byte AST input limit"),
+            });
         }
 
         run_ast_match_with_timeout(
@@ -2000,8 +2007,9 @@ impl PythonDeleteScan<'_> {
     fn check(&mut self, depth: usize) -> Result<(), MatchError> {
         check_ast_timeout(self.start_time, self.timeout, self.budget_ms, self.cancel)?;
         if depth > MAX_PYTHON_DELETE_DEPTH || self.remaining_nodes == 0 {
-            return Err(MatchError::ParseError {
+            return Err(MatchError::AnalysisIncomplete {
                 language: ScriptLanguage::Python,
+                stage: "python_deletion_bindings",
                 detail: "Python deletion binding analysis exceeds its traversal limit".to_string(),
             });
         }
@@ -8437,21 +8445,24 @@ mod tests {
     }
 
     #[test]
-    fn oversized_input_fails_open_without_ast_parse() {
+    fn oversized_input_reports_the_byte_limit_without_ast_parse() {
         let ast_matcher = AstMatcher::new().with_timeout(Duration::from_secs(10));
         let code = "x = 1\n".repeat((MAX_AST_INPUT_BYTES / 6) + 2);
         assert!(code.len() > MAX_AST_INPUT_BYTES);
 
         let start = Instant::now();
-        let result = ast_matcher.find_matches(&code, ScriptLanguage::Python);
-
-        assert!(
-            matches!(result, Err(MatchError::Timeout { .. })),
-            "oversized direct matcher input should fail open on the budget guard"
-        );
-        // As above, the matches!(Err(Timeout)) check is the real guard; this
-        // generous timing bound only documents the early return and avoids
-        // load-induced flakes.
+        let error = ast_matcher
+            .find_matches(&code, ScriptLanguage::Python)
+            .expect_err("oversized source cannot be fully analyzed");
+        assert!(!error.is_transient());
+        assert!(matches!(
+            error,
+            MatchError::AnalysisIncomplete {
+                language: ScriptLanguage::Python,
+                stage: "ast_input_size",
+                ..
+            }
+        ));
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "oversized input should not enter ast-grep parsing"

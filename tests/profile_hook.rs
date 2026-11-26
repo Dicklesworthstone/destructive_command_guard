@@ -342,3 +342,40 @@ fn python_local_call_results_reach_the_hook_without_spurious_deadlines_673() {
         }
     }
 }
+
+#[test]
+fn python_deletion_binding_traversal_limit_keeps_a_valid_body_unverified() {
+    // Both programs only add integers. The deeper expression exceeds the
+    // deletion-binding walk's structural limit even with time left to run.
+    for (terms, complete) in [(4, true), (160, false)] {
+        let sum = vec!["1"; terms].join("+");
+        let command = format!(
+            "python3 - <<'PY'\nimport shutil\n# See the rmtree documentation.\nvalue = {sum}\nPY"
+        );
+        let output = run_hook_with_env(
+            &payload(&command),
+            None,
+            false,
+            false,
+            &[
+                ("DCG_AST_TIMEOUT_MS", "5000"),
+                ("DCG_HEREDOC_TIMEOUT_MS", "5000"),
+            ],
+        );
+        assert!(output.status.success(), "{output:?}");
+        if complete {
+            assert!(output.stdout.is_empty(), "{output:?}");
+        } else {
+            let wire: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("incomplete hook verdict");
+            let result = &wire["hookSpecificOutput"];
+            assert_eq!(result["permissionDecision"], "ask", "{wire}");
+            let reason = result["permissionDecisionReason"].as_str().unwrap();
+            assert!(
+                reason.contains("incomplete: python_deletion_bindings"),
+                "{reason}"
+            );
+            assert!(!reason.contains("hook_timeout_ms"), "{reason}");
+        }
+    }
+}
