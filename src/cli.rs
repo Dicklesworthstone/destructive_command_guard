@@ -340,7 +340,7 @@ pub enum Command {
 
         /// Install the dcg PreToolUse hook for the Antigravity CLI (`agy`) at
         /// `~/.gemini/config/hooks.json` (user-level) or
-        /// `<repo>/.gemini/config/hooks.json` (with `--project`). `agy` reads
+        /// `<repo>/.agents/hooks.json` (with `--project`). `agy` reads
         /// Claude-Code-compatible `PreToolUse` hooks from this file and aborts
         /// its `run_command` shell tool when dcg returns a block decision.
         #[arg(
@@ -13731,14 +13731,14 @@ fn claude_dcg_hook_for_executable(
     }
 }
 
-fn hook_command_for_executable(executable: &std::path::Path) -> std::io::Result<String> {
+fn absolute_utf8_hook_program(executable: &std::path::Path) -> std::io::Result<&str> {
     if !executable.is_absolute() {
         return Err(std::io::Error::other(format!(
             "dcg hook executable path is not absolute: {}",
             executable.display()
         )));
     }
-    let executable = executable.to_str().ok_or_else(|| {
+    executable.to_str().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -13746,7 +13746,11 @@ fn hook_command_for_executable(executable: &std::path::Path) -> std::io::Result<
                 executable.display()
             ),
         )
-    })?;
+    })
+}
+
+fn hook_command_for_executable(executable: &std::path::Path) -> std::io::Result<String> {
+    let executable = absolute_utf8_hook_program(executable)?;
 
     #[cfg(windows)]
     {
@@ -13765,7 +13769,70 @@ fn claude_dcg_hook() -> std::io::Result<serde_json::Value> {
 }
 
 fn antigravity_dcg_hook() -> std::io::Result<serde_json::Value> {
-    claude_dcg_hook_for_executable(&current_dcg_executable()?)
+    antigravity_dcg_hook_for_executable(&current_dcg_executable()?)
+}
+
+/// The handler dcg writes into agy's `hooks.json`.
+///
+/// agy documents only `type`, `command` and `timeout` on a handler. On
+/// Windows it runs `command` through cmd.exe and ignores the `shell` key that
+/// Claude Code's Windows hook carries, so the PowerShell call-operator form
+/// `& '…'` failed with "& was unexpected at this time." and broke every
+/// `run_command` call (#677). Write the absolute path, quoted for cmd.exe on
+/// Windows and for a POSIX shell elsewhere, and no `shell` key.
+fn antigravity_dcg_hook_for_executable(
+    executable: &std::path::Path,
+) -> std::io::Result<serde_json::Value> {
+    antigravity_dcg_hook_for_program(absolute_utf8_hook_program(executable)?, cfg!(windows))
+}
+
+/// The platform is a parameter so the Windows shape is tested on every host.
+fn antigravity_dcg_hook_for_program(
+    program: &str,
+    windows: bool,
+) -> std::io::Result<serde_json::Value> {
+    let command = if windows {
+        cmd_quote_hook_program(program)?
+    } else {
+        posix_quote_hook_program(program)
+    };
+    Ok(serde_json::json!({
+        "type": "command",
+        "command": command
+    }))
+}
+
+/// Quote an absolute Windows program path for a cmd.exe command line.
+///
+/// A path without spaces or cmd.exe metacharacters is written bare, the form
+/// confirmed to work in agy on Windows. Any other path is wrapped in double
+/// quotes, inside which cmd.exe reads `&|<>()^,;=` and spaces literally.
+/// cmd.exe expands `%NAME%` even inside quotes and a path cannot contain `"`
+/// or a control character, so those are refused rather than written as a
+/// hook that runs something else or nothing.
+fn cmd_quote_hook_program(program: &str) -> std::io::Result<String> {
+    if program
+        .chars()
+        .any(|character| matches!(character, '%' | '"') || character.is_control())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "dcg hook executable path contains %, \" or a control character, \
+                 which cmd.exe cannot run as written: {program}"
+            ),
+        ));
+    }
+    if program.chars().any(|character| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '&' | '|' | '<' | '>' | '(' | ')' | '^' | ',' | ';' | '='
+            )
+    }) {
+        return Ok(format!("\"{program}\""));
+    }
+    Ok(program.to_string())
 }
 
 fn quoted_hook_program(command: &str) -> Option<String> {
@@ -14736,7 +14803,7 @@ fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::erro
 /// legacy `Bash` matcher entry written by older releases). When dcg returns a block decision
 /// (stdout `{"decision":"block",...}`), `agy` aborts its `run_command` tool.
 ///
-/// With `--project`, writes to `<repo>/.gemini/config/hooks.json` instead.
+/// With `--project`, writes to `<repo>/.agents/hooks.json` instead.
 ///
 /// Returns `Err` if the file cannot be read/written or, for project installs,
 /// if the current directory is not inside a git repository.
@@ -14808,13 +14875,21 @@ fn antigravity_hooks_path() -> std::path::PathBuf {
 }
 
 /// Path to a project-level Antigravity (`agy`) hooks file
-/// (`<repo>/.gemini/config/hooks.json`).
+/// (`<repo>/.agents/hooks.json`).
+///
+/// agy loads workspace hooks from `.agents/hooks.json` at the project root;
+/// a project-level `.gemini/config/hooks.json`, which dcg wrote before, is
+/// not a location agy reads.
 ///
 /// Returns `Err` if the current directory is not inside a git repository.
 fn project_antigravity_hooks_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     let repo_root = find_repo_root_from_cwd()
         .ok_or("Not inside a git repository — cannot determine project root")?;
-    Ok(repo_root.join(".gemini").join("config").join("hooks.json"))
+    Ok(project_antigravity_hooks_path_in(&repo_root))
+}
+
+fn project_antigravity_hooks_path_in(repo_root: &std::path::Path) -> std::path::PathBuf {
+    repo_root.join(".agents").join("hooks.json")
 }
 
 /// Regex Crush tests against the tool name; its shell tool is `bash` on
@@ -33206,6 +33281,118 @@ console.log(JSON.stringify({
         let changed_again =
             install_antigravity_hook_into_settings(&mut settings, false).expect("idempotent");
         assert!(!changed_again, "migrated entry should be idempotent");
+    }
+
+    /// #677: agy runs a hook's `command` through cmd.exe on Windows and has no
+    /// `shell` key, so the generated Windows hooks.json must hold a plain or
+    /// double-quoted path, never PowerShell's `& '…'`. It also repairs the
+    /// broken entry earlier releases wrote.
+    #[test]
+    fn agy_windows_hooks_json_runs_under_cmd_exe_677() {
+        let program = r"D:\tools\dcg\dcg.exe";
+        let desired = antigravity_dcg_hook_for_program(program, true).expect("Windows hook");
+        assert_eq!(
+            desired,
+            serde_json::json!({"type": "command", "command": program}),
+            "no `shell` key and no PowerShell call operator"
+        );
+
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "run_command",
+                    "hooks": [{
+                        "type": "command",
+                        "command": r"& 'D:\tools\dcg\dcg.exe'",
+                        "shell": "powershell",
+                        "timeout": 10
+                    }]
+                }]
+            }
+        });
+        let changed = install_dcg_hook_for_matcher(
+            &mut settings,
+            false,
+            ANTIGRAVITY_SHELL_MATCHER,
+            LEGACY_ANTIGRAVITY_SHELL_MATCHERS,
+            desired.clone(),
+        )
+        .expect("repair");
+        assert!(changed, "the PowerShell-form entry must be rewritten");
+        assert_eq!(
+            settings,
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "run_command",
+                        "hooks": [{
+                            "type": "command",
+                            "command": r"D:\tools\dcg\dcg.exe",
+                            "timeout": 10
+                        }]
+                    }]
+                }
+            })
+        );
+        let changed_again = install_dcg_hook_for_matcher(
+            &mut settings,
+            false,
+            ANTIGRAVITY_SHELL_MATCHER,
+            LEGACY_ANTIGRAVITY_SHELL_MATCHERS,
+            desired,
+        )
+        .expect("idempotent");
+        assert!(!changed_again);
+
+        // The hook written for this host never carries `shell` either.
+        let hook = antigravity_dcg_hook().expect("desired Antigravity hook");
+        assert!(hook.get("shell").is_none(), "{hook}");
+        let command = hook["command"].as_str().expect("hook command");
+        assert!(!command.starts_with('&'), "{command}");
+        assert_eq!(
+            dcg_command_program(command).map(std::path::PathBuf::from),
+            Some(current_dcg_executable().expect("current executable"))
+        );
+    }
+
+    #[test]
+    fn cmd_quote_hook_program_quotes_only_when_cmd_exe_needs_it_677() {
+        for (program, expected) in [
+            (r"D:\tools\dcg\dcg.exe", r"D:\tools\dcg\dcg.exe"),
+            (
+                r"C:\Users\O'Brien\.local\bin\dcg.exe",
+                r"C:\Users\O'Brien\.local\bin\dcg.exe",
+            ),
+            (
+                r"C:\Users\Jane Doe\.local\bin\dcg.exe",
+                r#""C:\Users\Jane Doe\.local\bin\dcg.exe""#,
+            ),
+            (
+                r"C:\Program Files (x86)\dcg\dcg.exe",
+                r#""C:\Program Files (x86)\dcg\dcg.exe""#,
+            ),
+            (r"C:\a&b\dcg.exe", r#""C:\a&b\dcg.exe""#),
+            (r"C:\a^b;c=d,e\dcg.exe", r#""C:\a^b;c=d,e\dcg.exe""#),
+        ] {
+            let command = cmd_quote_hook_program(program).expect(program);
+            assert_eq!(command, expected);
+            assert_eq!(dcg_command_program(&command).as_deref(), Some(program));
+        }
+        // cmd.exe expands %NAME% even inside quotes; `"` and control
+        // characters cannot appear in a path it would run as written.
+        for program in [r"C:\100%\dcg.exe", r#"C:\a"b\dcg.exe"#, "C:\\a\nb\\dcg.exe"] {
+            assert!(cmd_quote_hook_program(program).is_err(), "{program:?}");
+        }
+    }
+
+    /// #677 follow-up: agy reads workspace hooks from `.agents/hooks.json` at
+    /// the project root, not from a project-level `.gemini/config/hooks.json`.
+    #[test]
+    fn agy_project_hooks_live_in_dot_agents_677() {
+        assert_eq!(
+            project_antigravity_hooks_path_in(std::path::Path::new("/work/repo")),
+            std::path::Path::new("/work/repo/.agents/hooks.json")
+        );
     }
 
     // ========================================================================
