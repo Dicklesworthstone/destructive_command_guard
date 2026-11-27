@@ -1831,20 +1831,27 @@ install_binary() {
 # Cross-platform locking using mkdir (atomic on all POSIX systems including macOS)
 LOCK_DIR="${LOCK_FILE}.d"
 LOCKED=0
-if mkdir "$LOCK_DIR" 2>/dev/null; then
+# Take the lock and record our pid. A pid that cannot be written (full disk or
+# spent quota) would leave an ownerless lock that blocks every later run, so
+# release it and stop instead.
+take_install_lock() {
+  mkdir "$LOCK_DIR" 2>/dev/null || return 1
   LOCKED=1
-  echo $$ > "$LOCK_DIR/pid"
-else
-  # Check if existing lock is stale (process no longer running)
-  if [ -f "$LOCK_DIR/pid" ]; then
-    OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
-    if [ -n "$OLD_PID" ] && ! kill -0 "$OLD_PID" 2>/dev/null; then
-      rm -rf "$LOCK_DIR"
-      if mkdir "$LOCK_DIR" 2>/dev/null; then
-        LOCKED=1
-        echo $$ > "$LOCK_DIR/pid"
-      fi
-    fi
+  if ! echo $$ > "$LOCK_DIR/pid" 2>/dev/null; then
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+    LOCKED=0
+    err "Could not write pid file to $LOCK_DIR (disk full or read-only?)"
+    exit 1
+  fi
+}
+if ! take_install_lock; then
+  # The existing lock is stale if its process is gone, or if it never recorded
+  # a pid (an interrupted or disk-full run) and is more than 10 minutes old.
+  OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
+  if { [ -n "$OLD_PID" ] && ! kill -0 "$OLD_PID" 2>/dev/null; } \
+    || { [ -z "$OLD_PID" ] && [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +10 2>/dev/null)" ]; }; then
+    rm -rf "$LOCK_DIR"
+    take_install_lock || true
   fi
   if [ "$LOCKED" -eq 0 ]; then
     err "Another installer is running (lock $LOCK_DIR)"
