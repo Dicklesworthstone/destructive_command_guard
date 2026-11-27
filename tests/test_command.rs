@@ -169,6 +169,59 @@ fn trash_operand_decisions_agree_with_the_hook() {
     }
 }
 
+/// The freedesktop Trash is the Linux soft-delete that the
+/// `mv-sensitive-source-root-home` explanation lists as allowed, next to
+/// `~/.Trash`. A move into it, or into its `files/` directory, is allowed
+/// for the sources the Finder Trash move admits. The program-name case
+/// fold used to lower-case the `Trash` component (it spells the `trash`
+/// keyword), so the replay saw a move to `.../trash/` and denied it. A
+/// look-alike directory, `..` that leaves the Trash, an unexpanded `$HOME`,
+/// the sources that rule exists for, and a real `TRASH` program stay
+/// denied. Candidates are passed as arguments or JSON data to DCG. No shell
+/// executes them.
+#[test]
+fn freedesktop_trash_moves_agree_with_the_finder_trash() {
+    for (command, expected) in [
+        ("mv ./build ~/.local/share/Trash/", "allow"),
+        ("mv ./build ~/.local/share/Trash", "allow"),
+        ("mv ./build ~/.local/share/Trash/files/", "allow"),
+        ("mv build ~/.local/share/Trash/files", "allow"),
+        ("mv ~/Downloads/junk.md ~/.local/share/Trash/", "allow"),
+        ("mv /tmp/task/out ~/.local/share/Trash/files/", "allow"),
+        ("mv ~/.gnupg ~/.local/share/Trash/", "allow"),
+        ("mv /home/u/docs/a.txt /home/u/.local/share/Trash/", "allow"),
+        (
+            r#"mv "/home/u/docs/a b.txt" /home/u/.local/share/Trash/files/"#,
+            "allow",
+        ),
+        (
+            "mv '/home/u/docs/a;b.txt' /home/u/.local/share/Trash/",
+            "allow",
+        ),
+        ("mv ./build ~/.Trash/", "allow"),
+        ("mv ./build ~/.local/share/Trash-evil/", "deny"),
+        ("mv ./build ~/.local/share/Trashcan/", "deny"),
+        ("mv ./build ~/.local/share/trash/", "deny"),
+        ("mv ./build ~/.local/share/TRASH/", "deny"),
+        ("mv ./build ~/.local/share/Trash/../../../.ssh/", "deny"),
+        ("mv ./build ~/.local/share/Trash/files/../../..", "deny"),
+        ("mv ./build ~/.local/Trash/", "deny"),
+        (r#"mv ./build "$HOME/.local/share/Trash/""#, "deny"),
+        ("mv ./build $HOME/.local/share/Trash/", "deny"),
+        ("mv ~ ~/.local/share/Trash/", "deny"),
+        ("mv / ~/.local/share/Trash/", "deny"),
+        ("mv /etc ~/.local/share/Trash/", "deny"),
+        ("mv /home/u ~/.local/share/Trash/", "deny"),
+        ("mv /opt/vendor ~/.local/share/Trash/files/", "deny"),
+        ("mv . ~/.local/share/Trash/", "deny"),
+        ("mv ./build . ~/.local/share/Trash/files/", "deny"),
+        ("mv ./build ~/.local/share/Trash/ && rm -rf ~", "deny"),
+        ("mv ./build ~/.local/share/Trash/ && TRASH ~", "deny"),
+    ] {
+        assert_trash_decision(command, expected, None);
+    }
+}
+
 /// #675: rimraf deletes permanently, so outside a literal temp directory it
 /// is reviewed like `rm -rf`, also when npx, npm exec, pnpm, yarn or bun
 /// starts it. Candidates are passed as arguments or JSON data; none runs.

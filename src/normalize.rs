@@ -5753,6 +5753,23 @@ pub(crate) fn fold_program_name_case(command: &str, enabled_keywords: &[&str]) -
         if after_heredoc_operator {
             continue;
         }
+        // The freedesktop Trash, `~/.local/share/Trash`, is the directory
+        // dcg's own guidance names as the Linux soft-delete destination. Its
+        // last component spells the `trash` keyword, and folding it turned
+        // `mv ./build ~/.local/share/Trash/` into a move to `.../trash/`, a
+        // directory no Trash exemption accepts, so the replay denied what
+        // the command as written may do. Only this exact spelling is spared.
+        // A program run from that data directory would be one placed there,
+        // and such a program can be named anything.
+        if bytes[..start].ends_with(b"/.local/share/")
+            && run
+                .iter()
+                .copied()
+                .filter(|byte| !is_transparent(*byte))
+                .eq(*b"Trash")
+        {
+            continue;
+        }
         let name_of = |part: &[u8]| -> Vec<u8> {
             let mut name: Vec<u8> = part
                 .iter()
@@ -5981,6 +5998,42 @@ mod tests {
                 normalized.contains("rm -rf ~"),
                 "{command:?} -> {normalized:?}"
             );
+        }
+    }
+
+    /// The freedesktop Trash directory keeps its case: its name spells the
+    /// `trash` keyword, but it is the soft-delete destination, not a program.
+    /// Every other spelling of the name still folds.
+    #[test]
+    fn freedesktop_trash_directory_keeps_its_case() {
+        let keywords = ["trash", "rm"];
+        for command in [
+            "mv ./build ~/.local/share/Trash/",
+            "mv ./build ~/.local/share/Trash",
+            "mv ./build ~/.local/share/Trash/files/",
+            "mv a /home/u/.local/share/Trash/files",
+            r#"mv "a b" "/home/u/.local/share/Trash/""#,
+            "mv a ~/.local/share/'Trash'",
+        ] {
+            assert_eq!(
+                fold_program_name_case(command, &keywords),
+                None,
+                "{command:?}"
+            );
+        }
+        for (command, folded) in [
+            ("Trash ~", "trash ~"),
+            ("/usr/bin/Trash ~", "/usr/bin/trash ~"),
+            ("~/.local/bin/TRASH ~", "~/.local/bin/trash ~"),
+            ("~/.local/share/TRASH ~", "~/.local/share/trash ~"),
+            ("~/.local/sharE/Trash ~", "~/.local/sharE/trash ~"),
+            (
+                "~/.local/share/Trash/x RM -rf ~",
+                "~/.local/share/Trash/x rm -rf ~",
+            ),
+        ] {
+            let view = fold_program_name_case(command, &keywords);
+            assert_eq!(view.as_deref(), Some(folded), "{command:?}");
         }
     }
 
