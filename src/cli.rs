@@ -312,7 +312,7 @@ pub enum Command {
 
     /// Install the hook into Claude Code settings (or another agent with
     /// `--grok`, `--agy`, `--opencode`, `--omp`, `--crush`, `--reasonix`,
-    /// `--muse`, `--amp`, or `--droid`)
+    /// `--muse`, `--amp`, `--droid`, or `--shell-shim`)
     ///
     /// Claude user settings honor CLAUDE_CONFIG_DIR when non-empty, otherwise
     /// ~/.claude/settings.json is used.
@@ -321,6 +321,21 @@ pub enum Command {
         /// Force overwrite existing hook configuration
         #[arg(long)]
         force: bool,
+
+        /// Install PATH shims for shells that have no agent hook (Unix)
+        ///
+        /// Writes wrappers for guarded commands into `$XDG_BIN_HOME`, or
+        /// `~/.local/bin`, that call `dcg test` before the real binary.
+        /// Existing files without the dcg marker are refused unless `--force`
+        /// is given. See docs/shell-shim.md.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "project", "grok", "agy", "opencode", "omp", "crush", "reasonix", "muse", "amp",
+                "droid"
+            ]
+        )]
+        shell_shim: bool,
 
         /// Install to the selected agent's project configuration (in the
         /// current repository) instead of user-level settings
@@ -465,6 +480,16 @@ pub enum Command {
         /// Also remove configuration files
         #[arg(long)]
         purge: bool,
+
+        /// Remove the PATH shims installed by `dcg install --shell-shim`
+        ///
+        /// Only files carrying the dcg shim marker are removed; anything else
+        /// found at those names is left alone. See docs/shell-shim.md.
+        #[arg(
+            long,
+            conflicts_with_all = ["purge", "crush", "reasonix", "muse", "amp", "droid", "project"]
+        )]
+        shell_shim: bool,
 
         /// Remove the dcg hook entry from `~/.config/crush/crush.json` instead
         /// of Claude Code settings
@@ -2645,6 +2670,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Command::Install {
             force,
+            shell_shim,
             project,
             grok,
             agy,
@@ -2656,7 +2682,9 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             amp,
             droid,
         }) => {
-            if droid {
+            if shell_shim {
+                crate::shell_shim::install(force)?;
+            } else if droid {
                 install_droid_hook(force, project)?;
             } else if amp {
                 install_amp_plugin(force, project)?;
@@ -2687,6 +2715,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Command::Uninstall {
             purge,
+            shell_shim,
             crush,
             reasonix,
             muse,
@@ -2694,7 +2723,9 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             droid,
             project,
         }) => {
-            if droid {
+            if shell_shim {
+                crate::shell_shim::uninstall()?;
+            } else if droid {
                 uninstall_droid_hook(project)?;
             } else if amp {
                 uninstall_amp_plugin()?;

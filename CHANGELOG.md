@@ -11,6 +11,12 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+- **Shell shims for unhooked runtimes (`bd-sh-shim`):** `dcg install --shell-shim` writes marker-owned bash wrappers for guarded command names into `$XDG_BIN_HOME` (default `~/.local/bin`). Each wrapper asks `dcg test` for a verdict before executing the real binary, extending protection to plain shells and custom agent runtimes that have no hook. `dcg uninstall --shell-shim` removes only dcg-owned wrappers. See [docs/shell-shim.md](docs/shell-shim.md).
+
+---
+
 ## [v0.17.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.17.2) -- 2026-11-25 [Release]
 
 This patch release adds the opt-in `system.processes` pack, analyzes more
