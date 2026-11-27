@@ -13,7 +13,9 @@
 //! runtime the execution test SKIPs; the install/uninstall round trip and the
 //! doctor check always run.
 
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 
 /// The handler is called with the documented `ToolCallEvent` (`toolUseID`,
@@ -22,6 +24,7 @@ use std::process::Command;
 /// documented contract (a `ShellCommand { command, dir? }` for a Bash or
 /// shell_command call, else null); the plugin must also work when the helper
 /// is missing or throws.
+#[cfg(unix)]
 const DRIVER: &str = r#"
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
@@ -179,6 +182,7 @@ console.log(`Amp plugin: ${checks} checks, ${failures} failures`);
 process.exit(failures === 0 ? 0 : 1);
 "#;
 
+#[cfg(unix)]
 fn javascript_runtimes() -> Vec<&'static str> {
     ["bun", "node"]
         .into_iter()
