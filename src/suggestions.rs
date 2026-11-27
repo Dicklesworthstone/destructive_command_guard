@@ -1020,6 +1020,27 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         ],
     );
 
+    // rimraf is a permanent recursive delete (#675); the Trash keeps it
+    // recoverable, and a literal temp path is allowed as for `rm -rf`.
+    m.insert(
+        "core.filesystem:rimraf-general",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List what rimraf would remove before asking for approval",
+            )
+            .with_command("ls -la ./build"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Move the reviewed directory to the Trash instead, for example `trash-put ./build` on Linux (trash-cli) or `mv ./build ~/.Trash/` on macOS",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Keep disposable output under a literal temp path, where `rimraf /tmp/task/out` is allowed",
+            ),
+        ],
+    );
+
     // The command word is assembled at runtime. Do not guess a platform or
     // repeat the unverified delete; make the executable and target reviewable.
     m.insert(
@@ -2420,6 +2441,7 @@ mod tests {
             "core.filesystem:rm-bare-glob",
             "core.filesystem:rm-bare-glob-root",
             "core.filesystem:trash-unsafe-target",
+            "core.filesystem:rimraf-general",
             "core.filesystem:find-delete-root-home",
             "core.filesystem:find-delete-general",
             "core.filesystem:unlink-root-home",

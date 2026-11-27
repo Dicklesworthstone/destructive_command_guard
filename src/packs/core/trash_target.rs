@@ -18,6 +18,32 @@ pub(super) fn unsafe_rimraf_glob_operand(raw: &str, cwd: Option<&Path>) -> bool 
     unsafe_operand_in(raw, cwd, crate::config::home_dir().as_deref(), true)
 }
 
+/// rimraf deletes recursively and permanently, so it earns `rm -rf`'s temp
+/// exemption and nothing wider (#675): a literal path below `/tmp`,
+/// `/var/tmp` or their macOS `/private` forms (or a literal Windows user temp
+/// subpath), with a real component under the temp root and no `..`. A simple
+/// glob in the last component is accepted, as it is for `rm -rf /tmp/x/*`.
+pub(super) fn rimraf_operand_is_literal_temp(raw: &str) -> bool {
+    use super::filesystem::{
+        LITERAL_TEMP_PREFIXES, has_dotdot_segment, temp_path_suffix_has_real_component,
+        windows_literal_user_temp_subpath,
+    };
+
+    let Some((path, _)) = decode_target(raw) else {
+        return false;
+    };
+    if path.contains(['\0', '\\']) {
+        return false;
+    }
+    LITERAL_TEMP_PREFIXES
+        .iter()
+        .find_map(|prefix| path.strip_prefix(prefix))
+        .is_some_and(|suffix| {
+            temp_path_suffix_has_real_component(suffix) && !has_dotdot_segment(suffix)
+        })
+        || windows_literal_user_temp_subpath(&path)
+}
+
 fn unsafe_operand_in(
     raw: &str,
     cwd: Option<&Path>,

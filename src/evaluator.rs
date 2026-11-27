@@ -31229,11 +31229,11 @@ fn evaluate_packs_with_allowlists_at_depth(
                     original_command,
                     project_path,
                 ) {
-                    Ok(Some(span)) => {
+                    Ok(Some((span, rule))) => {
                         if let Some(result) = evaluate_named_pack_rule_with_span(
                             pack_id,
                             pack,
-                            crate::packs::core::filesystem::TRASH_TARGET_RULE,
+                            rule,
                             allowlists,
                             project_path,
                             &mut first_allowlist_hit,

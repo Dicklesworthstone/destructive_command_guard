@@ -852,10 +852,15 @@ impl Pack {
     /// Returns the matched pattern's reason, name, severity, and explanation if found.
     #[must_use]
     pub fn matches_destructive(&self, cmd: &str) -> Option<DestructiveMatch> {
-        if self.id == "core.filesystem"
-            && !matches!(core::filesystem::unsafe_trash_span(cmd, None), Ok(None))
-        {
-            return self.destructive_match_by_name(core::filesystem::TRASH_TARGET_RULE, cmd);
+        if self.id == "core.filesystem" {
+            match core::filesystem::unsafe_trash_span(cmd, None) {
+                Ok(None) => {}
+                Ok(Some((_, rule))) => return self.destructive_match_by_name(rule, cmd),
+                Err(()) => {
+                    return self
+                        .destructive_match_by_name(core::filesystem::TRASH_TARGET_RULE, cmd);
+                }
+            }
         }
         if self.id == "careful_company_running_windows.guardrails"
             && crate::packs::careful_company_running_windows::guardrails::authorization_store_write_span(

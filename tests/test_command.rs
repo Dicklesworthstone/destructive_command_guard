@@ -158,7 +158,7 @@ fn trash_operand_decisions_agree_with_the_hook() {
         ("trash /tmp/pr-prov/render", "allow"),
         ("trash-put ./build .env ../sibling/build", "allow"),
         ("gio trash -- 'build outputs'", "allow"),
-        ("rimraf a b", "allow"),
+        ("rimraf a b", "deny"),
         ("mv ./build ~/.Trash/", "allow"),
         ("gio info .", "allow"),
         ("trash-put '$OUT'", "allow"),
@@ -166,6 +166,46 @@ fn trash_operand_decisions_agree_with_the_hook() {
         ("printf '%s' 'gio trash .'", "allow"),
     ] {
         assert_trash_decision(command, expected, None);
+    }
+}
+
+/// #675: rimraf deletes permanently, so outside a literal temp directory it
+/// is reviewed like `rm -rf`, also when npx, npm exec, pnpm, yarn or bun
+/// starts it. Candidates are passed as arguments or JSON data; none runs.
+#[test]
+fn rimraf_decisions_agree_with_the_hook_675() {
+    for (command, expected) in [
+        ("rimraf dist", "deny"),
+        ("npx rimraf dist", "deny"),
+        ("npx --yes rimraf@5 ./build", "deny"),
+        ("npm exec -- rimraf node_modules", "deny"),
+        ("pnpm dlx rimraf dist", "deny"),
+        ("yarn rimraf dist", "deny"),
+        ("bunx rimraf dist", "deny"),
+        ("npx rimraf .", "deny"),
+        (r#"npx rimraf "$OUT""#, "deny"),
+        ("rimraf /tmp/task/out", "allow"),
+        ("npx rimraf /tmp/task/out", "allow"),
+        ("npm install -D rimraf", "allow"),
+        ("echo npx rimraf dist", "allow"),
+        ("trash-put ./build", "allow"),
+    ] {
+        assert_trash_decision(command, expected, None);
+    }
+    // Inside a shell -c script or a script heredoc the same argv is judged.
+    for command in [
+        "bash -c 'npx rimraf dist'",
+        "sh <<'EOF'\nnpx rimraf dist\nEOF",
+    ] {
+        let test = run_dcg_isolated(
+            &["test", "--dialect", "posix", "--format", "json", command],
+            None,
+        );
+        let verdict = parse_json(&test);
+        assert_eq!(
+            verdict["decision"], "deny",
+            "dcg test: {command}: {verdict}"
+        );
     }
 }
 

@@ -33,6 +33,25 @@ const RM_RF_ROOT_HOME_SUGGESTIONS: &[PatternSuggestion] = &[
     ),
 ];
 
+/// Suggestions for `rimraf` outside a temp directory (#675). The Trash
+/// utilities are recoverable and dcg checks their targets.
+const RIMRAF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::with_platform(
+        "trash-put ./build",
+        "Move the reviewed directory to the trash instead (recoverable; requires trash-cli)",
+        Platform::Linux,
+    ),
+    PatternSuggestion::with_platform(
+        "mv ./build ~/.Trash/",
+        "Move the reviewed directory to the Finder trash instead (recoverable)",
+        Platform::MacOS,
+    ),
+    PatternSuggestion::new(
+        "rimraf /tmp/task/out",
+        "rimraf of a literal path under a temp directory is allowed",
+    ),
+];
+
 /// Suggestions for general `rm -rf` pattern.
 const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
@@ -375,6 +394,27 @@ use std::ops::Range;
 use std::path::Path;
 
 pub(crate) const TRASH_TARGET_RULE: &str = "trash-unsafe-target";
+/// rimraf of a target outside a literal temp directory. rimraf removes
+/// recursively and permanently, exactly what `rm-rf-general` reviews, while
+/// the Trash utilities are recoverable and only need their target checks.
+pub(crate) const RIMRAF_GENERAL_RULE: &str = "rimraf-general";
+
+/// Programs a wrapper (`sudo`, `env`, `timeout`, …) may start that this
+/// check reads: the disposal utilities and the package runners.
+const TRASH_CHILD_PROGRAMS: &[&str] = &[
+    "trash",
+    "trash-put",
+    "rimraf",
+    "gio",
+    "mv",
+    "npx",
+    "pnpx",
+    "bunx",
+    "npm",
+    "pnpm",
+    "yarn",
+    "bun",
+];
 
 /// A candidate gate only. Removing quotes here can select inert text; the
 /// command parser below must prove the executable and each operand's role.
@@ -405,10 +445,13 @@ fn may_name_trash(command: &str) -> bool {
 /// Inspect original shell syntax. The Bash grammar gives us the executable
 /// and its raw argument fields, including empty quoted words and substitutions.
 /// Comments, redirection targets and quoted command examples are not argv.
+///
+/// Returns the span of the first disposal command that needs review and the
+/// rule that names why: [`TRASH_TARGET_RULE`] or [`RIMRAF_GENERAL_RULE`].
 pub(crate) fn unsafe_trash_span(
     command: &str,
     cwd: Option<&Path>,
-) -> Result<Option<Range<usize>>, ()> {
+) -> Result<Option<(Range<usize>, &'static str)>, ()> {
     use ast_grep_core::AstGrep;
     use ast_grep_language::SupportLang;
 
@@ -436,68 +479,181 @@ pub(crate) fn unsafe_trash_span(
         let words: Vec<&str> = std::iter::once(raw_name)
             .chain(args.filter_map(|arg| source.get(arg.range())))
             .collect();
-        if unsafe_trash_argv(&words, cwd) {
-            return Ok(Some(invocation.range()));
+        if let Some(rule) = unsafe_trash_argv(&words, cwd) {
+            return Ok(Some((invocation.range(), rule)));
         }
     }
     Ok(None)
 }
 
-fn unsafe_trash_argv(words: &[&str], cwd: Option<&Path>) -> bool {
-    use super::trash_target::{unsafe_rimraf_glob_operand, unsafe_trash_operand};
+fn unsafe_trash_argv(words: &[&str], cwd: Option<&Path>) -> Option<&'static str> {
+    use super::trash_target::unsafe_trash_operand;
     use crate::normalize::decode_posix_literal_word;
 
-    let Some((&name, args)) = words.split_first() else {
-        return false;
-    };
-    let Some(name) = decode_posix_literal_word(name) else {
-        return false;
-    };
-    match name.rsplit('/').next() {
-        Some("trash" | "trash-put") => args.iter().any(|word| unsafe_trash_operand(word, cwd)),
-        Some("rimraf") => {
-            let glob = args
-                .iter()
-                .map(|word| decode_posix_literal_word(word))
-                .take_while(|word| word.as_deref() != Some("--"))
-                .any(|word| matches!(word.as_deref(), Some("--glob" | "-g")));
-            args.iter().any(|word| {
-                if glob {
-                    unsafe_rimraf_glob_operand(word, cwd)
-                } else {
-                    unsafe_trash_operand(word, cwd)
-                }
+    let (&name, args) = words.split_first()?;
+    let name = decode_posix_literal_word(name)?;
+    let program = name.rsplit('/').next().unwrap_or_default();
+    match program {
+        "trash" | "trash-put" => args
+            .iter()
+            .any(|word| unsafe_trash_operand(word, cwd))
+            .then_some(TRASH_TARGET_RULE),
+        "rimraf" => rimraf_argv_rule(args, cwd),
+        "gio" => args
+            .split_first()
+            .is_some_and(|(operation, operands)| {
+                decode_posix_literal_word(operation).as_deref() == Some("trash")
+                    && operands.iter().any(|word| unsafe_trash_operand(word, cwd))
             })
-        }
-        Some("gio") => args.split_first().is_some_and(|(operation, operands)| {
-            decode_posix_literal_word(operation).as_deref() == Some("trash")
-                && operands.iter().any(|word| unsafe_trash_operand(word, cwd))
-        }),
-        Some("mv") => unsafe_trash_move(args, cwd),
+            .then_some(TRASH_TARGET_RULE),
+        "mv" => unsafe_trash_move(args, cwd).then_some(TRASH_TARGET_RULE),
         _ => {
+            if let Some(child) = package_runner_child(program, args) {
+                return unsafe_trash_argv(&child, cwd);
+            }
             // Ask the existing wrapper parser which argument is executed.
             // Only a suffix of the same raw words can supply a child argv.
             if !args.iter().any(|arg| {
                 decode_posix_literal_word(arg).is_some_and(|word| {
-                    matches!(
-                        word.rsplit('/').next(),
-                        Some("trash" | "trash-put" | "rimraf" | "gio" | "mv")
-                    )
+                    word.rsplit('/')
+                        .next()
+                        .is_some_and(|base| TRASH_CHILD_PROGRAMS.contains(&base))
                 })
             }) {
-                return false;
+                return None;
             }
             let invocation = words.join(" ");
             let stripped = crate::normalize::strip_wrapper_prefixes(&invocation);
             if !stripped.was_normalized() || stripped.wrapper_limit_reached {
-                return false;
+                return None;
             }
             let child = stripped.normalized.as_ref();
             let tokens = tokenize_for_normalization(child);
             let child_words: Vec<_> = tokens.iter().filter_map(|word| word.text(child)).collect();
-            child_words.len() < words.len() && unsafe_trash_argv(&child_words, cwd)
+            if child_words.len() < words.len() {
+                unsafe_trash_argv(&child_words, cwd)
+            } else {
+                None
+            }
         }
     }
+}
+
+/// rimraf removes recursively and permanently, so it is reviewed like
+/// `rm -rf` (#675): every operand must be a literal temp path. An operand
+/// that could select the worktree, home or a system root (empty, dynamic,
+/// `.`, a broad glob) keeps the more specific [`TRASH_TARGET_RULE`].
+fn rimraf_argv_rule(args: &[&str], cwd: Option<&Path>) -> Option<&'static str> {
+    use super::trash_target::{
+        rimraf_operand_is_literal_temp, unsafe_rimraf_glob_operand, unsafe_trash_operand,
+    };
+    use crate::normalize::decode_posix_literal_word;
+
+    let glob = args
+        .iter()
+        .map(|word| decode_posix_literal_word(word))
+        .take_while(|word| word.as_deref() != Some("--"))
+        .any(|word| matches!(word.as_deref(), Some("--glob" | "-g")));
+    if args.iter().any(|word| {
+        if glob {
+            unsafe_rimraf_glob_operand(word, cwd)
+        } else {
+            unsafe_trash_operand(word, cwd)
+        }
+    }) {
+        return Some(TRASH_TARGET_RULE);
+    }
+    let mut options = true;
+    let outside_temp = args.iter().any(|word| {
+        if options {
+            match decode_posix_literal_word(word).as_deref() {
+                Some("--") => {
+                    options = false;
+                    return false;
+                }
+                Some(option) if option.starts_with('-') && option != "-" => return false,
+                _ => {}
+            }
+        }
+        !rimraf_operand_is_literal_temp(word)
+    });
+    outside_temp.then_some(RIMRAF_GENERAL_RULE)
+}
+
+/// Package runners execute an npm package's binary with the words after it:
+/// `npx rimraf dist`, `npm exec -- rimraf dist`, `pnpm dlx rimraf dist`,
+/// `yarn rimraf dist`, `bunx rimraf dist`. rimraf is nearly always started
+/// this way, so return the binary's argv for the packages this check owns
+/// (`rimraf`, and `trash-cli`, whose binary is `trash`).
+fn package_runner_child<'a>(program: &str, args: &[&'a str]) -> Option<Vec<&'a str>> {
+    use crate::normalize::decode_posix_literal_word;
+
+    // Runner options that consume the following word.
+    const VALUE_OPTIONS: &[&str] = &[
+        "-p",
+        "--package",
+        "-c",
+        "--call",
+        "-w",
+        "--workspace",
+        "--registry",
+        "--cache",
+        "--prefix",
+        "--userconfig",
+        "-C",
+        "--dir",
+        "--cwd",
+        "-F",
+        "--filter",
+    ];
+    // Subcommands that take the binary as their next positional word, and
+    // whether the first positional word may itself name the binary.
+    let (subcommands, bare): (&[&str], bool) = match program {
+        "npx" | "pnpx" | "bunx" => (&[], true),
+        "npm" => (&["exec", "x"], false),
+        "pnpm" => (&["exec", "dlx"], true),
+        "yarn" => (&["exec", "dlx", "run"], true),
+        "bun" => (&["x", "run"], true),
+        _ => return None,
+    };
+
+    let mut index = 0;
+    let mut subcommand_seen = subcommands.is_empty();
+    let mut options = true;
+    while let Some(word) = args.get(index) {
+        let decoded = decode_posix_literal_word(word)?;
+        index += 1;
+        if options && decoded == "--" {
+            options = false;
+            continue;
+        }
+        if options && decoded.starts_with('-') {
+            if VALUE_OPTIONS.contains(&decoded.as_ref()) {
+                index += 1;
+            }
+            continue;
+        }
+        if !subcommand_seen && subcommands.contains(&decoded.as_ref()) {
+            subcommand_seen = true;
+            options = true;
+            continue;
+        }
+        if !subcommand_seen && !bare {
+            return None;
+        }
+        // `rimraf@5.0.10` runs the rimraf package at that version.
+        let package = decoded.split('@').next().unwrap_or_default();
+        let binary = match package {
+            "rimraf" => "rimraf",
+            "trash-cli" => "trash",
+            _ => return None,
+        };
+        let mut child = Vec::with_capacity(args.len() + 1 - index);
+        child.push(binary);
+        child.extend_from_slice(&args[index..]);
+        return Some(child);
+    }
+    None
 }
 
 fn unsafe_trash_move(args: &[&str], cwd: Option<&Path>) -> bool {
@@ -4383,7 +4539,7 @@ fn path_is_safe_for_style(path: &PathToken<'_>, style: RmFlagStyle) -> bool {
 
 /// Literal temp-family prefixes, including macOS's canonical `/private`
 /// forms (`/tmp` and `/var/tmp` are symlinks to them there) (#244).
-const LITERAL_TEMP_PREFIXES: [&str; 4] =
+pub(super) const LITERAL_TEMP_PREFIXES: [&str; 4] =
     ["/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/"];
 
 fn path_is_safe_unquoted(path: &str) -> bool {
@@ -4524,12 +4680,12 @@ fn temp_path_suffix_is_static_double_quoted(path: &str) -> bool {
     true
 }
 
-fn temp_path_suffix_has_real_component(path: &str) -> bool {
+pub(super) fn temp_path_suffix_has_real_component(path: &str) -> bool {
     path.split('/')
         .any(|component| !component.is_empty() && component != ".")
 }
 
-fn has_dotdot_segment(path: &str) -> bool {
+pub(super) fn has_dotdot_segment(path: &str) -> bool {
     path.split('/')
         .filter(|segment| !segment.is_empty())
         .any(|segment| segment == "..")
@@ -6118,6 +6274,21 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             High,
             "An unset variable or empty argument can select the working directory. A broad operand can move an entire worktree or home to the Trash, or permanently delete it with rimraf. Verify the exact paths and list them explicitly.",
             TRASH_TARGET_SUGGESTIONS
+        ),
+        // Also owned by the argv classifier, which reads rimraf through npx,
+        // npm exec, pnpm, yarn and bun.
+        destructive_pattern!(
+            "rimraf-general",
+            r"(?!)",
+            "rimraf deletes recursively and permanently, like rm -rf, and requires human approval outside a temp directory.",
+            High,
+            "rimraf (including `npx rimraf`, `pnpm dlx rimraf` and `yarn rimraf`) removes \
+             its targets and everything under them with no confirmation and no way back, \
+             the same operation as `rm -rf`. Outside a literal temp directory such as \
+             /tmp/<task>/out it gets the same review as `rm -rf`.\n\n\
+             Move the directory to the Trash instead, which keeps it recoverable, or ask \
+             the user to run the rimraf command.",
+            RIMRAF_GENERAL_SUGGESTIONS
         ),
         // ----- credential / login-file writes (Critical, semantic) -----
         //
@@ -9098,7 +9269,95 @@ mod tests {
             "echo trash > /dev/null",
             "trash ./build # . and /tmp",
             "trash ./build 2>/dev/null",
+            "rimraf --glob '/tmp/task/*.log'",
+        ] {
+            assert_eq!(unsafe_trash_span(command, None), Ok(None), "{command}");
+        }
+    }
+
+    /// #675: rimraf is a permanent recursive delete, so a literal target
+    /// outside a temp directory is reviewed as `rm -rf` is, including when a
+    /// package runner starts it. The recoverable Trash utilities keep only
+    /// their target checks.
+    #[test]
+    fn rimraf_is_reviewed_like_rm_rf_675() {
+        let pack = create_pack();
+        for command in [
+            "rimraf dist",
+            "rimraf a b",
+            "rimraf ./build node_modules",
+            "rimraf /tmp/task/out ./build",
+            "rimraf -v -- dist",
             "rimraf --glob '*.log'",
+            "rimraf /tmp/../srv/data",
+            "./node_modules/.bin/rimraf dist",
+            "npx rimraf dist",
+            "npx --yes rimraf@5.0.10 dist",
+            "npx -p rimraf rimraf dist",
+            "npm exec -- rimraf dist",
+            "npm exec rimraf -- dist",
+            "npm x rimraf dist",
+            "pnpm dlx rimraf dist",
+            "pnpm exec rimraf dist",
+            "pnpm --filter web exec rimraf dist",
+            "pnpm rimraf dist",
+            "pnpx rimraf dist",
+            "yarn rimraf dist",
+            "yarn dlx rimraf dist",
+            "yarn run rimraf dist",
+            "bunx rimraf dist",
+            "bun x rimraf dist",
+            "sudo npx rimraf dist",
+            "env CI=1 npx rimraf dist",
+            "cd /tmp/task && npx rimraf build",
+        ] {
+            assert_eq!(
+                pack.check(command).and_then(|m| m.name),
+                Some(RIMRAF_GENERAL_RULE),
+                "{command}"
+            );
+        }
+        // Targets that could select the worktree, home or a system root keep
+        // the more specific rule, through a runner as well.
+        for command in [
+            "npx rimraf .",
+            r#"npx rimraf "$OUT""#,
+            "pnpm dlx rimraf ''",
+            "yarn rimraf ~",
+            "bunx rimraf /",
+            "sudo npx rimraf@5 /",
+            "rimraf ./build .",
+            "npx trash-cli .",
+        ] {
+            assert_eq!(
+                pack.check(command).and_then(|m| m.name),
+                Some(TRASH_TARGET_RULE),
+                "{command}"
+            );
+        }
+        for command in [
+            "rimraf /tmp/task/out",
+            "rimraf /tmp/task/out /var/tmp/cache/x",
+            "rimraf '/private/tmp/task out'",
+            "rimraf /tmp/task/*",
+            "npx rimraf /tmp/task/out",
+            "pnpm dlx rimraf -- /tmp/task/out",
+            "rimraf",
+            "rimraf --help",
+            "npx trash-cli ./build",
+            "trash ./build",
+            "trash-put ./build node_modules",
+            "npm install rimraf",
+            "npm i -D rimraf@5 dist",
+            "npm uninstall rimraf",
+            "pnpm add -D rimraf",
+            "yarn add rimraf",
+            "bun add rimraf",
+            "npx tsc --outDir dist",
+            "npm run clean",
+            "echo rimraf dist",
+            "grep -rn rimraf package.json",
+            "git commit -m 'use rimraf dist'",
         ] {
             assert_eq!(unsafe_trash_span(command, None), Ok(None), "{command}");
         }
