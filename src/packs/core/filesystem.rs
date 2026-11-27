@@ -280,6 +280,14 @@ const MV_DYNAMIC_SUGGESTIONS: &[PatternSuggestion] = &[
     ),
 ];
 
+/// Suggestions for `trash-unsafe-target`. A `const`, because a slice built
+/// inline in `create_destructive_patterns` is a temporary that cannot be
+/// borrowed for `'static` (a `const fn` call is not promoted there).
+const TRASH_TARGET_SUGGESTIONS: &[PatternSuggestion] = &[PatternSuggestion::new(
+    "trash /tmp/my-task/out",
+    "After verifying the intended target, name its literal path",
+)];
+
 /// Suggestions for sensitive-source propagation chains. These commands first
 /// propagate a sensitive path into a temp-family location, then delete that
 /// temp tree in a later shell segment.
@@ -6109,10 +6117,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "This disposal command could remove a worktree or a protected directory. Name a specific literal path, e.g. `trash /tmp/my-task/out`.",
             High,
             "An unset variable or empty argument can select the working directory. A broad operand can move an entire worktree or home to the Trash, or permanently delete it with rimraf. Verify the exact paths and list them explicitly.",
-            &[PatternSuggestion::new(
-                "trash /tmp/my-task/out",
-                "After verifying the intended target, name its literal path",
-            )]
+            TRASH_TARGET_SUGGESTIONS
         ),
         // ----- credential / login-file writes (Critical, semantic) -----
         //
