@@ -27,6 +27,13 @@ deny	command kill -9 -1
 deny	command -p kill -TERM -1
 deny	env kill -9 -1
 deny	sudo kill -9 -1
+# Only kill's first -N word is the signal: a -1 after the signal or a PID is a target (#676)
+deny	kill -1 -1
+deny	kill 12345 -1
+deny	kill -9 12345 -1
+deny	kill -TERM "$PID" -1
+deny	sudo kill -HUP 4321 -1
+deny	ssh build-1 'kill 12345 -1'
 # Computed PIDs
 deny	kill $(pgrep -f verify_loop)
 deny	kill -9 $(lsof -t -i:3000)
@@ -79,6 +86,10 @@ allow	kill -TERM 12345
 allow	kill -9 12345 12346
 allow	kill -s TERM 12345
 allow	kill -HUP 4242
+allow	kill -1 12345
+allow	kill -1 12345 12346
+allow	kill 12345; ls -1
+allow	kill 12345 -10
 allow	/bin/kill -TERM 12345
 allow	sudo kill -HUP 4321
 allow	kill -0 12345

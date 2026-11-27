@@ -90,7 +90,7 @@ const RECORDED_PID_SUGGESTIONS: &[PatternSuggestion] = &[
 const SINGLE_PROCESS_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "kill -HUP {pid}",
-        "Name the signal and one PID; `kill -1` is read as a target, not as SIGHUP",
+        "Name the signal and give one PID; a -1 after the signal, `--` or a PID signals every process",
     ),
     PatternSuggestion::new(
         "kill -TERM -- -{pgid}",
@@ -168,15 +168,23 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             RECORDED_PID_SUGGESTIONS,
             executables = ["killall", "killall5"]
         ),
+        // kill reads only its first `-N` word as the signal; every later
+        // word, including one after a PID, is a target. The first branch
+        // also matches a leading `-1` (`kill -1 <pid>` is SIGHUP to one PID),
+        // which `kill_signals_only_recorded_pids` exempts. The second branch
+        // is a `-1` after any other word on the same line.
         destructive_pattern!(
             "kill-every-process",
-            r"(?<![\w-])kill(?:\s+-[sn]\s+\S+|\s+-[A-Za-z0-9]+)*?\s+(?:--\s+)?-1(?!\w)",
-            "kill -1 signals every process the user owns (every app, terminal and agent).",
+            r"(?<![\w-])kill(?:(?:\s+-[sn]\s+\S+|\s+-[A-Za-z0-9]+)*?\s+(?:--\s+)?|(?:[^\S\n]+[^\s;&|<>()]+)+?[^\S\n]+)-1(?!\w)",
+            "A kill target of -1 signals every process the user owns (every app, terminal and agent).",
             Critical,
             "A target of -1 means \"every process I am allowed to signal\": as root that \
              is the whole machine, as a user it is every app, terminal, agent and daemon \
-             they own. `kill -1 <pid>` in particular is often meant as SIGHUP but reads \
-             -1 as a target.\n\n\
+             they own. kill reads only its first -N argument as the signal, so \
+             `kill -1 <pid>` sends SIGHUP to that one PID and is allowed. A later -1 is a \
+             target: after the signal or `--` (`kill -9 -1`, `kill -s HUP -1`, \
+             `kill -- -1`) or after a PID (`kill <pid> -1`). A bare `kill -1` with no \
+             PID is blocked too.\n\n\
              Write the signal by name and give one PID:\n  \
              kill -HUP <pid>",
             SINGLE_PROCESS_SUGGESTIONS,
@@ -250,7 +258,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // answer for the extracted text as well.
         destructive_pattern!(
             "ssh-remote-pattern-kill",
-            r#"\bssh\b.*?(?:(?<![\w|-])(?:pkill|killall5?)\s+(?:-|['"\w^])|(?<![\w.-])kill(?:\s+-[A-Za-z0-9]+)*?\s+(?:--\s+)?-1(?!\w)|(?<![\w/.-])(?:pgrep|pidof)\s.*?(?<![\w.-])kill(?!\s+-0\b)(?:\s+-[A-Za-z0-9]+)*(?:\s+--)?\s+"?-?\\?\$)"#,
+            r#"\bssh\b.*?(?:(?<![\w|-])(?:pkill|killall5?)\s+(?:-|['"\w^])|(?<![\w.-])kill(?:(?:\s+-[A-Za-z0-9]+)*?\s+(?:--\s+)?|(?:[^\S\n]+[^\s;&|<>()]+)+?[^\S\n]+)-1(?!\w)|(?<![\w/.-])(?:pgrep|pidof)\s.*?(?<![\w.-])kill(?!\s+-0\b)(?:\s+-[A-Za-z0-9]+)*(?:\s+--)?\s+"?-?\\?\$)"#,
             "The remote command kills processes by pattern on another host.",
             High,
             "Remote build and CI hosts run other people's and other agents' jobs, \
@@ -343,6 +351,46 @@ mod tests {
         assert_blocks_with_severity(&pack, "launchctl bootout gui/501", Severity::Critical);
     }
 
+    /// #676: kill reads only its first `-N` word as the signal. A `-1` after
+    /// the signal, after `--` or after a PID is a broadcast target, so the
+    /// explanation's "after the signal or a PID" must hold for the rule too.
+    #[test]
+    fn a_later_minus_one_is_a_broadcast_target() {
+        let pack = create_pack();
+        for command in [
+            "kill 12345 -1",
+            "kill -9 12345 -1",
+            "kill -TERM \"$PID\" -1",
+            "kill -s HUP 12345 -1",
+            "kill -- 12345 -1",
+            "kill %1 -1",
+            "kill -1 -1",
+            "kill -1 12345 -1",
+            "/bin/kill 12345 -1",
+        ] {
+            assert_no_safe_match(&pack, command);
+            assert_blocks_with_pattern(&pack, command, "kill-every-process");
+            assert_blocks_with_severity(&pack, command, Severity::Critical);
+        }
+        assert_blocks_with_pattern(
+            &pack,
+            "ssh build-1 'kill 12345 -1'",
+            "ssh-remote-pattern-kill",
+        );
+        // A -1 that is not kill's own argument, and a process group whose ID
+        // merely starts with 1, stay allowed.
+        for command in [
+            "kill 12345; ls -1",
+            "kill 12345 && ls -1 /tmp",
+            "kill 12345\nls -1",
+            "kill 12345 -10",
+            "kill -TERM -12345",
+            "ssh build-1 'kill 12345; ls -1'",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
     /// Recorded-PID and process-group kills are what the explanations tell
     /// agents to do instead, so they must stay allowed.
     #[test]
@@ -363,6 +411,11 @@ mod tests {
             "kill -TERM -$PGID",
             "kill -9 -- -$pg",
         ] {
+            assert_allows(&pack, command);
+        }
+        // #676: a leading -1 is the signal number (SIGHUP), not a target.
+        for command in ["kill -1 12345", "kill -1 12345 12346"] {
+            assert_safe_pattern_matches(&pack, command);
             assert_allows(&pack, command);
         }
         for command in [

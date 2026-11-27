@@ -342,7 +342,7 @@ These patterns match potentially destructive commands:
 |--------------|--------|----------|
 | `pkill` | pkill signals every process whose name or command line matches a pattern. | high |
 | `killall` | killall signals every process with a given name, including other users' work. | high |
-| `kill-every-process` | kill -1 signals every process the user owns (every app, terminal and agent). | critical |
+| `kill-every-process` | A kill target of -1 signals every process the user owns (every app, terminal and agent). | critical |
 | `kill-computed-pids` | The PIDs to kill are computed by a command substitution at run time. | high |
 | `xargs-kill` | Piping a PID lookup into xargs kill signals whatever the lookup matched. | high |
 | `find-exec-kill` | find -exec kill signals processes chosen by a file search. | high |
