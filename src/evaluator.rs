@@ -51428,16 +51428,94 @@ mod tests {
         );
     }
 
+    /// The original-payload re-check runs only for an executing `curl`, not for
+    /// any word that contains the four letters. Here the Railway terms sit in a
+    /// masked `grep -e` pattern or `echo` text, and the only visible `curl` is in
+    /// a file name, so the re-check must stay off.
+    ///
+    /// This test used to send `curlgrep -H ... --data-binary ...`. Only `curl`'s
+    /// own header and body flags are masked as data, so that command's payload
+    /// reaches the pack unmasked, and the pack denies it by design. The next
+    /// test pins that.
     #[test]
     fn masked_non_curl_command_name_stays_allowed_for_railway_api_terms() {
-        let result = evaluate_with_pack_ids(
-            r#"curlgrep -H "Authorization: Bearer $RAILWAY_API_TOKEN" --data-binary '{"query":"mutation { projectDelete(id:\"p\") }"}'"#,
-            &["platform.railway"],
-        );
+        let denied: Vec<&str> = [
+            "grep -e 'projectDelete with RAILWAY_API_TOKEN' curl_examples.txt",
+            "grep -e 'projectDelete with RAILWAY_API_TOKEN' ./mycurl.log",
+            "echo 'projectDelete with RAILWAY_API_TOKEN belongs in docs' > curl-notes.md",
+        ]
+        .into_iter()
+        .filter(|command| !evaluate_with_pack_ids(command, &["platform.railway"]).is_allowed())
+        .collect();
 
         assert!(
-            result.is_allowed(),
-            "non-curl command names should not activate Railway API inspection"
+            denied.is_empty(),
+            "a non-curl word containing `curl` must not activate Railway API inspection: {denied:?}"
+        );
+    }
+
+    /// Railway API mutations are caught in the payload whichever client sends
+    /// them, which has been the pack's contract since it was added. Bare `curl`
+    /// payloads are masked as data and restored by the re-check. Every other
+    /// spelling's arguments reach the pack unmasked.
+    ///
+    /// The packs are the ones production evaluates, because `core.filesystem`
+    /// and `core.git` are always enabled. With `platform.railway` alone,
+    /// `'curl'`, `"curl"` and `curl.exe` are quick-rejected before the pack
+    /// runs. Production never evaluates that configuration.
+    #[test]
+    fn railway_api_mutations_are_denied_whichever_client_sends_them() {
+        let packs = ["core.filesystem", "core.git", "platform.railway"];
+        let header_and_body = r#"-H "Authorization: Bearer $RAILWAY_API_TOKEN" --data-binary '{"query":"mutation { projectDelete(id:\"p\") }"}'"#;
+        let mut commands: Vec<String> = [
+            "curl",
+            "env FOO=1 curl",
+            "sudo curl",
+            "sudo -u deploy /usr/local/bin/curl",
+            "command curl",
+            "/usr/bin/curl",
+            "'curl'",
+            "\"curl\"",
+            "curl.exe",
+            "curlie",
+            "curlgrep",
+        ]
+        .iter()
+        .map(|client| format!("{client} {header_and_body} https://api.example.com/graphql"))
+        .collect();
+        commands.extend(
+            [
+                r#"curlgrep -H "Authorization: Bearer $RAILWAY_API_TOKEN" --data-binary '{"query":"mutation { projectDelete(id:\"p\") }"}'"#,
+                r#"wget --header "Authorization: Bearer $RAILWAY_API_TOKEN" --post-data '{"query":"mutation { projectDelete(id:\"p\") }"}' https://api.example.com/graphql"#,
+                r#"http POST https://backboard.railway.app/graphql/v2 query='mutation { projectDelete(id:"p") }'"#,
+                r#"xh POST https://backboard.railway.app/graphql/v2 query='mutation { projectDelete(id:"p") }'"#,
+                r#"python3 -c "import requests; requests.post('https://backboard.railway.app/graphql/v2', json={'query': 'mutation { projectDelete(id: 1) }'})""#,
+            ]
+            .map(String::from),
+        );
+
+        let missed: Vec<String> = commands
+            .iter()
+            .filter_map(|command| {
+                let result = evaluate_with_pack_ids(command, &packs);
+                let info = result.pattern_info.as_ref();
+                let rule = info.and_then(|info| info.pattern_name.as_deref());
+                let pack = info.and_then(|info| info.pack_id.as_deref());
+                let blocked = result.is_denied()
+                    && pack == Some("platform.railway")
+                    && rule == Some("railway-api-project-delete");
+                (!blocked).then(|| {
+                    format!(
+                        "{command:?}: {:?} {pack:?} {rule:?} quick_rejected={}",
+                        result.decision, result.quick_rejected
+                    )
+                })
+            })
+            .collect();
+
+        assert!(
+            missed.is_empty(),
+            "Railway API project deletion must be blocked whichever client sends it: {missed:#?}"
         );
     }
 
