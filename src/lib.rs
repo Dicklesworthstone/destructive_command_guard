@@ -88,6 +88,7 @@ pub mod redaction;
 pub mod sarif;
 pub mod scan;
 pub mod session;
+pub mod shell_shim;
 pub mod simulate;
 pub mod stats;
 pub mod suggest;
